@@ -11,7 +11,6 @@ from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
 from monoid_agent_kernel.providers._common import capped_backoff
-from monoid_agent_kernel.reference.backend.activation import raise_if_activation_lease_lost
 from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort, queued_message_snapshot
 
 
@@ -59,9 +58,7 @@ class OutboxDispatchService:
 
     @staticmethod
     def _raise_if_lease_lost(record: MutableRunRecordPort) -> None:
-        # A few dependency-light embedders use structural record doubles without cancellation;
-        # absence means this local-only host has no lease authority to lose.
-        raise_if_activation_lease_lost(getattr(record, "cancellation_token", None))
+        record.write_authority.assert_active()
 
     def backoff_delay(self, attempts: int) -> float:
         """Capped exponential backoff with full jitter.

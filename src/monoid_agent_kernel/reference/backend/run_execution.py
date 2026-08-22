@@ -11,10 +11,7 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
-from monoid_agent_kernel.reference.backend.activation import (
-    is_activation_lease_loss,
-    raise_on_lease_loss,
-)
+from monoid_agent_kernel.reference.backend.activation import is_activation_lease_loss
 from monoid_agent_kernel.reference.backend.content_hydration import (
     hydrate_settled_text,
     needs_settled_text,
@@ -144,8 +141,10 @@ class RunExecutionService:
             if is_activation_lease_loss(exc):
                 raise
             return await loop.aclose()
+        record = self._context.record(run_id)
+        record.write_authority.assert_active()
         return await self._context.drive_open_session(
-            self._context.record(run_id),
+            record,
             request,
             loop,
             suspension,
@@ -212,7 +211,7 @@ class RunExecutionService:
                             await asyncio.to_thread(hydrate_settled_text, [frame], stream_run_dir)
                     yield frame
                 suspension = stream.suspension
-            raise_on_lease_loss(suspension)
+            prepared.record.write_authority.assert_active()
             result = await loop.aclose()
             closed = True
             self._context.record_run_result(prepared.run_id, result)

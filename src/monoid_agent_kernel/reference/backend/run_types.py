@@ -8,6 +8,7 @@ from typing import Any
 
 from monoid_agent_kernel._runtime_config_ingress import normalize_runtime_config
 from monoid_agent_kernel.core.agents import AgentDefinition, AgentRuntimeConfig
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
@@ -232,6 +233,7 @@ class BackendRunRecord:
     last_event_seq: int = 0
     last_event_type: str = ""
     cancellation_token: CancellationToken = field(default_factory=CancellationToken)
+    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
     runtime_config: AgentRuntimeConfig | None = None
     runtime_config_issuer: str = ""
     runtime_config_reason: str = ""

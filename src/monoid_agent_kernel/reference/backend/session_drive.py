@@ -13,10 +13,6 @@ from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspensi
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.providers._common import retry_delay_s
-from monoid_agent_kernel.reference.backend.activation import (
-    raise_if_activation_lease_lost,
-    raise_on_lease_loss,
-)
 from monoid_agent_kernel.reference.backend.ports import (
     LoopPort,
     MutableRunRecordPort,
@@ -123,7 +119,7 @@ class SessionDriveService:
         while True:
             # Lease loss is an activation disposition. It cannot become run state because a
             # replacement owner may already be projecting the same run.
-            raise_on_lease_loss(suspension)
+            record.write_authority.assert_active()
             limits = self._context.limits_provider()
             _set_record_state(
                 record,
@@ -278,7 +274,7 @@ class SessionDriveService:
 
     def persist_run_checkpoint(self, record: MutableRunRecordPort) -> None:
         """Augment the loop checkpoint with backend-owned queue and inbox state."""
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
         loop = record.loop
         if loop is None:
             return
@@ -286,7 +282,7 @@ class SessionDriveService:
         if checkpoint is None:
             return
         blobs = loop.collect_checkpoint_blobs()
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
         self.persist_run_checkpoint_payload(record, checkpoint, blobs)
 
     def persist_run_checkpoint_payload(
@@ -296,19 +292,19 @@ class SessionDriveService:
         blobs: Mapping[str, bytes],
     ) -> None:
         """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
         loop = record.loop
         if loop is None:
             return
         checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
         self._context.checkpoint_store_provider().put(checkpoint, blobs)
         # The store can block while recovery moves ownership. Outbox dispatch is the next external
         # boundary, so stale authority must stop here before any send is attempted.
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
         self._context.drain_outbox(record, loop)
-        raise_if_activation_lease_lost(record.cancellation_token)
+        record.write_authority.assert_active()
 
     async def persist_run_checkpoint_async(self, record: MutableRunRecordPort) -> None:
         self.persist_run_checkpoint(record)

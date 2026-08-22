@@ -1,44 +1,16 @@
-"""Activation-local control flow for hosted writer-authority loss."""
+"""Recognition of activation-local writer-authority revocation."""
 
 from __future__ import annotations
 
-from monoid_agent_kernel.core.outcome import InterruptionCause
-from monoid_agent_kernel.core.result import Suspension
-from monoid_agent_kernel.errors import NativeAgentError
-
-
-class ActivationLeaseLost(Exception):
-    """Unwind a stale hosted activation without projecting a run outcome."""
-
-
-def raise_if_activation_lease_lost(cancellation_token: object) -> None:
-    """Fence a hosted mutation or external boundary with the sticky lease-loss fact."""
-
-    if getattr(cancellation_token, "lease_lost", False) is True:
-        raise ActivationLeaseLost("hosted activation lost writer authority")
-
-
-def raise_on_lease_loss(suspension: Suspension | None) -> None:
-    """Reject a lease-loss observation before a host mutates run projections."""
-
-    if (
-        suspension is not None
-        and suspension.interruption_cause is InterruptionCause.LEASE_LOST
-    ):
-        raise ActivationLeaseLost("hosted activation lost writer authority")
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked
 
 
 def is_activation_lease_loss(exc: BaseException) -> bool:
-    """Recognize both the host unwind signal and a core write-fence refusal."""
+    """Return whether control flow is retiring a stale activation."""
 
-    return isinstance(exc, ActivationLeaseLost) or (
-        isinstance(exc, NativeAgentError) and exc.error_code == "lease_lost"
-    )
+    return isinstance(exc, WriteAuthorityRevoked)
 
 
 __all__ = [
-    "ActivationLeaseLost",
     "is_activation_lease_loss",
-    "raise_if_activation_lease_lost",
-    "raise_on_lease_loss",
 ]

@@ -32,7 +32,7 @@ from monoid_agent_kernel.core.tool_surface import (
     tool_surface_manifest,
     validate_tool_surface_snapshot,
 )
-from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.workspace import AuthorityBoundWorkspace, Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.providers.base import resolved_provider_name
@@ -92,21 +92,14 @@ class LoopBootstrapper:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
-    def _fenced_call(self, operation: Callable[[], Any]) -> Any:
-        """Run one bootstrap operation under a two-sided sticky-authority fence."""
+    def _guard_external(self, operation: Callable[[], Any]) -> Any:
+        """Run one bootstrap callback through the activation's shared authority."""
 
-        self._loop._check_lease_authority()
-        try:
-            return operation()
-        finally:
-            # Bootstrap invokes filesystem owners and extension callbacks before a session exists.
-            # A post-check is therefore what stops a callback that overlapped lease movement from
-            # handing control to the next artifact write or extension.
-            self._loop._check_lease_authority()
+        return self._loop.write_authority.guard_external_call(operation)
 
     def bootstrap(self) -> _RunResources:
         loop = self._loop
-        loop._check_lease_authority()
+        loop._assert_write_authority()
         # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
         # class-exact, so a deployment's extension subclass with both pattern tuples empty read
         # as "the caller configured this" and the operator's spec policy was silently not
@@ -119,9 +112,10 @@ class LoopBootstrapper:
         if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
-        workspace = self._fenced_call(lambda: workspace_factory(loop.spec))
+        raw_workspace = self._guard_external(lambda: workspace_factory(loop.spec))
+        workspace = AuthorityBoundWorkspace(raw_workspace, loop.write_authority)
         loop._stream_sink = QueueEventSink()
-        recorder = self._fenced_call(
+        recorder = self._guard_external(
             lambda: AgentRecorder(
                 loop.spec.run_root,
                 loop.spec.run_id,
@@ -134,7 +128,7 @@ class LoopBootstrapper:
                 # envelope, and this is the same proven-lineage root the model-stream context uses.
                 root_run_id=loop._validated_root_run_id(),
                 reopen=loop._restoring,
-                check_authority=loop._check_lease_authority,
+                write_authority=loop.write_authority,
             )
         )
         model_stream_observers = loop._materialize_model_stream_observers()
@@ -143,6 +137,7 @@ class LoopBootstrapper:
             workspace=workspace,
             recorder=recorder,
             permission_policy=loop.permission_policy,
+            write_authority=loop.write_authority,
         )
         shell_service = ShellService(
             run_id=loop.spec.run_id,
@@ -169,9 +164,10 @@ class LoopBootstrapper:
             shell_service,
             web_service,
             jobs_service,
+            loop.write_authority,
             permission_policy=loop.permission_policy,
-            capability_vault=loop._capability_vault,
-            outbox=loop._outbox,
+            _capability_vault=loop._capability_vault,
+            _outbox=loop._outbox,
             invocation_traceparent=safe_invocation_context.traceparent,
         )
         started = time.time()
@@ -197,11 +193,13 @@ class LoopBootstrapper:
                 loop.run_sink,
                 loop.writer_token,
                 evidence_policy=loop.model_evidence_policy,
+                write_authority=loop.write_authority,
             )
         model_runner = ModelCallRunner(
             adapter=loop.model_adapter,
             current_adapter=lambda: loop.model_adapter,
             current_cancellation_token=lambda: loop.cancellation_token,
+            current_write_authority=lambda: loop.write_authority,
             cancel_grace_s=loop.async_model_cancel_grace_s,
             current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
@@ -237,7 +235,7 @@ class LoopBootstrapper:
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:
-            self._fenced_call(lambda: base_registry.register_many(provider.get_tools(context)))
+            self._guard_external(lambda: base_registry.register_many(provider.get_tools(context)))
         if loop.subagent_definitions:
             loop._install_subagent_capability(base_registry, context, job_manager)
 
@@ -252,7 +250,7 @@ class LoopBootstrapper:
             model_runner=model_runner,
             model_stream_observers=model_stream_observers,
         )
-        initial_runtime_config = self._fenced_call(
+        initial_runtime_config = self._guard_external(
             lambda: loop._current_runtime_config(base_registry)
         )
         initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
@@ -265,7 +263,7 @@ class LoopBootstrapper:
             pending_observation_count=0,
         )
         initial_surface = validate_tool_surface_snapshot(
-            self._fenced_call(
+            self._guard_external(
                 lambda: loop.tool_surface_resolver.resolve(
                     bound_catalog=initial_bound_catalog,
                     turn=initial_turn,
@@ -273,10 +271,10 @@ class LoopBootstrapper:
             )
         )
         initial_visible_tool_specs = list(initial_surface.immediate_tools)
-        workspace_index = self._fenced_call(
+        workspace_index = self._guard_external(
             lambda: build_workspace_index(workspace, run_id=loop.spec.run_id)
         )
-        workspace_index_path = self._fenced_call(
+        workspace_index_path = self._guard_external(
             lambda: recorder.write_workspace_index(workspace_index)
         )
         static_segments: list[str] = []
@@ -285,14 +283,14 @@ class LoopBootstrapper:
             if index_segment:
                 static_segments.append(index_segment)
         for provider in loop.context_providers:
-            segment = self._fenced_call(provider.static_segment)
+            segment = self._guard_external(provider.static_segment)
             if segment and segment.strip():
                 static_segments.append(segment)
         if not loop._restoring:
-            workspace_base_payload = self._fenced_call(
+            workspace_base_payload = self._guard_external(
                 lambda: workspace.workspace_base_payload(loop.spec.run_id)
             )
-            workspace_base_path = self._fenced_call(
+            workspace_base_path = self._guard_external(
                 lambda: recorder.write_workspace_base(workspace_base_payload)
             )
             manifest = build_run_manifest(
@@ -318,8 +316,8 @@ class LoopBootstrapper:
                     workspace_base_path.relative_to(recorder.run_dir).as_posix()
                 ),
             )
-            self._fenced_call(lambda: recorder.write_manifest(manifest))
-            self._fenced_call(
+            self._guard_external(lambda: recorder.write_manifest(manifest))
+            self._guard_external(
                 lambda: recorder.emit(
                     "run.started",
                     data={
@@ -356,10 +354,10 @@ class LoopBootstrapper:
                     },
                 )
             )
-        self._fenced_call(
+        self._guard_external(
             lambda: loop._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
         )
-        loop._check_lease_authority()
+        loop._assert_write_authority()
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -587,16 +585,10 @@ class LoopFinalizer:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
-    def _fenced_write(self, operation: Callable[[], Any]) -> Any:
-        """Run one finalization mutation under a two-sided sticky-authority fence."""
+    def _guard_external(self, operation: Callable[[], Any]) -> Any:
+        """Run one finalization callback through the activation's shared authority."""
 
-        self._loop._check_lease_authority()
-        try:
-            return operation()
-        finally:
-            # Sticky authority loss takes precedence over an extension or filesystem failure that
-            # overlapped it, and prevents the next finalization mutation from starting.
-            self._loop._check_lease_authority()
+        return self._loop.write_authority.guard_external_call(operation)
 
     def _write_common_projection(
         self,
@@ -607,12 +599,12 @@ class LoopFinalizer:
 
         loop = self._loop
         recorder = res.recorder
-        _diff_text, diff_path, proposal_payload = self._fenced_write(
+        _diff_text, diff_path, proposal_payload = self._guard_external(
             lambda: recorder.write_proposal_revision(res.workspace)
         )
         metrics = self.build_metrics(state, res)
-        self._fenced_write(lambda: recorder.write_metrics(metrics))
-        self._fenced_write(
+        self._guard_external(lambda: recorder.write_metrics(metrics))
+        self._guard_external(
             lambda: recorder.emit(
                 "workspace.proposal.updated",
                 data=public_proposal_payload(proposal_payload, loop.permission_policy),
@@ -649,9 +641,9 @@ class LoopFinalizer:
             "requested_reasoning_effort": model.reasoning.effort,
             "effective_reasoning_effort": model.reasoning.effort,
             "error_code": state.error_code,
-            **context.shell_service.metrics(),
-            **context.jobs_service.background_metrics(),
-            **context.web_service.metrics(),
+            **context._shell_service.metrics(),
+            **context._jobs_service.background_metrics(),
+            **context._web_service.metrics(),
             **state.total_usage,
         }
         if context.subagent_count:
@@ -699,11 +691,11 @@ class LoopFinalizer:
         loop = self._loop
         context = res.context
         recorder = res.recorder
-        self._fenced_write(
-            lambda: context.job_manager.cancel_all(check_authority=loop._check_lease_authority)
+        self._guard_external(
+            context._job_manager.cancel_all
         )
         diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
-        self._fenced_write(
+        self._guard_external(
             lambda: recorder.emit(
                 "proposal.ready",
                 data={
@@ -721,8 +713,8 @@ class LoopFinalizer:
         # provenance is not checkpointed, so ``_rehydrate`` fails closed and treats any restored
         # non-empty text as model-authored. Over-recording is the safe direction; see the field on
         # ``RunState``.
-        settled_text_fields = self._fenced_write(lambda: _settled_text_fields(recorder, state))
-        self._fenced_write(
+        settled_text_fields = self._guard_external(lambda: _settled_text_fields(recorder, state))
+        self._guard_external(
             lambda: recorder.emit(
                 "run.finished",
                 data={
@@ -743,7 +735,7 @@ class LoopFinalizer:
         )
         artifacts = tuple(recorder.artifacts)
         run_dir = recorder.run_dir
-        self._fenced_write(recorder.close)
+        self._guard_external(recorder.close)
         return AgentRunResult(
             run_id=loop.spec.run_id,
             status=state.status,
@@ -777,8 +769,8 @@ class LoopFinalizer:
         # what they publish. Both normally carry the same value, and ``settled_text`` is
         # content-keyed, so the second record is a no-op by construction rather than by a caller
         # remembering not to repeat itself.
-        settled_text_fields = self._fenced_write(lambda: _settled_text_fields(recorder, state))
-        self._fenced_write(
+        settled_text_fields = self._guard_external(lambda: _settled_text_fields(recorder, state))
+        self._guard_external(
             lambda: recorder.emit(
                 "turn.settled",
                 turn_id=session.active_turn_id if session is not None else None,

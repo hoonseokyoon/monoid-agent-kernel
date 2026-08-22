@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import uuid
 import threading
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 
 from monoid_agent_kernel.core._util import utc_timestamp
@@ -142,7 +142,7 @@ class EventBus:
     run_id: str
     sinks: tuple[EventSink, ...]
     _seq: int = 0
-    check_authority: Callable[[], None] | None = None
+    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
     _closed: bool = field(default=False, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -155,38 +155,33 @@ class EventBus:
         turn_id: str | None = None,
         parent_id: str | None = None,
     ) -> AgentEvent:
+        self.write_authority.assert_active()
         with self._lock:
-            self._seq += 1
-            event = make_agent_event(
-                run_id=self.run_id,
-                seq=self._seq,
-                event_type=event_type,
-                data=data,
-                level=level,
-                turn_id=turn_id,
-                parent_id=parent_id,
-            )
+            def build_event() -> AgentEvent:
+                self._seq += 1
+                return make_agent_event(
+                    run_id=self.run_id,
+                    seq=self._seq,
+                    event_type=event_type,
+                    data=data,
+                    level=level,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+
+            event = self.write_authority.guard_local_mutation(build_event)
             # A background job (e.g. a shell monitor thread) can deliver its terminal event
             # after the run has closed the recorder. That late emit is a benign race, not an
             # error: drop it to the closed sinks rather than writing to a closed file handle.
             # emit/close serialize on the same lock, so this check is race-free.
             if self._closed:
                 return event
-            if self.check_authority is not None:
-                self.check_authority()
             for sink in self.sinks:
-                if self.check_authority is not None:
-                    self.check_authority()
-                try:
-                    sink.emit(event)
-                finally:
-                    # A sink may block while activation ownership moves. Re-read the sticky
-                    # authority fact before the next sink can publish the same event.
-                    if self.check_authority is not None:
-                        self.check_authority()
+                self.write_authority.guard_external_call(lambda sink=sink: sink.emit(event))
             return event
 
     def close(self) -> None:
+        self.write_authority.assert_active()
         with self._lock:
             if self._closed:
                 return
@@ -195,23 +190,11 @@ class EventBus:
             self._closed = True
             errors: list[BaseException] = []
             for sink in self.sinks:
-                if self.check_authority is not None:
-                    try:
-                        self.check_authority()
-                    except BaseException as exc:
-                        errors.insert(0, exc)
-                        break
                 try:
-                    sink.close()
+                    self.write_authority.guard_external_call(sink.close)
                 except BaseException as exc:
                     errors.append(exc)
-                if self.check_authority is not None:
-                    try:
-                        self.check_authority()
-                    except BaseException as exc:
-                        # Authority loss is the controlling failure and stops every later sink;
-                        # a close callback may flush buffered projection data.
-                        errors.insert(0, exc)
+                    if self.write_authority.revoked:
                         break
             if errors:
                 raise errors[0]

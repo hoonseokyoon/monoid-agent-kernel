@@ -10,7 +10,6 @@ _OPERATIONAL_CANCELLATION_CAUSES = frozenset(
     {
         InterruptionCause.USER_CANCEL,
         InterruptionCause.GRACEFUL_DRAIN,
-        InterruptionCause.LEASE_LOST,
         InterruptionCause.DEADLINE,
         InterruptionCause.HOST_SHUTDOWN,
     }
@@ -24,7 +23,6 @@ class CancellationToken:
     _callbacks: dict[int, Callable[[], None]] = field(default_factory=dict, init=False, repr=False)
     _next_callback_id: int = field(default=0, init=False, repr=False)
     _cause: InterruptionCause | None = field(default=None, init=False, repr=False)
-    _lease_lost: bool = field(default=False, init=False, repr=False)
 
     def cancel(
         self,
@@ -37,11 +35,15 @@ class CancellationToken:
         if cause not in _OPERATIONAL_CANCELLATION_CAUSES:
             allowed = ", ".join(sorted(item.value for item in _OPERATIONAL_CANCELLATION_CAUSES))
             raise ValueError(f"cancellation cause must be operational: {allowed}")
+        self._request(cause)
+
+    def _cancel_for_authority_loss(self) -> None:
+        """Wake execution after a separate ``ActivationWriteAuthority`` was revoked."""
+
+        self._request(InterruptionCause.LEASE_LOST)
+
+    def _request(self, cause: InterruptionCause) -> None:
         with self._lock:
-            # The first interruption cause remains diagnostic history. Lease authority is an
-            # independent safety fact and becomes sticky even when another cause arrived first.
-            if cause is InterruptionCause.LEASE_LOST:
-                self._lease_lost = True
             if self._event.is_set():
                 return
             self._cause = cause
@@ -86,10 +88,3 @@ class CancellationToken:
     def cause(self) -> InterruptionCause | None:
         with self._lock:
             return self._cause
-
-    @property
-    def lease_lost(self) -> bool:
-        """Return whether this activation has irreversibly lost writer authority."""
-
-        with self._lock:
-            return self._lease_lost

@@ -1281,7 +1281,7 @@ class ReferenceBackendHarness:
         record = self.backend._record(run_id)
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            for task in record.loop._session.res.context.job_manager.list_jobs():  # type: ignore[union-attr]
+            for task in record.loop._session.res.context._job_manager.list_jobs():  # type: ignore[union-attr]
                 if task.get("kind") == kind and task.get("status") == "running":
                     return task
             time.sleep(0.05)

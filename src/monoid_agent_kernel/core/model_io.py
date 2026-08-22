@@ -43,6 +43,7 @@ from typing import (
 from pydantic import TypeAdapter, ValidationError
 
 from monoid_agent_kernel._policy_util import dedupe
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked
 from monoid_agent_kernel.core._json_schema import END_OF_INPUT
 from monoid_agent_kernel.core._util import canonical_hmac_sha256, canonical_sha256
 from monoid_agent_kernel.core.invocation import InvocationContext
@@ -1767,6 +1768,8 @@ def dispatch_model_call(
         )
         try:
             subscription.observer.on_model_call(capture)
+        except WriteAuthorityRevoked:
+            raise
         except Exception:
             pass
         if check_authority is not None:
@@ -1774,7 +1777,11 @@ def dispatch_model_call(
     return settled
 
 
-def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -> None:
+def close_model_io_subscriptions(
+    subscriptions: Sequence[ModelIOSubscription],
+    *,
+    check_authority: Callable[[], None] | None = None,
+) -> None:
     """Release every observer that declared a `close`, once each, tolerating failures.
 
     Probed with `getattr` rather than required, which is what keeps `close` off the base protocol.
@@ -1786,19 +1793,31 @@ def close_model_io_subscriptions(subscriptions: Sequence[ModelIOSubscription]) -
     """
     seen: set[int] = set()
     for subscription in subscriptions:
+        if check_authority is not None:
+            check_authority()
         observer = subscription.observer
         if id(observer) in seen:
             continue
         seen.add(id(observer))
         try:
             close = getattr(observer, "close", None)
+        except WriteAuthorityRevoked:
+            raise
         except Exception:
             # ``close`` is optional and may be exposed through a descriptor. A broken probe is an
             # observer failure, not permission to alter the run outcome or skip later observers.
+            if check_authority is not None:
+                check_authority()
             continue
         if not callable(close):
             continue
         try:
             close()
+        except WriteAuthorityRevoked:
+            raise
         except Exception:
+            if check_authority is not None:
+                check_authority()
             continue
+        if check_authority is not None:
+            check_authority()

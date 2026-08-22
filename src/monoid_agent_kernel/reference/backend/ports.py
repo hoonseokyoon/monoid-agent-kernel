@@ -21,7 +21,12 @@ class TokenClaimsPort(Protocol):
 class CancellationTokenPort(Protocol):
     requested: bool
     cause: InterruptionCause | None
-    lease_lost: bool
+
+
+class WriteAuthorityPort(Protocol):
+    revoked: bool
+
+    def assert_active(self) -> None: ...
 
 
 class MessageQueuePort(Protocol):
@@ -149,6 +154,7 @@ class MutableRunRecordPort(RunRecordPort, Protocol):
     message_queue: MessageQueuePort
     loop: LoopPort | None
     cancellation_token: CancellationTokenPort
+    write_authority: WriteAuthorityPort
     seen_inbox_ids: set[str]
     outbox_sender: OutboxSender | None
 

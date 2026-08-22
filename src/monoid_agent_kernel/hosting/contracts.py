@@ -132,7 +132,8 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
     Invocation blob maps follow the inherited content-addressed blob rule. Every ``blob:`` result
     reference must resolve from the submitted map or same-run authoritative backing before the
     invocation revision becomes authoritative. A loaded record exposes reused bytes through
-    ``blob()``.
+    ``blob()``. Host adapters bind event and terminal writes to the same activation authority:
+    either mutation returning ``fenced`` revokes that authority before the host continues.
     """
 
     def load_invocation(

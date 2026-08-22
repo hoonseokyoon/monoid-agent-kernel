@@ -23,6 +23,10 @@ from monoid_agent_kernel.core._sync_bridge import (
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_timestamp
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
     _recovered_receipt,
@@ -572,11 +576,12 @@ class FinishResult:
 class AgentToolContext(ToolContext):
     run_id: str
     workspace: Workspace
-    recorder: AgentRecorder
-    job_manager: TaskManager
-    shell_service: ShellService
-    web_service: WebService
-    jobs_service: JobsService
+    _recorder: AgentRecorder
+    _job_manager: TaskManager
+    _shell_service: ShellService
+    _web_service: WebService
+    _jobs_service: JobsService
+    _write_authority: ActivationWriteAuthority = field(repr=False, compare=False)
     # Trace parent of the enclosing AgentLoop invocation. Subagent spawn derives a child span from
     # this value so parent receipts, delegation events, and child receipts remain in one trace.
     invocation_traceparent: str = ""
@@ -588,10 +593,10 @@ class AgentToolContext(ToolContext):
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     # Per-run capability leases (handles only). A tool handler reads ``capability_token`` to get
     # the access handle the gate acquired for its declared capability. None when no broker is set.
-    capability_vault: CapabilityVault | None = None
+    _capability_vault: CapabilityVault | None = field(default=None, repr=False, compare=False)
     # Per-run outbox of staged external sends (handles only). A tool handler calls ``emit_outbox``
     # to durably stage a side-effect the edge drains later. None when outbox staging is unavailable.
-    outbox: Outbox | None = None
+    _outbox: Outbox | None = field(default=None, repr=False, compare=False)
     tool_search_entries: tuple[ToolSearchEntry, ...] = ()
     tool_search_max_results: int = 5
     # Depth of this run in the subagent tree (0 = top-level). Threaded into spawned
@@ -640,6 +645,12 @@ class AgentToolContext(ToolContext):
     # a refusal for authorization-bearing operations rather than an unrestricted scope.
     _call_fallback: CallContext | None = field(default=None, repr=False, compare=False)
 
+    def _check_writer_authority(self) -> None:
+        self._write_authority.assert_active()
+
+    def _guard_external(self, operation: Callable[[], Any]) -> Any:
+        return self._write_authority.guard_external_call(operation)
+
     def _live_call(self) -> CallContext | None:
         call = self._call_var.get()
         return self._call_fallback if call is None else call
@@ -685,6 +696,7 @@ class AgentToolContext(ToolContext):
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
     ) -> dict[str, Any]:
+        self._check_writer_authority()
         path = normalize_unicode_scalars(path)
         kind = normalize_unicode_scalars(kind)
         label = None if label is None else normalize_unicode_scalars(label)
@@ -701,14 +713,15 @@ class AgentToolContext(ToolContext):
                 error_code="artifact_metadata_unportable",
             ) from exc
         data, _digest = self.workspace.read_bytes(path)
-        artifact = self.recorder.emit_artifact_bytes(
+        self._check_writer_authority()
+        artifact = self._recorder.emit_artifact_bytes(
             workspace_path=self.workspace.normalize(path),
             content=data,
             kind=kind,
             label=label,
             metadata=metadata,
         )
-        self.recorder.emit(
+        self._recorder.emit(
             "artifact.emitted",
             data={
                 "artifact_id": artifact.artifact_id,
@@ -748,6 +761,7 @@ class AgentToolContext(ToolContext):
         }
 
     def list_artifacts(self) -> list[dict[str, Any]]:
+        self._check_writer_authority()
         return [
             {
                 "artifact_id": artifact.artifact_id,
@@ -756,7 +770,7 @@ class AgentToolContext(ToolContext):
                 "label": artifact.label,
                 "metadata": dict(artifact.metadata),
             }
-            for artifact in self.recorder.artifacts
+            for artifact in self._recorder.artifacts
         ]
 
     def path_allowed(self, path: str, operation: str = "read") -> bool:
@@ -776,6 +790,7 @@ class AgentToolContext(ToolContext):
             return False
 
     def update_plan(self, items: list[dict[str, Any]]) -> None:
+        self._check_writer_authority()
         # ``self.plan`` keeps the model's own steps verbatim; only the published copy is capped.
         # Each step is truncated as a *string* inside its item: ``plan.updated.items`` is declared
         # ``_OBJ_ARRAY``, so an item that stops being an object fails ``validate_run_dir``, and
@@ -793,58 +808,76 @@ class AgentToolContext(ToolContext):
         # look permanently one step short of done. The count comes from the previewed length rather
         # than from ``PREVIEW_MAX_ITEMS`` so the cap stays stated in exactly one place.
         items = normalize_json_ingress(items)
-        self.plan = items
+        self._check_writer_authority()
+        self._write_authority.guard_local_mutation(lambda: setattr(self, "plan", items))
         published = preview_value("items", items, self.permission_policy, list_marker=False)
         data: dict[str, Any] = {"items": published}
         dropped = len(items) - len(published)
         if dropped > 0:
             data["truncated_items"] = dropped
-        self.recorder.emit("plan.updated", data=data)
+        self._recorder.emit("plan.updated", data=data)
 
     def finish(self, summary: str, outputs: list[str], notes: str | None) -> None:
-        self.pending_finish = FinishResult(
+        self._check_writer_authority()
+        pending_finish = FinishResult(
             normalize_unicode_scalars(summary),
             tuple(normalize_unicode_scalars(output) for output in outputs),
             None if notes is None else normalize_unicode_scalars(notes),
         )
+        self._write_authority.guard_local_mutation(
+            lambda: setattr(self, "pending_finish", pending_finish)
+        )
 
     def execute_shell(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.shell_service.execute(args, self._authorized_call)
+        return self._guard_external(
+            lambda: self._shell_service.execute(args, self._authorized_call)
+        )
 
     def run_script(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run a pre-resolved ``argv`` (skill.run_script) through the shell machinery —
         approval, env scrubbing, timeout, output limits, events — but WITHOUT a shell, so
         the bundled script's own args are never re-parsed by bash/powershell. ``args``
         carries ``argv`` (the real command) plus a ``command`` label for the preview."""
+        self._check_writer_authority()
         argv = [str(part) for part in args.get("argv") or ()]
         rest = {key: value for key, value in args.items() if key != "argv"}
-        return self.shell_service.execute(rest, self._authorized_call, argv_override=argv)
+        return self._guard_external(
+            lambda: self._shell_service.execute(
+                rest, self._authorized_call, argv_override=argv
+            )
+        )
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        return self.jobs_service.list_jobs()
+        self._check_writer_authority()
+        return self._jobs_service.list_jobs()
 
     def job_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.jobs_service.status(args)
+        self._check_writer_authority()
+        return self._jobs_service.status(args)
 
     def job_logs(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.jobs_service.logs(args)
+        self._check_writer_authority()
+        return self._jobs_service.logs(args)
 
     def job_cancel(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.jobs_service.cancel(args)
+        return self._guard_external(lambda: self._jobs_service.cancel(args))
 
     def job_wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.jobs_service.wait(args)
+        return self._guard_external(lambda: self._jobs_service.wait(args))
 
     def request_human_input(self, args: dict[str, Any]) -> dict[str, Any]:
-        task = self.job_manager.start_task(
-            "hitl",
-            {
-                "prompt": str(args.get("prompt") or ""),
-                "choices": tuple(str(choice) for choice in (args.get("choices") or ())),
-                "created_by": "model",
-            },
+        task = self._guard_external(
+            lambda: self._job_manager.start_task(
+                "hitl",
+                {
+                    "prompt": str(args.get("prompt") or ""),
+                    "choices": tuple(str(choice) for choice in (args.get("choices") or ())),
+                    "created_by": "model",
+                },
+            )
         )
-        return task.started_content(self.recorder.run_dir)
+        self._check_writer_authority()
+        return task.started_content(self._recorder.run_dir)
 
     def spawn_subagent(self, args: dict[str, Any]) -> dict[str, Any]:
         """Delegate to a child run via the ``subagent`` task kind. Foreground spawns
@@ -853,25 +886,28 @@ class AgentToolContext(ToolContext):
         through the reentry queue (see ``SubagentTaskExecutor``)."""
         background = bool(args.get("background", False))
         call = self._current_call
-        task = self.job_manager.start_task(
-            "subagent",
-            {
-                "definition_id": str(args.get("subagent_type") or ""),
-                "prompt": str(args.get("prompt") or ""),
-                "depth": self.subagent_depth,
-                "background": background,
-                "resume_on_exit": background,
-                "created_by": "model",
-                # Correlation so subagent.* events nest under this spawn tool call.
-                "parent_event_id": call.tool_event_id,
-                "turn_id": call.turn_id,
-                "traceparent": child_traceparent(self.invocation_traceparent),
-            },
+        task = self._guard_external(
+            lambda: self._job_manager.start_task(
+                "subagent",
+                {
+                    "definition_id": str(args.get("subagent_type") or ""),
+                    "prompt": str(args.get("prompt") or ""),
+                    "depth": self.subagent_depth,
+                    "background": background,
+                    "resume_on_exit": background,
+                    "created_by": "model",
+                    # Correlation so subagent.* events nest under this spawn tool call.
+                    "parent_event_id": call.tool_event_id,
+                    "turn_id": call.turn_id,
+                    "traceparent": child_traceparent(self.invocation_traceparent),
+                },
+            )
         )
         if background:
-            content = task.started_content(self.recorder.run_dir)
+            self._check_writer_authority()
+            content = task.started_content(self._recorder.run_dir)
             return {"spawned": True, "background": True, **content}
-        return self.job_manager.wait(task.job_id)
+        return self._guard_external(lambda: self._job_manager.wait(task.job_id))
 
     def record_skill_activation(self, name: str, *, resource_count: int = 0) -> None:
         """Observability hook called (best-effort) by the ``skill`` tool when a skill's
@@ -879,10 +915,14 @@ class AgentToolContext(ToolContext):
         tool call (so an OTel sink can enrich that tool span) and bumps the run-metrics
         counter. The skill tool duck-types this method, so skills stay decoupled from the
         core contract; this is the only place run-state learns about skills."""
+        self._check_writer_authority()
         call = self._current_call
-        self.skill_activation_count += 1
-        self.skills_activated.append(name)
-        self.recorder.emit(
+        def update_skill_metrics() -> None:
+            self.skill_activation_count += 1
+            self.skills_activated.append(name)
+
+        self._write_authority.guard_local_mutation(update_skill_metrics)
+        self._recorder.emit(
             "skill.activated",
             turn_id=call.turn_id,
             parent_id=call.tool_event_id,
@@ -890,25 +930,42 @@ class AgentToolContext(ToolContext):
         )
 
     def execute_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.search(
-            args, self._authorized_call, capability_token=self.capability_token("web.search")
+        return self._guard_external(
+            lambda: self._web_service.search(
+                args,
+                self._authorized_call,
+                capability_token=self.capability_token("web.search"),
+            )
         )
 
     def execute_web_fetch(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.fetch(
-            args, self._authorized_call, capability_token=self.capability_token("web.fetch")
+        return self._guard_external(
+            lambda: self._web_service.fetch(
+                args,
+                self._authorized_call,
+                capability_token=self.capability_token("web.fetch"),
+            )
         )
 
     def execute_web_context(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.web_service.context(
-            args, self._authorized_call, capability_token=self.capability_token("web.context")
+        return self._guard_external(
+            lambda: self._web_service.context(
+                args,
+                self._authorized_call,
+                capability_token=self.capability_token("web.context"),
+            )
         )
 
     def configure_tool_search(self, entries: tuple[ToolSearchEntry, ...], max_results: int) -> None:
-        self.tool_search_entries = entries
-        self.tool_search_max_results = max_results
+        self._check_writer_authority()
+        def configure() -> None:
+            self.tool_search_entries = entries
+            self.tool_search_max_results = max_results
+
+        self._write_authority.guard_local_mutation(configure)
 
     def search_tools(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._check_writer_authority()
         query = str(args.get("query") or "").strip().lower()
         requested_max = args.get("max_results")
         max_results = min(
@@ -921,18 +978,26 @@ class AgentToolContext(ToolContext):
         for item in results:
             binding_id = str(item.get("binding_id") or "")
             if binding_id and binding_id not in self._requested_tool_loads:
-                self._requested_tool_loads.append(binding_id)
+                self._write_authority.guard_local_mutation(
+                    lambda binding_id=binding_id: self._requested_tool_loads.append(binding_id)
+                )
+        self._check_writer_authority()
         return {"results": results, "count": len(results)}
 
     def consume_tool_load_requests(self) -> tuple[str, ...]:
-        requested = tuple(self._requested_tool_loads)
-        self._requested_tool_loads.clear()
-        return requested
+        self._check_writer_authority()
+        def consume() -> tuple[str, ...]:
+            requested = tuple(self._requested_tool_loads)
+            self._requested_tool_loads.clear()
+            return requested
+
+        return self._write_authority.guard_local_mutation(consume)
 
     def capability_token(self, capability: str) -> str | None:
-        if self.capability_vault is None:
+        self._check_writer_authority()
+        if self._capability_vault is None:
             return None
-        return self.capability_vault.token_for(capability, now=time.time())
+        return self._capability_vault.token_for(capability, now=time.time())
 
     def emit_outbox(
         self,
@@ -948,7 +1013,8 @@ class AgentToolContext(ToolContext):
         secret) so the edge sender can authenticate, appends the request to the run's outbox (which
         is checkpointed), and emits ``outbox.requested``. The IO happens later, at the edge. With
         ``expect_ack`` the edge delivers the send's receipt back as an inbox message (non-park)."""
-        if self.outbox is None:
+        self._check_writer_authority()
+        if self._outbox is None:
             raise ToolExecutionError("outbox is not available", error_code="outbox_unavailable")
         normalized_payload = normalize_json_ingress(payload)
         if not isinstance(normalized_payload, dict):
@@ -980,8 +1046,8 @@ class AgentToolContext(ToolContext):
             # edge derives a child span for the actual send. Observability only — never gates anything.
             traceparent=new_traceparent(),
         )
-        self.outbox.append(request)
-        self.recorder.emit(
+        self._write_authority.guard_local_mutation(lambda: self._outbox.append(request))
+        self._recorder.emit(
             "outbox.requested",
             turn_id=call.turn_id,
             parent_id=call.tool_event_id,
@@ -1159,9 +1225,6 @@ class _Session:
     # Fingerprint of the last checkpoint writer success. ``release_parked`` compares current
     # checkpointable state against it so uncommitted mutations cannot be silently discarded.
     persisted_checkpoint_sha256: str | None = None
-    # Hosted task ids present in the last committed checkpoint. Failure cleanup preserves them and
-    # cancels only process-local work plus newly-created, uncommitted hosted tasks.
-    persisted_hosted_task_ids: set[str] = field(default_factory=set)
     active_input: dict[str, Any] | None = None
     applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Correlation for the model turn currently being pumped. Deliberately activation-local rather
@@ -1234,6 +1297,13 @@ class AgentLoop:
     model_payload_file: bool = False
     permission_policy: PermissionPolicy = field(default_factory=PermissionPolicy)
     cancellation_token: CancellationToken | None = None
+    # Process-local mutation capability. It is independent from cancellation: Stop/drain retain
+    # authority to settle, while lease loss revokes this capability and only wakes cancellation as
+    # execution control. A host may inject the same object into activation-adjacent components.
+    write_authority: ActivationWriteAuthority = field(
+        default_factory=ActivationWriteAuthority,
+        kw_only=True,
+    )
     # Native async handlers receive cancellation immediately. Cleanup gets a bounded grace
     # window; a handler that suppresses cancellation is detached so the run-level outcome can
     # still settle. Sync worker calls retain their existing non-preemptible boundary behavior.
@@ -1314,6 +1384,8 @@ class AgentLoop:
     # (which is run-level/terminal); an interrupt keeps the session alive. Cleared at the start
     # of each new user submit so a stale stop never kills the next turn.
     _interrupt_requested: bool = field(default=False, init=False, repr=False)
+    _cancellation_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _authority_unsubscribe: Callable[[], None] | None = field(default=None, init=False, repr=False)
     # Cooperative "pause": set via :meth:`pause_turn`, consumed ONLY at the start-of-step
     # boundary (top of the pump loop) — never mid-step — so ``pending_observations`` are
     # always in a clean, resumable shape. Unlike an interrupt, a pause freezes the turn and a
@@ -1334,6 +1406,11 @@ class AgentLoop:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        if not isinstance(self.write_authority, ActivationWriteAuthority):
+            raise AgentConfigError("write_authority must be an ActivationWriteAuthority")
+        self._authority_unsubscribe = self.write_authority.add_revoke_callback(
+            self._wake_for_writer_authority_loss
+        )
         self._validate_durable_hosting()
         # Operator kill switch for the delta channel. Resolved here, into the field itself, rather
         # than at the emit site: gating the emit would leave `emit_output_deltas` reporting True
@@ -1355,6 +1432,32 @@ class AgentLoop:
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
+
+    def _wake_for_writer_authority_loss(self) -> None:
+        """Bridge sticky authority revocation into the run's ordinary cancellation wait."""
+
+        self._ensure_cancellation_token()._cancel_for_authority_loss()
+
+    def _ensure_cancellation_token(self) -> CancellationToken:
+        """Return the token every in-flight wait and authority callback share."""
+
+        with self._cancellation_lock:
+            token = self.cancellation_token
+            if token is None:
+                token = CancellationToken()
+                self.cancellation_token = token
+            return token
+
+    def lose_writer_authority(self) -> None:
+        """Irreversibly retire this activation after host lease ownership moves."""
+
+        self.write_authority.revoke()
+
+    def _detach_authority_callback(self) -> None:
+        unsubscribe = self._authority_unsubscribe
+        self._authority_unsubscribe = None
+        if unsubscribe is not None:
+            unsubscribe()
 
     def _validate_durable_hosting(self) -> None:
         if type(self.model_evidence_policy) is not str or self.model_evidence_policy not in {
@@ -1405,13 +1508,14 @@ class AgentLoop:
 
         observers: list[ModelStreamObserver] = []
         for factory in tuple(self.model_stream_observer_factories):
-            self._check_lease_authority()
             try:
-                observer = factory()
+                observer = self.write_authority.guard_external_call(factory)
+            except WriteAuthorityRevoked:
+                raise
             except Exception:  # noqa: BLE001 - content observers cannot fail an agent activation
+                self._assert_write_authority()
                 _LOGGER.debug("model stream observer factory failed", exc_info=True)
                 observer = None
-            self._check_lease_authority()
             if observer is not None:
                 observers.append(observer)
         return tuple(observers)
@@ -1631,10 +1735,8 @@ class AgentLoop:
         sink = self._stream_sink
         if sink is None:  # pragma: no cover — _require_open guarantees a bootstrapped sink
             raise NativeAgentError("run is not open; call aopen() first", error_code="run_not_open")
-        if self.cancellation_token is None:
-            # Cooperative cancel (on early break) needs a token the boundary checks observe.
-            self.cancellation_token = CancellationToken()
-        token = self.cancellation_token
+        # Cooperative cancel (on early break) and authority revocation share this token.
+        token = self._ensure_cancellation_token()
         return RunStream(
             sink=sink,
             drive_factory=lambda: self._astream_drive(user_input),
@@ -1813,6 +1915,7 @@ class AgentLoop:
         self, user_input: str | tuple[ContentPart, ...] | None = None
     ) -> Suspension:
         """Async form of :meth:`run_until_suspended` — the engine's source of truth."""
+        self._ensure_cancellation_token()
         session = self._require_open()
         try:
             return await self._arun_until_suspended_impl(user_input)
@@ -1899,12 +2002,12 @@ class AgentLoop:
                 # today's runtime config, context providers, tool surface, or media resolver. Use
                 # the durable logical id + digest first. The returned private result/refusal can
                 # then be applied without asking the provider or re-keying the original call.
-                self._check_lease_authority()
+                self._assert_write_authority()
                 evidence_recovery = _recover_evidence_dispatch(
                     res.model_runner,
                     evidence_recovery,
                 )
-                self._check_lease_authority()
+                self._assert_write_authority()
                 evidence_recovery, suspension = await self._aapply_recovered_model_outcome(
                     state,
                     res,
@@ -2215,11 +2318,6 @@ class AgentLoop:
         cleanup below deleted the very checkpoints a cancelled run keeps for restore. A no-op
         when nothing is pending or the run already settled terminal."""
         token = self.cancellation_token
-        if token is not None and token.lease_lost:
-            raise NativeAgentError(
-                "lease-lost activation must be discarded without finalization",
-                error_code="lease_lost",
-            )
         if session.terminal or token is None or not token.requested:
             return
         cause = token.cause or InterruptionCause.USER_CANCEL
@@ -2310,14 +2408,14 @@ class AgentLoop:
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""
         session = self._require_open()
-        return session.res.context.job_manager.has_resume_jobs()
+        return session.res.context._job_manager.has_resume_jobs()
 
     def wait_for_pending_tasks(self, timeout_s: float) -> bool:
         """Block up to ``timeout_s`` for a pending task to become ready (in-process
         completion or external report). Returns True if one is ready to drain, so
         the caller can ``run_until_suspended(None)`` to resume."""
         session = self._require_open()
-        manager = session.res.context.job_manager
+        manager = session.res.context._job_manager
         deadline = time.time() + max(0.0, timeout_s)
         while manager.has_resume_jobs():
             remaining = deadline - time.time()
@@ -2330,6 +2428,7 @@ class AgentLoop:
     def close(self) -> AgentRunResult:
         """Finalize the run: cancel jobs, write the terminal proposal, emit
         run.finished, close the recorder, and return the cumulative result."""
+        self._assert_write_authority()
         session = self._require_open()
         try:
             # Ordered before the turn-failure promotion below: a cancel acknowledged at an
@@ -2367,9 +2466,9 @@ class AgentLoop:
             # failed/limited run KEEPS its checkpoints so the last-good one (named in
             # failure.json) is available for an operator-driven restore.
             if session.state.status == "completed":
-                self._check_lease_authority()
-                self._checkpoint_store().delete(self.spec.run_id)
-                self._check_lease_authority()
+                self.write_authority.guard_external_call(
+                    lambda: self._checkpoint_store().delete(self.spec.run_id)
+                )
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.
@@ -2377,6 +2476,7 @@ class AgentLoop:
             self._session = None
             self._bootstrap_resources = None
             self._stream_sink = None
+            self._detach_authority_callback()
             # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
             # owned loop is torn down now. The run_once path calls close() from within the loop;
             # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
@@ -2422,6 +2522,7 @@ class AgentLoop:
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
+        self._detach_authority_callback()
         self._maybe_close_loop()
 
     async def arelease_parked(self) -> None:
@@ -2449,32 +2550,24 @@ class AgentLoop:
         cleanup_errors: list[BaseException] = []
         if resources is not None:
             try:
-                resources.context.job_manager.discard_uncommitted(
-                    preserve_hosted_task_ids=(
-                        session.persisted_hosted_task_ids if session is not None else set()
-                    )
-                )
+                resources.context._job_manager.discard_uncommitted()
             except BaseException as exc:  # cleanup continues through every owned resource
                 cleanup_errors.append(exc)
             try:
-                resources.recorder.close()
-            except RunCancelled as exc:
-                # Event-sink close is authority-fenced because a callback may flush buffered
-                # projections. During an explicit stale-activation discard, that expected fence
-                # stops the callback fan-out while AgentRecorder's finally blocks still release
-                # private handles; it is the cleanup outcome, not a cleanup failure.
-                if not (
-                    self._lease_authority_lost()
-                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
-                ):
-                    cleanup_errors.append(exc)
+                resources.recorder.discard_uncommitted()
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
-        self._close_model_io_subscriptions(resources)
+        if self.write_authority.revoked:
+            # External observer close hooks may flush or commit projections. A stale activation
+            # releases only kernel-owned handles and leaves adapter cleanup to its fenced host.
+            self._model_io_subscriptions_closed = True
+        else:
+            self._close_model_io_subscriptions(resources)
         self._finalized = True
         self._session = None
         self._bootstrap_resources = None
         self._stream_sink = None
+        self._detach_authority_callback()
         try:
             self._maybe_close_loop()
         except BaseException as exc:
@@ -2749,33 +2842,34 @@ class AgentLoop:
                 if self.model_content_file and recorder is not None:
                     # AgentRecorder owns and shields the private sidecar writer. This direct method
                     # keeps the recorder from pretending to implement the external observer API.
-                    self._check_lease_authority()
+                    self._assert_write_authority()
                     try:
                         writers.append(recorder.open_model_stream(stream_context))
+                    except WriteAuthorityRevoked:
+                        raise
                     except Exception:  # transitional/third-party recorder safety boundary
                         _LOGGER.debug("private model stream open failed", exc_info=True)
-                    self._check_lease_authority()
+                    self._assert_write_authority()
                 for observer in observers:
-                    self._check_lease_authority()
-                    writer = safe_open_model_stream(observer, stream_context)
-                    self._check_lease_authority()
+                    writer = self.write_authority.guard_external_call(
+                        lambda observer=observer: safe_open_model_stream(observer, stream_context)
+                    )
                     writers.append(writer)
                 observer_writers = tuple(writers)
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
-                self._check_lease_authority()
+                self._assert_write_authority()
                 if stream_sink_active and sink is not None:
-                    sink.push_delta(chunk)
-                    self._check_lease_authority()
+                    self.write_authority.guard_external_call(lambda: sink.push_delta(chunk))
 
                 stream_delta: ModelStreamDelta | None = None
                 if isinstance(chunk, TextDelta) and chunk.text:
                     if durable_delta_mirror and recorder is not None:
-                        self._check_lease_authority()
+                        self._assert_write_authority()
                         recorder.emit(
                             "model.output.delta", data={"text": chunk.text}, level="debug"
                         )
-                        self._check_lease_authority()
+                        self._assert_write_authority()
                     if observer_writers:
                         output_fragments.append(chunk.text)
                         stream_delta = ModelStreamDelta(channel="output", text=chunk.text)
@@ -2783,22 +2877,25 @@ class AgentLoop:
                     if durable_delta_mirror and recorder is not None:
                         # Display-only reasoning summary (DX-13b): a separate event so a consumer
                         # renders it in a "thinking" view, distinct from the answer text.
-                        self._check_lease_authority()
+                        self._assert_write_authority()
                         recorder.emit(
                             "model.reasoning.delta", data={"text": chunk.text}, level="debug"
                         )
-                        self._check_lease_authority()
+                        self._assert_write_authority()
                     if observer_writers:
                         stream_delta = ModelStreamDelta(channel="reasoning", text=chunk.text)
 
                 if stream_delta is not None:
                     for writer in observer_writers:
-                        self._check_lease_authority()
                         try:
-                            writer.push(stream_delta)
+                            self.write_authority.guard_external_call(
+                                lambda writer=writer: writer.push(stream_delta)
+                            )
+                        except WriteAuthorityRevoked:
+                            raise
                         except Exception:  # observers cannot fail a paid provider call
+                            self._assert_write_authority()
                             _LOGGER.debug("model stream observer push failed", exc_info=True)
-                        self._check_lease_authority()
 
             if not stream_sink_active:
                 should_abort = lambda: self._interrupt_requested  # noqa: E731
@@ -2912,7 +3009,7 @@ class AgentLoop:
                 if isinstance(latest_invocation, DurableModelInvocation):
                     session.last_model_invocation = latest_invocation
             if outcome_status is not None and observer_writers:
-                self._check_lease_authority()
+                self._assert_write_authority()
                 try:
                     outcome = ModelStreamOutcome(
                         status=outcome_status,
@@ -2928,12 +3025,15 @@ class AgentLoop:
                     _LOGGER.debug("model stream outcome normalization failed", exc_info=True)
                     outcome = ModelStreamOutcome(status=outcome_status)
                 for writer in observer_writers:
-                    self._check_lease_authority()
                     try:
-                        writer.close(outcome)
+                        self.write_authority.guard_external_call(
+                            lambda writer=writer: writer.close(outcome)
+                        )
+                    except WriteAuthorityRevoked:
+                        raise
                     except Exception:  # observers cannot replace the provider outcome
+                        self._assert_write_authority()
                         _LOGGER.debug("model stream observer close failed", exc_info=True)
-                    self._check_lease_authority()
         return turn, receipt
 
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:
@@ -2974,7 +3074,10 @@ class AgentLoop:
             if resources is not None
             else self.model_io_subscriptions
         )
-        close_model_io_subscriptions(subscriptions)
+        close_model_io_subscriptions(
+            subscriptions,
+            check_authority=self.write_authority.assert_active,
+        )
 
     def _record_failure(
         self,
@@ -3105,7 +3208,7 @@ class AgentLoop:
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
         self._assert_write_authority()
-        reported = session.res.context.job_manager.report_result(
+        reported = session.res.context._job_manager.report_result(
             normalize_unicode_scalars(task_id),
             normalize_json_ingress(result),
             status=normalize_unicode_scalars(status),
@@ -3147,7 +3250,7 @@ class AgentLoop:
         session = self._require_open()
         state = session.state
         res = session.res
-        manager = res.context.job_manager
+        manager = res.context._job_manager
         if manager.has_resume_jobs():
             hosted = set(manager.external_pending_task_ids())
             if not manager.outstanding_resume_task_ids().issubset(hosted):
@@ -3295,52 +3398,61 @@ class AgentLoop:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
         refuses (a live shell job is parked-on) — that park is simply not durable yet.
         Advances the per-run sequence so the store commits a new last-good checkpoint."""
-        self._check_lease_authority()
+        self._assert_write_authority()
         prior_suspension = session.last_suspension
         if suspension is not None:
             session.last_suspension = suspension_checkpoint_payload(suspension)
         checkpoint = self.snapshot()
         if checkpoint is None:
             session.last_suspension = prior_suspension
-            self._check_lease_authority()
+            self._assert_write_authority()
             return
         session.checkpoint_seq += 1
         checkpoint.seq = session.checkpoint_seq
         blobs = self.collect_checkpoint_blobs()
         if self._lease_authority_lost():
             session.last_suspension = prior_suspension
-            self._check_lease_authority()
+            self._assert_write_authority()
         try:
             committed = True
             if self.run_sink is not None and self.writer_token is not None:
-                from monoid_agent_kernel.hosting.contracts import CommitResult
-
-                commit_result = self.run_sink.commit_checkpoint(
-                    checkpoint,
-                    blobs,
-                    writer_token=self.writer_token,
+                from monoid_agent_kernel.hosting.commit_results import (
+                    accept_fenced_commit_result,
                 )
-                if not isinstance(commit_result, CommitResult) or commit_result.status not in {
-                    "committed",
-                    "already_committed",
-                }:
+
+                commit_result = self.write_authority.guard_external_call(
+                    lambda: self.run_sink.commit_checkpoint(
+                        checkpoint,
+                        blobs,
+                        writer_token=self.writer_token,
+                    )
+                )
+                commit_status = accept_fenced_commit_result(
+                    commit_result,
+                    write_authority=self.write_authority,
+                )
+                if commit_status not in {"committed", "already_committed"}:
                     raise RuntimeError("fenced checkpoint commit was not accepted")
             elif self.checkpoint_persist_callback is not None:
-                committed = self.checkpoint_persist_callback(checkpoint, blobs) is not False
+                committed = self.write_authority.guard_external_call(
+                    lambda: self.checkpoint_persist_callback(checkpoint, blobs)
+                ) is not False
             else:
-                self._checkpoint_store().put(checkpoint, blobs)
+                self.write_authority.guard_external_call(
+                    lambda: self._checkpoint_store().put(checkpoint, blobs)
+                )
         except Exception as exc:
             session.last_suspension = prior_suspension
             # Sticky writer-authority loss outranks a storage exception. The stale activation is
             # retired; exposing a generic checkpoint failure could instead terminalize/retry it.
-            self._check_lease_authority()
+            self._assert_write_authority()
             raise _CheckpointPersistError("checkpoint persistence failed") from exc
         if self._lease_authority_lost():
             # The external commit may have returned after ownership moved. Do not accept this
             # boundary into activation-local projection state or hand its ordinary Suspension to
             # a host; the outer pump guard converts this into the lease-loss disposition.
             session.last_suspension = prior_suspension
-            self._check_lease_authority()
+            self._assert_write_authority()
         if not committed:
             return
         session.applied_input_ids = set(checkpoint.applied_input_ids)
@@ -3352,11 +3464,6 @@ class AgentLoop:
             for input_id, receipt in checkpoint.applied_input_receipts.items()
         }
         session.persisted_checkpoint_sha256 = _checkpoint_state_sha256(checkpoint)
-        session.persisted_hosted_task_ids = {
-            str(task.get("task_id") or task.get("job_id") or "")
-            for task in checkpoint.hosted_tasks
-            if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
-        }
 
     @staticmethod
     def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
@@ -3551,7 +3658,7 @@ class AgentLoop:
                     error_code="model_invocation_corrupt",
                 )
             restored_invocation = decoded_invocation.value
-        manager = res.context.job_manager
+        manager = res.context._job_manager
         # Publish the restored durable baseline before registering hosted tasks. If any later
         # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
         self._session = _Session(
@@ -3581,11 +3688,6 @@ class AgentLoop:
                 input_id: dict(receipt) for input_id, receipt in cp.applied_input_receipts.items()
             },
             persisted_checkpoint_sha256=_checkpoint_state_sha256(cp),
-            persisted_hosted_task_ids={
-                str(task.get("task_id") or task.get("job_id") or "")
-                for task in cp.hosted_tasks
-                if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
-            },
             last_model_invocation=restored_invocation,
             model_tool_calls_pending=bool(
                 isinstance(cp.last_suspension, Mapping)
@@ -3706,7 +3808,7 @@ class AgentLoop:
         report_task_result."""
         session = self._require_open()
         self._assert_write_authority()
-        return session.res.context.job_manager.create_task(kind, request)
+        return session.res.context._job_manager.create_task(kind, request)
 
     def _require_open(self) -> _Session:
         if self._session is None:
@@ -3864,7 +3966,7 @@ class AgentLoop:
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
-        self._check_lease_authority()
+        self._assert_write_authority()
         # The child's metrics FILTERED to the usage vocabulary. The authority is
         # ``providers/_common.py:NORMALIZED_USAGE_KEYS`` -- the whole emitted domain of
         # ``normalize_usage`` -- rather than a hand-written three-key tuple, which meant a
@@ -4031,7 +4133,7 @@ class AgentLoop:
         *,
         from_finish: bool,
     ) -> Suspension | None:
-        self._check_lease_authority()
+        self._assert_write_authority()
         return self._settle_coordinator.apply(
             decision, state, res, context, from_finish=from_finish
         )
@@ -4277,7 +4379,7 @@ class AgentLoop:
     ) -> tuple[_EvidenceRecovery | None, Suspension | None]:
         """Apply stored model evidence before any current request-building dependency runs."""
 
-        self._check_lease_authority()
+        self._assert_write_authority()
         recovered = recovery.recovered_dispatch
         if recovered is None:
             raise DurableModelCallError(
@@ -4433,9 +4535,9 @@ class AgentLoop:
                 ),
                 None,
             )
-        if res.context.job_manager.has_resume_jobs():
+        if res.context._job_manager.has_resume_jobs():
             state.pending_observations = ()
-            external = res.context.job_manager.external_pending_task_ids()
+            external = res.context._job_manager.external_pending_task_ids()
             return (
                 None,
                 Suspension(
@@ -4551,10 +4653,10 @@ class AgentLoop:
             "input_tokens": state.total_usage["input_tokens"],
             "output_tokens": state.total_usage["output_tokens"],
             "total_tokens": state.total_usage["total_tokens"],
-            "web_search_calls": context.web_service.web_search_calls,
-            "web_fetch_calls": context.web_service.web_fetch_calls,
-            "web_context_calls": context.web_service.web_context_calls,
-            "web_failed_calls": context.web_service.web_failed_calls,
+            "web_search_calls": context._web_service.web_search_calls,
+            "web_fetch_calls": context._web_service.web_fetch_calls,
+            "web_context_calls": context._web_service.web_context_calls,
+            "web_failed_calls": context._web_service.web_failed_calls,
         }
         # The priced sub-counts, each published only when the adapter reported one -- a run that
         # used no cache must not read as one whose cache saved nothing. ``reasoning_tokens`` was
@@ -4591,7 +4693,7 @@ class AgentLoop:
         # Bind the run's (always-on) loop so background shell jobs schedule their asyncio
         # subprocess monitors onto it — they then progress while the run is parked between
         # turns, on the same single loop that drives the run.
-        context.job_manager.bind_loop(asyncio.get_running_loop())
+        context._job_manager.bind_loop(asyncio.get_running_loop())
         # The per-submit step budget continues across task-wait suspensions within one
         # submit; session_step is the global, monotonic turn counter for turn ids.
         max_steps = self.spec.limits.max_steps
@@ -5034,9 +5136,9 @@ class AgentLoop:
                         turn_id=turn_id,
                         abort_after_recovery_probe=resuming_checkpointed_step,
                     )
-                self._check_lease_authority()
+                self._assert_write_authority()
             except ModelAdapterError as exc:
-                self._check_lease_authority()
+                self._assert_write_authority()
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
                 # A failure after a billed answer still costs tokens. The proof refusals parse
@@ -5078,7 +5180,7 @@ class AgentLoop:
                     and exc.interruption_cause is InterruptionCause.LEASE_LOST
                 ):
                     raise
-                self._check_lease_authority()
+                self._assert_write_authority()
                 # The twin of the arm above, and for a while the one that accounted for nothing.
                 # Every run boundary is a ``NativeAgentError`` -- ``RunCancelled``, ``RunTimeout``,
                 # the ``TurnInterrupted`` the abort is translated into -- so a call the run itself
@@ -5179,12 +5281,12 @@ class AgentLoop:
                     session.model_tool_calls_pending = True
 
             if not turn.tool_calls:
-                if context.job_manager.has_resume_jobs():
+                if context._job_manager.has_resume_jobs():
                     # Park without blocking: clear the consumed observations and hand
                     # control back. The caller waits (in-process monitor completes, or
                     # an external reporter delivers) and resumes via run_until_suspended.
                     state.pending_observations = ()
-                    external = context.job_manager.external_pending_task_ids()
+                    external = context._job_manager.external_pending_task_ids()
                     return Suspension(
                         reason="awaiting_tasks",
                         status=state.status,  # type: ignore[arg-type]
@@ -5400,7 +5502,7 @@ class AgentLoop:
         return self._finalizer.finalize(state, res)
 
     def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
-        self._check_lease_authority()
+        self._assert_write_authority()
         return self._finalizer.checkpoint_on_settle(state, res)
 
     def _pop_background_observations(
@@ -5410,7 +5512,7 @@ class AgentLoop:
         step: int,
         state: RunState,
     ) -> tuple[ToolObservation, ...]:
-        observations = context.job_manager.pop_reentry_observations()
+        observations = context._job_manager.pop_reentry_observations()
         if not observations:
             return ()
         recorder.emit(
@@ -5455,7 +5557,7 @@ class AgentLoop:
         state: RunState,
     ) -> ToolObservation:
         task_id = str(observation.output.get("task_id") or "")
-        task = context.job_manager.jobs.get(task_id)
+        task = context._job_manager.jobs.get(task_id)
         request_payload = getattr(task, "request", None) if task is not None else None
         result_payload = getattr(task, "result", None) if task is not None else None
         normalized = normalize_tool_approval_result(result_payload, task_id=task_id)
@@ -5513,7 +5615,7 @@ class AgentLoop:
         """Store the lease from a resolved ``capability`` task in the vault (fail-closed against the
         original request scope), and queue the gated call for auto-redispatch when one was captured.
         A denial / malformed grant stores nothing — the model just sees the result observation."""
-        task = context.job_manager.jobs.get(str(observation.output.get("task_id") or ""))
+        task = context._job_manager.jobs.get(str(observation.output.get("task_id") or ""))
         request_payload = getattr(task, "request", None) if task is not None else None
         result_payload = getattr(task, "result", None) if task is not None else None
         if not isinstance(request_payload, dict) or not isinstance(result_payload, dict):
@@ -5690,17 +5792,17 @@ class AgentLoop:
                         "status": job.get("status"),
                         "resume_on_exit": job.get("resume_on_exit"),
                     }
-                    for job in context.job_manager.list_jobs()
+                    for job in context._job_manager.list_jobs()
                     if job.get("status") == "running" and job.get("resume_on_exit")
                 ],
             },
         )
-        while context.job_manager.has_resume_jobs():
+        while context._job_manager.has_resume_jobs():
             self._check_run_boundary(deadline)
             wait_s = 0.25
             if deadline is not None:
                 wait_s = max(0.01, min(wait_s, deadline - time.time()))
-            if context.job_manager.wait_for_reentry(wait_s):
+            if context._job_manager.wait_for_reentry(wait_s):
                 return
 
     def _emit_background_workspace_events(
@@ -5898,6 +6000,7 @@ class AgentLoop:
                 runtime=bound_tool.runtime,
             )
         )
+        self.write_authority.assert_active()
         try:
             handler = spec.handler
             async_call = is_async_callable(handler)
@@ -5907,7 +6010,9 @@ class AgentLoop:
             else:
                 result = await self._await_native_tool_handler(
                     start_abandonable_sync_call(
-                        lambda: handler(context, arguments),
+                        lambda: self.write_authority.guard_external_call(
+                            lambda: handler(context, arguments)
+                        ),
                         thread_name=f"nar-tool-{self.spec.run_id}",
                     ),
                     deadline,
@@ -5917,7 +6022,13 @@ class AgentLoop:
             if not isinstance(result, ToolResult):
                 raise TypeError("tool handler must return ToolResult")
         finally:
-            context._exit_call()
+            try:
+                context._exit_call()
+            finally:
+                # Native async callbacks cannot be held under a synchronous guard while awaited.
+                # This post-check gives authority loss precedence and suppresses all publication of
+                # a result produced by an activation that became stale during the external call.
+                self.write_authority.assert_active()
         return result
 
     async def _await_native_tool_handler(
@@ -6058,7 +6169,7 @@ class AgentLoop:
         #
         # What the approver actually needed was to see the arguments on the card, which
         # `redact_tool_arguments` now does directly. See `core.tool_approval`.
-        task_id = context.job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
+        task_id = context._job_manager.create_task(TOOL_APPROVAL_TASK_KIND, task_request)
         recorder.emit(
             "tool.approval.requested",
             turn_id=turn_id,
@@ -6470,7 +6581,7 @@ class AgentLoop:
             # gated call (so it can be auto-redispatched on grant — see _capability_replay_for_grant),
             # and hand the model a "pending" observation. On resolution the lease is admitted and the
             # call runs automatically (or, if auto-redispatch is off/unsafe, the model retries it).
-            task_id = context.job_manager.create_task(
+            task_id = context._job_manager.create_task(
                 "capability",
                 {
                     "capability": capability,
@@ -6669,7 +6780,7 @@ class AgentLoop:
         )
 
     def _check_run_boundary(self, deadline: float | None) -> None:
-        self._check_lease_authority()
+        self._assert_write_authority()
         if self.cancellation_token is not None and self.cancellation_token.requested:
             raise RunCancelled(
                 "run cancelled",
@@ -6683,38 +6794,22 @@ class AgentLoop:
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
 
-    def _check_lease_authority(self) -> None:
-        if self._lease_authority_lost():
-            raise RunCancelled(
-                "run cancelled",
-                interruption_cause=InterruptionCause.LEASE_LOST,
-            )
-
     def _lease_authority_lost(self) -> bool:
-        token = self.cancellation_token
-        return token is not None and token.lease_lost
+        return self.write_authority.revoked
 
     def _assert_write_authority(self) -> None:
-        if self._lease_authority_lost():
-            raise NativeAgentError(
-                "lease-lost activation cannot mutate run state",
-                error_code="lease_lost",
-            )
+        self.write_authority.assert_active()
 
     @staticmethod
     def _lease_loss_suspension(session: _Session) -> Suspension:
         """Return the mutation-free observation for an activation that lost its lease."""
 
-        state = session.state
-        state.interruption_cause = InterruptionCause.LEASE_LOST
-        state.error = "run lease was lost"
-        state.error_code = InterruptionCause.LEASE_LOST.value
-        session.midturn_park = "interrupted"
+        del session
         return Suspension(
             reason="interrupted",
             status="completed",
-            error=state.error,
-            error_code=state.error_code,
+            error="run lease was lost",
+            error_code=InterruptionCause.LEASE_LOST.value,
             interruption_cause=InterruptionCause.LEASE_LOST,
         )
 
