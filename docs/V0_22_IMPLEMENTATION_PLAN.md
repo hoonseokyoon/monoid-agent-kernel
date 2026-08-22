@@ -269,7 +269,7 @@ class TerminalOutcome:
     schema_version: str
     run_id: str
     kind: Literal[
-        "completed", "paused", "cancelled", "interrupted",
+        "completed", "paused", "limited", "cancelled", "interrupted",
         "failed_retryable", "failed_config", "failed_terminal",
         "dispatch_unknown", "evidence_uncommitted",
     ]
@@ -286,6 +286,8 @@ class TerminalOutcome:
 
 Outcome은 content를 inline으로 운반하지 않는다. Opaque address와 안전한 taxonomy를 운반한다.
 기존 `AgentRunResult`, `AgentTurnResult`, `Suspension`에서 outcome을 만드는 helper를 제공한다.
+`Suspension(reason="limited")`는 terminal `kind="limited"`와 `retry_eligibility="forbidden"`으로
+투영한다. Cooperative pause와 task wait만 `kind="paused"`로 투영한다.
 
 `RetryEligibility` 값은 다음으로 고정한다.
 

@@ -2898,6 +2898,8 @@ idempotency for process loss before a call returns an observation.
 `dispatch_unknown` to `after_reconciliation`. The projection copies safe taxonomy fields and
 opaque references; it has no raw prompt, model output, reasoning, replay body, or exception-text
 field.
+Run-limit exhaustion projects to `TerminalOutcome(kind="limited",
+retry_eligibility="forbidden")`. Cooperative pause and task-wait boundaries project to `paused`.
 
 ## Run Artifacts
 

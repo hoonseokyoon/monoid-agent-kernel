@@ -106,6 +106,26 @@ def test_dispatch_unknown_rejects_automatic_retry_eligibility(
         )
 
 
+@pytest.mark.parametrize(
+    "eligibility",
+    (
+        RetryEligibility.NOT_APPLICABLE,
+        RetryEligibility.SAFE,
+        RetryEligibility.AFTER_CONFIGURATION,
+        RetryEligibility.AFTER_RECONCILIATION,
+    ),
+)
+def test_limited_outcome_rejects_retry_eligibility(
+    eligibility: RetryEligibility,
+) -> None:
+    with pytest.raises(ValueError, match="limited forbids retry"):
+        TerminalOutcome(
+            run_id="run_1",
+            kind="limited",
+            retry_eligibility=eligibility,
+        )
+
+
 @pytest.mark.parametrize("cause", tuple(InterruptionCause))
 def test_terminal_outcome_accepts_every_declared_interruption_cause(
     cause: InterruptionCause,
@@ -336,6 +356,16 @@ def test_dispatch_unknown_suspension_requires_reconciliation_before_retry() -> N
             Suspension(reason="paused", status="completed"),
             "paused",
             RetryEligibility.NOT_APPLICABLE,
+            None,
+        ),
+        (
+            Suspension(
+                reason="limited",
+                status="limited",
+                error_code="max_steps_exceeded",
+            ),
+            "limited",
+            RetryEligibility.FORBIDDEN,
             None,
         ),
         (

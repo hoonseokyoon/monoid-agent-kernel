@@ -146,6 +146,8 @@ out in commit messages and here.
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal without paid continuation, multimodal stored
   result replay, transactional outbox staging, atomic-stage rejection, and capability gates.
+  Run-limit exhaustion projects to the terminal `limited` kind with retry forbidden, preserving
+  its meaning separately from cooperative pause and task-wait boundaries.
 
 ## [0.21.0] - 2026-08-12
 

@@ -28,6 +28,7 @@ ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS = accepted_namespaced_ids("terminal-ou
 TerminalOutcomeKind = Literal[
     "completed",
     "paused",
+    "limited",
     "cancelled",
     "interrupted",
     "failed_retryable",
@@ -123,6 +124,8 @@ class TerminalOutcome:
             raise ValueError(
                 "terminal outcome dispatch_unknown requires reconciliation or forbids retry"
             )
+        if self.kind == "limited" and retry_eligibility is not RetryEligibility.FORBIDDEN:
+            raise ValueError("terminal outcome limited forbids retry")
         if self.interruption_cause is not None:
             try:
                 interruption_cause = InterruptionCause(self.interruption_cause)
@@ -248,9 +251,12 @@ def terminal_outcome_from_suspension(
     elif suspension.reason == "settled":
         kind = "completed"
         retry = RetryEligibility.NOT_APPLICABLE
-    elif suspension.reason in {"paused", "awaiting_tasks", "limited"}:
+    elif suspension.reason in {"paused", "awaiting_tasks"}:
         kind = "paused"
         retry = RetryEligibility.NOT_APPLICABLE
+    elif suspension.reason == "limited":
+        kind = "limited"
+        retry = RetryEligibility.FORBIDDEN
     elif suspension.reason == "interrupted":
         kind = "interrupted"
         retry = RetryEligibility.SAFE

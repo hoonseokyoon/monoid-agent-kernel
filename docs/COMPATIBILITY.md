@@ -89,6 +89,9 @@ retry, and interruption vocabularies plus opaque output/evidence addresses in bo
 or raw provider exception. Its strict reader rejects fields outside the versioned top-level schema.
 A `dispatch_unknown` outcome permits only `after_reconciliation` or `forbidden` retry eligibility,
 so an ambiguous paid call cannot be classified for automatic retry.
+The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
+limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
+contract window, so deploy the current strict reader before a writer that can emit it.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The
