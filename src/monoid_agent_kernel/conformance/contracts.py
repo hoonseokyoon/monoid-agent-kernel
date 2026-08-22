@@ -1905,6 +1905,50 @@ def _run_fenced_run_sink_contract(
             missing_media_recovery_load.value,
             _CONTRACT_UNRESOLVED_BLOB_SHA256,
         )
+        missing_invocation_harness = factory()
+        missing_invocation_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-missing-invocation-result-reference",
+        )
+        missing_invocation_token = _contract_writer(
+            missing_invocation_harness,
+            missing_invocation_run_id,
+        )
+        missing_invocation_checkpoint = RunCheckpoint(
+            run_id=missing_invocation_run_id,
+            seq=1,
+            last_model_invocation=replace(
+                _contract_invocation(
+                    missing_invocation_run_id,
+                    revision=3,
+                    dispatch_state="settled",
+                    succeeded=True,
+                ),
+                result_ref=f"blob:{_CONTRACT_UNRESOLVED_BLOB_SHA256}",
+            ).to_json(),
+        )
+        missing_invocation_reference = missing_invocation_harness.sink.commit_checkpoint(
+            missing_invocation_checkpoint,
+            {},
+            writer_token=missing_invocation_token,
+        )
+        missing_invocation_harness = missing_invocation_harness.reopen()
+        missing_invocation_load = missing_invocation_harness.sink.latest_checked(
+            missing_invocation_run_id
+        )
+        missing_invocation_recovery = missing_invocation_harness.sink.commit_checkpoint(
+            missing_invocation_checkpoint,
+            {_CONTRACT_UNRESOLVED_BLOB_SHA256: _CONTRACT_UNRESOLVED_BLOB},
+            writer_token=missing_invocation_token,
+        )
+        missing_invocation_harness = missing_invocation_harness.reopen()
+        missing_invocation_recovery_load = missing_invocation_harness.sink.latest_checked(
+            missing_invocation_run_id
+        )
+        missing_invocation_recovery_bytes = _contract_blob_hex(
+            missing_invocation_recovery_load.value,
+            _CONTRACT_UNRESOLVED_BLOB_SHA256,
+        )
         missing_queued_media_evidence: dict[
             str,
             tuple[str, str, str, str | None],
@@ -2008,6 +2052,36 @@ def _run_fenced_run_sink_contract(
         )
         malformed_media_harness = malformed_media_harness.reopen()
         malformed_media_load = malformed_media_harness.sink.latest_checked(malformed_media_run_id)
+        malformed_invocation_harness = factory()
+        malformed_invocation_run_id = _contract_run_id(
+            namespace,
+            "checkpoint-malformed-invocation-result-reference",
+        )
+        malformed_invocation_token = _contract_writer(
+            malformed_invocation_harness,
+            malformed_invocation_run_id,
+        )
+        malformed_invocation_reference = malformed_invocation_harness.sink.commit_checkpoint(
+            RunCheckpoint(
+                run_id=malformed_invocation_run_id,
+                seq=1,
+                last_model_invocation=replace(
+                    _contract_invocation(
+                        malformed_invocation_run_id,
+                        revision=3,
+                        dispatch_state="settled",
+                        succeeded=True,
+                    ),
+                    result_ref=f"blob:{_CONTRACT_MALFORMED_BLOB_SHA256}",
+                ).to_json(),
+            ),
+            {},
+            writer_token=malformed_invocation_token,
+        )
+        malformed_invocation_harness = malformed_invocation_harness.reopen()
+        malformed_invocation_load = malformed_invocation_harness.sink.latest_checked(
+            malformed_invocation_run_id
+        )
         malformed_queued_media_evidence: dict[str, tuple[str, str]] = {}
         for carrier in _CONTRACT_QUEUED_MEDIA_CARRIERS:
             queued_harness = factory()
@@ -2436,6 +2510,26 @@ def _run_fenced_run_sink_contract(
                         expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
                         actual=missing_media_recovery_bytes,
                     ),
+                    observation(
+                        "missing_invocation_reference_status",
+                        expected="conflict",
+                        actual=missing_invocation_reference.status,
+                    ),
+                    observation(
+                        "missing_invocation_reference_not_published",
+                        expected="missing",
+                        actual=missing_invocation_load.status,
+                    ),
+                    observation(
+                        "missing_invocation_reference_recovery",
+                        expected="committed",
+                        actual=missing_invocation_recovery.status,
+                    ),
+                    observation(
+                        "missing_invocation_reference_recovery_bytes",
+                        expected=_CONTRACT_UNRESOLVED_BLOB.hex(),
+                        actual=missing_invocation_recovery_bytes,
+                    ),
                     *(
                         observation(
                             f"missing_queued_media_{carrier}_reference_status",
@@ -2487,6 +2581,16 @@ def _run_fenced_run_sink_contract(
                         "malformed_media_reference_not_published",
                         expected="missing",
                         actual=malformed_media_load.status,
+                    ),
+                    observation(
+                        "malformed_invocation_reference_status",
+                        expected="conflict",
+                        actual=malformed_invocation_reference.status,
+                    ),
+                    observation(
+                        "malformed_invocation_reference_not_published",
+                        expected="missing",
+                        actual=malformed_invocation_load.status,
                     ),
                     *(
                         observation(

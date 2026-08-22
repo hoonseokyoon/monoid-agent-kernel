@@ -106,8 +106,10 @@ class FencedCheckpointStore(Protocol):
     SHA-256 digest of its bytes. A malformed blob map returns ``conflict`` without publishing
     metadata or blob content. Every checkpoint blob reference must resolve from the submitted map
     or same-run authoritative backing before metadata and head publication. This includes
-    workspace ``content_sha256`` entries and media ``blob:`` references carried by checkpoint
-    messages. A loaded record exposes bytes reused from authoritative backing through ``blob()``.
+    workspace ``content_sha256`` entries, media ``blob:`` references carried by checkpoint
+    messages and queued messages, and a ``blob:`` result referenced by
+    ``last_model_invocation``. A loaded record exposes bytes reused from authoritative backing
+    through ``blob()``.
     """
 
     @property

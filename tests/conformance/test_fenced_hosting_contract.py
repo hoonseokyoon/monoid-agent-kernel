@@ -1645,6 +1645,8 @@ def test_reusable_contract_rejects_malformed_blob_reference_suffixes() -> None:
     assert (
         checkpoint_observations["malformed_queued_media_envelope_reference_status"] == "committed"
     )
+    assert checkpoint_observations["malformed_invocation_reference_status"] == "committed"
+    assert checkpoint_observations["malformed_invocation_reference_not_published"] == "loaded"
     assert invocation_observations["malformed_reference_status"] == "committed"
     assert invocation_observations["malformed_reference_head_not_published"] == 3
 
@@ -1709,6 +1711,42 @@ def test_reusable_contract_checks_each_queued_checkpoint_media_carrier() -> None
     for carrier in ("content_list", "envelope"):
         assert observations[f"missing_queued_media_{carrier}_reference_status"] == "committed"
         assert observations[f"missing_queued_media_{carrier}_not_published"] == "loaded"
+
+
+class _NestedInvocationBlindCheckpointReferenceSink(DeterministicFencedRunSink):
+    def _checkpoint_blob_references(self, checkpoint: RunCheckpoint) -> set[str]:
+        references = super()._checkpoint_blob_references(checkpoint)
+        invocation = checkpoint.last_model_invocation
+        result_ref = invocation.get("result_ref") if isinstance(invocation, dict) else None
+        if isinstance(result_ref, str) and result_ref.startswith("blob:"):
+            references.discard(result_ref.removeprefix("blob:"))
+        return references
+
+
+def _nested_invocation_blind_checkpoint_reference_factory() -> DeterministicFencedRunHarness:
+    harness = DeterministicFencedRunHarness()
+    harness.sink = _NestedInvocationBlindCheckpointReferenceSink(harness._writers)
+    return harness
+
+
+def test_reusable_contract_checks_nested_checkpoint_invocation_result_references() -> None:
+    outcomes = run_fenced_run_sink_contract(
+        _nested_invocation_blind_checkpoint_reference_factory
+    )
+    checkpoint_rule = next(
+        outcome
+        for outcome in outcomes
+        if outcome.rule_id == "FENCED-01-CHECKPOINT-CONTENT-IDENTITY"
+    )
+    observations = {item.observation_id: item.actual for item in checkpoint_rule.observations}
+
+    assert checkpoint_rule.status == "failed"
+    assert observations["missing_reference_status"] == "conflict"
+    assert observations["missing_media_reference_status"] == "conflict"
+    assert observations["missing_invocation_reference_status"] == "committed"
+    assert observations["missing_invocation_reference_not_published"] == "loaded"
+    assert observations["malformed_invocation_reference_status"] == "committed"
+    assert observations["malformed_invocation_reference_not_published"] == "loaded"
 
 
 class _SubmittedMapOnlyReferenceSink(DeterministicFencedRunSink):

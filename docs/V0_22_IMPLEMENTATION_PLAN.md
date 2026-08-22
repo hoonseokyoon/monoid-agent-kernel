@@ -602,10 +602,11 @@ Checked load record는 committed blob을 정확한 bytes로 돌려준다.
 대문자 digest key에 올바른 bytes를 넣은 경우도 `conflict`다. Contract는 이 case-folding 결함을 별도
 mutant로 검증하며, 거부된 map의 bytes가 backing에 남지 않았음을 빈-map 참조 재시도로 확인한다.
 Checkpoint workspace delta, committed message log, queued raw content list, queued inbox envelope의
-media `blob:` reference와 invocation `blob:` result reference는 제출 map이나 같은 run의 authoritative
-backing으로 해소된 뒤에만 commit할 수 있다. 각 fresh missing-reference commit은 `conflict`이고 head를
-유지한다. 같은 run에서 먼저 저장한 blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며
-재개방 record가 그 bytes를 반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
+media `blob:` reference와 nested `last_model_invocation`의 `blob:` result reference는 제출 map이나 같은
+run의 authoritative backing으로 해소된 뒤에만 commit할 수 있다. Standalone invocation의 `blob:` result도
+같은 규칙을 따른다. 각 fresh missing-reference commit은 `conflict`이고 head를 유지한다. 같은 run에서 먼저
+저장한 blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재개방 record가 그 bytes를
+반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
 `blob:` suffix는 정확한 lowercase SHA-256 digest다. Workspace `content_sha256`, committed·queued
 message media `source_ref`, invocation `result_ref`의 malformed suffix는 모두 `conflict`이고 metadata와
 head를 공개하지 않는다. `object:` 같은 bounded external invocation result address는 blob map 없이
@@ -1130,8 +1131,9 @@ Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방�
 field가 content identity에 참여한다.
 Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mutation/status/evidence-field
 조합의 잘못된 `CommitResult` mutant를 거부한다. Blob 검증은 잘못된 bytes와 대문자 digest를 독립
-축으로 검사하고, workspace·committed message·queued content list·queued envelope·invocation result
-참조를 submitted map과 same-run backing 두 해소 경로에서 확인한다. Terminal invocation 재시도는
+축으로 검사하고, workspace·committed message·queued content list·queued envelope·nested checkpoint
+invocation result·standalone invocation result 참조를 submitted map과 same-run backing 두 해소 경로에서
+확인한다. Terminal invocation 재시도는
 unknown의 failure-code 유무, success의
 retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
 owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
@@ -1144,8 +1146,10 @@ harness registry는 probe
 checkpoint·invocation과 corrupt·unsupported_version을 완전 교차한다. Delayed checkpoint는 fresh
 낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. 더 높은 checkpoint가
 빈 blob map으로 delayed digest를 재참조하고 재개방 뒤 bytes를 읽어 blob 권위 보존도 확인한다.
-Blob reference matrix는 workspace·committed media·두 queued media carrier·invocation의 malformed
-digest를 거부하고 external invocation result address를 허용한다.
+Blob reference matrix는 workspace·committed media·두 queued media carrier·nested checkpoint
+invocation·standalone invocation의 malformed digest를 거부하고 external invocation result address를
+허용한다. Core의 단일 `checkpoint_blob_references()`가 checkpoint carrier 전체를 추출하며 reference
+adapter와 conformance fixture가 같은 어휘를 사용한다.
 Fence precedence는 existing coordinate의 동일 payload·conflicting payload·malformed blob map과 fresh
 coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
 Checkpoint·invocation의 same-key blob-map conflict 뒤 loser digest를 empty-map record로 재참조해

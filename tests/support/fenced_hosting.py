@@ -15,11 +15,11 @@ from monoid_agent_kernel.core.checkpoint import (
     CHECKPOINT_CODEC,
     CheckpointRecord,
     RunCheckpoint,
+    checkpoint_blob_references,
     checkpoint_payload_for_write,
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.media import blob_shas_in_messages
 from monoid_agent_kernel.core.model_invocation import (
     MODEL_INVOCATION_CODEC,
     DurableModelInvocation,
@@ -87,22 +87,7 @@ class DeterministicFencedRunSink:
         )
 
     def _checkpoint_blob_references(self, checkpoint: RunCheckpoint) -> set[str]:
-        workspace_references = {
-            item["content_sha256"]
-            for item in checkpoint.workspace_delta
-            if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
-        }
-        queued_message_carriers: list[dict[str, Any]] = []
-        for message in checkpoint.queued_messages:
-            if isinstance(message, list):
-                queued_message_carriers.append({"content": message})
-            elif isinstance(message, dict):
-                queued_message_carriers.append(message)
-        return (
-            workspace_references
-            | blob_shas_in_messages(tuple(checkpoint.messages))
-            | blob_shas_in_messages(tuple(queued_message_carriers))
-        )
+        return checkpoint_blob_references(checkpoint)
 
     def _reference_is_available(
         self,

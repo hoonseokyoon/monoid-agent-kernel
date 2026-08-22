@@ -17,6 +17,7 @@ from monoid_agent_kernel.core.checkpoint import (
     LocalFsCheckpointStore,
     RunCheckpoint,
     _validate_checkpoint_payload,
+    checkpoint_blob_references,
     decode_checkpoint,
     read_checkpoint,
     read_checkpoint_checked,
@@ -473,6 +474,39 @@ def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: P
     assert payload["last_model_invocation"]["schema_version"] == (
         "monoid.model-invocation.v1"
     )
+
+
+@pytest.mark.parametrize(
+    ("result_ref", "expected"),
+    [
+        ("blob:" + "b" * 64, {"b" * 64}),
+        ("blob:not-a-digest", {"not-a-digest"}),
+        ("object:provider-result", set()),
+    ],
+)
+def test_checkpoint_blob_references_include_nested_invocation_result(
+    result_ref: str,
+    expected: set[str],
+) -> None:
+    invocation = DurableModelInvocation(
+        run_id="run_1",
+        logical_call_id="call_1",
+        revision=3,
+        dispatch_id="dispatch_1",
+        dispatch_attempt=1,
+        idempotency_key="idem_1",
+        dispatch_state="settled",
+        request_digest="a" * 64,
+        digest_generation="monoid.model-request-digest.v1",
+        receipt={},
+        result_ref=result_ref,
+    )
+    checkpoint = RunCheckpoint(
+        run_id="run_1",
+        last_model_invocation=invocation.to_json(),
+    )
+
+    assert checkpoint_blob_references(checkpoint) == expected
 
 
 def test_hosted_task_checkpoint_round_trip(tmp_path: Path) -> None:
