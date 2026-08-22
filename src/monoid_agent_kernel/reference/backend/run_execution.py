@@ -68,8 +68,8 @@ class RunExecutionContext:
     unregister_record: Callable[[MutableRunRecordPort], None]
     record: Callable[[str], MutableRunRecordPort]
     drive_open_session: DriveOpenSessionPort
-    record_run_result: Callable[[str, AgentRunResult], None]
-    record_run_failure: Callable[[str, Exception], None]
+    record_run_result: Callable[[MutableRunRecordPort, AgentRunResult], None]
+    record_run_failure: Callable[[MutableRunRecordPort, Exception], None]
     acquire_run_slot: Callable[[], Awaitable[None]]
     release_run_slot: Callable[[], None]
     submission_json: Callable[[PreparedRunPort], dict[str, Any]]
@@ -80,6 +80,20 @@ class RunExecutionService:
 
     def __init__(self, context: RunExecutionContext) -> None:
         self._context = context
+
+    @staticmethod
+    def _lease_lost(record: MutableRunRecordPort, exc: BaseException) -> bool:
+        return record.write_authority.revoked or is_activation_lease_loss(exc)
+
+    def _unregister_if_lease_lost(
+        self,
+        record: MutableRunRecordPort,
+        exc: BaseException,
+    ) -> bool:
+        if not self._lease_lost(record, exc):
+            return False
+        self._context.unregister_record(record)
+        return True
 
     async def run_prepared(self, prepared: PreparedRunPort, request: RunRequestPort) -> None:
         await self._context.acquire_run_slot()
@@ -98,14 +112,11 @@ class RunExecutionService:
                 loop = loop_build.loop
                 self._context.attach_loop(prepared.record, loop_build)
                 result = await self.drive_session(prepared.run_id, request, loop)
+                prepared.record.write_authority.assert_active()
+                self._context.record_run_result(prepared.record, result)
                 released = True
-                self._context.record_run_result(prepared.run_id, result)
             except Exception as exc:
-                lease_lost = is_activation_lease_loss(exc)
-                if lease_lost:
-                    # Retire host ownership before cleanup so status, commands, recovery, and the
-                    # watchdog stop seeing this activation as live while discard is in progress.
-                    self._context.unregister_record(prepared.record)
+                lease_lost = self._unregister_if_lease_lost(prepared.record, exc)
                 if loop is not None and not released:
                     try:
                         await asyncio.to_thread(loop.discard_uncommitted)
@@ -116,7 +127,13 @@ class RunExecutionService:
                         pass
                 if lease_lost:
                     return
-                self._context.record_run_failure(prepared.run_id, exc)
+                try:
+                    prepared.record.write_authority.assert_active()
+                    self._context.record_run_failure(prepared.record, exc)
+                except Exception as publication_exc:
+                    if self._unregister_if_lease_lost(prepared.record, publication_exc):
+                        return
+                    raise
         finally:
             # Cancellation derives from BaseException, so it bypasses the failure-recording branch.
             # It still owns every resource materialized before the cancellation point.
@@ -214,20 +231,31 @@ class RunExecutionService:
             prepared.record.write_authority.assert_active()
             result = await loop.aclose()
             closed = True
-            self._context.record_run_result(prepared.run_id, result)
+            prepared.record.write_authority.assert_active()
+            self._context.record_run_result(prepared.record, result)
+            prepared.record.write_authority.assert_active()
             yield result_frame(result, suspension)
         except Exception as exc:
-            lease_lost = is_activation_lease_loss(exc)
+            lease_lost = self._lease_lost(prepared.record, exc)
             if loop is not None and not closed and not lease_lost:
                 try:
                     await loop.aclose()
                     closed = True
-                except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
-                    pass
+                except Exception as close_exc:  # noqa: BLE001 - preserve the original failure
+                    lease_lost = self._lease_lost(prepared.record, close_exc)
+            lease_lost = lease_lost or prepared.record.write_authority.revoked
             if not lease_lost:
-                self._context.record_run_failure(prepared.run_id, exc)
-                yield failure_frame(exc)
-            else:
+                try:
+                    prepared.record.write_authority.assert_active()
+                    self._context.record_run_failure(prepared.record, exc)
+                    prepared.record.write_authority.assert_active()
+                except Exception as publication_exc:
+                    lease_lost = self._lease_lost(prepared.record, publication_exc)
+                    if not lease_lost:
+                        raise
+                if not lease_lost:
+                    yield failure_frame(exc)
+            if lease_lost:
                 self._context.unregister_record(prepared.record)
         finally:
             if loop is not None and not closed:

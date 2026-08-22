@@ -10,7 +10,7 @@ from monoid_agent_kernel.core.authority import (
     WriteAuthorityRevoked,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
-from monoid_agent_kernel.core.result import Suspension
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference.backend.activation import is_activation_lease_loss
 from monoid_agent_kernel.reference.backend.run_execution import (
@@ -61,8 +61,8 @@ def _execution_service(
                 write_authority=ActivationWriteAuthority(),
             ),
             drive_open_session=lambda *args, **kwargs: None,  # type: ignore[arg-type]
-            record_run_result=lambda run_id, result: results.append((run_id, result)),
-            record_run_failure=lambda run_id, exc: failures.append(exc),
+            record_run_result=lambda record, result: results.append((record.run_id, result)),
+            record_run_failure=lambda record, exc: failures.append(exc),
             acquire_run_slot=acquire,
             release_run_slot=lambda: released.append(True),
             submission_json=lambda prepared: {"run_id": prepared.run_id},
@@ -80,6 +80,17 @@ def _prepared(tmp_path: Path) -> SimpleNamespace:
         workspace_root=tmp_path,
         llm_gateway_token="llm",
         web_gateway_token="web",
+    )
+
+
+def _result(tmp_path: Path, run_id: str = "run_stale") -> AgentRunResult:
+    return AgentRunResult(
+        run_id=run_id,
+        status="completed",
+        final_text="done",
+        run_dir=tmp_path,
+        diff_path=tmp_path / "diff.patch",
+        proposal_path=tmp_path / "proposal.json",
     )
 
 
@@ -118,6 +129,70 @@ def test_autonomous_execution_discards_lease_loss_without_recording_failure(
 
     assert loop.discard_calls == 1
     assert loop.close_calls == 0
+    assert failures == []
+    assert results == []
+    assert released == [True]
+    assert unregistered == [prepared.record]
+
+
+def test_autonomous_execution_rechecks_sticky_authority_before_terminal_result(
+    tmp_path: Path,
+) -> None:
+    loop = _DiscardableLoop(tmp_path)
+    failures: list[Exception] = []
+    results: list[Any] = []
+    released: list[bool] = []
+    unregistered: list[Any] = []
+    service = _execution_service(
+        loop,
+        failures=failures,
+        results=results,
+        released=released,
+        unregistered=unregistered,
+    )
+    prepared = _prepared(tmp_path)
+
+    async def revoked_result(*args: Any, **kwargs: Any) -> AgentRunResult:
+        prepared.record.write_authority.revoke()
+        return _result(tmp_path, prepared.run_id)
+
+    service.drive_session = revoked_result  # type: ignore[method-assign]
+
+    asyncio.run(service.run_prepared(prepared, SimpleNamespace()))
+
+    assert loop.discard_calls == 1
+    assert failures == []
+    assert results == []
+    assert released == [True]
+    assert unregistered == [prepared.record]
+
+
+def test_autonomous_execution_treats_ordinary_failure_racing_revocation_as_lease_loss(
+    tmp_path: Path,
+) -> None:
+    loop = _DiscardableLoop(tmp_path)
+    failures: list[Exception] = []
+    results: list[Any] = []
+    released: list[bool] = []
+    unregistered: list[Any] = []
+    service = _execution_service(
+        loop,
+        failures=failures,
+        results=results,
+        released=released,
+        unregistered=unregistered,
+    )
+    prepared = _prepared(tmp_path)
+
+    async def revoked_failure(*args: Any, **kwargs: Any) -> AgentRunResult:
+        prepared.record.write_authority.revoke()
+        raise RuntimeError("ordinary failure lost the authority race")
+
+    service.drive_session = revoked_failure  # type: ignore[method-assign]
+
+    asyncio.run(service.run_prepared(prepared, SimpleNamespace()))
+
+    assert loop.discard_calls == 1
     assert failures == []
     assert results == []
     assert released == [True]
@@ -185,10 +260,67 @@ def test_stream_execution_discards_lease_loss_without_a_terminal_frame(
     assert unregistered == [prepared.record]
 
 
-def test_recovered_execution_unregisters_lease_loss_before_or_during_drive(
+def test_stream_execution_rechecks_authority_after_close_before_terminal_frame(
     tmp_path: Path,
 ) -> None:
-    for failure_boundary in ("pending_tasks", "drive"):
+    loop = _DiscardableLoop(tmp_path)
+    failures: list[Exception] = []
+    results: list[Any] = []
+    released: list[bool] = []
+    unregistered: list[Any] = []
+    service = _execution_service(
+        loop,
+        failures=failures,
+        results=results,
+        released=released,
+        unregistered=unregistered,
+    )
+    prepared = _prepared(tmp_path)
+
+    class _SettledStream:
+        suspension = Suspension(reason="settled", status="completed")
+
+        async def __aenter__(self) -> _SettledStream:
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def __aiter__(self) -> _SettledStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            raise StopAsyncIteration
+
+    async def revoked_close() -> AgentRunResult:
+        prepared.record.write_authority.revoke()
+        return _result(tmp_path, prepared.run_id)
+
+    loop.astream = lambda user_input: _SettledStream()  # type: ignore[attr-defined]
+    loop.aclose = revoked_close  # type: ignore[method-assign]
+
+    async def collect() -> list[dict[str, Any]]:
+        return [
+            frame
+            async for frame in service.stream_prepared(
+                prepared,
+                SimpleNamespace(input_parts=(), instruction="go"),
+            )
+        ]
+
+    frames = asyncio.run(collect())
+
+    assert frames == [{"kind": "meta", "run_id": "run_stale"}]
+    assert failures == []
+    assert results == []
+    assert released == [True]
+    assert unregistered == [prepared.record]
+
+
+def test_recovered_execution_unregisters_lease_loss_before_during_or_after_drive(
+    tmp_path: Path,
+) -> None:
+    for failure_boundary in ("pending_tasks", "drive", "result"):
         loop = _DiscardableLoop(tmp_path)
         failures: list[Exception] = []
         results: list[Any] = []
@@ -207,9 +339,12 @@ def test_recovered_execution_unregisters_lease_loss_before_or_during_drive(
                 raise WriteAuthorityRevoked()
             return False
 
-        async def stale_session(*args: Any, **kwargs: Any) -> None:
+        async def stale_session(*args: Any, **kwargs: Any) -> AgentRunResult:
             if failure_boundary == "drive":
                 raise WriteAuthorityRevoked()
+            if failure_boundary == "result":
+                recovered_record.write_authority.revoke()
+                return _result(tmp_path, recovered_record.run_id)
             raise AssertionError("drive must not start after authority loss")
 
         loop.has_pending_tasks = pending_tasks  # type: ignore[method-assign]
@@ -234,8 +369,10 @@ def test_recovered_execution_unregisters_lease_loss_before_or_during_drive(
                 call_soon=lambda *args: None,
                 spawn=lambda awaitable: None,
                 drive_open_session=stale_session,  # type: ignore[arg-type]
-                record_run_result=lambda run_id, result: results.append((run_id, result)),
-                record_run_failure=lambda run_id, exc: failures.append(exc),
+                record_run_result=lambda record, result: results.append(
+                    (record.run_id, result)
+                ),
+                record_run_failure=lambda record, exc: failures.append(exc),
                 meter_abandoned_run=lambda run_id, tenant_id: None,
                 acquire_run_slot=acquire,
                 release_run_slot=lambda: released.append(True),

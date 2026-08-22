@@ -88,8 +88,8 @@ class RecoveryContext:
     call_soon: Callable[..., None]
     spawn: Callable[[Awaitable[Any]], object]
     drive_open_session: DriveOpenSessionPort
-    record_run_result: Callable[[str, AgentRunResult], None]
-    record_run_failure: Callable[[str, Exception], None]
+    record_run_result: Callable[[MutableRunRecordPort, AgentRunResult], None]
+    record_run_failure: Callable[[MutableRunRecordPort, Exception], None]
     # ``(run_id, tenant_id)`` — the record-free metering seam for the give-up paths, which end
     # a run that was never re-registered (RunStateMutationService.meter_abandoned_run).
     meter_abandoned_run: Callable[[str, str], None]
@@ -335,10 +335,13 @@ class RecoveryService:
                 started=time.time(),
                 turns=1,
             )
+            record.write_authority.assert_active()
+            self._context.record_run_result(record, result)
             released = True
-            self._context.record_run_result(run_id, result)
         except Exception as exc:
-            lease_lost = is_activation_lease_loss(exc)
+            lease_lost = is_activation_lease_loss(exc) or (
+                record is not None and record.write_authority.revoked
+            )
             if lease_lost and record is not None:
                 # The local host record is an activation claim. Drop it before cleanup so a stale
                 # worker cannot keep advertising or heartbeating ownership while discard runs.
@@ -350,8 +353,17 @@ class RecoveryService:
                 # Preserve the recovered execution failure. AgentLoop has already attempted every
                 # owned activation resource before surfacing a cleanup error.
                 pass
-            if not lease_lost:
-                self._context.record_run_failure(run_id, exc)
+            if not lease_lost and record is not None:
+                try:
+                    record.write_authority.assert_active()
+                    self._context.record_run_failure(record, exc)
+                except Exception as publication_exc:
+                    if record.write_authority.revoked or is_activation_lease_loss(
+                        publication_exc
+                    ):
+                        self._context.unregister_record(record)
+                    else:
+                        raise
         finally:
             # Task cancellation bypasses ``except Exception`` but still owns the recovered loop.
             if not released and not discarded:

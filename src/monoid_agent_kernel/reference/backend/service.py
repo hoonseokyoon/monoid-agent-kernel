@@ -19,7 +19,10 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     SubagentDefinition,
 )
-from monoid_agent_kernel.core.authority import ActivationWriteAuthority
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
@@ -749,8 +752,8 @@ class RunnerBackend:
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 spawn=self._spawn,
                 drive_open_session=self._drive_open_session,
-                record_run_result=self._record_run_result,
-                record_run_failure=self._record_run_failure,
+                record_run_result=self._record_activation_result,
+                record_run_failure=self._record_activation_failure,
                 meter_abandoned_run=self._run_state.meter_abandoned_run,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
@@ -794,8 +797,8 @@ class RunnerBackend:
                 unregister_record=self._unregister_recovered_record,
                 record=self._record,
                 drive_open_session=self._drive_open_session,
-                record_run_result=self._record_run_result,
-                record_run_failure=self._record_run_failure,
+                record_run_result=self._record_activation_result,
+                record_run_failure=self._record_activation_failure,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
                 submission_json=lambda prepared: self._submission_for(prepared).to_json(),
@@ -1000,6 +1003,9 @@ class RunnerBackend:
             return True
 
     def _unregister_recovered_record(self, record: BackendRunRecord) -> None:
+        # Removal retires an activation capability. Publish revocation before dropping the host
+        # record so every entered mutation drains before a replacement can be registered.
+        record.write_authority.revoke()
         with self._lock:
             if self._records.get(record.run_id) is record:
                 self._records.pop(record.run_id, None)
@@ -2050,6 +2056,39 @@ class RunnerBackend:
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
         self._run_state.record_run_failure(run_id, exc)
+
+    def _guard_activation_settlement(
+        self,
+        record: BackendRunRecord,
+        operation: Callable[[], None],
+    ) -> None:
+        def settle_current_record() -> None:
+            with self._lock:
+                if self._records.get(record.run_id) is not record:
+                    raise WriteAuthorityRevoked()
+                operation()
+
+        record.write_authority.guard_local_mutation(settle_current_record)
+
+    def _record_activation_result(
+        self,
+        record: BackendRunRecord,
+        result: AgentRunResult,
+    ) -> None:
+        self._guard_activation_settlement(
+            record,
+            lambda: self._record_run_result(record.run_id, result),
+        )
+
+    def _record_activation_failure(
+        self,
+        record: BackendRunRecord,
+        exc: Exception,
+    ) -> None:
+        self._guard_activation_settlement(
+            record,
+            lambda: self._record_run_failure(record.run_id, exc),
+        )
 
     def _write_failure_bundle(
         self,
