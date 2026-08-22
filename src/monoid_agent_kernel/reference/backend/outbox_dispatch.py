@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
@@ -43,7 +43,9 @@ class OutboxRetryPolicy:
 class OutboxDispatchContext:
     retry_policy_provider: Callable[[], OutboxRetryPolicy]
     max_message_queue_depth_provider: Callable[[], int]
-    checkpoint_store_provider: Callable[[], CheckpointStore]
+    commit_checkpoint: Callable[
+        [MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None
+    ]
     rng_provider: Callable[[], random.Random]
     live_outbox_runs: Callable[[], list[tuple[MutableRunRecordPort, OutboxLoopPort]]]
     call_soon: Callable[..., None]
@@ -124,8 +126,11 @@ class OutboxDispatchService:
                 checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
                 checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
                 self._raise_if_lease_lost(record)
-                self._context.checkpoint_store_provider().put(checkpoint, loop.collect_checkpoint_blobs())
-                self._raise_if_lease_lost(record)
+                self._context.commit_checkpoint(
+                    record,
+                    checkpoint,
+                    loop.collect_checkpoint_blobs(),
+                )
 
     def stage_outbox_ack(
         self, record: MutableRunRecordPort, request: Any, status: str, receipt: OutboxReceipt

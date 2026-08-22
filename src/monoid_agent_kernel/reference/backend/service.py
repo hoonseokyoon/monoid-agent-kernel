@@ -770,7 +770,7 @@ class RunnerBackend:
                     cap_s=self.outbox_retry_cap_s,
                 ),
                 max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
-                checkpoint_store_provider=self._checkpoint_store,
+                commit_checkpoint=self._commit_reference_checkpoint,
                 rng_provider=lambda: self._outbox_rng,
                 live_outbox_runs=self._live_outbox_runs,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
