@@ -2365,7 +2365,9 @@ class AgentLoop:
             # failed/limited run KEEPS its checkpoints so the last-good one (named in
             # failure.json) is available for an operator-driven restore.
             if session.state.status == "completed":
+                self._check_lease_authority()
                 self._checkpoint_store().delete(self.spec.run_id)
+                self._check_lease_authority()
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.

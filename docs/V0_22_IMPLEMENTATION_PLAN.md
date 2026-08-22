@@ -1192,6 +1192,9 @@ evidence를 다음 step 뒤에 남기지 않는다.
   turn settle과 run finalization은 하나의 common projection writer를 사용한다. proposal, metrics,
   settled text, event write를 각각 전·후 fencing하며 EventBus도 emit/close sink별로 authority를
   확인한다. TaskManager는 cancel_all 내부의 각 job cancellation 전·후에 같은 fence를 적용한다.
+  AgentRecorder는 proposal revision의 diff/file/manifest와 settled text의 transcript/content
+  sidecar 사이를 추가로 fencing한다. Final recorder close와 completed checkpoint delete도 전·후에
+  authority를 재검사한다.
   drain은 admission quiesce, terminal 판정, cancellation, cause stamp를 한 backend lock 구간에서
   수행하고 cancellation callback 뒤 terminal 상태를 다시 확인한다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는

@@ -506,6 +506,10 @@ class AgentRecorder:
             parent_id=parent_id,
         )
 
+    def _check_writer_authority(self) -> None:
+        if self.check_authority is not None:
+            self.check_authority()
+
     def _terminate_torn_transcript_tail(self) -> None:
         """Close off ``transcript.jsonl``'s torn last line. See :meth:`_terminate_torn_tail`."""
 
@@ -1107,6 +1111,7 @@ class AgentRecorder:
         **content-missing is a tolerated read outcome** — hydration fills absent fields and never
         fails a read.
         """
+        self._check_writer_authority()
         # ``content_digest``, never a bare sha256 of the text: it hashes canonical JSON under a
         # shape key so a text field cannot collide with a structured value's serialization. Once a
         # record persists one it is frozen (see the function's own docstring).
@@ -1121,11 +1126,13 @@ class AgentRecorder:
                     "final_text_len": content_length(text),
                 },
             )
+            self._check_writer_authority()
             # Marked written only once it is. Adding before the write meant a raising write (a
             # full disk mid-flush) recorded the digest as present with nothing on disk, so a later
             # call for the same text short-circuited and returned a digest resolving to nothing.
             self._settled_text_digests.add(digest)
         store = self._get_model_content_store()
+        self._check_writer_authority()
         if store is not None:
             try:
                 text_len = content_length(text)
@@ -1133,6 +1140,7 @@ class AgentRecorder:
                     store.settled_text(text, digest, text_len)
             except Exception:  # noqa: BLE001 - private sidecar failure must not change this method
                 _LOGGER.debug("settled text sidecar write failed", exc_info=True)
+            self._check_writer_authority()
         return digest
 
     def emit_artifact_bytes(
@@ -1159,16 +1167,22 @@ class AgentRecorder:
         return artifact
 
     def write_diff(self, diff_text: str) -> Path:
+        self._check_writer_authority()
         diff_path = self.run_dir / "diff.patch"
         diff_path.write_text(diff_text, encoding="utf-8")
+        self._check_writer_authority()
         return diff_path
 
     def write_proposal_revision(self, workspace: Workspace) -> tuple[str, Path, dict[str, Any]]:
         """Persist one internally consistent diff and proposal snapshot revision."""
+        self._check_writer_authority()
         with proposal_snapshot_lock(self.run_dir):
             diff_text = workspace.diff_patch()
+            self._check_writer_authority()
             diff_path = self.write_diff(diff_text)
+            self._check_writer_authority()
             proposal_payload = self.write_proposal_snapshot(workspace, diff_path)
+            self._check_writer_authority()
         return diff_text, diff_path, proposal_payload
 
     def write_manifest(self, manifest: RunManifest) -> Path:
@@ -1187,14 +1201,19 @@ class AgentRecorder:
         return path
 
     def write_proposal_snapshot(self, workspace: Workspace, diff_path: Path) -> dict[str, Any]:
+        self._check_writer_authority()
         proposal_path = self.run_dir / "proposal.json"
         files_dir = self.run_dir / "proposal" / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
+        self._check_writer_authority()
         files: list[dict[str, Any]] = []
         for entry in workspace.changed_entries():
+            self._check_writer_authority()
             files.append(self._write_proposal_entry(entry, files_dir))
+            self._check_writer_authority()
         diff_data = diff_path.read_bytes() if diff_path.exists() else b""
         diff_bytes = diff_path.stat().st_size if diff_path.exists() else 0
+        self._check_writer_authority()
         payload: dict[str, Any] = {
             "schema_version": namespaced_id("proposal.v2"),
             "run_id": self.run_id,
@@ -1210,7 +1229,9 @@ class AgentRecorder:
         # proposal_hash a stable content identifier so repeated settle checkpoints
         # with no workspace change produce the same hash.
         payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash", "updated_at"))
+        self._check_writer_authority()
         write_json_atomic(proposal_path, payload)
+        self._check_writer_authority()
         return payload
 
     def write_metrics(self, metrics: dict[str, Any]) -> Path:
@@ -1278,6 +1299,7 @@ class AgentRecorder:
                                 _LOGGER.debug("model payload corpus close failed", exc_info=True)
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
+        self._check_writer_authority()
         payload: dict[str, Any] = {
             "path": entry.path,
             "kind": entry.kind,
@@ -1291,7 +1313,9 @@ class AgentRecorder:
             return payload
         target = files_dir.joinpath(*entry.path.split("/"))
         target.parent.mkdir(parents=True, exist_ok=True)
+        self._check_writer_authority()
         target.write_bytes(entry.content)
+        self._check_writer_authority()
         payload["snapshot_path"] = str(target.relative_to(self.run_dir).as_posix())
         payload["snapshot_sha256"] = sha256_bytes(entry.content)
         return payload

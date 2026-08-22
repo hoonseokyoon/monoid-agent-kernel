@@ -712,7 +712,7 @@ class LoopFinalizer:
         )
         artifacts = tuple(recorder.artifacts)
         run_dir = recorder.run_dir
-        recorder.close()
+        self._fenced_write(recorder.close)
         return AgentRunResult(
             run_id=loop.spec.run_id,
             status=state.status,

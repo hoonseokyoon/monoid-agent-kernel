@@ -2944,6 +2944,12 @@ Task shutdown applies authority per running job. `TaskManager.cancel_all` checks
 each individual cancellation, so one blocking executor cannot let the stale activation write cancel
 markers or terminate executors for later jobs.
 
+Kernel-owned composite recorder operations expose the same internal boundary. Proposal revision
+checks between diff, per-file snapshots, and the proposal manifest; settled-text persistence checks
+between the private transcript and content sidecar. Final recorder close is itself fenced, and a
+completed run checks around checkpoint deletion. These checks prevent a composite helper from
+hiding later durable mutations behind one outer fence.
+
 Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
 `FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop
 checks authority after snapshot/blob collection, immediately after the external commit returns,

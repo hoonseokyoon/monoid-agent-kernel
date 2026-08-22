@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import monoid_agent_kernel.recorder as recorder_module
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
@@ -634,6 +635,90 @@ def test_run_close_stops_event_sink_close_fanout_after_lease_loss(tmp_path: Path
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
     assert close_counts == [1, 0]
+
+
+def test_proposal_revision_rechecks_authority_after_diff_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    session = loop._session
+    assert session is not None
+    recorder = session.res.recorder
+    original = recorder.write_diff
+
+    def lose_after_diff(diff_text: str) -> Path:
+        path = original(diff_text)
+        token.cancel(InterruptionCause.LEASE_LOST)
+        return path
+
+    monkeypatch.setattr(recorder, "write_diff", lose_after_diff)
+
+    with pytest.raises(RunCancelled) as caught:
+        recorder.write_proposal_revision(session.res.workspace)
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert recorder.run_dir.joinpath("diff.patch").exists()
+    assert not recorder.run_dir.joinpath("proposal.json").exists()
+    loop.discard_uncommitted()
+
+
+def test_settled_text_rechecks_authority_before_content_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.model_content_file = True
+    loop.open()
+    session = loop._session
+    assert session is not None
+    recorder = session.res.recorder
+    original = recorder_module._write_jsonl
+
+    def lose_after_transcript(handle: Any, payload: dict[str, Any]) -> None:
+        original(handle, payload)
+        if payload.get("kind") == "settled_text":
+            token.cancel(InterruptionCause.LEASE_LOST)
+
+    monkeypatch.setattr(recorder_module, "_write_jsonl", lose_after_transcript)
+
+    with pytest.raises(RunCancelled) as caught:
+        recorder.settled_text("settled answer")
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert '"kind": "settled_text"' in recorder.run_dir.joinpath("transcript.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert not recorder.run_dir.joinpath("model-content.jsonl").exists()
+    loop.discard_uncommitted()
+
+
+def test_checkpoint_delete_rechecks_authority_after_store_returns(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+
+    class LosingDeleteStore(LocalFsCheckpointStore):
+        def delete(self, run_id: str) -> None:
+            super().delete(run_id)
+            token.cancel(InterruptionCause.LEASE_LOST)
+
+    store = LosingDeleteStore(loop.spec.run_root)
+    loop.checkpoint_store = store
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "settled"
+    assert store.latest(loop.spec.run_id) is not None
+
+    with pytest.raises(RunCancelled) as caught:
+        loop.close()
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert store.latest(loop.spec.run_id) is None
 
 
 def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
