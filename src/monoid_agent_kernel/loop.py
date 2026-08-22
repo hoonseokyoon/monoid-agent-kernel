@@ -3082,6 +3082,16 @@ class AgentLoop:
             if state.pending_user_input is not None
             else None
         )
+        cancellation_requested, pending_cancellation_cause = (
+            self.cancellation_token.snapshot()
+            if self.cancellation_token is not None
+            else (False, None)
+        )
+        checkpoint_interruption_cause = (
+            pending_cancellation_cause
+            if cancellation_requested and pending_cancellation_cause is not None
+            else state.interruption_cause
+        )
         return RunCheckpoint(
             run_id=self.spec.run_id,
             seq=session.checkpoint_seq,
@@ -3131,9 +3141,7 @@ class AgentLoop:
             remaining_duration_s=(
                 max(0.0, res.deadline - time.time()) if res.deadline is not None else None
             ),
-            cancellation_requested=bool(
-                self.cancellation_token is not None and self.cancellation_token.requested
-            ),
+            cancellation_requested=cancellation_requested,
             applied_input_ids=sorted(session.applied_input_ids),
             active_input=(dict(session.active_input) if session.active_input is not None else None),
             applied_input_receipts={
@@ -3155,7 +3163,9 @@ class AgentLoop:
                 else None
             ),
             interruption_cause=(
-                "" if state.interruption_cause is None else state.interruption_cause.value
+                ""
+                if checkpoint_interruption_cause is None
+                else checkpoint_interruption_cause.value
             ),
             plan=[dict(item) for item in res.context.plan],
             pending_finish=(

@@ -84,6 +84,15 @@ def test_first_interruption_cause_wins() -> None:
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
 
 
+def test_cancellation_snapshot_pairs_the_request_with_its_winning_cause() -> None:
+    token = CancellationToken()
+    assert token.snapshot() == (False, None)
+
+    token.cancel(InterruptionCause.HOST_SHUTDOWN)
+
+    assert token.snapshot() == (True, InterruptionCause.HOST_SHUTDOWN)
+
+
 def test_callback_added_after_cancellation_runs_immediately() -> None:
     token = CancellationToken()
     token.cancel()
@@ -180,6 +189,33 @@ def test_a_restored_loop_reinstalls_the_durable_interruption_cause(tmp_path: Pat
     stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
     assert stored is not None
     assert stored.checkpoint.interruption_cause == InterruptionCause.GRACEFUL_DRAIN.value
+
+
+def test_a_quiescent_snapshot_persists_the_pending_token_cause_atomically(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "settled"
+
+    token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+    checkpoint = loop.snapshot()
+    loop.discard_uncommitted()
+
+    assert checkpoint is not None
+    assert checkpoint.cancellation_requested is True
+    assert checkpoint.interruption_cause == InterruptionCause.GRACEFUL_DRAIN.value
+
+    restored = _restorable_loop(tmp_path)
+    restored.restore(checkpoint)
+    try:
+        suspension = restored.run_until_suspended(None)
+    finally:
+        restored.discard_uncommitted()
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
 
 
 def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(

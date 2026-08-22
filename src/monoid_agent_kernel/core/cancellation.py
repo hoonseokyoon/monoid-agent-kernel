@@ -58,6 +58,12 @@ class CancellationToken:
     def requested(self) -> bool:
         return self._event.is_set()
 
+    def snapshot(self) -> tuple[bool, InterruptionCause | None]:
+        """Return the request flag and its first-writer cause under one lock."""
+
+        with self._lock:
+            return self._event.is_set(), self._cause
+
     @property
     def cause(self) -> InterruptionCause | None:
         with self._lock:

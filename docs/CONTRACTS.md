@@ -2863,7 +2863,8 @@ fencing through the host-owned sink. It contains no database, queue, or Temporal
 
 `CancellationToken.cancel(cause=InterruptionCause.USER_CANCEL)` records one typed cause. The first
 accepted cause wins; later cancellation requests are no-ops, including callbacks.
-The no-argument call retains the `user_cancel` behavior.
+The no-argument call retains the `user_cancel` behavior. Checkpoint capture reads the request flag
+and cause atomically; a pending token cause takes precedence over the prior park's state cause.
 
 | Cause | Kernel boundary | Durable mutation |
 |---|---|---|
