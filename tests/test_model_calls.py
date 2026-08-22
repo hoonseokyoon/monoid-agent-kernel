@@ -812,7 +812,12 @@ def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other
             ),
                 ("close", "discard_uncommitted", "_close_owned_handles"),
         ),
-        (content_module, "ModelContentStore", ("_disable_locked",), ("close",)),
+            (
+                content_module,
+                "ModelContentStore",
+                ("_disable_locked",),
+                ("close", "discard"),
+            ),
     ):
         source = Path(module.__file__).read_text(encoding="utf-8")
         cls = owning_class(ast.parse(source), class_name)

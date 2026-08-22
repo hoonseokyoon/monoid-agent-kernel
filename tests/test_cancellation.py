@@ -362,9 +362,9 @@ def test_a_legacy_lease_loss_checkpoint_restores_as_revoked_writer_authority(
     suspension = loop.run_until_suspended("must not execute")
     assert suspension.reason == "interrupted"
     assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
-    assert loop._session is not None
-    assert loop._session.checkpoint_seq == 1
-    assert loop._session.state.status == "completed"
+    assert loop._session is None
+    assert loop._bootstrap_resources is None
+    assert not loop.spec.run_root.exists()
     loop.discard_uncommitted()
 
 

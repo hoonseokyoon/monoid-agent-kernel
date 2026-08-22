@@ -483,6 +483,11 @@ class AgentRecorder:
         init=False,
         repr=False,
     )
+    _remove_model_content_revoke_callback: Callable[[], None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _model_calls_handle: TextIO | None = field(default=None, init=False, repr=False)
     _model_calls_failed: bool = field(default=False, init=False, repr=False)
     # Distinct from ``_failed``: the handle is opened lazily, so without a closed state a record
@@ -1206,10 +1211,16 @@ class AgentRecorder:
             if self._model_content_store_failed:
                 return None
             try:
-                self._model_content_store = ModelContentStore(
+                store = ModelContentStore(
                     self.run_dir / MODEL_CONTENT_FILENAME,
                     run_id=self.run_id,
                 )
+                # Revocation waits for callbacks to finish. Discarding here disables timer and
+                # close-driven appends before ``revoke()`` returns, while a normal close keeps its
+                # buffered-prefix behavior.
+                remove_callback = self.write_authority.add_revoke_callback(store.discard)
+                self._model_content_store = store
+                self._remove_model_content_revoke_callback = remove_callback
             except WriteAuthorityRevoked:
                 raise
             except Exception:  # noqa: BLE001 - private content persistence is best-effort
@@ -1446,10 +1457,10 @@ class AgentRecorder:
                 except OSError:
                     _LOGGER.debug("event log discard close failed", exc_info=True)
                 break
-        self._close_owned_handles()
+        self._close_owned_handles(flush_model_content=False)
 
-    def _close_owned_handles(self) -> None:
-        """Close local file resources; this helper deliberately performs no publication."""
+    def _close_owned_handles(self, *, flush_model_content: bool = True) -> None:
+        """Close local handles, optionally flushing the normal model-content prefix."""
 
         try:
             # Event-sink failure must not retain the private transcript handle. TextIO close is
@@ -1461,9 +1472,17 @@ class AgentRecorder:
                 store = self._model_content_store
                 if store is not None:
                     try:
-                        store.close()
+                        if flush_model_content and not self.write_authority.revoked:
+                            store.close()
+                        else:
+                            store.discard()
                     except Exception:  # noqa: BLE001 - private persistence is best-effort
                         _LOGGER.debug("model content store close failed", exc_info=True)
+                    finally:
+                        remove_callback = self._remove_model_content_revoke_callback
+                        self._remove_model_content_revoke_callback = None
+                        if remove_callback is not None:
+                            remove_callback()
             finally:
                 # Nested rather than sequential: one private artifact failing to close must
                 # not retain the other's descriptor, the same rule the transcript already has

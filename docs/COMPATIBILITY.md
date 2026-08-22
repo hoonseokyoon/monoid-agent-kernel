@@ -615,7 +615,9 @@ workflow history is required. That operational version never replaces checkpoint
 compatibility or the checkpoint receipt as semantic authority.
 
 Checkpoints produced before v0.22 may encode `lease_lost` as a cancellation request. A v0.22
-reader migrates that value by revoking the activation's `ActivationWriteAuthority`; it does not
-route lease loss through the public `CancellationToken.cancel()` API. The Reference recovery
-service also resolves the registered activation record before its first authority-sensitive loop
-call, so a concurrent revocation still unregisters and discards the stale activation.
+reader detects that value before bootstrap and revokes the activation's
+`ActivationWriteAuthority`, leaving recorder, workspace replay, task restore, and extension
+callbacks unopened. The public `CancellationToken.cancel()` API receives only operational causes.
+The Reference recovery service also resolves the registered activation record before its first
+authority-sensitive loop call, so a concurrent revocation still unregisters and discards the
+stale activation.

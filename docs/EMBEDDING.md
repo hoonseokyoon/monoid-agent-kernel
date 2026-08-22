@@ -262,6 +262,9 @@ Checkpoint, invocation, canonical event, and terminal adapters validate that tok
 each durable mutation. When any adapter reports `fenced`, revoke the shared authority immediately.
 Host adapters also fence or deduplicate external shell, MCP, memory, and custom effects that can
 continue after an activation loses authority.
+Revocation synchronously disables the recorder's private model-content store. Stale activation
+cleanup cancels pending flush timers, drops buffered deltas, and closes its handle without appending
+segments or a stream terminal record.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes

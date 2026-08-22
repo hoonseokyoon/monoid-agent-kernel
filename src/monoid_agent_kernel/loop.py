@@ -2017,6 +2017,8 @@ class AgentLoop:
     ) -> Suspension:
         """Async form of :meth:`run_until_suspended` — the engine's source of truth."""
         self._ensure_cancellation_token()
+        if self._lease_authority_lost():
+            return self._lease_loss_suspension()
         session = self._require_open()
         try:
             return await self._arun_until_suspended_impl(user_input)
@@ -2508,6 +2510,7 @@ class AgentLoop:
 
     def has_pending_tasks(self) -> bool:
         """Whether the run has resume-tasks still outstanding (not yet drained)."""
+        self._assert_write_authority()
         session = self._require_open()
         return session.res.context._job_manager.has_resume_jobs()
 
@@ -2515,6 +2518,7 @@ class AgentLoop:
         """Block up to ``timeout_s`` for a pending task to become ready (in-process
         completion or external report). Returns True if one is ready to drain, so
         the caller can ``run_until_suspended(None)`` to resume."""
+        self._assert_write_authority()
         session = self._require_open()
         manager = session.res.context._job_manager
         deadline = time.time() + max(0.0, timeout_s)
@@ -3623,6 +3627,15 @@ class AgentLoop:
                 "model-I/O subscriptions are closed; construct a fresh AgentLoop activation",
                 error_code="model_io_subscriptions_closed",
             )
+        if (
+            checkpoint.cancellation_requested
+            and checkpoint.interruption_cause == InterruptionCause.LEASE_LOST.value
+        ):
+            # Compatibility migration for checkpoints written before execution cancellation and
+            # writer authority became separate capabilities. Detect it before bootstrap creates,
+            # reopens, replays, or publishes any activation-owned resource.
+            self.lose_writer_authority()
+            return
         self._restoring = True
         try:
             res = self._bootstrap()
@@ -3825,13 +3838,7 @@ class AgentLoop:
                 if cp.interruption_cause
                 else InterruptionCause.USER_CANCEL
             )
-            if cause is InterruptionCause.LEASE_LOST:
-                # Compatibility migration for checkpoints written before execution cancellation
-                # and writer authority became separate capabilities. Lease loss revokes this
-                # activation and uses the token only as its private wake channel.
-                self.lose_writer_authority()
-            else:
-                self._ensure_cancellation_token().cancel(cause)
+            self._ensure_cancellation_token().cancel(cause)
 
     @staticmethod
     def _apply_workspace_delta(
@@ -6914,7 +6921,7 @@ class AgentLoop:
         self.write_authority.assert_active()
 
     @staticmethod
-    def _lease_loss_suspension(session: _Session) -> Suspension:
+    def _lease_loss_suspension(session: _Session | None = None) -> Suspension:
         """Return the mutation-free observation for an activation that lost its lease."""
 
         del session

@@ -6190,9 +6190,10 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
     """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
 
     The flag is the request. Operational causes use the shared token-creation seam; legacy lease
-    loss revokes writer authority and uses that token only as its private wake channel. Pinned as
-    "the guard is the flag alone, and both cause families have an explicit disposition", because a
-    token precondition or routing lease loss through public ``cancel`` restores one of the defects.
+    loss revokes writer authority before bootstrap and uses that token only as its private wake
+    channel. Pinned as "the guard is the flag alone, and both cause families have an explicit
+    disposition", because a token precondition, late revocation, or public ``cancel`` restores one
+    of the defects.
     """
 
     assert "cancellation_requested" in _snapshot_written_keys()
@@ -6227,15 +6228,26 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
     assert cancels == ["self._ensure_cancellation_token().cancel(cause)"], {
         "cancel_calls": cancels
     }
+    public_restore = _function_node("loop.py", "restore")
     authority_losses = [
-        ast.unparse(node)
-        for node in ast.walk(restore)
+        node
+        for node in ast.walk(public_restore)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "lose_writer_authority"
     ]
-    assert authority_losses == ["self.lose_writer_authority()"], {
-        "authority_loss_calls": authority_losses
+    bootstraps = [
+        node
+        for node in ast.walk(public_restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_bootstrap"
+    ]
+    assert len(authority_losses) == 1 and len(bootstraps) == 1
+    assert authority_losses[0].lineno < bootstraps[0].lineno, {
+        "authority_loss_line": authority_losses[0].lineno,
+        "bootstrap_line": bootstraps[0].lineno,
+        "hint": "legacy lease loss must be classified before bootstrap side effects",
     }
 
 
