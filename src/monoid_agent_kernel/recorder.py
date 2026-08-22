@@ -255,6 +255,12 @@ class StatusJsonSink:
             )
             self.state.pop("provider_retried", None)
             self.state.pop("interruption_cause", None)
+        elif event.type == "turn.settled":
+            cause = data.get("interruption_cause")
+            if isinstance(cause, str) and cause:
+                self.state["interruption_cause"] = cause
+            else:
+                self.state.pop("interruption_cause", None)
         elif event.type == "turn.interrupted":
             cause = data.get("interruption_cause")
             if isinstance(cause, str) and cause:

@@ -211,6 +211,33 @@ def test_record_event_captures_the_whole_classification_a_turn_failed_carries(
     record.terminal = True
 
 
+def test_turn_settled_clears_a_backend_record_interruption_cause(
+    tmp_path: Path,
+    backend_factory: Any,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = backend_factory.create(workspace=workspace, turns=[])
+    run_id = "run_settled_cause_clear"
+    record = _backend_record(run_id, tmp_path / "runs" / run_id, workspace)
+    record.interruption_cause = InterruptionCause.USER_CANCEL
+    with backend._lock:
+        backend._records[run_id] = record
+
+    backend.record_event(
+        run_id,
+        make_agent_event(
+            run_id=run_id,
+            seq=1,
+            event_type="turn.settled",
+            data={"status": "completed", "interruption_cause": ""},
+        ),
+    )
+
+    assert record.interruption_cause is None
+    record.state = SessionState.CANCELLED
+    record.terminal = True
+
+
 def test_record_event_captures_the_whole_classification_a_run_failed_carries(
     tmp_path: Path,
     backend_factory: Any,

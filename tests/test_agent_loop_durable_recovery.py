@@ -964,7 +964,9 @@ def test_post_settlement_interrupt_accounts_usage_before_replay(
             loop.discard_uncommitted()
 
     assert interrupted.reason == "interrupted"
+    assert interrupted.interruption_cause is InterruptionCause.USER_CANCEL
     assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.interruption_cause == InterruptionCause.USER_CANCEL.value
     assert interrupted_checkpoint.total_usage == usage
     assert not any(
         message.get("role") == "assistant" for message in interrupted_checkpoint.messages
@@ -1517,9 +1519,11 @@ def test_projected_recovered_tool_calls_resume_after_context_interrupt(
     )
 
     assert settled.reason == "settled"
+    assert settled.interruption_cause is None
     assert settled.turn is not None
     assert settled.turn.final_text == "done after resumed tool"
     assert final_checkpoint is not None
+    assert final_checkpoint.interruption_cause == ""
     assert final_checkpoint.last_suspension is not None
     assert final_checkpoint.last_suspension["model_tool_calls_pending"] is False
     final_tool_turns = [

@@ -65,6 +65,15 @@ class RetryEligibility(StrEnum):
     FORBIDDEN = "forbidden"
 
 
+_SAFE_INTERRUPTION_CAUSES = frozenset(
+    {
+        InterruptionCause.GRACEFUL_DRAIN,
+        InterruptionCause.HOST_SHUTDOWN,
+        InterruptionCause.LEASE_LOST,
+    }
+)
+
+
 def _require_optional_nonnegative_int(value: object, field_name: str) -> None:
     if value is None:
         return
@@ -241,7 +250,7 @@ def terminal_outcome_from_suspension(
     elif suspension.error_code == "run_timeout" or cause is InterruptionCause.DEADLINE:
         kind = "cancelled"
         retry = RetryEligibility.FORBIDDEN
-    elif cause is not None:
+    elif cause in _SAFE_INTERRUPTION_CAUSES:
         kind = "interrupted"
         retry = RetryEligibility.SAFE
     elif suspension.reason == "settled":

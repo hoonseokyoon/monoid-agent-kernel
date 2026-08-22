@@ -1836,6 +1836,10 @@ class AgentLoop:
         session.unrecovered_turn_failure = None
         session.midturn_park = None
         state, res = session.state, session.res
+        # An interruption cause belongs to the park that returned it. Every new pump activation,
+        # including a None resume that applies an already-settled durable model result, leaves
+        # that park. A newly observed boundary below assigns its own cause again.
+        state.interruption_cause = None
         if user_input is not None:
             session.active_turn_id = None
             session.active_turn_parent_id = None
@@ -1847,7 +1851,6 @@ class AgentLoop:
             state.provider_http_status = None
             state.retryable = False
             state.config_recoverable = False
-            state.interruption_cause = None
             state.final_text = ""
             state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.

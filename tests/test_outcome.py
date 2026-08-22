@@ -473,3 +473,48 @@ def test_turn_stop_remains_nonterminal_interrupted_even_with_user_cancel_cause()
 
     assert outcome.kind == "interrupted"
     assert outcome.retry_eligibility is RetryEligibility.SAFE
+
+
+@pytest.mark.parametrize(
+    ("suspension", "expected_kind", "expected_retry"),
+    (
+        (
+            Suspension(
+                reason="turn_failed",
+                status="failed",
+                interruption_cause=InterruptionCause.PROVIDER_FAILURE,
+            ),
+            "failed_terminal",
+            RetryEligibility.FORBIDDEN,
+        ),
+        (
+            Suspension(
+                reason="turn_failed",
+                status="failed",
+                config_recoverable=True,
+                interruption_cause=InterruptionCause.VALIDATION_FAILURE,
+            ),
+            "failed_config",
+            RetryEligibility.AFTER_CONFIGURATION,
+        ),
+        (
+            Suspension(
+                reason="limited",
+                status="limited",
+                interruption_cause=InterruptionCause.UNKNOWN,
+            ),
+            "limited",
+            RetryEligibility.FORBIDDEN,
+        ),
+    ),
+)
+def test_failure_causes_preserve_the_ordinary_terminal_classification(
+    suspension: Suspension,
+    expected_kind: TerminalOutcomeKind,
+    expected_retry: RetryEligibility,
+) -> None:
+    outcome = terminal_outcome_from_suspension(suspension, run_id="run_1")
+
+    assert outcome.kind == expected_kind
+    assert outcome.retry_eligibility is expected_retry
+    assert outcome.interruption_cause is suspension.interruption_cause

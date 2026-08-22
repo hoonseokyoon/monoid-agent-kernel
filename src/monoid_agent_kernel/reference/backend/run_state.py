@@ -354,6 +354,8 @@ class RunStateMutationService:
                 record.retryable = _event_flag(event.data, "retryable")
                 record.config_recoverable = _event_flag(event.data, "config_recoverable")
                 record.provider_retried = _event_flag(event.data, "provider_retried")
+            elif event.type == "turn.settled":
+                record.interruption_cause = _event_interruption_cause(event.data)
             elif event.type == "turn.interrupted":
                 record.interruption_cause = _event_interruption_cause(event.data)
             elif event.type in {"run.resumed", "model.turn.started"}:

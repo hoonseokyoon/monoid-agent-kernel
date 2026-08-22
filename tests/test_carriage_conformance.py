@@ -5746,6 +5746,7 @@ EVENT_CONSUMER_CORE = frozenset(
         "run.resumed",
         "turn.failed",
         "turn.interrupted",
+        "turn.settled",
         "model.turn.started",
     }
 )

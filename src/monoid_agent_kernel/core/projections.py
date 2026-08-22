@@ -316,6 +316,8 @@ def _apply_event_projection(
             projection["error"] = _event_text(data, "error")
             projection["error_code"] = _event_text(data, "error_code")
             _assign_failure_classification(projection, data)
+        elif event_type == "turn.settled":
+            projection["interruption_cause"] = _event_interruption_cause(data)
         elif event_type == "turn.interrupted":
             projection["interruption_cause"] = _event_interruption_cause(data)
         elif event_type == "session.state.changed":
