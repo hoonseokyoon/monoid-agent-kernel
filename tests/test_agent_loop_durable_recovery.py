@@ -1105,11 +1105,14 @@ def test_projected_recovered_tool_calls_resume_after_context_interrupt(
     try:
         interrupted = interrupted_loop.run_until_suspended(None)
         interrupted_checkpoint = interrupted_loop.snapshot()
+        with pytest.raises(NativeAgentError) as raised:
+            interrupted_loop.run_until_suspended("replace the unfinished tool turn")
     finally:
         with suppress(BaseException):
             interrupted_loop.discard_uncommitted()
 
     assert interrupted.reason == "interrupted"
+    assert raised.value.error_code == "evidence_recovery_requires_resume"
     assert interrupted.model_tool_calls_pending is True
     assert interrupted_checkpoint is not None
     assert interrupted_checkpoint.last_suspension is not None

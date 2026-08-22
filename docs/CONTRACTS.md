@@ -2874,9 +2874,10 @@ log and before all of its tools finish. The interruption suspension persists
 `model_tool_calls_pending=true`. `pending_observations` then carries the completed calls in that
 batch. A `None` resume reloads the same settled model result, recognizes the already-projected
 assistant turn, skips tool call IDs with completed observations, and executes the remaining calls.
-The assistant turn is never appended twice. A new user input explicitly abandons this pending turn
-and clears the marker. Tool handlers still need stable external idempotency for process loss before
-a call returns an observation.
+The assistant turn is never appended twice. New user input is rejected with
+`evidence_recovery_requires_resume` until a `None` resume completes the pending tool exchange.
+Tool handlers still need stable external idempotency for process loss before a call returns an
+observation.
 
 `core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
 `TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects

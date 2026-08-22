@@ -233,8 +233,10 @@ same logical call with its checkpointed tool observations, while a new user inpu
 abandons the interrupted result. An interrupt after a recovered assistant tool-call turn is added
 to the message log persists `model_tool_calls_pending=true` and every completed observation. Resume
 with `None`: the loop reloads the settled result, skips completed call IDs, and executes the rest
-without adding a second assistant turn. Give effectful tool handlers stable idempotency keys because
-a process can still disappear after an external effect and before its observation is returned.
+without adding a second assistant turn. The loop rejects new user input with
+`evidence_recovery_requires_resume` until this tool exchange completes. Give effectful tool handlers
+stable idempotency keys because a process can still disappear after an external effect and before
+its observation is returned.
 
 ## Model and tool wiring
 

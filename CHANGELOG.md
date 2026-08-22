@@ -133,7 +133,8 @@ out in commit messages and here.
   `None` resume. If the recovered assistant tool-call turn was already projected when an interrupt
   lands, the interruption checkpoint marks that turn as pending and carries each completed tool
   observation. A later `None` resume reloads the same settled result, skips completed stable call
-  IDs, executes the remaining calls, and appends no duplicate assistant turn.
+  IDs, executes the remaining calls, and appends no duplicate assistant turn. New user input is
+  rejected until this already-projected tool exchange completes.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal without paid continuation, multimodal stored

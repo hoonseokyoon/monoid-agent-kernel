@@ -1809,9 +1809,9 @@ class AgentLoop:
             )
         evidence_recovery = _evidence_recovery(session, self.spec.run_id)
         if evidence_recovery is not None and user_input is not None:
-            if evidence_recovery.blocks_new_input:
+            if evidence_recovery.blocks_new_input or evidence_recovery.outcome_projected:
                 raise NativeAgentError(
-                    "required model evidence must be recovered before accepting new input",
+                    "durable model recovery must complete before accepting new input",
                     error_code="evidence_recovery_requires_resume",
                 )
             # A new user turn intentionally abandons a prior interrupted result. Required evidence

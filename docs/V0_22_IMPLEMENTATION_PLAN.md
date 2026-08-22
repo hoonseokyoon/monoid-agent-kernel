@@ -848,8 +848,8 @@ Authoritative invocation settle과 evidence projection을 구분한다.
 - 복구된 assistant tool-call turn을 message log에 반영한 뒤 interrupt가 발생하면 suspension에
   `model_tool_calls_pending=true`를 저장한다. 같은 batch에서 완료된 tool observation은
   `pending_observations`에 누적한다. `None` resume은 같은 settled result를 다시 읽고 이미 완료된 call
-  ID를 건너뛴 뒤 남은 call만 실행한다. Assistant turn은 중복 추가하지 않는다. 새 user input은 이
-  pending turn을 명시적으로 포기하고 marker를 지운다.
+  ID를 건너뛴 뒤 남은 call만 실행한다. Assistant turn은 중복 추가하지 않는다. 이 tool exchange가
+  완료될 때까지 새 user input은 `evidence_recovery_requires_resume`으로 거부한다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
