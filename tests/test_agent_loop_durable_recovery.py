@@ -71,6 +71,15 @@ class _ScriptedAdapter:
         return outcome
 
 
+class _RaisingDynamicContextProvider:
+    def static_segment(self) -> None:
+        return None
+
+    def dynamic_segment(self, turn: Any) -> None:
+        del turn
+        raise AssertionError("dynamic context must not run before stored outcome application")
+
+
 @dataclass
 class _CrashAfterInvocationCommit:
     inner: Any
@@ -261,6 +270,8 @@ def _loop(
     model: ModelConfig | None = None,
     model_evidence_policy: str = "passive",
     limits: RunLimits | None = None,
+    context_providers: tuple[Any, ...] = (),
+    model_calls_file: bool = False,
 ) -> AgentLoop:
     return AgentLoop(
         spec=_spec(tmp_path, limits=limits),
@@ -271,6 +282,8 @@ def _loop(
         checkpoint_persist_callback=checkpoint_persist_callback,
         invocation_context=invocation_context,
         model_evidence_policy=model_evidence_policy,  # type: ignore[arg-type]
+        context_providers=context_providers,
+        model_calls_file=model_calls_file,
     )
 
 
@@ -329,6 +342,8 @@ def _restore(
     model: ModelConfig | None = None,
     model_evidence_policy: str = "passive",
     limits: RunLimits | None = None,
+    context_providers: tuple[Any, ...] = (),
+    model_calls_file: bool = False,
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -340,6 +355,8 @@ def _restore(
         model=model,
         model_evidence_policy=model_evidence_policy,
         limits=limits,
+        context_providers=context_providers,
+        model_calls_file=model_calls_file,
     )
     loop.restore(baseline)
     try:
@@ -590,6 +607,7 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
         sink=sink,
         writer_token=token,
         model_evidence_policy="required",
+        model_calls_file=True,
     )
     loop.open()
     try:
@@ -613,6 +631,7 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
         user_input=None,
         sink=sink,
         model_evidence_policy="required",
+        model_calls_file=True,
     )
     assert second.reason == "turn_failed", second
     assert second.error_code == "evidence_uncommitted"
@@ -627,6 +646,7 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
         user_input=None,
         sink=sink,
         model_evidence_policy="required",
+        model_calls_file=True,
     )
     assert settled.reason == "settled"
     assert settled.turn is not None and settled.turn.final_text == "durable answer"
@@ -641,6 +661,15 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
     ]
     assert [record["usage"] for record in model_turns] == [usage, {}]
     assert sum(record["usage"].get("total_tokens", 0) for record in model_turns) == 6
+    model_calls_path = next((tmp_path / "runs").rglob("model_calls.jsonl"))
+    model_calls = [
+        json.loads(line)
+        for line in model_calls_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(model_calls) == 1
+    assert model_calls[0]["stop_reason"] == "stop"
+    assert model_calls[0]["usage"] == usage
     events_path = next((tmp_path / "runs").rglob("events.jsonl"))
     failed_turns = [
         event
@@ -692,6 +721,49 @@ def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_cha
     assert final_checkpoint is not None
     assert len(adapter.requests) == 1
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+
+
+def test_required_evidence_recovery_applies_stored_final_before_dynamic_context(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        context_providers=(_RaisingDynamicContextProvider(),),
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None
+    assert final_checkpoint.messages[-1]["content"] == "durable answer"
+    assert len(adapter.requests) == 1
 
 
 def test_required_evidence_recovery_replays_multimodal_result_without_rebuilding_request(
@@ -1204,6 +1276,7 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
         sink=sink,
         writer_token=token,
         model_evidence_policy="required",
+        model_calls_file=True,
     )
     loop.open()
     try:
@@ -1224,6 +1297,7 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
         user_input=None,
         sink=sink,
         model_evidence_policy="required",
+        model_calls_file=True,
     )
     assert restored.reason == "turn_failed"
     assert restored.error_code == "rate_limited"
@@ -1231,6 +1305,15 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
     assert restored.http_status == 429
     assert final_checkpoint is not None and final_checkpoint.total_usage == usage
     assert len(adapter.requests) == 1
+    model_calls_path = next((tmp_path / "runs").rglob("model_calls.jsonl"))
+    model_calls = [
+        json.loads(line)
+        for line in model_calls_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(model_calls) == 1
+    assert model_calls[0]["error_code"] == "rate_limited"
+    assert model_calls[0]["usage"] == usage
 
 
 def test_required_evidence_recovery_surfaces_retryable_refusal_without_paid_retry(

@@ -2853,9 +2853,14 @@ backoff, dead-letter handling, and destination credentials.
 An invocation settlement remains authoritative when a later required evidence commit fails.
 Recovery uses the checkpointed logical-call ID and request digest to re-commit the exact invocation
 revision and required evidence before it reads current runtime config, context providers, tool
-surface, or media. A stored success or final refusal then reaches the loop without rebuilding a
-provider-facing request. Runtime-config drift cannot block evidence delivery or replay of that
-stored outcome. The provider call count does not increase. Repeated evidence parks, transcript
+surface, or media. It then applies a stored success or final refusal to loop state before those
+current request-building dependencies run. A recovered final settles from the stored outcome; a
+recovered tool-call turn enters the canonical message log before current tool resolution and
+execution setup. Runtime-config drift cannot block evidence delivery or application of the stored
+outcome. The provider call count does not increase. Passive model-I/O observers and requested
+model-call sidecars receive the authoritative call during its original settlement, including when
+required evidence fails afterward. Evidence recovery does not publish the passive call a second
+time. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected
 by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
 no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.

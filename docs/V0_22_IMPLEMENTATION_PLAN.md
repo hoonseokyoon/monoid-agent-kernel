@@ -839,15 +839,19 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   `dispatch_unknown`이다.
 - Invocation settle 성공 + required evidence 실패: `evidence_uncommitted`다.
 - `evidence_uncommitted` 복구: checkpoint의 logical call ID와 request digest로 evidence delivery를
-  먼저 확정하고 settled invocation result를 재사용한다. 현재 runtime config, context provider,
-  tool surface, media wire payload는 이 evidence commit의 입력이 아니다.
+  먼저 확정하고 settled invocation result를 재사용한다. 저장된 성공 또는 최종 거절을 loop state에
+  적용한 뒤 현재 runtime config, context provider, tool surface, media를 조회한다. 최종 응답은 이
+  지점에서 정산하고, tool call turn은 message log에 반영한 뒤 현재 tool 실행 환경을 구성한다.
+  현재 runtime config, context provider, tool surface, media wire payload는 evidence commit의 입력이 아니다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
 Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
 `evidence_uncommitted`로 분리한다. Recovery는 현재 writer fence를 같은 invocation으로 다시 검증한
 뒤 evidence mutation만 재시도한다. Passive `settled_sink`는 required/outbox mutation과 독립이며
-기존처럼 결과 분류를 바꾸지 않는다.
+기존처럼 결과 분류를 바꾸지 않는다. 최초 invocation settlement에서 passive observer와 활성화된
+model-call sidecar에 authoritative call을 한 번 전달한다. Required evidence 실패 뒤 복구는 이 passive
+전달을 반복하지 않는다.
 
 첫 `evidence_uncommitted` park는 저장된 receipt usage를 run total에 반영한다. 같은 logical call의
 복구는 마지막 evidence-uncommitted checkpoint가 이미 반영한 usage를 읽고 이후 aggregate receipt와의

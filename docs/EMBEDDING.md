@@ -214,8 +214,12 @@ outbox entry cannot commit. A partial invocation-only commit violates the declar
 
 On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
 with the same run ID and a current writer token. The loop commits evidence from the stored logical
-call ID and request digest before consulting the current request-building configuration. Stored
-success and final-refusal replay therefore survive runtime-config changes. Treat
+call ID and request digest, then applies the stored success or final refusal before consulting the
+current request-building configuration. A recovered final settles immediately. A recovered
+tool-call turn enters the message log before the current tool surface is resolved for execution.
+Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
+model-call sidecars receive the authoritative call at the original settlement even when required
+evidence parks afterward; recovery does not duplicate that passive publication. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
@@ -405,7 +409,7 @@ state as operational diagnostics.
 | Lost task-secret response | Keep the secret absent from durable state and require explicit replacement. | Hosted golden path scans durable files for callback bearers. |
 | Gateway credential expiry | Mint a new scoped gateway token and keep provider keys at the gateway. | Gateway contract and token tests cover expiry and scope. |
 | Telemetry exporter failure | Drop, buffer, or retry telemetry without changing run semantics. | Event sink boundaries isolate exporter failure. |
-| Required model-evidence delivery failure | Commit the settled invocation, park as `evidence_uncommitted`, and redrive the same checkpoint. | Fenced recovery retries only `commit_model_evidence`; provider call count stays fixed. |
+| Required model-evidence delivery failure | Commit the settled invocation, publish passive call records once, park as `evidence_uncommitted`, and redrive the same checkpoint. | Fenced recovery retries only `commit_model_evidence`; it applies the stored outcome before current request-building state and keeps provider and passive-record counts fixed. |
 | Transactional evidence outbox failure | Publish neither the settlement nor the outbox entry; close paid-call ambiguity through `dispatch_unknown`. | `transactional_outbox` capability gate and atomic-stage recovery tests cover the boundary. |
 
 ## Conformance and release gate

@@ -117,8 +117,12 @@ out in commit messages and here.
   `transactional_outbox` capability.
 - Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
   Recovery commits evidence from the stored logical-call ID and request digest before rebuilding
-  any runtime-dependent provider request. Stored success and final-refusal replay survive config
-  drift. Stored refusals are surfaced without an automatic paid retry. Repeated evidence parks,
+  any runtime-dependent provider request. It applies the stored success or final refusal to loop
+  state before consulting current runtime config, context providers, tool surfaces, or media;
+  recovered tool calls enter the transcript before current tool execution setup. Stored outcomes
+  therefore survive config drift. Stored refusals are surfaced without an automatic paid retry.
+  Passive observers and requested model-call sidecars receive the original settled call once even
+  when required evidence parks the run; recovery does not republish it. Repeated evidence parks,
   transcript rows, and public events carry only newly billable usage, preventing provider replay
   and usage duplication. Model step limits and cooperative pause cannot preempt this commit
   barrier. Cancellation and deadline apply after the fenced evidence mutation; an interrupt before

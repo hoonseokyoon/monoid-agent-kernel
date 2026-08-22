@@ -1130,9 +1130,19 @@ class ModelCallRunner:
                     raise
                 if isinstance(exc, ModelEvidenceUncommitted):
                     # The paid dispatch and its canonical result/refusal are already settled.
-                    # Required evidence is a separate recovery lane: do not publish a fabricated
-                    # failed model call or let the kernel retry loop absorb this infrastructure
-                    # outcome as another provider attempt.
+                    # Required evidence is a separate recovery lane. Passive subscribers and
+                    # sidecars still receive the authoritative provider outcome now, while the
+                    # original request/preimage is in hand; the projection failure itself never
+                    # becomes a fabricated model-call failure and never enters the retry loop.
+                    if durable_outcome_receipt is not None:
+                        with contextlib.suppress(Exception):
+                            self._publish(
+                                request,
+                                None,
+                                durable_outcome_receipt,
+                                elapsed_ms=durable_outcome_receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
                     raise
                 if recovered_failure_receipt is not None:
                     with contextlib.suppress(Exception):
@@ -1278,13 +1288,27 @@ class ModelCallRunner:
                         failure_code=result_error.error_code,
                         usage=durable_completed.usage,
                     )
-                settle_model_dispatch(
-                    lifecycle_hook,
-                    reservation,
-                    durable_completed,
-                    result_blob=result_blob,
-                    stream_committed=delivered,
-                )
+                try:
+                    settle_model_dispatch(
+                        lifecycle_hook,
+                        reservation,
+                        durable_completed,
+                        result_blob=result_blob,
+                        stream_committed=delivered,
+                    )
+                except ModelEvidenceUncommitted:
+                    # The success settlement is finalized after the provider try/except above.
+                    # Publish it here so passive observers and sidecars see the paid call even
+                    # though required evidence parks the loop before the ordinary publish below.
+                    with contextlib.suppress(Exception):
+                        self._publish(
+                            request,
+                            turn,
+                            durable_completed,
+                            elapsed_ms=durable_completed.latency_ms,
+                            request_preimage=request_preimage,
+                        )
+                    raise
             settled = self._publish(
                 request,
                 turn,
