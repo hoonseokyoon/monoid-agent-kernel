@@ -5274,6 +5274,64 @@ def test_durable_runner_requires_an_explicit_logical_call_id_before_dispatch() -
     assert lifecycle._loaded("call-durable-1").status == "missing"
 
 
+@pytest.mark.parametrize(
+    ("lose_after", "expected_states"),
+    (
+        ("reserve", ["reserved"]),
+        ("dispatch_started", ["reserved", "dispatch_started"]),
+    ),
+)
+def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
+    lose_after: str,
+    expected_states: list[str],
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def _lose_authority(self, transition: str) -> None:
+            if transition == lose_after:
+                token.cancel(InterruptionCause.USER_CANCEL)
+                token.cancel(InterruptionCause.LEASE_LOST)
+
+        def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
+            effective = super().reserve(proposed)
+            self._lose_authority("reserve")
+            return effective
+
+        def dispatch_started(self, reservation: ModelDispatchReservation) -> None:
+            super().dispatch_started(reservation)
+            self._lose_authority("dispatch_started")
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert lifecycle.states == expected_states
+    assert adapter.calls == 0
+    assert observer.captures == []
+    assert sidecar == []
+
+
 def test_durable_resume_abort_gate_runs_after_recovery_probe_before_dispatch() -> None:
     harness = DeterministicFencedRunHarness()
     lifecycle = _JournalLifecycle(harness)

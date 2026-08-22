@@ -2767,7 +2767,9 @@ The synchronous lifecycle sequence is:
 ```text
 normalize + request digest
   -> reserve effective key
+  -> recheck lease authority
   -> commit dispatch_started
+  -> recheck lease authority
   -> enter adapter
   -> commit settled success/refusal OR commit unknown
   -> recheck lease authority
@@ -2893,6 +2895,11 @@ model-stream completion. It returns the in-memory `lease_lost` park without a ch
 projection, or terminal mutation. A replacement owner loads the committed invocation, accounts and
 publishes it under current authority, and continues recovery without redispatching the provider
 call.
+
+The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
+the authoritative reservation and blocks `dispatch_started`. Lease loss observed by
+`dispatch_started()` leaves that journal state for reconciliation and blocks adapter entry. The
+stale activation publishes no failure receipt or sidecar in either case.
 
 Evidence recovery uses a two-sided fence. It checks authority before calling the lifecycle recovery
 hook and again after the hook returns. A pre-existing lease loss cannot enter required-evidence

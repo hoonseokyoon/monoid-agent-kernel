@@ -1028,6 +1028,7 @@ class ModelCallRunner:
                             request_digest=receipt.request_digest,
                             idempotency_key=request.idempotency_key,
                         )
+                        self._check_lease_authority()
                         # A restored reservation owns the key. The request digest excludes this
                         # carriage field, so replacing it does not invalidate the identity already
                         # checked above.
@@ -1041,6 +1042,7 @@ class ModelCallRunner:
                         # The commit sits immediately before adapter entry. A hook failure leaves
                         # attempts_made unchanged, so the receipt does not claim provider work.
                         lifecycle_hook.dispatch_started(reservation)
+                        self._check_lease_authority()
                     attempts_made = next_attempt
                     reports_before = progress.count
                     attempt_started = time.monotonic()
@@ -1176,6 +1178,9 @@ class ModelCallRunner:
                 if lifecycle_hook is None:
                     turn = normalize_model_turn(turn)
             except BaseException as exc:
+                # Any lifecycle mutation above may be the operation that observes concurrent lease
+                # loss. Authority supersedes the exception taxonomy before passive publication.
+                self._check_lease_authority()
                 if (
                     isinstance(exc, RunCancelled)
                     and exc.interruption_cause is InterruptionCause.LEASE_LOST
