@@ -21,6 +21,8 @@ from monoid_agent_kernel.core.model_invocation import (
     logical_model_call_id,
     model_dispatch_id,
 )
+from monoid_agent_kernel.core.model_content import read_model_content
+from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig, RunLimits
 from monoid_agent_kernel.errors import (
     AgentConfigError,
@@ -286,6 +288,8 @@ def _loop(
     limits: RunLimits | None = None,
     context_providers: tuple[Any, ...] = (),
     model_calls_file: bool = False,
+    model_content_file: bool = False,
+    model_stream_observer_factories: tuple[Any, ...] = (),
     tool_ids: tuple[str, ...] = (),
 ) -> AgentLoop:
     return AgentLoop(
@@ -299,6 +303,8 @@ def _loop(
         model_evidence_policy=model_evidence_policy,  # type: ignore[arg-type]
         context_providers=context_providers,
         model_calls_file=model_calls_file,
+        model_content_file=model_content_file,
+        model_stream_observer_factories=model_stream_observer_factories,
     )
 
 
@@ -826,6 +832,65 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
         if (event := json.loads(line)).get("type") == "turn.failed"
     ]
     assert [event["data"]["provider_usage"] for event in failed_turns] == [usage, {}]
+
+
+def test_required_evidence_projection_failure_preserves_completed_model_stream(
+    tmp_path: Path,
+) -> None:
+    class _Writer:
+        def __init__(self) -> None:
+            self.outcomes: list[ModelStreamOutcome] = []
+
+        def push(self, _delta: Any) -> None:
+            return None
+
+        def close(self, outcome: ModelStreamOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    class _Observer:
+        def __init__(self, writer: _Writer) -> None:
+            self.writer = writer
+
+        def open(self, _context: Any) -> _Writer:
+            return self.writer
+
+    harness = DeterministicFencedRunHarness()
+    usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    writer = _Writer()
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=_RejectModelEvidence(harness.sink),
+        writer_token=token,
+        model_evidence_policy="required",
+        model_content_file=True,
+        model_stream_observer_factories=(lambda: _Observer(writer),),
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    expected = ModelStreamOutcome(
+        status="completed",
+        final_text="durable answer",
+        usage=usage,
+    )
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert len(adapter.requests) == 1
+    assert writer.outcomes == [expected]
+    content_path = next((tmp_path / "runs").rglob("model-content.jsonl"))
+    snapshots = read_model_content(content_path).snapshots
+    assert len(snapshots) == 1
+    assert snapshots[0].status == "completed"
+    assert snapshots[0].final_text == "durable answer"
+    assert snapshots[0].usage == usage
 
 
 def test_required_evidence_recovery_preserves_policy_and_identity_across_config_changes(
@@ -1745,6 +1810,7 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
         writer_token=token,
         model_evidence_policy="required",
         model_calls_file=True,
+        model_content_file=True,
     )
     loop.open()
     try:
@@ -1756,6 +1822,11 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
 
     assert evidence_park.error_code == "evidence_uncommitted"
     assert checkpoint is not None and checkpoint.total_usage == usage
+    refusal_content_path = next((tmp_path / "runs").rglob("model-content.jsonl"))
+    refusal_streams = read_model_content(refusal_content_path).snapshots
+    assert len(refusal_streams) == 1
+    assert refusal_streams[0].status == "failed"
+    assert refusal_streams[0].error_code == "evidence_uncommitted"
 
     restored, final_checkpoint = _restore(
         tmp_path,

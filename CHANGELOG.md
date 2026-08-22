@@ -129,7 +129,10 @@ out in commit messages and here.
   recovered tool calls enter the transcript before current tool execution setup. Stored outcomes
   therefore survive config drift. Stored refusals are surfaced without an automatic paid retry.
   Passive observers and requested model-call sidecars receive the original settled call once even
-  when required evidence parks the run; recovery does not republish it. Repeated evidence parks,
+  when required evidence parks the run; recovery does not republish it. Successful provider
+  streams close live observers and the private model-content sidecar as completed with settled
+  final text and usage while the run independently parks for evidence recovery. Settled provider
+  refusals retain their failed stream classification. Repeated evidence parks,
   transcript rows, and public events carry only newly billable usage, preventing provider replay
   and usage duplication. The durable recovery marker forces required delivery even when a new
   activation is configured as passive. `run_once()` releases this park and raises

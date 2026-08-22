@@ -27,6 +27,7 @@ from monoid_agent_kernel.model_call import (
     ModelCallRunner,
     _recovered_receipt,
     _recovered_result_matches_evidence,
+    _settled_model_stream_outcome,
 )
 from monoid_agent_kernel.model_lifecycle import (
     RecoveredModelDispatch,
@@ -2703,6 +2704,25 @@ class AgentLoop:
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "cancelled"
+            raise
+        except ModelEvidenceUncommitted as exc:
+            settled_stream = _settled_model_stream_outcome(exc)
+            if settled_stream is None:
+                # A durable provider refusal can also park on required evidence. It has no
+                # successful stream outcome to preserve, so it keeps the ordinary failure
+                # classification used before the projection lane was separated.
+                outcome_status = "failed"
+                outcome_final_text = "".join(output_fragments) or None
+                outcome_error_code = exc.error_code
+                outcome_retryable = exc.retryable is True
+                outcome_config_recoverable = exc.config_recoverable is True
+            else:
+                # Provider execution completed and only its required evidence projection failed.
+                # Close every presentation/private-content writer from the settled provider fact;
+                # the same exception still parks the run for sink-only recovery below this layer.
+                outcome_status = settled_stream.status
+                outcome_final_text = settled_stream.final_text
+                outcome_usage = settled_stream.usage
             raise
         except BaseException as exc:
             outcome_status = "failed"

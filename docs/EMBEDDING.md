@@ -227,7 +227,9 @@ current request-building configuration. A recovered final settles immediately. A
 tool-call turn enters the message log before the current tool surface is resolved for execution.
 Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
 model-call sidecars receive the authoritative call at the original settlement even when required
-evidence parks afterward; recovery does not duplicate that passive publication. The checkpoint
+evidence parks afterward; recovery does not duplicate that passive publication. Live model-stream
+observers and the private content sidecar close a settled provider success as `completed` with its
+final text and usage while the run separately parks for evidence recovery. The checkpoint
 marker and the authoritative invocation flag each force required delivery on the replacement
 activation even when its configured policy is `passive`. One-shot `run_once()` releases this
 committed park and raises `TurnNotSettled`; restore

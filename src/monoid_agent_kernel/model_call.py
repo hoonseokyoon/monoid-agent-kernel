@@ -68,6 +68,7 @@ from monoid_agent_kernel.core.model_io import (
     destination_digest,
     dispatch_model_call,
 )
+from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
@@ -161,6 +162,41 @@ class SettledModelCall:
     receipt: ModelCallReceipt
     request_preimage: bytes | None = None
     turn: Any | None = None
+
+
+_SETTLED_MODEL_STREAM_OUTCOME = "_monoid_settled_model_stream_outcome"
+
+
+def _carry_settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+    turn: ModelTurn,
+) -> None:
+    """Carry a successful provider stream across a required-evidence projection failure.
+
+    The exception still parks durable evidence recovery. This private in-process fact lets the
+    owning loop close live observers and the private content writer with the provider outcome
+    that already settled, instead of relabelling a paid success as a failed stream. The normalized
+    turn is the same source used by the ordinary successful return path.
+    """
+
+    setattr(
+        error,
+        _SETTLED_MODEL_STREAM_OUTCOME,
+        ModelStreamOutcome(
+            status="completed",
+            final_text=turn.final_text,
+            usage=turn.usage,
+        ),
+    )
+
+
+def _settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+) -> ModelStreamOutcome | None:
+    """Read only the private, typed success marker produced by this runner."""
+
+    outcome = getattr(error, _SETTLED_MODEL_STREAM_OUTCOME, None)
+    return outcome if isinstance(outcome, ModelStreamOutcome) else None
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
@@ -1296,10 +1332,11 @@ class ModelCallRunner:
                         result_blob=result_blob,
                         stream_committed=delivered,
                     )
-                except ModelEvidenceUncommitted:
+                except ModelEvidenceUncommitted as evidence_error:
                     # The success settlement is finalized after the provider try/except above.
                     # Publish it here so passive observers and sidecars see the paid call even
                     # though required evidence parks the loop before the ordinary publish below.
+                    _carry_settled_model_stream_outcome(evidence_error, turn)
                     with contextlib.suppress(Exception):
                         self._publish(
                             request,

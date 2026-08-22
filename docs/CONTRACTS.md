@@ -2870,7 +2870,10 @@ tool resolution and execution setup. Runtime-config drift cannot block evidence 
 application of the stored outcome. The provider call count does not increase. Passive model-I/O
 observers and requested model-call sidecars receive the authoritative call during its original
 settlement, including when required evidence fails afterward. Evidence recovery does not publish
-the passive call a second time. The checkpoint marker sets
+the passive call a second time. A successful provider result closes live model-stream observers
+and `model-content.jsonl` as `completed` with its normalized final text and usage before the run
+parks on `evidence_uncommitted`; the projection failure preserves the paid stream's settled state.
+A settled provider refusal retains the failed stream classification. The checkpoint marker sets
 `ModelDispatchRecoveryQuery.require_evidence=True` as a second recovery path for an already
 published evidence park.
 The configured `required` policy cannot upgrade an existing invocation whose journal field is

@@ -876,7 +876,10 @@ Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
 뒤 evidence mutation만 재시도한다. Passive `settled_sink`는 required/outbox mutation과 독립이며
 기존처럼 결과 분류를 바꾸지 않는다. 최초 invocation settlement에서 passive observer와 활성화된
 model-call sidecar에 authoritative call을 한 번 전달한다. Required evidence 실패 뒤 복구는 이 passive
-전달을 반복하지 않는다.
+전달을 반복하지 않는다. 성공한 provider stream은 live observer와 `model-content.jsonl`에서
+`completed`로 닫고 normalized final text와 usage를 보존한다. Evidence projection 실패 중에도
+성공한 provider stream은 settled 상태를 유지한다. Settled provider refusal은 failed stream 분류를
+유지한다.
 
 `run_once()`는 `evidence_uncommitted`를 일반 recoverable provider failure처럼 terminal로 승격하지
 않는다. Committed checkpoint boundary를 release하고 `TurnNotSettled`를 표면화한다. 새 activation은
