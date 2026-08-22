@@ -30,8 +30,10 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
     normalize_json_ingress,
 )
+from monoid_agent_kernel.core.media import BLOB_SCHEME, blob_shas_in_messages
 from monoid_agent_kernel.core.model_invocation import decode_model_invocation
 from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core._storage_capabilities import StorageCapabilities
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
@@ -244,6 +246,37 @@ class RunCheckpoint:
     def from_json(cls, payload: dict[str, Any]) -> RunCheckpoint | None:
         """Compatibility wrapper over :func:`decode_checkpoint`."""
         return decode_checkpoint(payload).value
+
+
+def checkpoint_blob_references(checkpoint: RunCheckpoint) -> set[str]:
+    """Return every blob digest suffix that must resolve before checkpoint publication.
+
+    Malformed ``blob:`` suffixes remain in the result so a fenced adapter's content-addressed
+    lookup rejects them. External invocation result addresses use another scheme and require no
+    blob lookup.
+    """
+
+    references = {
+        item["content_sha256"]
+        for item in checkpoint.workspace_delta
+        if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
+    }
+    queued_message_carriers: list[dict[str, Any]] = []
+    for message in checkpoint.queued_messages:
+        if isinstance(message, list):
+            queued_message_carriers.append({"content": message})
+        elif isinstance(message, dict):
+            queued_message_carriers.append(message)
+    references.update(blob_shas_in_messages(tuple(checkpoint.messages)))
+    references.update(blob_shas_in_messages(tuple(queued_message_carriers)))
+    if checkpoint.last_model_invocation is not None:
+        invocation = decode_model_invocation(checkpoint.last_model_invocation)
+        if not invocation.ok or invocation.value is None:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        result_ref = invocation.value.result_ref
+        if result_ref.startswith(BLOB_SCHEME):
+            references.add(result_ref[len(BLOB_SCHEME) :])
+    return references
 
 
 _CHECKPOINT_STRING_FIELDS = frozenset(
@@ -692,6 +725,16 @@ class LocalFsCheckpointStore:
     # live peer before stealing anyway (so a stuck holder can never deadlock a put).
     lock_timeout_s: float = 10.0
     lock_stale_s: float = 30.0
+
+    @property
+    def capabilities(self) -> StorageCapabilities:
+        """Declare only guarantees this legacy local store can actually provide.
+
+        The import stays lazy so importing the stable kernel root does not load the host-only
+        namespace. LocalFS remains a legacy ``CheckpointStore`` and exposes no fenced mutation.
+        """
+
+        return StorageCapabilities(single_writer=True, durable_checkpoints=True)
 
     def _dir(self, run_id: str) -> Path:
         return self.run_root / run_id / "checkpoints"

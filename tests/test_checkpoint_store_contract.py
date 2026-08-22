@@ -73,6 +73,25 @@ def test_put_latest_seq_isolation_and_delete(store: CheckpointStore) -> None:
     assert store.latest("run_2") is not None
 
 
+def test_local_fs_declares_only_single_writer_checkpoint_capabilities(tmp_path: Path) -> None:
+    store = LocalFsCheckpointStore(tmp_path)
+
+    assert store.capabilities.single_writer is True
+    assert store.capabilities.durable_checkpoints is True
+    assert store.capabilities.concurrent_writers is False
+    assert store.capabilities.compare_and_set is False
+    assert store.capabilities.lease_fencing is False
+    assert store.capabilities.durable_events is False
+    assert store.capabilities.durable_invocations is False
+    assert store.capabilities.terminal_first_writer_wins is False
+    assert store.capabilities.transactional_outbox is False
+    assert store.capabilities.cross_process_notify is False
+    assert not hasattr(store, "commit_checkpoint")
+    assert not hasattr(store, "commit_invocation")
+    assert not hasattr(store, "append_event")
+    assert not hasattr(store, "settle_terminal")
+
+
 def test_legacy_store_read_failure_is_not_classified_as_corrupt(tmp_path: Path) -> None:
     class UnavailableLegacyStore(LocalFsCheckpointStore):
         latest_checked = None

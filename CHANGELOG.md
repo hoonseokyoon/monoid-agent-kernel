@@ -19,6 +19,47 @@ out in commit messages and here.
   explicit field projection and the iterative portable JSON copier, removing the recursive
   `dataclasses.asdict` boundary and its redundant deep copy.
 
+### Added — fenced hosting contracts
+
+- Added the explicit `monoid_agent_kernel.hosting` namespace with writer tokens, fail-closed
+  storage capabilities, fenced commit results, private invocation records, and composite
+  checkpoint/run-sink protocols. Loaded invocation records provide lazy result-blob access without
+  exposing an unfenced standalone blob mutation. These host-facing names stay outside the stable
+  package root and carry no database, queue, lease, Redis, or Temporal dependency.
+- Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
+  blob-inclusive content identity, monotonic checkpoint publication, terminal first-writer-wins,
+  field- and edge-complete durable invocation transitions, fresh-facade durability, and
+  backend-hook-coordinated CAS and writer-handoff races for every authoritative mutation.
+  Concurrent writers use separate facades over shared backing. Per-execution namespaces make the
+  suite repeatable on one persistent test service. Reopened records use complete canonical-payload
+  comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
+  canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
+  invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
+  normalize in both same-revision retry and lifecycle-transition directions. Exact retries of every older invocation
+  revision cannot republish an obsolete journal head. Every successful invocation fixture commits
+  the result blob referenced by its durable metadata. The harness lifecycle closes every factory
+  instance and reopened sink facade after each complete contract execution. All four resource-key
+  families prove independent same-coordinate commits and retries across two authorized runs.
+  Checkpoint schema aliases and nested invocation aliases normalize in both retry directions.
+  Fresh malformed checkpoint and invocation blob maps are rejected before metadata or head
+  publication, and every blob key is verified against its submitted bytes. A corrected retry then
+  commits and round-trips the intended bytes. Same-run records that share the digest retain their
+  original bytes before repair, and stale or cross-run malformed requests remain fenced before
+  validation.
+  Reopened event and terminal-winner inspection compare complete canonical payloads instead of
+  trusting retry digests. Retry reservations reject dispatch IDs used by any earlier attempt in
+  the logical call history, while a complete third attempt with a fresh ID remains legal. Accepted
+  terminal schema aliases normalize in both same-winner retry directions.
+  Checkpoint and settled-invocation CAS/writer-handoff races carry referenced blobs and verify their
+  post-race bytes. Populated commit-result sequence, submitted digest, and winner digest evidence is
+  checked for every mutation family across committed, idempotent, and conflict statuses. Writer
+  authority probes vary owner and generation independently across existing and fresh resources,
+  and handoff races cover same-owner lease renewal plus owner reassignment. Every CAS race reloads
+  the complete winning payload. Fresh checkpoint and invocation records with unresolved blob
+  references are rejected without head publication and recover with the referenced bytes.
+  `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
+  retaining the legacy unfenced store API.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path

@@ -333,6 +333,7 @@ class DurableModelInvocation:
 - 실패한 `settled`에는 receipt와 failure code가 있고 result가 없다.
 - `unknown`은 자동 retry를 금지한다.
 - `logical_call_id`, request digest, idempotency key는 lifecycle 중 바뀌지 않는다.
+- 같은 dispatch attempt 안에서 `dispatch_id`와 `dispatch_attempt`도 바뀌지 않는다.
 - 다음 dispatch attempt만 `dispatch_id`와 `dispatch_attempt`를 변경한다.
 - `revision`은 logical call 안에서 1부터 연속 증가하며 load의 권위 순서를 정한다.
 - receipt payload는 endpoint, prompt, response, raw exception message를 포함하지 않는다.
@@ -373,6 +374,7 @@ Package root와 `monoid_agent_kernel.contracts`는 hosting type을 re-export하�
 ```python
 @dataclass(frozen=True)
 class WriterToken:
+    run_id: str
     owner_id: str
     generation: int
 
@@ -382,6 +384,13 @@ class CommitResult:
     sequence: int | None = None
     content_digest: str = ""
     winner_digest: str = ""
+
+@dataclass(frozen=True)
+class ModelInvocationRecord:
+    revision: int
+    invocation: DurableModelInvocation
+
+    def blob(self, sha256: str) -> bytes: ...
 
 @dataclass(frozen=True)
 class StorageCapabilities:
@@ -397,8 +406,11 @@ class StorageCapabilities:
     cross_process_notify: bool = False
 ```
 
-`WriterToken`은 credential이 아니다. Host의 owner ID와 monotonic lease epoch를 운반한다. 만료와
-현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다.
+`WriterToken`은 credential이 아니다. Run ID, host owner ID, monotonic lease epoch를 함께
+운반한다. Run binding은 같은 owner와 generation으로 발급된 다른 run의 token 교환을 막는다.
+만료와 현재 owner 판정은 storage mutation 안에서 host adapter가 수행한다. Adapter는 run ID,
+owner ID, generation을 현재 authority와 각각 비교하며 세 값이 모두 정확히 일치할 때만 mutation을
+허용한다.
 
 ### 6.2 Protocol shape
 
@@ -420,7 +432,7 @@ class FencedCheckpointStore(Protocol):
 class FencedRunSink(FencedCheckpointStore, Protocol):
     def load_invocation(
         self, run_id: str, logical_call_id: str
-    ) -> DurableLoadResult[DurableModelInvocation]: ...
+    ) -> DurableLoadResult[ModelInvocationRecord]: ...
 
     def commit_invocation(
         self,
@@ -441,18 +453,106 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
 
 `FencedRunSink`는 run journal 전체를 구현하는 host를 위한 합성 protocol이다.
 `FencedCheckpointStore`는 checkpoint만 공유 저장소에 두는 host가 사용할 수 있다.
+`ModelInvocationRecord`는 committed invocation revision과 private result blob reader를 함께
+운반한다. Crash recovery는 `result_ref`의 digest로 `record.blob()`을 호출하고 metadata와 blob을
+같은 권위 경계에서 복원한다.
+
+Reusable conformance harness는 `set_current_writer(WriterToken)`으로 정확한 현재 token을 설치한다.
+이 seam은 host의 실제 generation allocator를 호출하지 않는다. 따라서 per-run counter와 global
+monotonic counter를 모두 허용하면서, 같은 owner/generation에서 run binding만 독립적으로 검증한다.
+`reopen()`은 같은 backing store와 host authority를 새 sink facade로 연다. Contract는 재개방 뒤
+checkpoint/blob, invocation/result blob, event identity, terminal winner를 다시 읽거나 재전송한다.
+`inject_authoritative_load_fault(record_family, run_id, status, logical_call_id=...)`는 정상 commit으로
+만든 권위 head를 backend raw mutation 또는 동등한 decoder hook으로 `corrupt`나
+`unsupported_version` 상태로 바꾼다. Fault는 `reopen()` 뒤에도 유지된다. Contract는 checkpoint와
+invocation 두 family에서 두 상태와 value 부재를 모두 확인해 `missing`으로 축약하거나 손상된 값을
+노출하는 adapter를 거부한다.
+Harness의 `read_event(run_id, seq)` seam은 재개방한 facade에서 event 전체 canonical payload를 읽는다.
+Digest만 남기고 event payload를 버리는 adapter는 durable event capability를 선언할 수 없다.
+Writer generation 전환 run에서는 `seq=1`과 `seq=2`를 모두 재개방 후 읽어 두 canonical payload를
+각각 비교한다. Sequence별 CAS digest만 남기고 run별 최신 event payload 하나로 덮어쓰는 adapter를
+거부한다.
+`read_terminal(run_id)` seam도 terminal winner 전체 canonical payload를 읽어 first-writer digest만 남긴
+구현을 거부한다.
+Run-isolation probe는 같은 local key를 가진 두 run의 checkpoint, event, invocation, terminal 전체
+canonical payload를 모두 읽는다. Checkpoint의 `final_text`와 invocation의 dispatch ID·request digest를
+run마다 다르게 제출한다. Run binding과 CAS digest만 분리하고 나머지 payload를 전역 최신값으로
+덮어쓰는 adapter도 이 비교에서 실패한다.
+각 harness는 `close()`로 sink facade가 소유한 DB session, client, thread pool을 해제한다. Contract는
+factory instance와 명시적으로 reopened된 모든 facade를 추적한다. 다음 독립 probe를 열기 전에 직전
+probe의 facade group을 역순으로 닫고, `finally`에서 마지막 group을 닫는다. 이 수명 규칙이 database
+session과 pooled connection의 최대 동시 보유량을 제한한다. Lazy record blob reader는 해당 probe가
+열려 있을 때 bytes 관찰로 materialize한다. Close-sensitive reference harness가 닫힌 facade의 reader를
+사용하는 회귀를 거부한다.
+Checkpoint와 invocation은 선택 필드가 아니라 committed canonical payload 전체의 digest를
+재개방 record와 비교한다.
+같은 key에 다른 well-formed blob map을 제출한 CAS loser는 `conflict`이며 blob도 공개하지 않는다.
+Contract는 재개방 뒤 loser 전용 digest를 빈 map으로 참조하는 새 checkpoint와 invocation lifecycle을
+시도해 둘 다 `conflict`인지 확인한다. Metadata CAS 전에 blob을 게시하는 adapter는 이 probe에서 실패한다.
+같은 key의 checkpoint, event, terminal, invocation 재시도는 mutable canonical non-key field를
+하나씩 독립적으로 변경해 모두 `conflict`인지 확인한다. Matrix의 field 집합은 각 record의
+canonical JSON field에서 계산하며, 스키마 확장 뒤 variant가 빠지면 contract가 즉시 실패한다.
+Invocation의 schema version과 digest generation은 current canonical tag로 고정한다. 허용된 legacy
+alias와 current tag 사이의 같은 revision 재시도는 양방향 모두 canonical payload가 같으므로
+`already_committed`다. Legacy alias를 쓴 다음 current-tagged legal revision과 current tag 뒤
+legacy-tagged legal revision은 canonical stable identity가 같으므로 모두 `committed`다.
+Checkpoint의 schema version과 `last_model_invocation` 안의 schema version/digest generation도 current
+writer shape로 정규화한다. 세 alias 위치의 current→legacy·legacy→current 같은-sequence 재시도는 모두
+`already_committed`다.
+TerminalOutcome의 허용된 legacy schema도 current writer shape로 정규화한다. Current→legacy와
+legacy→current의 같은 winner 재시도는 모두 `already_committed`다.
+Contract 실행마다 UUID 기반 namespace를 만들고 모든 run ID와 invocation idempotency key에
+적용한다. 같은 durable test service에서 반복 실행해도 이전 conformance artifact와 충돌하지 않는다.
+
+Contract는 `race_conflicting_writes` harness hook으로 두 worker를 backend의 CAS read/publication
+gap에서 조정하고 checkpoint, event, invocation, terminal의 conflicting content를 각각 경쟁시킨다.
+Method 호출 시작만 맞추는 barrier는 이 seam을 충족하지 않는다. 각 경쟁은 정확히 하나의
+`committed`와 하나의 `conflict`를 만들며, 재개방 뒤 winner retry는 `already_committed`, loser retry는
+`conflict`다. 두 worker는 같은 backing store를 가리키는 별도 sink facade를 사용한다. Hook은 내부에서
+연 facade를 직접 닫는다. Backend CAS를 검증하면서 database session이나 client facade의 cross-thread
+안전성을 요구하지 않는다.
+별도 writer-handoff race는 stale mutation과 generation rotation을 함께 시작한다. Rotation이 먼저
+직렬화되면 stale write는 `fenced`다. Write가 먼저 직렬화되면 stale write가 `committed`다. 네 mutation
+모두 stale/current payload가 다르므로 write-first의 current retry는 `conflict`다. Blob mutation의
+stale callback과 current callback은 서로 다른 digest를 제출한다. Rotation-first 경로에서는 stale
+전용 digest를 빈 map으로 참조할 수 없어야 하며,
+write-first 경로에서는 같은 참조가 authoritative backing에서 해소되어야 한다. Current callback은
+stale 전용 bytes를 제출하지 않는다. 이 probe가 metadata fencing 밖의 stale blob publication을
+검출한다.
+네 mutation의 handoff는 stale/current canonical payload를 서로 다르게 제출하고, 재개방한 record
+전체를 linearization이 선택한 값과 비교한다. 올바른 status를 반환한 뒤 metadata만 stale·loser
+값으로 덮어쓰는 adapter도 실패한다. Checkpoint와 invocation은 winner blob bytes까지 함께 비교한다.
+Contract는 같은 owner가 generation만 갱신하는 lease renewal과 owner와 generation이 함께 바뀌는
+reassignment를 네 mutation에서 각각 경쟁시킨다. 정적 authority matrix는 현재 owner의 stale
+generation과 현재 generation의 잘못된 owner를 독립적으로 제출한다. Matrix는 existing resource와
+fresh resource를 별도 run에서 검증하고, 거부 뒤 current token의 정상 commit까지 확인한다. Existing
+resource는 stale token으로 같은 payload, 다른 payload, malformed blob map을 각각 제출한다. 세 경우
+모두 content equality, conflict, blob validation보다 fence 판정이 먼저 실행되어 `fenced`다.
+Fresh resource도 stale owner+generation, current owner+stale generation, wrong owner+current generation의
+세 token에 malformed checkpoint·invocation map을 각각 교차한다. Insert 경로도 blob validation보다
+fence 판정을 먼저 실행한다. 각 malformed map은 mutation별 고유한 valid stale-only blob도 함께
+제출한다. 재개방 뒤 current token의 checkpoint와 invocation empty-map 참조가 모두 `conflict`여야 한다.
+따라서 `fenced`를 반환하면서 blob을 먼저 게시하는 adapter도 실패한다.
+Checkpoint race는 referenced workspace blob을 포함하고 invocation race는 reserved/start history 뒤
+settled-success result blob을 포함한다. CAS와 writer-handoff가 끝난 뒤 재개방 record에서 정확한
+bytes를 읽는다. CAS race는 `committed` 결과를 낸 좌·우 값에서 winner를 결정하고 네 mutation의
+재개방 canonical payload 전체가 그 winner인지 비교한다. Metadata fencing 밖에서 stale blob 또는
+loser payload를 공개하는 adapter는 이 검증을 통과하지 못한다.
 
 ### 6.3 Commit 판정 순서
 
 모든 mutation은 다음 순서로 판정한다.
 
-1. writer token을 현재 owner/generation과 비교한다.
+1. writer token의 run binding을 target run과 비교한 뒤 현재 owner/generation과 비교한다.
 2. stale token이면 `fenced`를 반환하고 아무 mutation도 수행하지 않는다.
 3. 같은 resource key와 같은 canonical content면 `already_committed`를 반환한다.
 4. 같은 resource key와 다른 content면 `conflict`를 반환한다.
 5. 새 mutation을 commit하고 `committed`를 반환한다.
 
 Stale writer의 identical retry도 `fenced`다. Fencing 판정이 idempotency 판정보다 먼저다.
+Stale owner+generation, current owner+stale generation, wrong owner+current generation, 다른 run token에
+malformed checkpoint/invocation blob map을 각각 결합해도 `fenced`다. Blob digest 검증은 run binding과
+owner/generation 검증 뒤에만 실행한다.
 
 Resource key는 다음과 같다.
 
@@ -463,8 +563,66 @@ Resource key는 다음과 같다.
 | invocation | `(run_id, logical_call_id, revision)` |
 | terminal | `(run_id, "terminal")` |
 
+Contract는 같은 harness에서 run A와 run B를 모두 authorize한 뒤 동일한 local coordinate를 각 run에
+독립 commit한다. 두 run의 checkpoint/event `seq=1`, invocation `call-1/revision=1`, terminal은 모두
+`committed`이고 재개방 뒤 각각 `already_committed`다. Checkpoint와 invocation load도 요청한 run의
+record를 반환한다. 이 검증은 네 resource key에서 `run_id`가 빠지는 adapter를 거부한다.
+
 Terminal의 첫 committed content가 winner다. 같은 winner 재전송은 `already_committed`, 다른 content는
 `conflict`다.
+
+`CommitResult.sequence`, `content_digest`, `winner_digest`는 선택 evidence다. Adapter가 값을 채우면
+resource coordinate, canonical submitted digest, canonical winner digest와 정확히 일치해야 한다.
+Contract는 네 mutation family의 `committed`, `already_committed`, `conflict` 대표 결과에서 세 필드를
+각각 검증한다. Winner가 없는 status의 `winner_digest`는 비어 있어야 한다.
+
+Canonical commit digest는 아래 값을 `canonical_sha256`으로 계산한다.
+
+```python
+{
+    "record": canonical_payload,
+    "blobs": {
+        key: sha256(blob_bytes)
+        for key, blob_bytes in sorted(submitted_blobs.items())
+    },
+}
+```
+
+Checkpoint의 `canonical_payload`는 current writer shape로 정규화한 payload다. Event, invocation,
+terminal은 각각 current canonical `to_json()` payload를 사용한다. `winner_digest`도 winner가 commit될
+때의 record와 blob 집합에 같은 계산을 적용한다.
+
+Checkpoint와 invocation의 canonical content에는 함께 제출된 blob key와 byte digest가 포함된다.
+Checked load record는 committed blob을 정확한 bytes로 돌려준다.
+같은 metadata에 다른 blob key를 추가하거나 같은 key의 bytes를 바꾸면 `conflict`다.
+모든 blob key는 제출 bytes의 lowercase SHA-256이다. 새 resource에 잘못된 key/bytes 조합을 제출하면
+`conflict`이고 metadata, head, blob을 공개하지 않는다. Contract는 checkpoint와 invocation에서 이
+거부 뒤 재개방한 durable state를 직접 검사한다. 같은 resource를 올바른 bytes로 다시 제출하면
+`committed`이고 재개방 record가 정확한 bytes를 반환한다.
+대문자 digest key에 올바른 bytes를 넣은 경우도 `conflict`다. Contract는 이 case-folding 결함을 별도
+mutant로 검증하며, 거부된 map의 bytes가 backing에 남지 않았음을 빈-map 참조 재시도로 확인한다.
+Checkpoint workspace delta, committed message log, queued raw content list, queued inbox envelope의
+media `blob:` reference와 nested `last_model_invocation`의 `blob:` result reference는 제출 map이나 같은
+run의 authoritative backing으로 해소된 뒤에만 commit할 수 있다. Standalone invocation의 `blob:` result도
+같은 규칙을 따른다. 각 fresh missing-reference commit은 `conflict`이고 head를 유지한다. 같은 run에서 먼저
+저장한 blob을 새 map 없이 참조하는 checkpoint와 invocation은 commit되며 재개방 record가 그 bytes를
+반환한다. 올바른 bytes를 제출한 missing-reference 재시도도 commit된다.
+`blob:` suffix는 정확한 lowercase SHA-256 digest다. Workspace `content_sha256`, committed·queued
+message media `source_ref`, invocation `result_ref`의 malformed suffix는 모두 `conflict`이고 metadata와
+head를 공개하지 않는다. `object:` 같은 bounded external invocation result address는 blob map 없이
+commit되며 재개방한 canonical payload에 그대로 남는다.
+Run A에만 존재하는 digest를 run B가 빈 map으로 참조하면 checkpoint와 invocation 모두 `conflict`다.
+Content-addressed blob namespace는 run 권위 경계를 포함한다.
+Run A token으로 run B payload와 valid blob을 제출한 fenced write는 run B backing에 bytes를 공개하지
+않는다. Run B current token의 같은 digest empty-map 참조가 계속 `conflict`인지 checkpoint와 invocation
+각각에서 확인한다.
+Contract는 먼저 같은 run에서 같은 digest를 참조하는 별도 valid record를 seed한다. Malformed write
+직후 repair 전에 seed record의 blob과 authoritative head를 다시 읽어 run-scoped blob 저장소에서도
+기존 content-addressed row가 바뀌지 않았고 malformed metadata가 공개되지 않았음을 검증한다.
+성공한 invocation의 contract fixture는 `result_ref`가 가리키는 result blob을 같은 commit에 제출한다.
+Checkpoint는 높은 sequence가 먼저 도착해도 아직 비어 있는 낮은 `(run_id, seq)` 좌표를 blob과 함께
+commit한다. 같은 지연 write의 재시도는 `already_committed`이고, latest head는 높은 committed
+sequence를 유지한다.
 
 Invocation transition은 다음 순서를 검증한다.
 
@@ -475,8 +633,40 @@ attempt N reserved
   → attempt N+1 reserved       # settled failure가 retry policy를 허용한 경우만
 ```
 
-`unknown`은 해당 logical call의 최종 journal 상태다. Revision gap, state regression, settled success
-뒤 새 attempt는 `conflict`다.
+`unknown`은 failure code 유무와 관계없이 해당 logical call의 최종 journal 상태다. Revision gap,
+state regression, settled success 뒤 새 attempt는 `conflict`다. Successful settlement의 receipt에
+`retryable=true`가 있어도 성공 결과가 우선하며 새 paid dispatch를 열지 않는다.
+Settled failure receipt에서 `retryable` 필드가 생략되면 재시도 근거가 없다. Contract는 명시적인
+`retryable=false`, 필드 생략, `retryable=true`를 별도 상태로 검증하며 마지막 경우만 다음 paid
+dispatch reservation을 허용한다.
+세 retryability 상태는 receipt content identity에서도 서로 다르다. 같은 revision의 세 상태를 모든
+6개 방향으로 비교해 `conflict`를 요구하고, 재개방한 canonical payload가 원래 winner인지 확인한다.
+Core는 accepted top-level receipt field와 nested usage counter 집합을 공개한다. Contract fixture는 이
+두 집합에서 자동 파생된다. 각 필드는 fresh settled failure로 정상 commit·reopen된 뒤 같은 revision의
+alternate evidence와 `conflict`하고, 두 번째 reopen에서도 처음 winner payload를 유지해야 한다.
+최신 head가 revision N이면 과거의 정확한 revision 재전송은 `already_committed`이며 head는 N을
+유지한다. 같은 historical coordinate에 다른 canonical payload를 제출하면 `conflict`이고 head는 N을
+유지한다. Contract는 revision 4 뒤 revision 1, 2, 3의 exact retry와 dispatch identity가 다른 retry를
+각각 실행한다. Revision 3에는 stable identity와 legal settled transition을 유지한 채 receipt와
+failure code만 각각 바꾸는 conflict도 추가한다. 모든 경우에 head 4가 유지되어야 한다.
+같은 run 안의 여러 logical call은 `(run_id, logical_call_id)`마다 독립 head를 유지한다. 둘째 call을
+commit한 뒤 첫째와 둘째를 모두 재로딩하며, 존재하지 않는 logical call은 `missing`과 빈 value를
+반환한다. Per-run last-invocation pointer 구현은 이 복구 검증에서 실패한다.
+첫 revision은 `reserved`만 허용한다. `reserved`, `dispatch_started`, `settled`, `unknown` 사이의
+문서화되지 않은 13개 인접 edge는 각각 독립 history에서 `conflict`로 검증한다.
+첫 record는 `(revision=1, dispatch_attempt=1, state=reserved)`만 허용한다. revision 2, attempt 2,
+둘 다 2인 초기 좌표는 독립 history에서 각각 `conflict`다.
+Retryable failure 뒤 reservation은 정확히 다음 attempt와 새 dispatch ID를 함께 사용한다. 같은
+attempt, 같은 dispatch ID, 둘 다 같은 조합, 건너뛴 attempt는 각각 `conflict`다.
+다음 attempt의 reservation은 logical call의 `idempotency_key`와 `request_digest`를 그대로 유지한다.
+Contract는 두 필드를 각각 단독 변형한 후보를 `conflict`로 거부한다.
+Stable invocation identity는 `reserved → dispatch_started`, `dispatch_started → settled`,
+`dispatch_started → unknown`의 모든 legal edge에서 유지된다. Terminal 두 edge는 idempotency key,
+request digest, dispatch ID, dispatch attempt를 각각 변형한 8칸 행렬로 `conflict`를 검증한다.
+새 dispatch ID는 해당 logical call의 모든 이전 attempt와 달라야 한다. Contract는 두 번의 retryable
+failure를 만든 뒤 attempt 3에서 attempt 1의 ID를 재사용하는 history를 `conflict`로 검증한다. 같은
+history에서 fresh ID를 쓴 attempt 3의 reserved, dispatch_started, settled lifecycle은 모두
+`committed`다.
 
 ### 6.4 LocalFS capability
 
@@ -726,7 +916,7 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 | `core/outcome.py` | outcome/cause/retry type, strict codec, conversion helper |
 | `core/model_invocation.py` | durable invocation record와 checked codec |
 | `hosting/__init__.py` | 좁은 hosting export |
-| `hosting/contracts.py` | writer token, capabilities, fenced protocols, commit result |
+| `hosting/contracts.py` | writer token, capabilities, fenced protocols, commit/result record |
 | `tests/test_outcome.py` | outcome invariant와 conversion |
 | `tests/test_model_invocation.py` | lifecycle/codec/result reference |
 | `tests/test_fenced_hosting.py` | protocol과 deterministic fake sink |
@@ -774,12 +964,15 @@ Fresh install 뒤 첫 parallel run의 cold-cache timeout은 warm rerun으로 확
 
 ### PR 2 — Hosting contracts
 
-- `WriterToken`, `CommitResult`, `StorageCapabilities`
+- `WriterToken`, `CommitResult`, `ModelInvocationRecord`, `StorageCapabilities`
 - `FencedCheckpointStore`, `FencedRunSink`
 - LocalFS `single_writer` capability
 - deterministic fake adapter와 fencing conformance
 
-종료 조건: stale identical mutation도 `fenced`, same-key conflict와 terminal winner가 검증된다.
+종료 조건: capability 선언, stale identical mutation의 `fenced`, in-flight writer handoff,
+concurrent same-key CAS, 재개방 durability, 반복 실행 격리, terminal winner,
+checkpoint/invocation private blob round-trip, malformed fresh blob 비공개, event 전체 payload 보존,
+전체 attempt history의 dispatch ID 유일성이 검증된다.
 
 ### PR 3 — ModelCallRunner lifecycle
 
@@ -925,6 +1118,62 @@ helper가 대기하는 동안 별도 수동 polling을 실행하지 않는다. `
 precedence, compatibility 영향을 다시 조사한다. 근본 원인을 하나의 type, protocol, state
 machine, capability gate로 해결할 수 있는지 결정한다. 필요하면 이 계획과 해당 PR의 dx-note를
 먼저 갱신한다. 구조 개선과 회귀 test를 완료한 뒤 같은 PR에서 리뷰 사이클을 새로 시작한다.
+
+PR 2에서는 반복된 durability 지적에 이 gate를 적용했다. 반환 status 중심 검증을 durable
+postcondition과 logical-call 전체 history 검증으로 확장했다. Fresh malformed blob은 거부 뒤 state를
+다시 읽고 기존 shared blob bytes를 즉시 재검증한다. Malformed map도 stale/cross-run fencing 뒤에만
+검사한다. Event와 terminal winner는 재개방 facade에서 전체 payload를 읽으며, dispatch ID는 직전
+attempt가 아니라 모든 이전 attempt를 조회한다. 각 경계에는 결함 구현이 정확한 observation을
+실패시키는 mutant test가 있다. Attempt 3 이상을 일괄 거부하는 구현도 양성 lifecycle observation이
+잡아낸다. Terminal schema alias를 raw tag로 digest하는 구현도 양방향 retry observation이 잡아낸다.
+Invocation raw alias digest 구현은 schema/digest-generation 각각의 양방향 same-revision observation이
+잡아낸다. Event에는 accepted schema alias가 없다. `schema_version`을 포함한 모든 non-key canonical
+field가 content identity에 참여한다.
+Blob-bearing CAS/writer-handoff 뒤 referenced bytes를 다시 읽고, 모든 mutation/status/evidence-field
+조합의 잘못된 `CommitResult` mutant를 거부한다. Blob 검증은 잘못된 bytes와 대문자 digest를 독립
+축으로 검사하고, workspace·committed message·queued content list·queued envelope·nested checkpoint
+invocation result·standalone invocation result 참조를 submitted map과 same-run backing 두 해소 경로에서
+확인한다. Terminal invocation 재시도는
+unknown의 failure-code 유무, success의
+retryable tag 유무, failure의 retryable 유무를 하나의 정책 행렬로 검증한다. Malformed-map precedence는
+owner와 generation의 세 invalid 조합을 모두 교차 검증한다. Handoff blob probe는 stale/current writer에
+서로 다른 digest를 주고 linearization에 따라 stale 전용 digest의 backing visibility가 달라지는지
+확인한다. 같은 handoff에서 재개방한 checkpoint·event·invocation·terminal 전체 payload가
+linearization winner와 일치하는지도 검증한다. Run 격리는 다른 run에만 저장된 blob 참조를 두
+blob-bearing mutation에서 거부하고, 두 run의 event·terminal 전체 payload를 각각 재로딩한다. Contract
+harness registry는 probe
+전환 때 직전 facade group을 닫고 최대 동시 facade 수를 회귀 검증한다. Checked load fault matrix는
+checkpoint·invocation과 corrupt·unsupported_version을 완전 교차한다. Delayed checkpoint는 fresh
+낮은 좌표의 commit·idempotent retry와 높은 latest head를 동시에 요구한다. 더 높은 checkpoint가
+빈 blob map으로 delayed digest를 재참조하고 재개방 뒤 bytes를 읽어 blob 권위 보존도 확인한다.
+Blob reference matrix는 workspace·committed media·두 queued media carrier·nested checkpoint
+invocation·standalone invocation의 malformed digest를 거부하고 external invocation result address를
+허용한다. Core의 단일 `checkpoint_blob_references()`가 checkpoint carrier 전체를 추출하며 reference
+adapter와 conformance fixture가 같은 어휘를 사용한다.
+Fence precedence는 existing coordinate의 동일 payload·conflicting payload·malformed blob map과 fresh
+coordinate의 세 invalid-authority token·malformed blob map을 독립 축으로 검증한다.
+Checkpoint·invocation의 same-key blob-map conflict 뒤 loser digest를 empty-map record로 재참조해
+conflicting blob 비공개도 확인한다.
+Writer generation 전환 run의 event `seq=1`·`seq=2`를 모두 재로딩해 같은 run 안의 payload 보존을
+검증한다.
+Fresh partial-authority 세 조합은 checkpoint·invocation의 고유 stale-only blob visibility를 모두
+검증해 malformed pre-fence publication을 거부한다.
+Invocation load 격리는 같은 run의 두 logical call과 unknown call을 함께 조회해 복합 키 전체를
+검증한다.
+Historical invocation revision 1·2·3은 exact retry와 dispatch-identity conflict를 모두 비교한다.
+Historical settled revision은 receipt-only·failure-code-only conflict도 비교하고 latest head 4를
+유지한다. Historical receipt conflict에는 `retryable=true` winner에 대한 false·필드 생략 후보도
+포함한다. Cross-run fenced blob 제출 뒤 authorized empty-map 참조는 계속 실패해야 한다.
+Invocation terminal edge identity는 settled·unknown과 네 stable identity field를 완전 교차한다.
+Terminal retry 행렬은 settled failure의 `retryable=false`·필드 생략·`retryable=true`를 구분하고,
+명시적인 true만 새 reservation을 허용한다. Run 격리 행렬은 checkpoint·event·invocation·terminal
+네 family의 서로 다른 non-key payload를 재개방 후 각각 완전 비교한다.
+Retry reservation identity 행렬은 새 dispatch coordinate에서 `idempotency_key`와 `request_digest`
+drift를 각각 거부한다.
+Receipt identity 행렬은 `retryable=true | false | omitted`의 모든 directed pair를 conflict로 거부하고
+각 conflict 뒤 원래 winner payload를 재로딩한다.
+전체 receipt identity 행렬은 공개된 top-level field와 nested usage counter를 빠짐없이 순회한다.
+정상 settlement 수용, same-revision conflict, conflict 뒤 winner 보존을 독립 mutant로 검증한다.
 
 ### 14.6 최종 통합 PR
 

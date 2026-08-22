@@ -6628,6 +6628,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     "provider_retried": frozenset(
         {
             "contracts.py",
+            # v0.22's fenced sink conformance matrix treats every canonical receipt field as
+            # durable CAS identity and exercises both legal settlement and conflicting evidence.
+            "conformance/contracts.py",
             # Joined in the burn-down's durable batch: see config_recoverable above.
             "core/checkpoint.py",
             # Joined in W6-1: see config_recoverable above. `attempts` and this are not the same
