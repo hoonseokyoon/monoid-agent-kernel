@@ -147,6 +147,10 @@ out in commit messages and here.
   rejected until this already-projected tool exchange completes. Checkpoints also carry the
   context-owned plan, pending `run.finish` result, and pending `tool.search` loads, so skipping a
   completed call after process restore preserves its kernel-owned effects.
+- Model-call usage now has one accounting owner for successful receipts and exception-carried
+  bills. A settled receipt updates cumulative usage and metrics before stop or deadline can persist
+  an unapplied result. Resume projects that stored result with a zero delta, preserving billing and
+  token-limit enforcement without a duplicate provider call.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal without paid continuation, multimodal stored

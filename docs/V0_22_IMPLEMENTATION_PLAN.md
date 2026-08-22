@@ -892,6 +892,11 @@ non-negative delta만 더한다. 같은 evidence 재시도, settled failure 재�
 provider 호출 없이 적용한 행의 usage는 빈 mapping이다. Retryable settled failure는 그대로
 표면화하고 다음 paid model step의 시작 여부를 driver가 결정한다.
 
+모든 authoritative settled receipt는 assistant turn projection보다 먼저 `total_usage`와 cumulative
+metrics에 반영한다. 그 다음 stop/deadline boundary를 검사한다. Settlement 직후 interrupt가 발생한
+checkpoint도 paid usage를 포함하며 assistant message는 아직 포함하지 않는다. Resume은 저장된 결과를
+적용하고 usage delta 0을 사용한다.
+
 기존 반환형을 유지하기 위해 AgentLoop는 `evidence_uncommitted`를 non-terminal
 `Suspension(reason="turn_failed", error_code="evidence_uncommitted")`로 표면화한다.
 `TerminalOutcome` conversion helper가 이를 `kind="evidence_uncommitted"`와

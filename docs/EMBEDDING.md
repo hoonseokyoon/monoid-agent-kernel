@@ -235,6 +235,9 @@ activation even when its configured policy is `passive`. One-shot `run_once()` r
 committed park and raises `TurnNotSettled`; restore
 the checkpoint and resume with `None`. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+The kernel accounts an authoritative settled receipt before a stop or deadline can park its result
+as unapplied. Persisted interruption checkpoints therefore include the paid usage even when the
+assistant turn remains absent; resume projects the stored result without adding that usage again.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes

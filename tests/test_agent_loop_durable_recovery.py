@@ -893,6 +893,54 @@ def test_required_evidence_projection_failure_preserves_completed_model_stream(
     assert snapshots[0].usage == usage
 
 
+def test_post_settlement_interrupt_accounts_usage_before_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    usage = {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="settled answer", usage=usage, stop_reason="stop")
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(tmp_path, adapter, sink=harness.sink, writer_token=token)
+    original_acall_model = loop._acall_model
+
+    async def interrupt_after_settlement(*args: Any, **kwargs: Any):
+        outcome = await original_acall_model(*args, **kwargs)
+        loop.interrupt_turn()
+        return outcome
+
+    monkeypatch.setattr(loop, "_acall_model", interrupt_after_settlement)
+    loop.open()
+    try:
+        interrupted = loop.run_until_suspended("hello")
+        interrupted_checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.total_usage == usage
+    assert not any(
+        message.get("role") == "assistant" for message in interrupted_checkpoint.messages
+    )
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "settled answer"
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+
 def test_required_evidence_recovery_preserves_policy_and_identity_across_config_changes(
     tmp_path: Path,
 ) -> None:

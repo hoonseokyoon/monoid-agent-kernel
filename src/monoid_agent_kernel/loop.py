@@ -3957,21 +3957,15 @@ class AgentLoop:
         state: RunState,
         res: _RunResources,
         turn: ModelTurn,
-        call_receipt: ModelCallReceipt,
         runtime_config: AgentRuntimeConfig,
         *,
         step: int,
         turn_id: str,
         parent_id: str | None,
-        already_accounted_usage: Mapping[str, int],
         replayed_without_provider: bool,
     ) -> None:
-        """Apply one successful provider outcome to run state and observable projections."""
+        """Project one already-accounted successful provider outcome into run state."""
 
-        _accumulate_usage_mapping(
-            state.total_usage,
-            _usage_delta(call_receipt.usage, already_accounted_usage),
-        )
         state.previous_turn_handle = turn.response_id or state.previous_turn_handle
         assistant_message: dict[str, Any] = {
             "role": "assistant",
@@ -4018,14 +4012,6 @@ class AgentLoop:
                 "has_final": bool(turn.final_text),
                 "usage": projected_usage,
             },
-        )
-        self._emit_metrics_updated(
-            res.recorder,
-            state,
-            res.context,
-            step=step,
-            turn_id=turn_id,
-            parent_id=parent_id,
         )
 
     def _record_failed_model_turn(
@@ -4100,10 +4086,6 @@ class AgentLoop:
         session.active_turn_id = turn_id
         session.active_turn_parent_id = parent_id
 
-        # Preserve the established boundary order: evidence is fenced first, then terminal stop
-        # and deadline win before result application. No runtime config, context provider, tool
-        # provider, surface resolver, prompt builder, or media resolver runs in between.
-        self._check_run_boundary(res.deadline)
         try:
             call_receipt = _recovered_receipt(ModelCallReceipt(), recovered)
         except DurableModelCallError as exc:
@@ -4113,6 +4095,24 @@ class AgentLoop:
             recovery,
             recovery.invocation.logical_call_id,
         )
+        # Settlement owns billing before content projection owns the assistant turn. A stop that
+        # wins at the boundary below therefore persists the paid call in total_usage, and replay
+        # sees the same receipt as already accounted instead of dropping it. Required-evidence
+        # parks already charged this receipt, so their delta is empty and remains idempotent.
+        self._account_model_usage(
+            call_receipt.usage,
+            res.recorder,
+            state,
+            res.context,
+            step=step,
+            turn_id=turn_id,
+            parent_id=parent_id,
+            already_accounted_usage=already_accounted_usage,
+        )
+        # Evidence is fenced and billing is owned before terminal stop/deadline can preempt result
+        # application. No runtime config, context provider, tool provider, surface resolver,
+        # prompt builder, or media resolver runs in between.
+        self._check_run_boundary(res.deadline)
         if recovery.outcome_projected and recovered.failure_code:
             raise DurableModelCallError(
                 "projected model outcome recovery restored a failure",
@@ -4169,12 +4169,10 @@ class AgentLoop:
                 state,
                 res,
                 turn,
-                call_receipt,
                 original_config,
                 step=step,
                 turn_id=turn_id,
                 parent_id=parent_id,
-                already_accounted_usage=already_accounted_usage,
                 replayed_without_provider=True,
             )
         elif not turn.tool_calls:
@@ -4247,6 +4245,42 @@ class AgentLoop:
             return (None, settled)
         raise ModelAdapterError("model returned neither final text nor tool calls")
 
+    def _account_model_usage(
+        self,
+        aggregate_usage: Mapping[str, int],
+        recorder: AgentRecorder,
+        state: RunState,
+        context: Any,
+        *,
+        step: int,
+        turn_id: str,
+        parent_id: str | None,
+        already_accounted_usage: Mapping[str, int] | None = None,
+    ) -> dict[str, int]:
+        """The one route a settled or failed model call's spend takes into run totals.
+
+        Successful settlement and exceptional exit used to account in separate places. That made
+        assistant projection own successful billing, so a post-settlement interrupt could persist
+        a replayable invocation before its usage reached the checkpoint. Billing now commits to
+        RunState directly from the authoritative aggregate receipt before any result-application
+        boundary. Failure wrappers feed the same function from their exception-carried receipt.
+
+        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
+        the totals moved, so the cumulative meter moves at the same ownership point.
+        """
+
+        billed = _usage_delta(
+            aggregate_usage,
+            already_accounted_usage or {},
+        )
+        if not billed:
+            return {}
+        _accumulate_usage_mapping(state.total_usage, billed)
+        self._emit_metrics_updated(
+            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
+        )
+        return billed
+
     def _account_billed_model_call(
         self,
         exc: BaseException,
@@ -4259,32 +4293,18 @@ class AgentLoop:
         parent_id: str | None,
         already_accounted_usage: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
-        """The one route a failed model call's already-billed spend takes into the run's totals.
+        """Account the aggregate provider usage carried by an escaping call exception."""
 
-        Two arms end a model call by re-raising, and the accounting was written into one of them.
-        A rule living inside a handler is a rule bound to the exception types that handler
-        catches: ``except ModelAdapterError`` covers a provider's refusal and nothing else, so a
-        run boundary -- which is a ``NativeAgentError`` and takes the next arm -- carried its
-        absorbed attempts' bill out of the loop with no one reading it. Written once here so the
-        arms cannot answer the question differently; each arm still decides whether it has a
-        transcript row to write, which is the part that genuinely differs between them.
-
-        Emitting ``metrics.updated`` is inseparable from the accumulation, not a step beside it:
-        the totals moved, and a meter that publishes only when a turn *settles* leaves a run whose
-        model calls all failed billed reporting a cost of zero.
-        """
-
-        billed = _usage_delta(
+        return self._account_model_usage(
             _billed_usage(exc),
-            already_accounted_usage or {},
+            recorder,
+            state,
+            context,
+            step=step,
+            turn_id=turn_id,
+            parent_id=parent_id,
+            already_accounted_usage=already_accounted_usage,
         )
-        if not billed:
-            return {}
-        _accumulate_usage_mapping(state.total_usage, billed)
-        self._emit_metrics_updated(
-            recorder, state, context, step=step, turn_id=turn_id, parent_id=parent_id
-        )
-        return billed
 
     def _emit_metrics_updated(
         self,
@@ -4878,18 +4898,30 @@ class AgentLoop:
                 # to an absent arm: an arm that does not exist records no decision, which is how
                 # the cancellation above went four rounds without one.
                 raise
+            if not outcome_already_projected:
+                # Provider settlement owns its bill before the stop/deadline boundary can persist
+                # an unapplied durable result. Content projection below owns the assistant message
+                # and call-specific transcript, not the cumulative spend.
+                self._account_model_usage(
+                    call_receipt.usage,
+                    recorder,
+                    state,
+                    context,
+                    step=step,
+                    turn_id=turn_id,
+                    parent_id=turn_parent_id,
+                    already_accounted_usage=already_accounted_usage,
+                )
             self._check_run_boundary(deadline)
             if not outcome_already_projected:
                 self._project_successful_model_turn(
                     state,
                     res,
                     turn,
-                    call_receipt,
                     runtime_config,
                     step=step,
                     turn_id=turn_id,
                     parent_id=turn_parent_id,
-                    already_accounted_usage=already_accounted_usage,
                     replayed_without_provider=False,
                 )
 

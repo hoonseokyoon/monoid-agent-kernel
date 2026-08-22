@@ -2886,6 +2886,10 @@ terminal checkpoint. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected
 by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
 no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.
+Every authoritative settled receipt enters `RunState.total_usage` and the cumulative metrics lane
+before stop or deadline can preempt assistant-result application. An interruption checkpoint can
+therefore carry an unapplied settled invocation, and it already carries that invocation's bill.
+Resume applies the stored result with a zero usage delta and does not call the provider again.
 
 An interrupt may arrive after a recovered assistant tool-call turn enters the canonical message
 log and before all of its tools finish. The interruption suspension persists
