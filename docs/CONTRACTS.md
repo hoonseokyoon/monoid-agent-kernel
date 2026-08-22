@@ -2896,6 +2896,12 @@ projection, or terminal mutation. A replacement owner loads the committed invoca
 publishes it under current authority, and continues recovery without redispatching the provider
 call.
 
+The Reference host treats this observation as an activation disposition. Session driving checks
+for `lease_lost` before copying any suspension field onto the backend record. Autonomous,
+streaming, and recovered execution paths then call `discard_uncommitted()` and omit
+`record_run_result`, `record_run_failure`, stream result frames, and `aclose`. This preserves the
+replacement owner's sole projection authority.
+
 The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
 the authoritative reservation and blocks `dispatch_started`. Lease loss observed by
 `dispatch_started()` leaves that journal state for reconciliation and blocks adapter entry. The

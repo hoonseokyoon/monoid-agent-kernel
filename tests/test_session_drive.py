@@ -7,16 +7,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.reference.backend.projection import (
     RunProjectionContext,
     RunProjectionService,
 )
+from monoid_agent_kernel.reference.backend.activation import ActivationLeaseLost
 from monoid_agent_kernel.reference.backend import session_drive
 from monoid_agent_kernel.reference.backend.run_types import BackendRunRecord
 from monoid_agent_kernel.reference.backend.session_drive import (
@@ -127,6 +131,55 @@ def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=2)
 
     assert service.session_should_stop(record, started=started, turns=2) is True
+
+
+def test_session_drive_rejects_lease_loss_before_projecting_or_closing(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    record = _Record("run_stale")
+    record.state = SessionState.RUNNING
+    record.terminal = False
+    record.error = "prior"
+    record.error_code = "prior_code"
+    record.interruption_cause = InterruptionCause.GRACEFUL_DRAIN
+
+    class _Request:
+        multi_turn = False
+
+    class _Loop:
+        close_calls = 0
+
+        async def aclose(self) -> AgentRunResult:
+            self.close_calls += 1
+            raise AssertionError("a stale activation must not close")
+
+    loop = _Loop()
+
+    with pytest.raises(ActivationLeaseLost):
+        asyncio.run(
+            service.drive_open_session(
+                record,
+                _Request(),
+                loop,
+                Suspension(
+                    reason="interrupted",
+                    status="completed",
+                    error="run lease was lost",
+                    error_code="lease_lost",
+                    interruption_cause=InterruptionCause.LEASE_LOST,
+                ),
+                started=time.time(),
+                turns=1,
+            )
+        )
+
+    assert loop.close_calls == 0
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == "prior"
+    assert record.error_code == "prior_code"
+    assert record.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
 
 
 def test_turn_retry_backoff_saturates_at_the_cap_instead_of_overflowing(

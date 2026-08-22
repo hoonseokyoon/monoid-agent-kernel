@@ -11,6 +11,10 @@ from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.errors import NativeAgentError
+from monoid_agent_kernel.reference.backend.activation import (
+    is_activation_lease_loss,
+    raise_on_lease_loss,
+)
 from monoid_agent_kernel.reference.backend.content_hydration import (
     hydrate_settled_text,
     needs_settled_text,
@@ -102,6 +106,8 @@ class RunExecutionService:
                         # The original execution failure remains the actionable cause. AgentLoop
                         # already attempts every owned resource before surfacing cleanup failure.
                         pass
+                if is_activation_lease_loss(exc):
+                    return
                 self._context.record_run_failure(prepared.run_id, exc)
         finally:
             # Cancellation derives from BaseException, so it bypasses the failure-recording branch.
@@ -123,7 +129,9 @@ class RunExecutionService:
         first_input: str | tuple[ContentPart, ...] = request.input_parts or request.instruction
         try:
             suspension = await loop.arun_until_suspended(first_input)
-        except NativeAgentError:
+        except NativeAgentError as exc:
+            if is_activation_lease_loss(exc):
+                raise
             return await loop.aclose()
         return await self._context.drive_open_session(
             self._context.record(run_id),
@@ -193,19 +201,22 @@ class RunExecutionService:
                             await asyncio.to_thread(hydrate_settled_text, [frame], stream_run_dir)
                     yield frame
                 suspension = stream.suspension
+            raise_on_lease_loss(suspension)
             result = await loop.aclose()
             closed = True
             self._context.record_run_result(prepared.run_id, result)
             yield result_frame(result, suspension)
         except Exception as exc:
-            if loop is not None and not closed:
+            lease_lost = is_activation_lease_loss(exc)
+            if loop is not None and not closed and not lease_lost:
                 try:
                     await loop.aclose()
                     closed = True
                 except Exception:  # noqa: BLE001 - finalization best-effort; the failure is recorded below
                     pass
-            self._context.record_run_failure(prepared.run_id, exc)
-            yield failure_frame(exc)
+            if not lease_lost:
+                self._context.record_run_failure(prepared.run_id, exc)
+                yield failure_frame(exc)
         finally:
             if loop is not None and not closed:
                 try:

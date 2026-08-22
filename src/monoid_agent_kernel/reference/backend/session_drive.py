@@ -13,6 +13,7 @@ from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspensi
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.providers._common import retry_delay_s
+from monoid_agent_kernel.reference.backend.activation import raise_on_lease_loss
 from monoid_agent_kernel.reference.backend.ports import (
     LoopPort,
     MutableRunRecordPort,
@@ -117,6 +118,9 @@ class SessionDriveService:
         """Drive an already-open run until close, idle, cancellation, or terminal suspension."""
         consecutive_turn_failures = 0
         while True:
+            # Lease loss is an activation disposition. It cannot become run state because a
+            # replacement owner may already be projecting the same run.
+            raise_on_lease_loss(suspension)
             limits = self._context.limits_provider()
             _set_record_state(
                 record,

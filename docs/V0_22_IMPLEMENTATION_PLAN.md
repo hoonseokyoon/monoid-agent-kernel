@@ -1170,6 +1170,8 @@ evidence를 다음 step 뒤에 남기지 않는다.
   쓰지 않는다. 신호 전에 commit된 model invocation settlement는 권위 evidence로 남는다.
   Settlement 반환 직후 lease authority를 다시 검사하고 stale activation의 usage accounting,
   receipt observer, model-call sidecar, model-stream close를 차단한다.
+  Reference host는 suspension projection 전에 이 park를 감지한다. autonomous, streaming,
+  recovery 실행은 activation을 discard하고 result/failure/stream frame/close를 생략한다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는
   dispatch-start를 막고, dispatch-start 뒤 loss는 provider 진입을 막는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.

@@ -39,6 +39,7 @@ from monoid_agent_kernel.reference.backend.ports import (
     MutableRunRecordPort,
     RunRequestPort,
 )
+from monoid_agent_kernel.reference.backend.activation import is_activation_lease_loss
 from monoid_agent_kernel.reference.backend.run_state import write_failure_status_artifact
 from monoid_agent_kernel.reference.backend.runtime_config import runtime_config_from_meta
 
@@ -340,7 +341,8 @@ class RecoveryService:
                 # Preserve the recovered execution failure. AgentLoop has already attempted every
                 # owned activation resource before surfacing a cleanup error.
                 pass
-            self._context.record_run_failure(run_id, exc)
+            if not is_activation_lease_loss(exc):
+                self._context.record_run_failure(run_id, exc)
         finally:
             # Task cancellation bypasses ``except Exception`` but still owns the recovered loop.
             if not released and not discarded:
