@@ -14,6 +14,7 @@ class CancellationToken:
     _callbacks: dict[int, Callable[[], None]] = field(default_factory=dict, init=False, repr=False)
     _next_callback_id: int = field(default=0, init=False, repr=False)
     _cause: InterruptionCause | None = field(default=None, init=False, repr=False)
+    _lease_lost: bool = field(default=False, init=False, repr=False)
 
     def cancel(
         self,
@@ -24,6 +25,10 @@ class CancellationToken:
         except (TypeError, ValueError) as exc:
             raise ValueError("cancellation cause is outside the portable vocabulary") from exc
         with self._lock:
+            # The first interruption cause remains diagnostic history. Lease authority is an
+            # independent safety fact and becomes sticky even when another cause arrived first.
+            if cause is InterruptionCause.LEASE_LOST:
+                self._lease_lost = True
             if self._event.is_set():
                 return
             self._cause = cause
@@ -68,3 +73,10 @@ class CancellationToken:
     def cause(self) -> InterruptionCause | None:
         with self._lock:
             return self._cause
+
+    @property
+    def lease_lost(self) -> bool:
+        """Return whether this activation has irreversibly lost writer authority."""
+
+        with self._lock:
+            return self._lease_lost

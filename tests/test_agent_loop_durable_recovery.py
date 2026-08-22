@@ -196,12 +196,14 @@ class _RejectCheckpointCommit:
 class _RejectModelEvidence:
     inner: Any
     failures: int = 1
+    calls: int = 0
 
     @property
     def capabilities(self):
         return self.inner.capabilities
 
     def commit_model_evidence(self, *args: Any, **kwargs: Any) -> CommitResult:
+        self.calls += 1
         if self.failures > 0:
             self.failures -= 1
             return CommitResult(status="conflict")
@@ -1873,6 +1875,60 @@ def test_required_evidence_commits_before_terminal_run_boundary(
     assert terminal.reason == "terminal"
     assert terminal.error_code == expected_error_code
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+
+
+def test_lease_loss_precedes_required_evidence_recovery_mutation(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    first_writer = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_writer,
+        model_evidence_policy="required",
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("hello")
+        checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    assert sink.calls == 1
+    previous_checkpoint = harness.sink.latest_checked(RUN_ID)
+
+    cancellation_token = CancellationToken()
+    replacement_writer = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=replacement_writer,
+        model_evidence_policy="required",
+        cancellation_token=cancellation_token,
+    )
+    restored_loop.restore(checkpoint)
+    cancellation_token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+    cancellation_token.cancel(InterruptionCause.LEASE_LOST)
+    try:
+        suspension = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert cancellation_token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert cancellation_token.lease_lost is True
+    assert sink.calls == 1
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) not in harness.sink._model_evidence
+    assert harness.sink.latest_checked(RUN_ID) == previous_checkpoint
     assert len(adapter.requests) == 1
 
 

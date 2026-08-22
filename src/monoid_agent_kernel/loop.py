@@ -1728,6 +1728,7 @@ class AgentLoop:
         session = self._session
         if session is None:
             return False
+        self._assert_write_authority()
         session.res.recorder.emit(event_type, data=data, level=level, turn_id=turn_id)
         return True
 
@@ -1756,6 +1757,7 @@ class AgentLoop:
         ``max_attempts`` attempts, then dead-letters it as ``failed``; a non-retryable failure fails
         immediately. The loop never computes the schedule — it records what the edge decided. The
         ``idempotency_key`` makes the (at-least-once) redispatch safe."""
+        self._assert_write_authority()
         request_id = normalize_unicode_scalars(
             exact_runtime_string(request_id, field_name="outbox request_id")
         )
@@ -1810,6 +1812,8 @@ class AgentLoop:
     ) -> Suspension:
         """Async form of :meth:`run_until_suspended` — the engine's source of truth."""
         session = self._require_open()
+        if self._lease_authority_lost():
+            return self._lease_loss_suspension(session)
         if session.terminal:
             raise NativeAgentError(
                 "run reached a terminal state and cannot accept more input",
@@ -1878,6 +1882,7 @@ class AgentLoop:
                 # today's runtime config, context providers, tool surface, or media resolver. Use
                 # the durable logical id + digest first. The returned private result/refusal can
                 # then be applied without asking the provider or re-keying the original call.
+                self._check_lease_authority()
                 evidence_recovery = _recover_evidence_dispatch(
                     res.model_runner,
                     evidence_recovery,
@@ -1912,18 +1917,7 @@ class AgentLoop:
             )
             state.interruption_cause = cause
             if cause is InterruptionCause.LEASE_LOST:
-                # Lease loss removes this activation's write authority. Return an in-memory
-                # observation only; the new owner or reconciler decides durable terminal state.
-                state.error = "run lease was lost"
-                state.error_code = cause.value
-                session.midturn_park = "interrupted"
-                return Suspension(
-                    reason="interrupted",
-                    status="completed",
-                    error=state.error,
-                    error_code=state.error_code,
-                    interruption_cause=cause,
-                )
+                return self._lease_loss_suspension(session)
             if cause in {
                 InterruptionCause.GRACEFUL_DRAIN,
                 InterruptionCause.HOST_SHUTDOWN,
@@ -1941,6 +1935,13 @@ class AgentLoop:
                 )
                 self._persist_checkpoint(session, result)
                 return result
+            if cause is InterruptionCause.DEADLINE:
+                return self._settle_deadline(
+                    state,
+                    res,
+                    session,
+                    RunTimeout("run exceeded max duration"),
+                )
             state.status = "limited"
             state.error = str(exc)
             state.error_code = (
@@ -1960,23 +1961,7 @@ class AgentLoop:
             self._persist_checkpoint(session, result)
             return result
         except RunTimeout as exc:
-            state.status = "limited"
-            state.error = str(exc)
-            state.error_code = error_code_for_exception(exc)
-            state.interruption_cause = InterruptionCause.DEADLINE
-            state.final_text = "Stopped after reaching max duration."
-            state.final_text_is_model_output = False
-            session.terminal = True
-            result = replace(
-                Suspension(reason="terminal", status="limited"),
-                final_text=state.final_text,
-                error=state.error,
-                error_code=state.error_code,
-                interruption_cause=InterruptionCause.DEADLINE,
-                turn=self._checkpoint_on_settle(state, res),
-            )
-            self._persist_checkpoint(session, result)
-            return result
+            return self._settle_deadline(state, res, session, exc)
         except ModelAdapterError as exc:
             if not _recoverable_turn_error(exc):
                 # Non-recoverable model error -> terminal (same bookkeeping as the generic
@@ -2147,6 +2132,7 @@ class AgentLoop:
         """Signal that the run is parked awaiting the next user message. A
         multi-turn driver calls this before blocking on its message channel."""
         session = self._require_open()
+        self._assert_write_authority()
         session.res.recorder.emit("run.awaiting_input", data={"reason": "user"})
 
     def fail_recoverable(self, message: str, *, error_code: str = "model_error") -> None:
@@ -2157,6 +2143,7 @@ class AgentLoop:
         ``run.failed``) and mark the session terminal, without having to duplicate the loop's
         terminal bookkeeping. The driver then closes the run as usual."""
         session = self._require_open()
+        self._assert_write_authority()
         self._record_failure(
             session.state,
             session.res,
@@ -2192,15 +2179,23 @@ class AgentLoop:
         cleanup below deleted the very checkpoints a cancelled run keeps for restore. A no-op
         when nothing is pending or the run already settled terminal."""
         token = self.cancellation_token
-        if session.terminal or token is None or not token.requested:
-            return
-        cause = token.cause or InterruptionCause.USER_CANCEL
-        if cause is InterruptionCause.LEASE_LOST:
+        if token is not None and token.lease_lost:
             raise NativeAgentError(
                 "lease-lost activation must be discarded without finalization",
                 error_code="lease_lost",
             )
+        if session.terminal or token is None or not token.requested:
+            return
+        cause = token.cause or InterruptionCause.USER_CANCEL
         state = session.state
+        if cause is InterruptionCause.DEADLINE:
+            self._settle_deadline(
+                state,
+                session.res,
+                session,
+                RunTimeout("run exceeded max duration"),
+            )
+            return
         exc = RunCancelled("run cancelled", interruption_cause=cause)
         state.status = "limited"
         state.error = str(exc)
@@ -2359,6 +2354,7 @@ class AgentLoop:
         """
 
         session = self._require_open()
+        self._assert_write_authority()
         checkpoint = self.snapshot()
         if (
             session.last_suspension is None
@@ -3018,6 +3014,7 @@ class AgentLoop:
         After this, subsequent proposals/diffs report only changes made after this
         point — the building block for incremental apply across a multi-turn run."""
         session = self._require_open()
+        self._assert_write_authority()
         res = session.res
         res.workspace.snapshot_current_as_new_baseline()
         res.recorder.write_workspace_base(res.workspace.workspace_base_payload(self.spec.run_id))
@@ -3038,6 +3035,7 @@ class AgentLoop:
         the backend or another thread calls this to deliver a result, waking a
         parked run. The result is injected per the task kind's ResultInjector."""
         session = self._require_open()
+        self._assert_write_authority()
         reported = session.res.context.job_manager.report_result(
             normalize_unicode_scalars(task_id),
             normalize_json_ingress(result),
@@ -3230,8 +3228,7 @@ class AgentLoop:
         Advances the per-run sequence so the store commits a new last-good checkpoint."""
         if (
             self.cancellation_token is not None
-            and self.cancellation_token.requested
-            and self.cancellation_token.cause is InterruptionCause.LEASE_LOST
+            and self._lease_authority_lost()
         ):
             raise NativeAgentError(
                 "lease-lost activation cannot persist a checkpoint",
@@ -3633,6 +3630,7 @@ class AgentLoop:
         automation/hitl). Returns the task id; its result is delivered later via
         report_task_result."""
         session = self._require_open()
+        self._assert_write_authority()
         return session.res.context.job_manager.create_task(kind, request)
 
     def _require_open(self) -> _Session:
@@ -5305,6 +5303,7 @@ class AgentLoop:
         return self._finalizer.build_metrics(state, res)
 
     def _finalize(self, state: RunState, res: _RunResources) -> AgentRunResult:
+        self._assert_write_authority()
         return self._finalizer.finalize(state, res)
 
     def _checkpoint_on_settle(self, state: RunState, res: _RunResources) -> AgentTurnResult:
@@ -6588,16 +6587,66 @@ class AgentLoop:
             raise TurnInterrupted("turn interrupted")
 
     def _check_lease_authority(self) -> None:
-        token = self.cancellation_token
-        if (
-            token is not None
-            and token.requested
-            and token.cause is InterruptionCause.LEASE_LOST
-        ):
+        if self._lease_authority_lost():
             raise RunCancelled(
                 "run cancelled",
                 interruption_cause=InterruptionCause.LEASE_LOST,
             )
+
+    def _lease_authority_lost(self) -> bool:
+        token = self.cancellation_token
+        return token is not None and token.lease_lost
+
+    def _assert_write_authority(self) -> None:
+        if self._lease_authority_lost():
+            raise NativeAgentError(
+                "lease-lost activation cannot mutate run state",
+                error_code="lease_lost",
+            )
+
+    @staticmethod
+    def _lease_loss_suspension(session: _Session) -> Suspension:
+        """Return the mutation-free observation for an activation that lost its lease."""
+
+        state = session.state
+        state.interruption_cause = InterruptionCause.LEASE_LOST
+        state.error = "run lease was lost"
+        state.error_code = InterruptionCause.LEASE_LOST.value
+        session.midturn_park = "interrupted"
+        return Suspension(
+            reason="interrupted",
+            status="completed",
+            error=state.error,
+            error_code=state.error_code,
+            interruption_cause=InterruptionCause.LEASE_LOST,
+        )
+
+    def _settle_deadline(
+        self,
+        state: RunState,
+        res: _RunResources,
+        session: _Session,
+        exc: RunTimeout,
+    ) -> Suspension:
+        """Project every deadline signal through one canonical terminal outcome."""
+
+        state.status = "limited"
+        state.error = str(exc)
+        state.error_code = error_code_for_exception(exc)
+        state.interruption_cause = InterruptionCause.DEADLINE
+        state.final_text = "Stopped after reaching max duration."
+        state.final_text_is_model_output = False
+        session.terminal = True
+        result = replace(
+            Suspension(reason="terminal", status="limited"),
+            final_text=state.final_text,
+            error=state.error,
+            error_code=state.error_code,
+            interruption_cause=InterruptionCause.DEADLINE,
+            turn=self._checkpoint_on_settle(state, res),
+        )
+        self._persist_checkpoint(session, result)
+        return result
 
     @staticmethod
     def _emit_turn_interrupted(

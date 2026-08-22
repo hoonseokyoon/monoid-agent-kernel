@@ -662,6 +662,7 @@ class ModelCallRunner:
         and has no meaning for a one-shot call, which cannot be stopped part-way.
         """
 
+        self._check_lease_authority()
         token = self._token()
         if token is not None and token.requested:
             raise RunCancelled(
@@ -680,11 +681,7 @@ class ModelCallRunner:
         """
 
         token = self._token()
-        if (
-            token is not None
-            and token.requested
-            and token.cause is InterruptionCause.LEASE_LOST
-        ):
+        if token is not None and token.lease_lost:
             raise RunCancelled(
                 "run cancelled",
                 interruption_cause=InterruptionCause.LEASE_LOST,

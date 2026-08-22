@@ -2866,6 +2866,10 @@ fencing through the host-owned sink. It contains no database, queue, or Temporal
 accepted cause wins; later cancellation requests are no-ops, including callbacks.
 The no-argument call retains the `user_cancel` behavior. Checkpoint capture reads the request flag
 and cause atomically; a pending token cause takes precedence over the prior park's state cause.
+Writer authority is tracked independently: any `cancel(LEASE_LOST)` call makes
+`CancellationToken.lease_lost` sticky even when another interruption cause arrived first. Every
+mutation boundary reads that authority flag, and the returned in-memory observation uses
+`lease_lost` while the original diagnostic cause remains available on the token.
 
 | Cause | Kernel boundary | Durable mutation |
 |---|---|---|
@@ -2889,6 +2893,16 @@ model-stream completion. It returns the in-memory `lease_lost` park without a ch
 projection, or terminal mutation. A replacement owner loads the committed invocation, accounts and
 publishes it under current authority, and continues recovery without redispatching the provider
 call.
+
+Evidence recovery uses a two-sided fence. It checks authority before calling the lifecycle recovery
+hook and again after the hook returns. A pre-existing lease loss cannot enter required-evidence
+delivery, and a loss racing with that delivery cannot reach result application or later
+publication. Every fenced sink mutation remains the final storage-level authority check.
+
+Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
+`status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
+`interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
+run.
 
 ### Model evidence delivery policy
 

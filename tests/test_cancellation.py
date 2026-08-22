@@ -76,13 +76,15 @@ def test_cancel_callbacks_are_one_shot_and_removable() -> None:
     assert token.requested is True
 
 
-def test_first_interruption_cause_wins() -> None:
+def test_first_interruption_cause_wins_while_lease_authority_is_independent() -> None:
     token = CancellationToken()
 
     token.cancel(InterruptionCause.GRACEFUL_DRAIN)
     token.cancel(InterruptionCause.USER_CANCEL)
+    token.cancel(InterruptionCause.LEASE_LOST)
 
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert token.lease_lost is True
 
 
 def test_cancellation_snapshot_pairs_the_request_with_its_winning_cause() -> None:
@@ -226,10 +228,13 @@ def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(
     token = CancellationToken()
     loop.cancellation_token = token
     loop.open()
+    token.cancel(InterruptionCause.GRACEFUL_DRAIN)
     token.cancel(InterruptionCause.LEASE_LOST)
 
     suspension = loop.run_until_suspended("go")
 
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert token.lease_lost is True
     assert suspension.reason == "interrupted"
     assert suspension.error_code == InterruptionCause.LEASE_LOST.value
     assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
@@ -238,6 +243,51 @@ def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(
         loop.close()
     assert exc_info.value.error_code == "lease_lost"
     assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
+
+
+def test_token_deadline_uses_the_canonical_timeout_terminal(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    token.cancel(InterruptionCause.DEADLINE)
+
+    suspension = loop.run_until_suspended("go")
+
+    assert suspension.reason == "terminal"
+    assert suspension.status == "limited"
+    assert suspension.error == "run exceeded max duration"
+    assert suspension.error_code == "run_timeout"
+    assert suspension.final_text == "Stopped after reaching max duration."
+    assert suspension.interruption_cause is InterruptionCause.DEADLINE
+    stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.error_code == "run_timeout"
+    assert stored.checkpoint.interruption_cause == InterruptionCause.DEADLINE.value
+    loop.discard_uncommitted()
+
+
+def test_lease_loss_after_a_terminal_verdict_blocks_finalization(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    token.cancel(InterruptionCause.USER_CANCEL)
+    terminal = loop.run_until_suspended("go")
+    token.cancel(InterruptionCause.LEASE_LOST)
+
+    assert terminal.reason == "terminal"
+    assert terminal.interruption_cause is InterruptionCause.USER_CANCEL
+    with pytest.raises(NativeAgentError, match="lease-lost activation") as exc_info:
+        loop.close()
+    assert exc_info.value.error_code == "lease_lost"
+    events_path = next(loop.spec.run_root.rglob("events.jsonl"))
+    event_types = {
+        json.loads(line)["type"]
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert "run.finished" not in event_types
 
 
 def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
@@ -278,6 +328,22 @@ def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:
     assert stored is not None
     assert stored.checkpoint.terminal is True
     assert stored.checkpoint.cancellation_requested is True
+
+
+def test_close_routes_a_parked_token_deadline_through_timeout_handling(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    assert loop.run_until_suspended("go").reason == "settled"
+    token.cancel(InterruptionCause.DEADLINE)
+
+    result = loop.close()
+
+    assert result.status == "limited"
+    assert result.error_code == "run_timeout"
+    assert result.final_text == "Stopped after reaching max duration."
+    assert result.interruption_cause is InterruptionCause.DEADLINE
 
 
 def test_cancel_acknowledged_at_a_midturn_park_keeps_the_stop_notice(tmp_path: Path) -> None:

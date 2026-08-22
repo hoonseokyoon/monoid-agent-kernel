@@ -920,6 +920,8 @@ def cancel(self, cause: InterruptionCause = InterruptionCause.USER_CANCEL) -> No
 
 첫 cause가 승리한다. 후속 cancel은 event를 다시 set하지 않고 cause를 덮어쓰지 않는다.
 기존 no-argument caller는 `user_cancel` 의미를 유지한다.
+Lease authority는 cause와 별도인 sticky 상태다. 후속 `lease_lost` 신호는 최초 cause를 보존하면서
+모든 mutation fence를 활성화하고, stale activation의 반환 observation은 `lease_lost`를 사용한다.
 
 처리 규칙은 다음과 같다.
 
@@ -1168,6 +1170,8 @@ evidence를 다음 step 뒤에 남기지 않는다.
   쓰지 않는다. 신호 전에 commit된 model invocation settlement는 권위 evidence로 남는다.
   Settlement 반환 직후 lease authority를 다시 검사하고 stale activation의 usage accounting,
   receipt observer, model-call sidecar, model-stream close를 차단한다.
+- Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.
+- Token `deadline`과 wall-clock timeout은 `run_timeout` terminal projection을 공유한다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
 
 종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal

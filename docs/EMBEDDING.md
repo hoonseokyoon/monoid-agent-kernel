@@ -250,6 +250,11 @@ Lease loss uses the stricter ownership boundary. The runner rechecks authority i
 durable settlement and suppresses stale usage accounting, metrics, passive model-I/O delivery,
 model-call sidecars, and model-stream completion. The replacement owner recovers the stored receipt
 and publishes it without another provider dispatch.
+Treat `CancellationToken.cause` as first-cause diagnostic history and
+`CancellationToken.lease_lost` as sticky writer authority. A later lease-loss signal activates all
+write fences even when Stop or drain arrived first. Required-evidence recovery checks this authority
+before and after its lifecycle hook. Token-based deadlines use the same `run_timeout` terminal
+projection as elapsed wall-clock deadlines.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes

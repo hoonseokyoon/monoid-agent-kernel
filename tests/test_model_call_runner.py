@@ -1003,6 +1003,34 @@ def test_cancellation_releases_a_slow_adapter() -> None:
     assert time.monotonic() - started < 2.0
 
 
+def test_lease_loss_supersedes_an_earlier_stop_before_standalone_publication() -> None:
+    token = CancellationToken()
+    token.cancel(InterruptionCause.USER_CANCEL)
+    token.cancel(InterruptionCause.LEASE_LOST)
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert observer.captures == []
+    assert sidecar == []
+
+
 def test_the_token_is_read_per_call_not_captured_at_construction() -> None:
     """``AgentLoop.astream`` installs a token on a run already in progress.
 
@@ -5385,6 +5413,7 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
     class LeaseLosingLifecycle(_JournalLifecycle):
         def settled(self, settlement: ModelDispatchSettlement) -> None:
             super().settled(settlement)
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
             token.cancel(InterruptionCause.LEASE_LOST)
 
     lifecycle = LeaseLosingLifecycle(harness)
@@ -5409,6 +5438,8 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
         )
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert token.lease_lost is True
     assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
     head = lifecycle._head("call-durable-1")
     assert head is not None and head.dispatch_state == "settled"
