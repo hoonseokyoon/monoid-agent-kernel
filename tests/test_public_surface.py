@@ -411,6 +411,19 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
     ]
 
 
+def test_public_conformance_surface_exposes_fenced_sink_contract() -> None:
+    import monoid_agent_kernel.conformance as conformance
+
+    expected = {
+        "FencedRunSinkHarness",
+        "FencedRunSinkHarnessFactory",
+        "run_fenced_run_sink_contract",
+    }
+
+    assert expected <= set(conformance.__all__)
+    assert all(hasattr(conformance, name) for name in expected)
+
+
 def test_helpers_and_conveniences_are_not_root_or_contract_exports() -> None:
     import monoid_agent_kernel as root
     import monoid_agent_kernel.contracts as contracts

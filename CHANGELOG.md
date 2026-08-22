@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-23
+
 ### Added — portable production-boundary records
 
 - Added the content-free `TerminalOutcome` contract with typed retry eligibility and interruption
@@ -167,6 +169,24 @@ out in commit messages and here.
   result replay, transactional outbox staging, atomic-stage rejection, and capability gates.
   Run-limit exhaustion projects to the terminal `limited` kind with retry forbidden, preserving
   its meaning separately from cooperative pause and task-wait boundaries.
+
+### Changed — activation authority and typed interruption
+
+- Split operational cancellation from writer authority. `CancellationToken` now carries
+  `user_cancel`, `graceful_drain`, `deadline`, or `host_shutdown`; lease loss revokes the shared
+  `ActivationWriteAuthority` and wakes execution without storing lease loss on the token.
+  Cancellation cause now survives suspension, checkpoint, result, Reference projection, and
+  recovery. Reference drain closes admission before signaling live runs.
+- Workspace, recorder, tool context, model stream, observer, task, outbox, checkpoint, result, and
+  cleanup paths share activation-scoped mutation guards. A revoked activation publishes no later
+  checkpoint, event, projection, usage, or terminal result. Tool extensions receive a slotted,
+  method-only context rather than raw recorder, task, outbox, or workspace handles.
+- Reference checkpoint commits and outbox redrive use one record-bound authority seam. LocalFS and
+  SQLite stores declare single-writer capability; overlapping canonical writers use a
+  `FencedRunSink` whose adapter checks `WriterToken` owner and generation atomically with storage.
+- Added deterministic abandoned-activation races covering retained synchronous handlers, workspace
+  writes, artifact allocation, callback fan-out, model streams, task cleanup, checkpoint commits,
+  outbox commits, recovery, and terminal settlement.
 
 ## [0.21.0] - 2026-08-12
 
