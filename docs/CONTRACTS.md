@@ -2902,7 +2902,8 @@ publication. Every fenced sink mutation remains the final storage-level authorit
 Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
 `status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
 `interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
-run.
+run. A previously settled park keeps its single turn settlement; close adds the timeout terminal
+projection without emitting `turn.settled` again.
 
 ### Model evidence delivery policy
 

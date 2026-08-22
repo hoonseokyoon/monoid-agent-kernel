@@ -2194,6 +2194,7 @@ class AgentLoop:
                 session.res,
                 session,
                 RunTimeout("run exceeded max duration"),
+                project_turn=False,
             )
             return
         exc = RunCancelled("run cancelled", interruption_cause=cause)
@@ -6627,8 +6628,10 @@ class AgentLoop:
         res: _RunResources,
         session: _Session,
         exc: RunTimeout,
+        *,
+        project_turn: bool = True,
     ) -> Suspension:
-        """Project every deadline signal through one canonical terminal outcome."""
+        """Project one canonical deadline terminal without duplicating a settled turn."""
 
         state.status = "limited"
         state.error = str(exc)
@@ -6643,7 +6646,7 @@ class AgentLoop:
             error=state.error,
             error_code=state.error_code,
             interruption_cause=InterruptionCause.DEADLINE,
-            turn=self._checkpoint_on_settle(state, res),
+            turn=self._checkpoint_on_settle(state, res) if project_turn else None,
         )
         self._persist_checkpoint(session, result)
         return result

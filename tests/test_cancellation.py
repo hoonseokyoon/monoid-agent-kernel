@@ -344,6 +344,12 @@ def test_close_routes_a_parked_token_deadline_through_timeout_handling(tmp_path:
     assert result.error_code == "run_timeout"
     assert result.final_text == "Stopped after reaching max duration."
     assert result.interruption_cause is InterruptionCause.DEADLINE
+    events = [
+        json.loads(line)
+        for line in result.run_dir.joinpath("events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [event["type"] for event in events].count("turn.settled") == 1
 
 
 def test_cancel_acknowledged_at_a_midturn_park_keeps_the_stop_notice(tmp_path: Path) -> None:
