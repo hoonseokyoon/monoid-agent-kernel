@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
+from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
@@ -32,6 +33,8 @@ MODEL_INVOCATION_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
 ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = accepted_namespaced_ids("model-invocation.v1")
 MODEL_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
 ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS = accepted_namespaced_ids("model-request-digest.v1")
+LOGICAL_MODEL_CALL_GENERATION = namespaced_id("logical-model-call.v1")
+MODEL_DISPATCH_GENERATION = namespaced_id("model-dispatch.v1")
 
 DispatchState = Literal["reserved", "dispatch_started", "settled", "unknown"]
 
@@ -117,6 +120,82 @@ MODEL_INVOCATION_RECEIPT_FIELDS = frozenset(_RECEIPT_FIELDS.values())
 
 MODEL_INVOCATION_RECEIPT_USAGE_FIELDS = frozenset(_USAGE_FIELDS.values())
 """Canonical token counters accepted inside ``receipt.usage``."""
+
+
+def logical_model_call_id(run_id: str, step_id: str) -> str:
+    """Derive the content-free durable address of one AgentLoop model call."""
+
+    if not is_safe_opaque_id(run_id):
+        raise ValueError("logical model call run_id must be a bounded opaque id")
+    if not is_safe_opaque_id(step_id):
+        raise ValueError("logical model call step_id must be a bounded opaque id")
+    digest = canonical_sha256(
+        {
+            "generation": LOGICAL_MODEL_CALL_GENERATION,
+            "run_id": run_id,
+            "step_id": step_id,
+        }
+    )
+    return f"mcall_{digest}"
+
+
+def model_dispatch_id(logical_call_id: str, dispatch_attempt: int) -> str:
+    """Derive a distinct durable dispatch address for one logical-call attempt."""
+
+    if not is_safe_opaque_id(logical_call_id):
+        raise ValueError("model dispatch logical_call_id must be a bounded opaque id")
+    _require_positive_int(dispatch_attempt, "dispatch attempt")
+    digest = canonical_sha256(
+        {
+            "generation": MODEL_DISPATCH_GENERATION,
+            "logical_call_id": logical_call_id,
+            "dispatch_attempt": dispatch_attempt,
+        }
+    )
+    return f"mdispatch_{digest}"
+
+
+def model_invocation_receipt(receipt: Any) -> dict[str, Any]:
+    """Project a settled runner receipt into the public-safe durable vocabulary.
+
+    The invocation journal is public evidence. It keeps counts and taxonomy while omitting
+    invocation context, model configuration, destinations, prompt identity, redaction details,
+    and the per-attempt log. The result passes through ``_normalized_receipt`` before returning,
+    so this helper cannot produce a shape the durable record later refuses.
+    """
+
+    usage: dict[str, int] = {}
+    raw_usage = getattr(receipt, "usage", {})
+    if isinstance(raw_usage, Mapping):
+        for key, value in raw_usage.items():
+            if type(key) is not str or not is_portable_json_integer(value) or value < 0:
+                continue
+            canonical_key = _USAGE_FIELDS.get(_collapsed_receipt_key(key))
+            if canonical_key is not None:
+                usage[canonical_key] = value
+
+    projected: dict[str, Any] = {
+        "attempts": getattr(receipt, "attempts", 0),
+        "latency_ms": getattr(receipt, "latency_ms", 0),
+        "provider_retried": getattr(receipt, "provider_retried", False),
+        "retryable": getattr(receipt, "retryable", False),
+        "request_digest": getattr(receipt, "request_digest", ""),
+        "usage": usage,
+    }
+    for source, target in (
+        ("stop_reason", "stop_reason"),
+        ("provider_error_code", "provider_error_code"),
+    ):
+        value = getattr(receipt, source, "")
+        if is_safe_taxonomy_code(value):
+            projected[target] = value
+    http_status = getattr(receipt, "http_status", None)
+    if type(http_status) is int and 100 <= http_status <= 599:
+        projected["http_status"] = http_status
+    normalized = _normalized_receipt(projected)
+    if normalized is None:  # pragma: no cover - the projection above is always a mapping
+        raise AssertionError("durable model invocation receipt projection disappeared")
+    return normalized
 
 
 def _collapsed_receipt_key(key: str) -> str:
@@ -378,8 +457,13 @@ __all__ = [
     "ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS",
     "MODEL_REQUEST_DIGEST_GENERATION",
     "ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS",
+    "LOGICAL_MODEL_CALL_GENERATION",
+    "MODEL_DISPATCH_GENERATION",
     "DispatchState",
     "DurableModelInvocation",
     "MODEL_INVOCATION_CODEC",
     "decode_model_invocation",
+    "logical_model_call_id",
+    "model_dispatch_id",
+    "model_invocation_receipt",
 ]

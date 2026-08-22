@@ -6696,6 +6696,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # is restamped (`mark_provider_usage`) with the merged total, so the loop's
             # failure accounting sees the whole call, not the last attempt.
             "model_call.py",
+            # Joined in v0.22 PR3: durable settlement and unknown-write failures preserve
+            # already-reported paid usage on the escaping durable boundary error.
+            "model_lifecycle.py",
             "providers/base.py",
             "providers/gateway.py",
             # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in
