@@ -920,6 +920,8 @@ def cancel(self, cause: InterruptionCause = InterruptionCause.USER_CANCEL) -> No
 
 첫 cause가 승리한다. 후속 cancel은 event를 다시 set하지 않고 cause를 덮어쓰지 않는다.
 기존 no-argument caller는 `user_cancel` 의미를 유지한다.
+CancellationToken은 `user_cancel | graceful_drain | lease_lost | deadline | host_shutdown`만
+받는다. provider/validation/unknown cause는 failure/outcome 분류에 남고 token ingress에서 거부한다.
 Lease authority는 cause와 별도인 sticky 상태다. 후속 `lease_lost` 신호는 최초 cause를 보존하면서
 모든 mutation fence를 활성화하고, stale activation의 반환 observation은 `lease_lost`를 사용한다.
 

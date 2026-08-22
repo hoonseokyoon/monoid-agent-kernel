@@ -2868,6 +2868,9 @@ fencing through the host-owned sink. It contains no database, queue, or Temporal
 accepted cause wins; later cancellation requests are no-ops, including callbacks.
 The no-argument call retains the `user_cancel` behavior. Checkpoint capture reads the request flag
 and cause atomically; a pending token cause takes precedence over the prior park's state cause.
+The token accepts the operational subset `user_cancel | graceful_drain | lease_lost | deadline |
+host_shutdown`. `provider_failure | validation_failure | unknown` belong to failure and portable
+outcome classification; token ingress rejects them before changing state or firing callbacks.
 Writer authority is tracked independently: any `cancel(LEASE_LOST)` call makes
 `CancellationToken.lease_lost` sticky even when another interruption cause arrived first. Every
 mutation boundary reads that authority flag, and the returned in-memory observation uses

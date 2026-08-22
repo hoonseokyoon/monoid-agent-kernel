@@ -6,6 +6,16 @@ from dataclasses import dataclass, field
 
 from monoid_agent_kernel.core.interruption import InterruptionCause
 
+_OPERATIONAL_CANCELLATION_CAUSES = frozenset(
+    {
+        InterruptionCause.USER_CANCEL,
+        InterruptionCause.GRACEFUL_DRAIN,
+        InterruptionCause.LEASE_LOST,
+        InterruptionCause.DEADLINE,
+        InterruptionCause.HOST_SHUTDOWN,
+    }
+)
+
 
 @dataclass
 class CancellationToken:
@@ -24,6 +34,9 @@ class CancellationToken:
             cause = InterruptionCause(cause)
         except (TypeError, ValueError) as exc:
             raise ValueError("cancellation cause is outside the portable vocabulary") from exc
+        if cause not in _OPERATIONAL_CANCELLATION_CAUSES:
+            allowed = ", ".join(sorted(item.value for item in _OPERATIONAL_CANCELLATION_CAUSES))
+            raise ValueError(f"cancellation cause must be operational: {allowed}")
         with self._lock:
             # The first interruption cause remains diagnostic history. Lease authority is an
             # independent safety fact and becomes sticky even when another cause arrived first.

@@ -87,6 +87,29 @@ def test_first_interruption_cause_wins_while_lease_authority_is_independent() ->
     assert token.lease_lost is True
 
 
+@pytest.mark.parametrize(
+    "cause",
+    (
+        InterruptionCause.PROVIDER_FAILURE,
+        InterruptionCause.VALIDATION_FAILURE,
+        InterruptionCause.UNKNOWN,
+    ),
+)
+def test_cancellation_token_rejects_failure_causes_without_mutating_state(
+    cause: InterruptionCause,
+) -> None:
+    token = CancellationToken()
+    callbacks: list[str] = []
+    token.add_cancel_callback(lambda: callbacks.append("called"))
+
+    with pytest.raises(ValueError, match="cancellation cause must be operational"):
+        token.cancel(cause)
+
+    assert token.snapshot() == (False, None)
+    assert token.lease_lost is False
+    assert callbacks == []
+
+
 def test_cancellation_snapshot_pairs_the_request_with_its_winning_cause() -> None:
     token = CancellationToken()
     assert token.snapshot() == (False, None)
