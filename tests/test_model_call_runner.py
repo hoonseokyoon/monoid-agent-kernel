@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -1005,8 +1006,10 @@ def test_cancellation_releases_a_slow_adapter() -> None:
 
 def test_lease_loss_supersedes_an_earlier_stop_before_standalone_publication() -> None:
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
     token.cancel(InterruptionCause.USER_CANCEL)
-    token.cancel(InterruptionCause.LEASE_LOST)
+    authority.revoke()
     observer = RecordingObserver()
     sidecar: list[SettledModelCall] = []
 
@@ -1015,6 +1018,7 @@ def test_lease_loss_supersedes_an_earlier_stop_before_standalone_publication() -
             ModelCallRunner(
                 adapter=SyncAdapter(),
                 current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
                 subscriptions=(
                     ModelIOSubscription(
                         observer=observer,
@@ -5287,12 +5291,14 @@ def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
 ) -> None:
     harness = DeterministicFencedRunHarness()
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
 
     class LeaseLosingLifecycle(_JournalLifecycle):
         def _lose_authority(self, transition: str) -> None:
             if transition == lose_after:
                 token.cancel(InterruptionCause.USER_CANCEL)
-                token.cancel(InterruptionCause.LEASE_LOST)
+                authority.revoke()
 
         def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
             effective = super().reserve(proposed)
@@ -5314,6 +5320,7 @@ def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
                 adapter=adapter,
                 lifecycle_hook=lifecycle,
                 current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
                 subscriptions=(
                     ModelIOSubscription(
                         observer=observer,
@@ -5467,12 +5474,14 @@ def test_durable_success_commits_the_canonical_private_result_before_passive_del
 def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars() -> None:
     harness = DeterministicFencedRunHarness()
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
 
     class LeaseLosingLifecycle(_JournalLifecycle):
         def settled(self, settlement: ModelDispatchSettlement) -> None:
             super().settled(settlement)
             token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-            token.cancel(InterruptionCause.LEASE_LOST)
+            authority.revoke()
 
     lifecycle = LeaseLosingLifecycle(harness)
     adapter = _CountingDurableAdapter()
@@ -5485,6 +5494,7 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
                 adapter=adapter,
                 lifecycle_hook=lifecycle,
                 current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
                 subscriptions=(
                     ModelIOSubscription(
                         observer=observer,
@@ -5497,7 +5507,7 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
-    assert token.lease_lost is True
+    assert authority.revoked is True
     assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
     head = lifecycle._head("call-durable-1")
     assert head is not None and head.dispatch_state == "settled"
@@ -5507,6 +5517,8 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
 
 def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None:
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
     entered, release = threading.Event(), threading.Event()
     first_captures: list[ModelCallCapture] = []
 
@@ -5522,7 +5534,7 @@ def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None
     def lose_authority() -> None:
         assert entered.wait(5)
         token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        authority.revoke()
         release.set()
 
     racer = threading.Thread(target=lose_authority)
@@ -5532,6 +5544,7 @@ def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None
             ModelCallRunner(
                 adapter=SyncAdapter(),
                 current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
                 subscriptions=(
                     ModelIOSubscription(
                         observer=BlockingObserver(),
@@ -5557,6 +5570,8 @@ def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None
 def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensation() -> None:
     harness = DeterministicFencedRunHarness()
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
     lifecycle = _JournalLifecycle(harness)
 
     class RacingAdapter:
@@ -5567,7 +5582,7 @@ def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensati
                 "run cancelled",
                 interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
             )
-            token.cancel(InterruptionCause.LEASE_LOST)
+            authority.revoke()
             raise stale_exception
 
     observer = RecordingObserver()
@@ -5579,6 +5594,7 @@ def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensati
                 adapter=RacingAdapter(),
                 lifecycle_hook=lifecycle,
                 current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
                 subscriptions=(
                     ModelIOSubscription(
                         observer=observer,
@@ -5591,7 +5607,7 @@ def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensati
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
-    assert token.lease_lost is True
+    assert authority.revoked is True
     assert lifecycle.states == ["reserved", "dispatch_started"]
     head = lifecycle._head("call-durable-1")
     assert head is not None and head.dispatch_state == "dispatch_started"

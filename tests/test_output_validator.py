@@ -592,7 +592,7 @@ def test_lease_loss_during_output_validation_precedes_settle_projection(
             checkpoint_before_loss = (
                 None if stored is None else stored.checkpoint.to_json()
             )
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
         finally:
             release.set()
         suspension = pending.result(timeout=5)

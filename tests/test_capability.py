@@ -447,12 +447,12 @@ def _redispatch_loop(
 
 
 def _capability_task_count(loop: AgentLoop) -> int:
-    jobs = loop._session.res.context.job_manager.jobs  # type: ignore[union-attr]
+    jobs = loop._session.res.context._job_manager.jobs  # type: ignore[union-attr]
     return sum(1 for job in jobs.values() if job.kind == "capability")
 
 
 def _hosted_task_count(loop: AgentLoop, kind: str) -> int:
-    jobs = loop._session.res.context.job_manager.jobs  # type: ignore[union-attr]
+    jobs = loop._session.res.context._job_manager.jobs  # type: ignore[union-attr]
     return sum(1 for job in jobs.values() if job.kind == kind)
 
 

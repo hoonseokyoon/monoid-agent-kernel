@@ -920,10 +920,19 @@ def cancel(self, cause: InterruptionCause = InterruptionCause.USER_CANCEL) -> No
 
 첫 cause가 승리한다. 후속 cancel은 event를 다시 set하지 않고 cause를 덮어쓰지 않는다.
 기존 no-argument caller는 `user_cancel` 의미를 유지한다.
-CancellationToken은 `user_cancel | graceful_drain | lease_lost | deadline | host_shutdown`만
-받는다. provider/validation/unknown cause는 failure/outcome 분류에 남고 token ingress에서 거부한다.
-Lease authority는 cause와 별도인 sticky 상태다. 후속 `lease_lost` 신호는 최초 cause를 보존하면서
-모든 mutation fence를 활성화하고, stale activation의 반환 observation은 `lease_lost`를 사용한다.
+CancellationToken은 `user_cancel | graceful_drain | deadline | host_shutdown`만 받는다.
+`lease_lost | provider_failure | validation_failure | unknown`은 portable outcome 분류에 남고 token
+ingress에서 거부한다.
+
+Lease authority는 `ActivationWriteAuthority`가 담당한다. Host는 writer ownership이 이동하면
+`revoke()` 또는 `AgentLoop.lose_writer_authority()`를 호출한다. Revocation은 sticky, thread-safe,
+idempotent이며 loop의 내부 wake signal을 활성화한다. 먼저 기록된 cancellation cause는 유지된다.
+Stale activation의 반환 observation은 session state를 바꾸지 않는 `lease_lost` suspension이다.
+
+`ActivationWriteAuthority`는 프로세스 내부 capability다. `WriterToken(run_id, owner_id,
+generation)`은 durable store가 mutation과 원자적으로 검증하는 identity다. AgentLoop가 생성하거나
+host가 주입한 authority 한 개를 workspace, ToolContext, recorder, EventBus, TaskManager, model runner,
+observer가 공유한다.
 
 처리 규칙은 다음과 같다.
 
@@ -932,7 +941,7 @@ Lease authority는 cause와 별도인 sticky 상태다. 후속 `lease_lost` 신�
 | `user_cancel` | terminal cancelled | 현재 writer token으로 terminal settle 시도 |
 | `graceful_drain` | partial state를 safe park로 만들고 interrupted 반환 | checkpoint 허용, terminal 정책은 host 결정 |
 | `host_shutdown` | graceful drain과 같은 handoff 기본값 | checkpoint 허용 |
-| `lease_lost` | 즉시 실행 중단, in-memory interrupted outcome 반환 | usage/metric/observer/sidecar/checkpoint/event/projection/terminal 금지 |
+| authority revoke (`lease_lost`) | 즉시 실행 중단, ephemeral interrupted outcome 반환 | usage/metric/observer/sidecar/checkpoint/event/projection/terminal 금지 |
 | `deadline` | timed-out terminal outcome | 현재 writer token이 유효할 때만 settle |
 
 `Suspension`, `AgentTurnResult`, `AgentRunResult`, `RunState`, checkpoint의 additive tail field로 cause를
@@ -940,8 +949,8 @@ Lease authority는 cause와 별도인 sticky 상태다. 후속 `lease_lost` 신�
 해석한다.
 
 Reference backend의 `drain()`은 `graceful_drain`을 사용한다. 외부 `cancel_run`과
-`LoopSession.cancel()`은 `user_cancel`을 사용한다. Lease watcher를 가진 host adapter는
-`lease_lost`를 사용한다.
+`LoopSession.cancel()`은 `user_cancel`을 사용한다. Lease watcher를 가진 host adapter는 token을
+취소하지 않고 activation authority를 revoke한다.
 
 ## 10. Deterministic conformance
 
@@ -1155,17 +1164,22 @@ local store로 우회하지 않으며, 손상된 invocation/result가 provider �
 종료 조건: evidence failure가 provider 호출을 반복하지 않고, park 전 crash도 settled step의 required
 evidence를 다음 step 뒤에 남기지 않는다.
 
-### PR 6 — Typed interruption
+### PR 6 — Typed interruption and activation write authority
 
 - cancellation cause round-trip
-- user cancel, graceful drain, lease loss 분기
+- `CancellationToken` 실행 중단과 `ActivationWriteAuthority` 쓰기 권한 분리
+- authority-bound workspace, ToolContext, recorder, event, task, observer
+- fenced sink 결과 공통 해석과 authority revoke
 - Reference backend drain adoption
-- Stop/completion/lease-loss race test
+- Stop/completion/lease-loss와 A/B activation race test
 
 구현 계약:
 
-- cancellation cause는 first-writer-wins이며 checkpoint, suspension, result, event, metrics,
+- cancellation cause는 first-writer-wins이며 `user_cancel | graceful_drain | deadline |
+  host_shutdown`만 token이 받는다. Checkpoint, suspension, result, event, metrics,
   status projection을 같은 값으로 통과한다.
+- `lease_lost`는 portable vocabulary에 남고 public `CancellationToken.cancel()` ingress에서는
+  거부된다. Host는 authority의 `revoke()`/`lose_writer_authority()`만 사용한다.
 - `graceful_drain`과 `host_shutdown`은 checkpoint 가능한 non-terminal interrupt를 만든다.
   Reference backend는 admission barrier를 먼저 닫고, 이 park를 terminal close로 정리한다.
 - `lease_lost` activation은 in-memory park만 반환하며 checkpoint, event, projection, terminal을
@@ -1175,7 +1189,7 @@ evidence를 다음 step 뒤에 남기지 않는다.
   Reference host는 suspension projection 전에 이 park를 감지한다. autonomous, streaming,
   recovery 실행은 activation을 discard하고 result/failure/stream frame/close를 생략하며,
   identity-matched local record를 해제해 stale status/heartbeat/recovery 차단을 끝낸다.
-  `RunCancelled` handler도 exception의 과거 cause를 읽기 전에 sticky lease authority를 다시
+  `RunCancelled` handler도 exception의 과거 cause를 읽기 전에 shared write authority를 다시
   확인한다. model-call dispatch compensation과 stream close도 같은 현재 authority를 읽으며,
   stale cancellation의 usage stamp를 stale activation accounting으로 전달하지 않는다.
   output validator, tool handler, child agent await 뒤에는 run boundary를 다시 확인하고,
@@ -1195,17 +1209,32 @@ evidence를 다음 step 뒤에 남기지 않는다.
   handle만 해제한다.
   Private model-content writer와 각 custom stream observer writer도 open callback마다 전·후
   authority를 확인한다. Open 중 lease를 잃으면 뒤 writer open과 provider dispatch를 시작하지 않는다.
-  turn settle과 run finalization은 하나의 common projection writer를 사용한다. proposal, metrics,
+  turn settle과 run finalization은 공통 authority guard를 사용한다. Proposal, metrics,
   settled text, event write를 각각 전·후 fencing하며 EventBus도 emit/close sink별로 authority를
-  확인한다. TaskManager는 cancel_all 내부의 각 job cancellation 전·후에 같은 fence를 적용한다.
+  확인한다. TaskManager는 정상 shutdown에서 각 job cancellation에 authority를 적용한다. Stale
+  discard는 in-process handle과 executor만 정리하고 marker/event/projection을 쓰지 않는다.
   AgentRecorder는 proposal revision의 diff/file/manifest와 settled text의 transcript/content
   sidecar 사이를 추가로 fencing한다. Final recorder close와 completed checkpoint delete도 전·후에
   authority를 재검사한다.
+  Abandon된 synchronous tool handler가 뒤늦게 재개될 수 있으므로 AgentToolContext의 상태 변경과
+  kernel-managed side effect 진입점은 shared authority를 자체 검사한다. Raw recorder, TaskManager,
+  service, outbox dependency는 private field이며 공식 ToolContext method만 extension에 제공한다.
+  `AuthorityBoundWorkspace`가 read와 모든 write API를 검사한다. Artifact, plan, finish, shell/web,
+  task/job, skill activation, tool-search load request, outbox staging을 포함한다.
+  AgentRecorder의 artifact writer는 같은 fence를 반복하고 artifact directory를 원자적으로 선점해
+  recovered owner와 late prior owner의 동일 path overwrite를 막는다.
+  Model-call ledger와 replay payload recorder는 lazy handle open, append, chunk publication,
+  request/response nested write 사이에서 authority를 재검사한다. Best-effort diagnostic exception
+  containment은 lease-loss control flow를 다시 발생시킨다.
   drain은 admission quiesce, terminal 판정, cancellation, cause stamp를 한 backend lock 구간에서
   수행하고 cancellation callback 뒤 terminal 상태를 다시 확인한다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는
   dispatch-start를 막고, dispatch-start 뒤 loss는 provider 진입을 막는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.
+- Checkpoint, invocation, evidence commit은 공통 result interpreter를 사용한다. `committed`와
+  `already_committed`는 진행하고, `conflict`는 기존 storage 오류를 보존한다. `fenced`는 authority를
+  즉시 revoke하고 `WriteAuthorityRevoked`를 발생시킨다. 알 수 없는 status는 adapter contract
+  오류다. Host event/terminal adapter도 같은 규칙을 따른다.
 - Token `deadline`과 wall-clock timeout은 `run_timeout` terminal projection을 공유한다.
   Settled park의 close는 기존 turn settlement를 재실행하지 않는다.
 - Model stream 종료 상태도 typed cause를 따른다. `user_cancel`은 `cancelled`, `deadline`은
@@ -1218,6 +1247,23 @@ evidence를 다음 step 뒤에 남기지 않는다.
 - unknown non-empty cause도 shared portable-cause parser에서 거부하며 live status, offline,
   backend projection이 모두 현재 cause 없음으로 읽는다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
+
+Mutation inventory와 보호 경계:
+
+| 표면 | 보호 | revoke 이후 |
+|---|---|---|
+| plan, finish, counters, outbox staging | `guard_local_mutation` | 새 mutation 거부 |
+| workspace API | `AuthorityBoundWorkspace` | 새 read/write 거부 |
+| recorder, event, artifact, sidecar | shared authority | 새 append/open/write 거부 |
+| checkpoint, invocation, evidence | store의 `WriterToken` fence | `fenced`가 activation revoke |
+| canonical event와 terminal | host adapter의 `WriterToken` fence | stale write 거부 |
+| observer, sink, extension callback | callback별 `guard_external_call` | 현재 callback 뒤 publication 중단 |
+| shell, MCP, memory, custom effect | 전·후 authority + adapter 계약 | 시작한 effect는 완료 가능, 결과 publication 금지 |
+| stale cleanup | activation-owned handle/process 정리 | event/marker/projection/terminal 금지 |
+
+PR 6은 PostgreSQL/ObjectStore adapter, Temporal, AgentLoop의 canonical event/terminal sink 연결,
+activation별 전체 run directory, 이미 시작된 외부 효과의 강제 중단, Python extension sandbox,
+LocalFS multi-process 승격을 포함하지 않는다.
 
 종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal
 mutation을 만들지 않는다.
