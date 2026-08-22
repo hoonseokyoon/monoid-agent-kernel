@@ -1329,6 +1329,9 @@ class _Session:
     # Fingerprint of the last checkpoint writer success. ``release_parked`` compares current
     # checkpointable state against it so uncommitted mutations cannot be silently discarded.
     persisted_checkpoint_sha256: str | None = None
+    # Hosted tasks owned by that committed boundary. Active failure cleanup preserves these and
+    # cancels later tasks; revoked cleanup publishes no hosted cancellation at all.
+    persisted_hosted_task_ids: set[str] = field(default_factory=set)
     active_input: dict[str, Any] | None = None
     applied_input_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Correlation for the model turn currently being pumped. Deliberately activation-local rather
@@ -2658,7 +2661,11 @@ class AgentLoop:
         cleanup_errors: list[BaseException] = []
         if resources is not None:
             try:
-                resources.context._job_manager.discard_uncommitted()
+                resources.context._job_manager.discard_uncommitted(
+                    preserve_hosted_task_ids=(
+                        session.persisted_hosted_task_ids if session is not None else set()
+                    )
+                )
             except BaseException as exc:  # cleanup continues through every owned resource
                 cleanup_errors.append(exc)
             try:
@@ -3572,6 +3579,11 @@ class AgentLoop:
             for input_id, receipt in checkpoint.applied_input_receipts.items()
         }
         session.persisted_checkpoint_sha256 = _checkpoint_state_sha256(checkpoint)
+        session.persisted_hosted_task_ids = {
+            str(task.get("task_id") or task.get("job_id") or "")
+            for task in checkpoint.hosted_tasks
+            if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
+        }
 
     @staticmethod
     def _workspace_delta_entries(workspace: Workspace) -> list[dict[str, Any]]:
@@ -3812,6 +3824,11 @@ class AgentLoop:
                 input_id: dict(receipt) for input_id, receipt in cp.applied_input_receipts.items()
             },
             persisted_checkpoint_sha256=_checkpoint_state_sha256(cp),
+            persisted_hosted_task_ids={
+                str(task.get("task_id") or task.get("job_id") or "")
+                for task in cp.hosted_tasks
+                if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
+            },
             last_model_invocation=restored_invocation,
             model_tool_calls_pending=bool(
                 isinstance(cp.last_suspension, Mapping)

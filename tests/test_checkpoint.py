@@ -169,11 +169,31 @@ def test_release_parked_rejects_uncommitted_state_and_leaves_hosted_cleanup_to_h
     assert raised.value.error_code == "run_not_durably_parked"
     assert _latest_checkpoint(spec).hosted_tasks == []  # type: ignore[union-attr]
     loop.discard_uncommitted()
-    assert uncommitted_task.status == "running"
-    assert not uncommitted_task.cancel_path.exists()  # type: ignore[union-attr]
+    assert uncommitted_task.status == "cancelled"
+    assert uncommitted_task.cancel_path.exists()  # type: ignore[union-attr]
     assert recorder._transcript_file.closed is True
     assert loop._session is None
     assert loop._owned_loop is None
+
+
+def test_revoked_discard_does_not_publish_hosted_task_cancellation(tmp_path: Path) -> None:
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="park")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    loop.run_until_suspended("hold here")
+    task_id = loop.create_task("hitl", {"prompt": "stale"})
+    assert loop._session is not None
+    task = loop._session.res.context._job_manager.get_job(task_id)
+
+    loop.lose_writer_authority()
+    loop.discard_uncommitted()
+
+    assert task.status == "running"
+    assert task.cancel_path.exists() is False
 
 
 def test_discard_preserves_hosted_task_from_last_committed_checkpoint(tmp_path: Path) -> None:
@@ -394,7 +414,8 @@ def test_discard_attempts_all_cleanup_after_task_cleanup_failure(
     recorder = loop._session.res.recorder  # type: ignore[union-attr]
     manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
 
-    def fail_task_cleanup() -> None:
+    def fail_task_cleanup(*, preserve_hosted_task_ids: set[str]) -> None:
+        del preserve_hosted_task_ids
         raise RuntimeError("task cleanup failed")
 
     monkeypatch.setattr(manager, "discard_uncommitted", fail_task_cleanup)

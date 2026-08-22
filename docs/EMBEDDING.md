@@ -265,6 +265,10 @@ continue after an activation loses authority.
 Revocation synchronously disables the recorder's private model-content store. Stale activation
 cleanup cancels pending flush timers, drops buffered deltas, and closes its handle without appending
 segments or a stream terminal record.
+Ordinary cleanup while authority remains active cancels hosted tasks created after the last
+committed checkpoint and writes their normal cancel marker. It preserves hosted tasks already
+owned by that checkpoint. Revoked cleanup releases in-process handles only and delegates hosted
+task cancellation to the fenced/idempotent host adapter.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes

@@ -1427,13 +1427,59 @@ class TaskManager:
         finally:
             self._shutdown_task_loop()
 
-    def discard_uncommitted(self) -> None:
-        """Release activation-owned process handles without publishing cleanup state.
+    def discard_uncommitted(self, *, preserve_hosted_task_ids: set[str]) -> None:
+        """Discard work while preserving the latest committed hosted-task ownership.
 
-        Hosted cancellation is an external effect and belongs to a fenced/idempotent host
-        adapter. The kernel only terminates work it owns in this process. It does not append a
-        cancel marker, event, projection, or terminal mutation while discarding stale state.
+        An active activation cancels newly-created hosted tasks through the ordinary task API, so
+        its external worker observes the cancel marker. A revoked activation takes the local-only
+        path and leaves hosted cleanup to its fenced/idempotent host adapter.
         """
+
+        if not self.write_authority.revoked:
+            try:
+                self._cancel_active_uncommitted(preserve_hosted_task_ids)
+                return
+            except WriteAuthorityRevoked:
+                # Authority may move between selecting work and cancelling it. From that point on
+                # this activation may release process-owned resources only.
+                pass
+        self._discard_revoked_handles()
+
+    def _cancel_active_uncommitted(self, preserve_hosted_task_ids: set[str]) -> None:
+        with self._condition:
+            job_ids: list[str] = []
+            for job_id, job in self.jobs.items():
+                if job.status != "running":
+                    continue
+                executor = self.executors.get(job.kind)
+                in_process = bool(executor is not None and executor.in_process)
+                if in_process or job_id not in preserve_hosted_task_ids:
+                    job_ids.append(job_id)
+        cleanup_errors: list[BaseException] = []
+        try:
+            for job_id in job_ids:
+                try:
+                    self.cancel(job_id)
+                except WriteAuthorityRevoked:
+                    raise
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with self._condition:
+                    if all(self.jobs[job_id].status != "running" for job_id in job_ids):
+                        break
+                time.sleep(0.05)
+        finally:
+            try:
+                self._shutdown_task_loop()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    def _discard_revoked_handles(self) -> None:
+        """Release only in-process handles and publish no stale cleanup state."""
 
         with self._condition:
             jobs = [
