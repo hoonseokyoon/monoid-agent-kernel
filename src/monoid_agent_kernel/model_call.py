@@ -273,16 +273,20 @@ def _recovered_receipt(
         ) from exc
 
 
-def _recovered_result_matches_receipt(
+def _recovered_result_matches_evidence(
     turn: ModelTurn,
-    receipt: ModelCallReceipt,
+    evidence: Mapping[str, Any],
 ) -> bool:
-    stop_reason = turn.stop_reason or ""
-    return (
-        dict(turn.usage) == dict(receipt.usage)
-        and stop_reason == receipt.stop_reason
-        and turn.provider_retried is receipt.provider_retried
-    )
+    """Compare only facts preserved by both durable projections.
+
+    The public receipt describes the whole logical call, including usage absorbed by kernel
+    retries and provider-retry evidence folded across attempts. The private result describes the
+    final provider turn. Their usage and retry fields intentionally have different meanings. A
+    public-safe stop reason, when present, is the one shared result fact that can be compared.
+    Blob-address verification and ``durable_model_turn`` validate the private result itself.
+    """
+
+    return "stop_reason" not in evidence or (turn.stop_reason or "") == evidence["stop_reason"]
 
 
 def _safe_repr(value: Any) -> str:
@@ -828,7 +832,7 @@ class ModelCallRunner:
                                 provider_retried=receipt.provider_retried,
                             )
                         turn = durable_model_turn(recovered.result_blob)
-                        if not _recovered_result_matches_receipt(turn, receipt):
+                        if not _recovered_result_matches_evidence(turn, recovered.receipt):
                             raise DurableModelCallError(
                                 "durable model result conflicts with its receipt",
                                 error_code="durable_invocation_result_corrupt",

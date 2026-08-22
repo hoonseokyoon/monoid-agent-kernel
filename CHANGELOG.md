@@ -84,15 +84,18 @@ out in commit messages and here.
   persistence, and sends every checkpoint through the fenced sink without a local fallback. The
   default in-process path and lazy root import remain unchanged.
 - Added the host-side `FencedModelCallLifecycle` adapter. AgentLoop now derives stable logical-call
-  IDs from run/turn coordinates, reuses a committed reservation key, turns a restored
+  IDs from durable run/turn coordinates independently of caller provenance, reuses a committed
+  reservation key, turns a restored
   `dispatch_started` head into `dispatch_unknown`, and refuses every automatic paid-call retry from
   an unknown head. Request-digest mismatch, corrupt records, unsupported records, missing result
   bytes, and digest mismatches fail before provider entry.
 - Added canonical replay of settled success and failure. Successful recovery verifies and decodes
   the private recorded-turn blob with `ModelTurn.raw` removed. Failed recovery reconstructs the
   typed refusal from safe receipt evidence, including configuration recoverability and billed
-  usage, without restoring provider exception text. Passive model-I/O consumers receive the
-  recovered settlement once.
+  usage, without restoring provider exception text. Public receipt accounting preserves the full
+  logical-call usage across kernel retries, including cache-creation and audio tokens, while the
+  private result retains final-turn evidence. Passive model-I/O consumers receive the recovered
+  settlement once.
 - Added AgentLoop crash-injection coverage for reserved, dispatch-started, successful settled, and
   failed settled heads, plus request drift, unreadable heads, tampered result bytes, fenced
   checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call

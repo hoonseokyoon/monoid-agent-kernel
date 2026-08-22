@@ -2786,10 +2786,12 @@ and the sink must declare `lease_fencing`, `durable_checkpoints`, and `durable_i
 the existing local checkpoint behavior and does not import the hosting package during a root or
 core-only import.
 
-AgentLoop derives each logical call from its durable run and turn coordinates. Restoring the same
-checkpoint recreates the same next turn coordinate, so the new activation queries the same
-invocation head after it computes the canonical request digest. The host adapter applies this
-table before provider entry:
+AgentLoop derives each logical call from `AgentRunSpec.run_id` and the durable `turn_XXXX`
+coordinate backed by checkpoint `session_step`. Caller-supplied `InvocationContext.step_id` remains
+observability provenance and cannot change the recovery address. Restoring the same checkpoint
+recreates the same next turn coordinate, so the new activation queries the same invocation head
+after it computes the canonical request digest. The host adapter applies this table before provider
+entry:
 
 | Authoritative head | Recovery action | Provider calls during recovery |
 |---|---|---:|
@@ -2802,11 +2804,15 @@ table before provider entry:
 
 Every existing head must match the current request digest and digest generation. A mismatch raises
 `durable_invocation_request_conflict` before provider entry. Corrupt and unsupported invocation
-heads fail closed. Successful result recovery verifies the `blob:<sha256>` address, blob bytes,
-strict recorded-turn shape, usage, stop reason, and provider-retry evidence. Recovered turns contain
-an empty `raw` mapping. Failed result recovery preserves the failure code, provider code, HTTP
-status, retryability, configuration recoverability, provider-retry fact, and usage recorded in the
-public-safe receipt. Provider exception text is never reconstructed.
+heads fail closed. Successful result recovery verifies the `blob:<sha256>` address, blob bytes, and
+strict recorded-turn shape. It compares stop reason when that fact survived the public-safe receipt
+projection. Recovered turns contain an empty `raw` mapping. The public receipt describes the whole
+logical call, including usage absorbed by kernel retries and provider-retry evidence folded across
+attempts. The private result describes the final provider turn. Recovery keeps these two evidence
+scopes separate, and run accounting consumes the public receipt's canonical usage counters,
+including `cache_creation_tokens` and `audio_tokens`. Failed result recovery preserves the failure
+code, provider code, HTTP status, retryability, configuration recoverability, provider-retry fact,
+and usage recorded in the public-safe receipt. Provider exception text is never reconstructed.
 
 Every non-task suspension commits its checkpoint through `FencedRunSink.commit_checkpoint()`.
 AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,

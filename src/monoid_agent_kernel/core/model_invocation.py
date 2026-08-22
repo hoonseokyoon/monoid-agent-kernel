@@ -109,7 +109,9 @@ _RECEIPT_DURATION_FIELDS = frozenset({"duration_ms", "latency_ms"})
 _USAGE_FIELDS = {
     "audioinputtokens": "audio_input_tokens",
     "audiooutputtokens": "audio_output_tokens",
+    "audiotokens": "audio_tokens",
     "cachedinputtokens": "cached_input_tokens",
+    "cachecreationtokens": "cache_creation_tokens",
     "cachereadtokens": "cache_read_tokens",
     "cachewritetokens": "cache_write_tokens",
     "inputtokens": "input_tokens",

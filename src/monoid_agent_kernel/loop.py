@@ -2412,7 +2412,7 @@ class AgentLoop:
                 delta_consumer=delta_consumer,
                 should_abort=should_abort,
                 logical_call_id=(
-                    logical_model_call_id(self.spec.run_id, invocation_context.step_id)
+                    logical_model_call_id(self.spec.run_id, turn_id)
                     if runner.lifecycle_hook is not None
                     else ""
                 ),

@@ -359,7 +359,9 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
             "usage": {
                 "audioInputTokens": 1,
                 "audioOutputTokens": 2,
+                "audioTokens": 3,
                 "cachedInputTokens": 3,
+                "cacheCreationTokens": 4,
                 "cacheReadTokens": 4,
                 "cacheWriteTokens": 5,
                 "inputTokens": 6,
@@ -395,7 +397,9 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
     assert set(invocation.receipt["usage"]) == {
         "audio_input_tokens",
         "audio_output_tokens",
+        "audio_tokens",
         "cached_input_tokens",
+        "cache_creation_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
         "input_tokens",

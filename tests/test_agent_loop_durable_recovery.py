@@ -13,11 +13,12 @@ import pytest
 from support.fenced_hosting import DeterministicFencedRunHarness
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
     logical_model_call_id,
 )
-from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
     AgentConfigError,
     DurableModelCallError,
@@ -58,6 +59,7 @@ class _ScriptedAdapter:
 class _CrashAfterInvocationCommit:
     inner: Any
     target_state: str
+    target_failure_code: str | None = None
     armed: bool = True
 
     @property
@@ -80,6 +82,10 @@ class _CrashAfterInvocationCommit:
             self.armed
             and result.status in {"committed", "already_committed"}
             and invocation.dispatch_state == self.target_state
+            and (
+                self.target_failure_code is None
+                or invocation.failure_code == self.target_failure_code
+            )
         ):
             self.armed = False
             raise _HardCrash(invocation.dispatch_state)
@@ -147,14 +153,17 @@ def _loop(
     sink: Any,
     writer_token: WriterToken,
     checkpoint_persist_callback: Any = None,
+    invocation_context: InvocationContext | None = None,
+    model: ModelConfig | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         spec=_spec(tmp_path),
         model_adapter=adapter,
-        runtime_config_provider=runtime_provider(runtime_config()),
+        runtime_config_provider=runtime_provider(runtime_config(model=model)),
         run_sink=sink,
         writer_token=writer_token,
         checkpoint_persist_callback=checkpoint_persist_callback,
+        invocation_context=invocation_context,
     )
 
 
@@ -165,13 +174,22 @@ def _crash_at(
     state: str,
     *,
     user_input: str = "hello",
+    invocation_context: InvocationContext | None = None,
+    target_failure_code: str | None = None,
+    model: ModelConfig | None = None,
 ):
     token = harness.claim_writer(RUN_ID, "worker-1")
     loop = _loop(
         tmp_path,
         adapter,
-        sink=_CrashAfterInvocationCommit(harness.sink, state),
+        sink=_CrashAfterInvocationCommit(
+            harness.sink,
+            state,
+            target_failure_code=target_failure_code,
+        ),
         writer_token=token,
+        invocation_context=invocation_context,
+        model=model,
     )
     loop.open()
     baseline = loop.snapshot()
@@ -196,6 +214,8 @@ def _restore(
     *,
     user_input: str = "hello",
     sink: Any = None,
+    invocation_context: InvocationContext | None = None,
+    model: ModelConfig | None = None,
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -203,6 +223,8 @@ def _restore(
         adapter,
         sink=harness.sink if sink is None else sink,
         writer_token=token,
+        invocation_context=invocation_context,
+        model=model,
     )
     loop.restore(baseline)
     try:
@@ -252,9 +274,15 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     turn = ModelTurn(
         response_id="response-1",
         final_text="durable answer",
-        usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        usage={
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "total_tokens": 5,
+            "cache_creation_tokens": 2,
+            "audio_tokens": 1,
+        },
         raw={"private": "provider payload"},
-        stop_reason="stop",
+        stop_reason="provider stop reason",
     )
     adapter = _ScriptedAdapter(turn)
     baseline, settled = _crash_at(tmp_path, harness, adapter, "settled")
@@ -268,8 +296,101 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     assert suspension.turn.final_text == "durable answer"
     assert len(adapter.requests) == 1
     assert b"provider payload" not in result_blob
+    assert settled.invocation.receipt is not None
+    assert "stop_reason" not in settled.invocation.receipt
+    assert settled.invocation.receipt["usage"] == turn.usage
     assert checkpoint is not None
     assert checkpoint.total_usage == turn.usage
+
+
+def test_recovery_identity_ignores_changed_caller_provenance(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        invocation_context=InvocationContext(step_id="pipeline-step-before-crash"),
+    )
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        invocation_context=InvocationContext(step_id="different-restored-step"),
+    )
+
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None and suspension.turn.final_text == "durable answer"
+    assert settled.invocation.logical_call_id == LOGICAL_CALL_ID
+    assert len(adapter.requests) == 1
+
+
+def test_recovered_receipt_keeps_whole_call_usage_across_kernel_retry(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    absorbed = ModelDispatchRefused("transient overload", retryable=True)
+    mark_provider_usage(
+        absorbed,
+        {
+            "input_tokens": 2,
+            "output_tokens": 3,
+            "total_tokens": 5,
+            "cache_creation_tokens": 1,
+        },
+    )
+    final_turn = ModelTurn(
+        final_text="recovered",
+        usage={
+            "input_tokens": 3,
+            "output_tokens": 4,
+            "total_tokens": 7,
+            "audio_tokens": 2,
+        },
+        stop_reason="stop",
+    )
+    adapter = _ScriptedAdapter(absorbed, final_turn)
+    model = ModelConfig(
+        retry=ModelRetryConfig(
+            layer="kernel",
+            max_attempts=2,
+            initial_delay_s=0.0,
+            jitter_s=0.0,
+        )
+    )
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        target_failure_code="",
+        model=model,
+    )
+
+    suspension, checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model=model,
+    )
+
+    whole_call_usage = {
+        "input_tokens": 5,
+        "output_tokens": 7,
+        "total_tokens": 12,
+        "cache_creation_tokens": 1,
+        "audio_tokens": 2,
+    }
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None and suspension.turn.final_text == "recovered"
+    result_sha = settled.invocation.result_ref.removeprefix("blob:")
+    assert durable_model_turn(settled.blob(result_sha)).usage == final_turn.usage
+    assert settled.invocation.receipt is not None
+    assert settled.invocation.receipt["usage"] == whole_call_usage
+    assert checkpoint is not None and checkpoint.total_usage == whole_call_usage
+    assert len(adapter.requests) == 2
 
 
 def test_settled_failure_replays_classification_without_provider_call(tmp_path: Path) -> None:

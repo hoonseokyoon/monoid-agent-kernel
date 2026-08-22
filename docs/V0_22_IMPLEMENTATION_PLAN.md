@@ -54,7 +54,7 @@ commit된 스냅샷에서 시작한다. 현재 구현은 다음 특성을 가진
 
 | 현재 동작 | 위치 | v0.22 영향 |
 |---|---|---|
-| loop 호출 주소는 `run_id + step_id/turn_id`로 안정적이다. | `loop.py:2448-2460` | `logical_call_id`의 입력으로 재사용한다. |
+| loop 호출 주소는 `run_id + turn_id`로 안정적이다. | `loop.py:2448-2460` | `logical_call_id`의 입력으로 재사용한다. |
 | `turn_id`는 `turn_0001` 형태의 monotonic step이다. | `loop.py:3682` | 마지막 park에서 복구하면 같은 다음 turn 주소를 다시 계산할 수 있다. |
 | idempotency key는 adapter 호출 직전에 새로 발급된다. | `model_call.py:666-715` | key를 reserve record에 먼저 저장하도록 발급 위치를 이동한다. |
 | caller가 넣은 key는 항상 덮어쓴다. | `model_call.py:670-674` | 기존 기본 동작을 유지하고 durable coordinator만 저장된 key를 주입한다. |
@@ -215,13 +215,15 @@ metadata commit이 실패한 경우 blob은 orphan이 된다. Metadata가 참조
 logical_call_id = "mcall_" + sha256(
   canonical_json({
     "generation": "monoid.logical-model-call.v1",
-    "run_id": invocation_context.run_id,
-    "step_id": invocation_context.step_id
+    "run_id": spec.run_id,
+    "step_id": turn_id
   })
 )
 ```
 
-- AgentLoop는 항상 non-empty `run_id`와 `step_id`를 제공한다.
+- AgentLoop는 checkpoint가 보존하는 `session_step`에서 `turn_id`를 만들고 `spec.run_id`와 함께
+  logical-call 주소로 사용한다.
+- Caller의 `InvocationContext.step_id`는 관찰용 provenance다. 복구 주소에는 포함하지 않는다.
 - Standalone `ModelCallRunner`의 durable mode는 caller가 명시적 `logical_call_id`를 제공한다.
 - `dispatch_id`는 logical call과 1-based kernel dispatch attempt에서 결정한다.
 - adapter 내부 retry는 하나의 opaque kernel dispatch로 취급한다.
@@ -793,9 +795,11 @@ retryability, config-recoverability, HTTP status, usage를 재생성해 같은 l
 Process crash 뒤 남은 kernel retry history를 추측해 자동 재개하지 않는다. 복구된 failure를 먼저
 표면화하고 checkpoint한 뒤 다음 loop drive가 새 logical call로 정책을 다시 적용한다.
 
-Host hook은 result blob의 content digest, canonical body shape, receipt와 turn의 usage/stop/retry
-evidence 일치를 검증한다. 불일치, missing blob, corrupt/unsupported load는 provider를 호출하지 않고
-typed durable error로 끝낸다.
+Host hook은 result blob의 content digest와 canonical body shape를 검증한다. Public receipt에
+보존된 stop reason은 result와 교차 검증한다. Receipt usage와 provider-retry evidence는 logical call
+전체를 나타내고 private turn의 두 필드는 최종 provider turn을 나타내므로 서로 같다고 비교하지
+않는다. Run accounting은 public receipt의 canonical usage를 사용한다. 불일치, missing blob,
+corrupt/unsupported load는 provider를 호출하지 않고 typed durable error로 끝낸다.
 
 ## 8. Sink delivery policy
 
