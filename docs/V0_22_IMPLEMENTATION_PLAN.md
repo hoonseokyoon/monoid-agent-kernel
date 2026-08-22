@@ -54,7 +54,7 @@ commit된 스냅샷에서 시작한다. 현재 구현은 다음 특성을 가진
 
 | 현재 동작 | 위치 | v0.22 영향 |
 |---|---|---|
-| loop 호출 주소는 `run_id + step_id/turn_id`로 안정적이다. | `loop.py:2448-2460` | `logical_call_id`의 입력으로 재사용한다. |
+| loop 호출 주소는 `run_id + turn_id`로 안정적이다. | `loop.py:2448-2460` | `logical_call_id`의 입력으로 재사용한다. |
 | `turn_id`는 `turn_0001` 형태의 monotonic step이다. | `loop.py:3682` | 마지막 park에서 복구하면 같은 다음 turn 주소를 다시 계산할 수 있다. |
 | idempotency key는 adapter 호출 직전에 새로 발급된다. | `model_call.py:666-715` | key를 reserve record에 먼저 저장하도록 발급 위치를 이동한다. |
 | caller가 넣은 key는 항상 덮어쓴다. | `model_call.py:670-674` | 기존 기본 동작을 유지하고 durable coordinator만 저장된 key를 주입한다. |
@@ -215,13 +215,15 @@ metadata commit이 실패한 경우 blob은 orphan이 된다. Metadata가 참조
 logical_call_id = "mcall_" + sha256(
   canonical_json({
     "generation": "monoid.logical-model-call.v1",
-    "run_id": invocation_context.run_id,
-    "step_id": invocation_context.step_id
+    "run_id": spec.run_id,
+    "step_id": turn_id
   })
 )
 ```
 
-- AgentLoop는 항상 non-empty `run_id`와 `step_id`를 제공한다.
+- AgentLoop는 checkpoint가 보존하는 `session_step`에서 `turn_id`를 만들고 `spec.run_id`와 함께
+  logical-call 주소로 사용한다.
+- Caller의 `InvocationContext.step_id`는 관찰용 provenance다. 복구 주소에는 포함하지 않는다.
 - Standalone `ModelCallRunner`의 durable mode는 caller가 명시적 `logical_call_id`를 제공한다.
 - `dispatch_id`는 logical call과 1-based kernel dispatch attempt에서 결정한다.
 - adapter 내부 retry는 하나의 opaque kernel dispatch로 취급한다.
@@ -707,6 +709,11 @@ Validation 규칙:
   설정 오류로 거부한다.
 - 기존 `checkpoint_store` 경로는 구성 변화 없이 동작한다.
 
+`run_sink` mode의 checkpoint write는 `commit_checkpoint(..., writer_token=...)`를 사용한다.
+`committed | already_committed`만 성공이다. `conflict | fenced`, 잘못된 반환형, sink exception은
+checkpoint persistence failure로 처리하며 local checkpoint store로 우회하지 않는다. Restore의
+checkpoint 선택과 writer token 발급은 host가 소유한다.
+
 Runtime import 순환을 막기 위해 `loop.py`는 hosting type을 `TYPE_CHECKING`에서만 import한다.
 실행 시 protocol method를 직접 호출한다.
 
@@ -760,6 +767,12 @@ Process crash를 표현하는 `BaseException`은 보상 전이를 실행하지 �
 settle 실패 보상과 unknown 전이를 수행한다. 따라서 named failpoint가 reserve/start/adapter-return
 직후의 실제 journal head를 관찰할 수 있다.
 
+Hook은 optional recovery query를 구현할 수 있다. AgentLoop는 안정적인 logical-call ID를 만들고,
+Runner는 request normalize와 digest 계산 직후 query를 호출한다. Digest의 단일 소유자는 Runner다.
+Hook은 `missing | reserved`에서 새 dispatch를 계속하고, `dispatch_started`를 unknown으로 닫으며,
+`unknown`을 다시 표면화하고, `settled` evidence를 반환한다. PR3 hook 구현은 recovery method 없이
+계속 동작한다.
+
 ### 7.3 Result 재사용
 
 `settled` success를 복구하면 private result blob을 `ModelTurn`으로 복원한다. 복원기는 다음을
@@ -775,6 +788,22 @@ settle 실패 보상과 unknown 전이를 수행한다. 따라서 named failpoin
 
 복원된 turn은 live adapter가 반환한 turn과 같은 normalize path를 거친다. 이후 usage 누적,
 assistant message append, tool call 실행은 기존 loop 경로를 사용한다.
+
+복구 query의 request digest와 저장된 digest가 다르면 provider 진입 전에
+`durable_invocation_request_conflict`로 끝낸다. Settled failure는 저장된 failure code, provider code,
+retryability, config-recoverability, HTTP status, usage를 재생성해 같은 loop failure path로 보낸다.
+Settled failure receipt는 attempt count와 `stream_committed`를 함께 보존한다. 현재 정책이 kernel
+retry를 소유하고, 저장된 refusal이 retryable이며 config 변경이 필요 없고, attempt budget이 남고,
+`stream_committed=false`가 명시된 경우에만 다음 dispatch attempt를 이어간다. 저장된 aggregate usage와
+idempotency key를 유지한다. Delivery evidence가 없으면 stored refusal을 표면화한다.
+
+Host hook은 result blob의 content digest와 canonical body shape를 검증한다. Public receipt에
+보존된 stop reason은 result와 교차 검증한다. Receipt usage와 provider-retry evidence는 logical call
+전체를 나타내고 private turn의 두 필드는 최종 provider turn을 나타내므로 서로 같다고 비교하지
+않는다. Settled result를 반환하기 전에 권위 revision을 동일 content로 다시 commit해 현재 writer
+fence를 검증한다. Run accounting은 public receipt의 canonical usage를 사용한다. 불일치, missing
+blob, corrupt/unsupported load는 provider를 호출하지 않고 typed durable error로 끝내며 이미 지불된
+receipt usage를 오류에 보존한다.
 
 ## 8. Sink delivery policy
 
@@ -1024,8 +1053,11 @@ checkpoint/invocation private blob round-trip, malformed fresh blob 비공개, e
 - settled result blob과 replay
 - request digest mismatch 차단
 - before/after dispatch crash test
+- fenced checkpoint commit과 invocation summary 연결
+- durable hosting capability와 writer-token run binding 검증
 
-종료 조건: 모든 crash matrix에서 provider call 수가 기대값과 일치한다.
+종료 조건: 모든 crash matrix에서 provider call 수가 기대값과 일치하고, fenced checkpoint 실패가
+local store로 우회하지 않으며, 손상된 invocation/result가 provider 진입 전에 차단된다.
 
 ### PR 5 — Sink policy
 
@@ -1071,7 +1103,7 @@ opt-in이다. Default in-process 경로는 마지막 PR까지 기존 동작을 �
 | PR 1 | `codex/v0.22-pr1-serialization` | `codex/v0.22-production-boundaries` |
 | PR 2 | `codex/v0.22-pr2-hosting-contracts` | `codex/v0.22-production-boundaries` |
 | PR 3 | `codex/v0.22-pr3-model-call-lifecycle` | `codex/v0.22-production-boundaries` |
-| PR 4 | `codex/v0.22-pr4-loop-recovery` | `codex/v0.22-production-boundaries` |
+| PR 4 | `codex/v0.22-pr4-agent-loop-recovery` | `codex/v0.22-production-boundaries` |
 | PR 5 | `codex/v0.22-pr5-sink-policy` | `codex/v0.22-production-boundaries` |
 | PR 6 | `codex/v0.22-pr6-typed-interruption` | `codex/v0.22-production-boundaries` |
 | PR 7 | `codex/v0.22-pr7-release-closure` | `codex/v0.22-production-boundaries` |

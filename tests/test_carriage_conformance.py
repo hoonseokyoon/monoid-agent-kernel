@@ -6573,12 +6573,18 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # vocabulary.
             # Joined in the burn-down's durable batch: the park payload has a schema now, and
             # this is one of the fields it type-checks.
+            # v0.22's fenced sink conformance matrix treats every canonical receipt field as
+            # durable CAS identity and exercises both legal settlement and conflicting evidence.
+            "conformance/contracts.py",
             "core/checkpoint.py",
             # Joined in W6-1: the durable model-call ledger records the whole failure
             # classification, so a keyless or failed call can be triaged from the artifact alone.
             "core/model_calls.py",
             "core/model_content.py",
             "core/model_io.py",
+            # v0.22's durable invocation receipt preserves this failure classification through
+            # crash recovery without carrying provider exception text.
+            "core/model_invocation.py",
             "core/model_stream.py",
             # Joined in the burn-down's carriage sweep: the offline run-status projection
             # carries the full classification a parked turn.failed emits.
@@ -6655,6 +6661,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "errors.py",
             "loop.py",
             "model_call.py",
+            # v0.22's private durable-result decoder restores the recorded turn's retry fact
+            # before the runner verifies it against the public invocation receipt.
+            "model_lifecycle.py",
             "observability/otel.py",
             "providers/base.py",
             "providers/gateway.py",

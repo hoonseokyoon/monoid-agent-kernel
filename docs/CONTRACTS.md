@@ -2777,6 +2777,64 @@ The lifecycle value types live in `monoid_agent_kernel.model_lifecycle`. They st
 stable package root and contain no storage, queue, lease, database, or Temporal dependency. A host
 adapter binds them to `FencedRunSink` and `WriterToken`; the runner imports neither hosting type.
 
+### AgentLoop fenced recovery
+
+`AgentLoop(run_sink=..., writer_token=...)` activates fenced checkpoint and model-invocation
+recovery for one run. Both values are required together. The token's `run_id` must match the run,
+and the sink must declare `lease_fencing`, `durable_checkpoints`, and `durable_invocations`.
+`checkpoint_persist_callback` cannot be combined with this mode. The default AgentLoop path keeps
+the existing local checkpoint behavior and does not import the hosting package during a root or
+core-only import.
+
+AgentLoop derives each logical call from `AgentRunSpec.run_id` and the durable `turn_XXXX`
+coordinate backed by checkpoint `session_step`. Caller-supplied `InvocationContext.step_id` remains
+observability provenance and cannot change the recovery address. Restoring the same checkpoint
+recreates the same next turn coordinate, so the new activation queries the same invocation head
+after it computes the canonical request digest. The host adapter applies this table before provider
+entry:
+
+| Authoritative head | Recovery action | Provider calls during recovery |
+|---|---|---:|
+| missing | reserve a new dispatch | 1 |
+| `reserved` | reuse the stored idempotency key and continue | 1 |
+| `dispatch_started` | commit `unknown`, raise `dispatch_unknown` | 0 |
+| `unknown` | raise `dispatch_unknown` | 0 |
+| successful `settled` | verify and replay the private result blob | 0 |
+| failed `settled` | restore attempt/usage evidence; resume an explicitly safe kernel retry or surface the refusal | 0 or remaining policy-bound attempts |
+
+Every existing head must match the current request digest and digest generation. A mismatch raises
+`durable_invocation_request_conflict` before provider entry. Corrupt and unsupported invocation
+heads fail closed. Before exposing either settled arm, recovery re-commits the exact authoritative
+revision through `commit_invocation()`. The fence check precedes idempotency in that mutation, so a
+stale activation cannot replay a successful turn or execute its tool calls. Successful result
+recovery verifies the `blob:<sha256>` address, blob bytes, and strict recorded-turn shape. It
+compares stop reason when that fact survived the public-safe receipt projection. Recovered turns
+contain an empty `raw` mapping. The public receipt describes the whole logical call, including usage
+absorbed by kernel retries and provider-retry evidence folded across attempts. The private result
+describes the final provider turn. Recovery keeps these two evidence scopes separate, and run
+accounting consumes the public receipt's canonical usage counters, including
+`cache_creation_tokens` and `audio_tokens`. Missing, tampered, undecodable, and receipt-conflicting
+results raise a typed integrity error carrying that already-billed public usage. Failed result
+recovery preserves the failure code, provider code, HTTP status, retryability, configuration
+recoverability, provider-retry fact, attempt count, usage, and explicit `stream_committed` evidence
+recorded in the public-safe receipt. A current kernel retry policy may continue from the next
+dispatch attempt only when the refusal is retryable, configuration-independent, below its attempt
+limit, and `stream_committed` is explicitly `false`. Missing historical delivery evidence fails
+closed and surfaces the stored refusal. Resumed receipts retain aggregate usage and leave the
+unavailable historical per-attempt log empty. Provider exception text is never reconstructed.
+
+Every non-task suspension commits its checkpoint through `FencedRunSink.commit_checkpoint()`.
+AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,
+invalid, and raising results escape as checkpoint-persistence failures. Durable mode has no local
+checkpoint fallback. `RunCheckpoint.last_model_invocation` carries the latest compact summary for
+diagnostics and blob reachability. The invocation head loaded from `FencedRunSink` remains the
+authority for recovery.
+
+The concrete adapter is `monoid_agent_kernel.hosting.model_calls.FencedModelCallLifecycle`. Its
+module path is explicit while stable hosting import expansion remains an M2 decision. It performs
+checked loads, monotonic revision writes, content-addressed result settlement, and writer-token
+fencing through the host-owned sink. It contains no database, queue, or Temporal runtime.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:

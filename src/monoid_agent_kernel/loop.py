@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
@@ -36,6 +36,11 @@ from monoid_agent_kernel.core.model_io import (
     ModelCallReceipt,
     ModelIOSubscription,
     close_model_io_subscriptions,
+)
+from monoid_agent_kernel.core.model_invocation import (
+    DurableModelInvocation,
+    decode_model_invocation,
+    logical_model_call_id,
 )
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
@@ -225,6 +230,9 @@ from monoid_agent_kernel.public_view import (
     shell_args_preview,
     web_args_preview,
 )
+
+if TYPE_CHECKING:
+    from monoid_agent_kernel.hosting import FencedRunSink, WriterToken
 from monoid_agent_kernel.recorder import AgentRecorder
 from monoid_agent_kernel.shell import ShellApprovalProvider
 from monoid_agent_kernel.tool_services import CallContext, JobsService, ShellService, WebService
@@ -983,6 +991,9 @@ class _Session:
     # to that durable start event without expanding the checkpoint contract.
     active_turn_id: str | None = None
     active_turn_parent_id: str | None = None
+    # Latest invocation evidence observed by this activation. The sink remains authoritative;
+    # this is the compact summary carried by the next checkpoint.
+    last_model_invocation: DurableModelInvocation | None = None
 
 
 @dataclass
@@ -1066,6 +1077,10 @@ class AgentLoop:
     # Optional backend-owned checkpoint writer. Core still builds the checkpoint and advances its
     # sequence; a backend can fold in queue/inbox metadata before the bytes are committed.
     checkpoint_persist_callback: CheckpointPersistCallback | None = None
+    # Opt-in host authority for fenced checkpoints and durable model invocations. The token is
+    # scoped to this exact run; hosts issue a fresh generation when ownership moves.
+    run_sink: FencedRunSink | None = None
+    writer_token: WriterToken | None = None
     # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
@@ -1129,6 +1144,7 @@ class AgentLoop:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
+        self._validate_durable_hosting()
         # Operator kill switch for the delta channel. Resolved here, into the field itself, rather
         # than at the emit site: gating the emit would leave `emit_output_deltas` reporting True
         # while nothing streamed, which is the "one half bound, its twin reporting otherwise" shape
@@ -1149,6 +1165,36 @@ class AgentLoop:
         self._bootstrapper = LoopBootstrapper(self)
         self._settle_coordinator = LoopSettleCoordinator(self)
         self._finalizer = LoopFinalizer(self)
+
+    def _validate_durable_hosting(self) -> None:
+        if self.run_sink is None and self.writer_token is None:
+            return
+        if self.run_sink is None or self.writer_token is None:
+            raise AgentConfigError("run_sink and writer_token must be configured together")
+        if self.checkpoint_persist_callback is not None:
+            raise AgentConfigError(
+                "run_sink cannot be combined with checkpoint_persist_callback"
+            )
+        try:
+            token_run_id = self.writer_token.run_id
+        except Exception as exc:
+            raise AgentConfigError("writer_token is missing its run binding") from exc
+        if token_run_id != self.spec.run_id:
+            raise AgentConfigError("writer_token run_id must match the AgentLoop run_id")
+        try:
+            capabilities = self.run_sink.capabilities
+            required = {
+                "lease_fencing": capabilities.lease_fencing,
+                "durable_checkpoints": capabilities.durable_checkpoints,
+                "durable_invocations": capabilities.durable_invocations,
+            }
+        except Exception as exc:
+            raise AgentConfigError("run_sink capabilities are unavailable") from exc
+        missing = sorted(name for name, value in required.items() if value is not True)
+        if missing:
+            raise AgentConfigError(
+                "run_sink is missing required capabilities: " + ", ".join(missing)
+            )
 
     def _materialize_model_stream_observers(self) -> tuple[ModelStreamObserver, ...]:
         """Build this activation's observer snapshot without making diagnostics a run gate."""
@@ -2365,6 +2411,11 @@ class AgentLoop:
                 deadline=deadline,
                 delta_consumer=delta_consumer,
                 should_abort=should_abort,
+                logical_call_id=(
+                    logical_model_call_id(self.spec.run_id, turn_id)
+                    if runner.lifecycle_hook is not None
+                    else ""
+                ),
             )
         except ModelCallAborted as exc:
             outcome_status = "interrupted"
@@ -2423,6 +2474,11 @@ class AgentLoop:
             outcome_final_text = turn.final_text
             outcome_usage = turn.usage
         finally:
+            lifecycle = runner.lifecycle_hook
+            if session is not None and lifecycle is not None:
+                latest_invocation = getattr(lifecycle, "last_invocation", None)
+                if isinstance(latest_invocation, DurableModelInvocation):
+                    session.last_model_invocation = latest_invocation
             if outcome_status is not None and observer_writers:
                 try:
                     outcome = ModelStreamOutcome(
@@ -2730,6 +2786,11 @@ class AgentLoop:
             pending_tool_approval_replays=[
                 dict(replay) for replay in state.pending_tool_approval_replays
             ],
+            last_model_invocation=(
+                session.last_model_invocation.to_json()
+                if session.last_model_invocation is not None
+                else None
+            ),
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -2772,7 +2833,20 @@ class AgentLoop:
         blobs = self.collect_checkpoint_blobs()
         try:
             committed = True
-            if self.checkpoint_persist_callback is not None:
+            if self.run_sink is not None and self.writer_token is not None:
+                from monoid_agent_kernel.hosting.contracts import CommitResult
+
+                commit_result = self.run_sink.commit_checkpoint(
+                    checkpoint,
+                    blobs,
+                    writer_token=self.writer_token,
+                )
+                if not isinstance(commit_result, CommitResult) or commit_result.status not in {
+                    "committed",
+                    "already_committed",
+                }:
+                    raise RuntimeError("fenced checkpoint commit was not accepted")
+            elif self.checkpoint_persist_callback is not None:
                 committed = self.checkpoint_persist_callback(checkpoint, blobs) is not False
             else:
                 self._checkpoint_store().put(checkpoint, blobs)
@@ -2969,6 +3043,15 @@ class AgentLoop:
         self._apply_workspace_delta(
             res.workspace, cp.workspace_delta, blob_reader, self.spec.limits
         )
+        restored_invocation: DurableModelInvocation | None = None
+        if cp.last_model_invocation is not None:
+            decoded_invocation = decode_model_invocation(cp.last_model_invocation)
+            if not decoded_invocation.ok or decoded_invocation.value is None:
+                raise NativeAgentError(
+                    "checkpoint model invocation summary is invalid",
+                    error_code="model_invocation_corrupt",
+                )
+            restored_invocation = decoded_invocation.value
         manager = res.context.job_manager
         # Publish the restored durable baseline before registering hosted tasks. If any later
         # rehydration step fails, cleanup preserves every task owned by the source checkpoint.
@@ -3004,6 +3087,7 @@ class AgentLoop:
                 for task in cp.hosted_tasks
                 if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
             },
+            last_model_invocation=restored_invocation,
         )
         manager.restore_state(
             [

@@ -15,7 +15,7 @@ from monoid_agent_kernel.core.model_invocation import (
     model_dispatch_id,
     model_invocation_receipt,
 )
-from monoid_agent_kernel.core.model_io import ModelCallReceipt
+from monoid_agent_kernel.core.model_io import ModelCallAttempt, ModelCallReceipt
 
 REQUEST_DIGEST = "a" * 64
 
@@ -70,22 +70,36 @@ def test_runner_receipt_projection_keeps_only_public_safe_invocation_evidence() 
         error_code="model_error",
         provider_error_code="rate_limited",
         retryable=True,
+        config_recoverable=True,
         http_status=429,
         destination_status="resolved",
         destination_digest="c" * 64,
         idempotency_key="idem_private",
+        attempt_log=(
+            ModelCallAttempt(
+                index=1,
+                usage={"input_tokens": 1, "private_counter": 49},
+            ),
+            ModelCallAttempt(
+                index=2,
+                usage={"input_tokens": 2, "private_counter": 50},
+                stream_committed=True,
+            ),
+        ),
     )
 
     projected = model_invocation_receipt(receipt)
 
     assert projected == {
         "attempts": 2,
+        "config_recoverable": True,
         "latency_ms": 12,
         "provider_retried": True,
         "retryable": True,
         "request_digest": REQUEST_DIGEST,
         "usage": {"input_tokens": 3},
         "stop_reason": "stop",
+        "stream_committed": True,
         "provider_error_code": "rate_limited",
         "http_status": 429,
     }
@@ -353,11 +367,14 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
             "settledAt": "2026-08-21T10:00:01Z",
             "startedAt": "2026-08-21T10:00:00Z",
             "stopReason": "stop",
+            "streamCommitted": True,
             "systemFingerprint": "fingerprint_1",
             "usage": {
                 "audioInputTokens": 1,
                 "audioOutputTokens": 2,
+                "audioTokens": 3,
                 "cachedInputTokens": 3,
+                "cacheCreationTokens": 4,
                 "cacheReadTokens": 4,
                 "cacheWriteTokens": 5,
                 "inputTokens": 6,
@@ -386,6 +403,7 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
         "settled_at",
         "started_at",
         "stop_reason",
+        "stream_committed",
         "system_fingerprint",
         "usage",
     }
@@ -393,7 +411,9 @@ def test_model_invocation_receipt_canonicalizes_the_full_safe_evidence_vocabular
     assert set(invocation.receipt["usage"]) == {
         "audio_input_tokens",
         "audio_output_tokens",
+        "audio_tokens",
         "cached_input_tokens",
+        "cache_creation_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
         "input_tokens",

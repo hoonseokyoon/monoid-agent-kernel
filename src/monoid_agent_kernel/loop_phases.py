@@ -169,6 +169,14 @@ class LoopBootstrapper:
         # token is one nobody cancels. ``model_adapter`` and ``async_model_cancel_grace_s`` are
         # public mutable fields the loop reads live everywhere else, and a snapshot of either made
         # this runner disagree with the code around it rather than merely go stale.
+        lifecycle_hook = None
+        if loop.run_sink is not None and loop.writer_token is not None:
+            # Keep the host package lazy for standalone/core-only imports. A configured host is
+            # the only activation that needs this adapter, and __post_init__ already validated the
+            # pair and its declared capabilities before bootstrap reaches this point.
+            from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
+
+            lifecycle_hook = FencedModelCallLifecycle(loop.run_sink, loop.writer_token)
         model_runner = ModelCallRunner(
             adapter=loop.model_adapter,
             current_adapter=lambda: loop.model_adapter,
@@ -190,6 +198,7 @@ class LoopBootstrapper:
             # The corpus needs the exact bytes the key was hashed over; the ledger alone does
             # not, and must not pay the per-call buffering for them.
             capture_request_preimage=loop.model_payload_file,
+            lifecycle_hook=lifecycle_hook,
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
