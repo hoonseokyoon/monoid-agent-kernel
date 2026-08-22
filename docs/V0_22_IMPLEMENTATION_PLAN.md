@@ -725,6 +725,41 @@ reserve record의 key를 request에 넣는다.
 Adapter 내부 retry는 hook 밖의 한 dispatch다. `provider_retried`와 receipt attempt evidence가 그
 사실을 보존한다. Kernel retry는 attempt별 `dispatch_id`를 만든다.
 
+Hook은 저장소 protocol을 직접 노출하지 않는 동기식 runner 경계다. Runner는 실행 의미를 소유하고,
+hook 구현은 host의 `FencedRunSink`, `WriterToken`, revision CAS를 소유한다. Runner가 hook에 전달하는
+값은 다음 세 묶음으로 제한한다.
+
+- reservation: logical call ID, dispatch attempt/ID, request digest generation/digest, 제안 key
+- settlement: reservation, 공개-safe receipt projection, 성공 result blob 또는 failure code
+- unknown: reservation과 safe failure code
+
+`reserve`는 effective reservation을 반환한다. 새 호출이면 제안 key를 commit하고, 기존 `reserved`
+record를 재개하면 저장된 key를 반환한다. Runner는 반환값에서 key만 바뀔 수 있도록 검사한다.
+Logical call ID, dispatch coordinate, request digest와 generation의 drift는 provider dispatch 전에
+거부한다. 첫 reserve 뒤 kernel retry는 같은 key를 제안하고 새 attempt에서 파생한 dispatch ID를
+사용한다.
+
+Provider failure evidence는 fail-closed다. 명시적인 terminal/refusal evidence만 settled failure로
+기록한다. Connection drop, timeout, malformed terminal, 분류되지 않은 adapter exception은
+`unknown`으로 기록하고 kernel retry를 중단한다. 기존 `retryable` 값은 dispatch 완료 증거로 사용하지
+않는다. Shipped adapter가 증명하지 않은 failure도 `unknown`이다. Provider별 증거 확대는 M1
+conformance에서 수행한다.
+
+상태 전이 write는 passive observer보다 먼저 실행하며 실패를 흡수하지 않는다. `reserve` 또는
+`dispatch_started` write가 실패하면 adapter에 진입하지 않는다. Adapter 진입 뒤 settled write가
+실패하면 runner는 `unknown` write를 시도하고 `dispatch_unknown`을 표면화한다. Unknown write 자체가
+실패해도 paid-call retry는 허용하지 않는다. Recovery는 남아 있는 `dispatch_started` head를
+`unknown`으로 닫는다.
+
+성공 settlement의 result blob은 `core.model_payloads`의 canonical recorded-turn projection을 재사용한다.
+`raw`는 제외하고 text, tool calls, reasoning, usage, stop reason을 보존한다. Blob을 canonical하게
+encode할 수 없거나 durable size bound를 넘으면 paid call을 `unknown`으로 닫는다. Passive
+`settled_sink` 전달은 authoritative settlement 뒤에 실행된다.
+
+Process crash를 표현하는 `BaseException`은 보상 전이를 실행하지 않는다. 정상 Python `Exception`만
+settle 실패 보상과 unknown 전이를 수행한다. 따라서 named failpoint가 reserve/start/adapter-return
+직후의 실제 journal head를 관찰할 수 있다.
+
 ### 7.3 Result 재사용
 
 `settled` success를 복구하면 private result blob을 `ModelTurn`으로 복원한다. 복원기는 다음을
