@@ -728,20 +728,12 @@ class ModelCallRunner:
                         "durable model calls require an explicit bounded logical_call_id",
                         error_code="durable_invocation_identity_required",
                     )
-                # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
-                # already been crossed, but by then the adapter has been invoked and the provider has
-                # been paid for work the run had already decided not to do. Checking here also covers
-                # the interval the caller cannot: building the receipt digests above happens between
-                # the caller's own boundary check and this line, so a deadline can expire in between.
-                #
-                # Durable mode performs synchronous reserve/start commits between this check and
-                # adapter entry. A boundary crossed during those commits is caught by the race once
-                # provider work starts; the host must keep those mutations bounded.
-                #
-                # Lifted out of `_adrive` so that refusing the call and dispatching it are
-                # distinguishable here; `_adrive` is called from nowhere else, so the check still
-                # exists once.
-                self._check_cancel_or_deadline(deadline)
+                # An ordinary call keeps the historical boundary precedence: cancellation or an
+                # expired deadline refuses it before ingress normalization, keying, or adapter
+                # entry. Durable calls defer this check only long enough to probe and complete an
+                # existing authoritative settlement/evidence barrier below.
+                if lifecycle_hook is None:
+                    self._check_cancel_or_deadline(deadline)
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -837,6 +829,11 @@ class ModelCallRunner:
                         request_digest=receipt.request_digest,
                     )
                     if recovered is not None:
+                        # The recovery hook performs the fenced, idempotent settlement/evidence
+                        # commit and invokes no provider. Let that commit barrier finish before a
+                        # terminal boundary wins; otherwise cancel or expiry can permanently strand
+                        # required evidence for a provider call that already settled.
+                        self._check_cancel_or_deadline(deadline)
                         object.__setattr__(
                             request,
                             "idempotency_key",
@@ -916,6 +913,10 @@ class ModelCallRunner:
                                 request_preimage=request_preimage,
                             )
                             return turn, settled
+                # Check immediately before any path can reserve or enter the adapter. Digesting and
+                # probing durable recovery above are local/idempotent work; every new provider
+                # dispatch remains barred once cancellation or the deadline has won.
+                self._check_cancel_or_deadline(deadline)
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is

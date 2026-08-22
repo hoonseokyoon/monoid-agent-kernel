@@ -336,6 +336,7 @@ def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[boo
 class _EvidenceRecovery:
     step: int
     invocation: DurableModelInvocation
+    blocks_new_input: bool = True
 
 
 def _accounted_evidence_usage(
@@ -361,16 +362,31 @@ def _accounted_evidence_usage(
 
 
 def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
-    """Capture a prior settled call whose required evidence is the only unfinished work."""
+    """Capture a settled call whose durable model step has not reached application."""
 
     step = getattr(session, "session_step", 0)
     invocation = getattr(session, "last_model_invocation", None)
     suspension = getattr(session, "last_suspension", None)
+    state = getattr(session, "state", None)
+    messages = getattr(state, "messages", None)
+    evidence_uncommitted = (
+        isinstance(suspension, Mapping)
+        and suspension.get("error_code") == "evidence_uncommitted"
+    )
+    # An interrupt immediately after durable recovery committed can preempt application of the
+    # stored turn. The current invocation identity plus the absent assistant message is the durable
+    # proof: once the assistant message exists, replaying the turn could duplicate tool effects.
+    interrupted_before_application = (
+        isinstance(suspension, Mapping)
+        and suspension.get("reason") == "interrupted"
+        and isinstance(messages, list)
+        and (not messages or messages[-1].get("role") != "assistant")
+    )
     if (
         type(step) is not int
         or step < 1
         or not isinstance(suspension, Mapping)
-        or suspension.get("error_code") != "evidence_uncommitted"
+        or not (evidence_uncommitted or interrupted_before_application)
         or not isinstance(invocation, DurableModelInvocation)
         or invocation.dispatch_state != "settled"
     ):
@@ -378,7 +394,11 @@ def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
     turn_id = f"turn_{step:04d}"
     if invocation.logical_call_id != logical_model_call_id(run_id, turn_id):
         return None
-    return _EvidenceRecovery(step=step, invocation=invocation)
+    return _EvidenceRecovery(
+        step=step,
+        invocation=invocation,
+        blocks_new_input=evidence_uncommitted,
+    )
 
 
 def _instruction_from_replayed_user_message(messages: list[dict[str, Any]]) -> str | None:
@@ -1708,10 +1728,14 @@ class AgentLoop:
             )
         evidence_recovery = _evidence_recovery(session, self.spec.run_id)
         if evidence_recovery is not None and user_input is not None:
-            raise NativeAgentError(
-                "required model evidence must be recovered before accepting new input",
-                error_code="evidence_recovery_requires_resume",
-            )
+            if evidence_recovery.blocks_new_input:
+                raise NativeAgentError(
+                    "required model evidence must be recovered before accepting new input",
+                    error_code="evidence_recovery_requires_resume",
+                )
+            # A new user turn intentionally abandons a prior interrupted result. Required evidence
+            # is already committed; only an explicit None resume applies the stored model turn.
+            evidence_recovery = None
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
@@ -3874,7 +3898,7 @@ class AgentLoop:
             evidence_recovery.step if evidence_recovery is not None else None
         )
         while evidence_recovery_step is not None or session.submit_local_step < max_steps:
-            self._check_run_boundary(deadline)
+            recovering_evidence = evidence_recovery_step is not None
             # Cooperative pause is checked ONLY here, at the start of a step — never inside
             # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
             # tool results sit in state.pending_observations not-yet-sent, so a paused park is
@@ -3884,15 +3908,15 @@ class AgentLoop:
             # exactly as it would when requested after an in-flight model call had started.
             # Preempting here would replace the durable evidence-recovery marker with a generic
             # paused suspension and strand the stored result.
-            if self._pause_requested and evidence_recovery_step is None:
-                raise TurnPaused("turn paused")
-            if evidence_recovery_step is not None:
-                recovering_evidence = True
+            if not recovering_evidence:
+                self._check_run_boundary(deadline)
+                if self._pause_requested:
+                    raise TurnPaused("turn paused")
+            else:
                 step = evidence_recovery_step
                 local_step = session.submit_local_step
                 evidence_recovery_step = None
-            else:
-                recovering_evidence = False
+            if not recovering_evidence:
                 session.submit_local_step += 1
                 local_step = session.submit_local_step
                 session.session_step += 1

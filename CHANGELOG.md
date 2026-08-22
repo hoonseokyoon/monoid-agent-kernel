@@ -118,7 +118,10 @@ out in commit messages and here.
 - Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
   Recovery reuses the exact settled success or refusal, proves the current writer fence, and
   retries only evidence delivery. Repeated evidence parks and resumed kernel retries subtract
-  previously charged receipt usage, preventing both provider replay and usage duplication.
+  previously charged receipt usage, preventing both provider replay and usage duplication. Model
+  step limits and cooperative pause cannot preempt this commit barrier. Cancellation and deadline
+  apply after the fenced evidence mutation; an interrupt before result application retains the
+  same logical call for a `None` resume.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal, remaining kernel attempts, multimodal

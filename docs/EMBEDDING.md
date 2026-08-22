@@ -215,6 +215,10 @@ outbox entry cannot commit. A partial invocation-only commit violates the declar
 On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
 with the same run ID, request-building configuration, and current writer token. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+Evidence recovery is a commit barrier for a model step that already settled. The runner completes
+the fenced settlement/evidence mutation before applying a pending cancellation or expired deadline.
+An interrupt can still park before the recovered result is applied; a `None` resume reloads that
+same logical call, while a new user input intentionally abandons the interrupted result.
 
 ## Model and tool wiring
 
