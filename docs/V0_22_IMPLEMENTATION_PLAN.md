@@ -1045,8 +1045,11 @@ checkpoint/invocation private blob round-trip, malformed fresh blob 비공개, e
 - settled result blob과 replay
 - request digest mismatch 차단
 - before/after dispatch crash test
+- fenced checkpoint commit과 invocation summary 연결
+- durable hosting capability와 writer-token run binding 검증
 
-종료 조건: 모든 crash matrix에서 provider call 수가 기대값과 일치한다.
+종료 조건: 모든 crash matrix에서 provider call 수가 기대값과 일치하고, fenced checkpoint 실패가
+local store로 우회하지 않으며, 손상된 invocation/result가 provider 진입 전에 차단된다.
 
 ### PR 5 — Sink policy
 
@@ -1092,7 +1095,7 @@ opt-in이다. Default in-process 경로는 마지막 PR까지 기존 동작을 �
 | PR 1 | `codex/v0.22-pr1-serialization` | `codex/v0.22-production-boundaries` |
 | PR 2 | `codex/v0.22-pr2-hosting-contracts` | `codex/v0.22-production-boundaries` |
 | PR 3 | `codex/v0.22-pr3-model-call-lifecycle` | `codex/v0.22-production-boundaries` |
-| PR 4 | `codex/v0.22-pr4-loop-recovery` | `codex/v0.22-production-boundaries` |
+| PR 4 | `codex/v0.22-pr4-agent-loop-recovery` | `codex/v0.22-production-boundaries` |
 | PR 5 | `codex/v0.22-pr5-sink-policy` | `codex/v0.22-production-boundaries` |
 | PR 6 | `codex/v0.22-pr6-typed-interruption` | `codex/v0.22-production-boundaries` |
 | PR 7 | `codex/v0.22-pr7-release-closure` | `codex/v0.22-production-boundaries` |
