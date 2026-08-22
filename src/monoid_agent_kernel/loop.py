@@ -3093,11 +3093,22 @@ class AgentLoop:
             if self.cancellation_token is not None
             else (False, None)
         )
-        checkpoint_interruption_cause = (
-            pending_cancellation_cause
-            if cancellation_requested and pending_cancellation_cause is not None
-            else state.interruption_cause
-        )
+        if session.terminal:
+            # A chosen terminal verdict is authoritative over a cancellation that arrives after
+            # that transition. Keep the flag only when the terminal state accepted the same token
+            # cause; cancel/timeout handlers stamp it before setting ``terminal``.
+            cancellation_requested = bool(
+                cancellation_requested
+                and pending_cancellation_cause is not None
+                and pending_cancellation_cause is state.interruption_cause
+            )
+            checkpoint_interruption_cause = state.interruption_cause
+        else:
+            checkpoint_interruption_cause = (
+                pending_cancellation_cause
+                if cancellation_requested and pending_cancellation_cause is not None
+                else state.interruption_cause
+            )
         return RunCheckpoint(
             run_id=self.spec.run_id,
             seq=session.checkpoint_seq,

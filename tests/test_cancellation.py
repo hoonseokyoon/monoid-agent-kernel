@@ -343,9 +343,39 @@ def test_close_of_an_interrupted_park_promotes_limited_and_keeps_checkpoints(
     result = loop.close()
 
     assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    assert result.interruption_cause is None
+    assert "interruption_cause" not in result.metrics
     stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
     assert stored is not None
     assert stored.checkpoint.terminal is True
+    assert stored.checkpoint.interruption_cause == ""
+    last = stored.checkpoint.last_suspension
+    assert last is not None and not last.get("interruption_cause")
+
+
+def test_a_late_cancel_does_not_replace_an_already_chosen_close_verdict(
+    tmp_path: Path,
+) -> None:
+    loop, spec = _midturn_parked_loop(tmp_path, "interrupt")
+    assert loop.run_until_suspended("go").reason == "interrupted"
+    token = loop.cancellation_token
+    assert token is not None
+    persist_checkpoint = loop._persist_checkpoint
+
+    def cancel_before_terminal_snapshot(session, suspension):  # noqa: ANN001
+        token.cancel(InterruptionCause.USER_CANCEL)
+        return persist_checkpoint(session, suspension)
+
+    loop._persist_checkpoint = cancel_before_terminal_snapshot  # type: ignore[method-assign]
+
+    result = loop.close()
+
+    assert (result.status, result.error_code) == ("limited", "closed_unsettled")
+    assert result.interruption_cause is None
+    stored = LocalFsCheckpointStore(spec.run_root).latest(spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.cancellation_requested is False
+    assert stored.checkpoint.interruption_cause == ""
 
 
 def test_a_restored_midturn_park_still_closes_unsettled(tmp_path: Path) -> None:
