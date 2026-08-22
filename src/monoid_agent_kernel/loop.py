@@ -392,6 +392,9 @@ def _recover_evidence_dispatch(
             hook,
             logical_call_id=invocation.logical_call_id,
             request_digest=invocation.request_digest,
+            # The checkpoint marker is authoritative. A new activation's default/passive
+            # configuration cannot lower the required-delivery obligation that created it.
+            require_evidence=recovery.blocks_new_input,
         )
     except ModelEvidenceUncommitted as exc:
         # The provider bill was recorded on the first failed evidence delivery. A later
@@ -2381,10 +2384,23 @@ class AgentLoop:
                     # stop that it had succeeded, and letting the completed-run cleanup
                     # delete the checkpoints the park preserved. They surface typed instead,
                     # after the same close() the absorbed case gets.
-                    if parked.reason != "turn_failed":
+                    if (
+                        parked.reason != "turn_failed"
+                        or parked.suspension.error_code == "evidence_uncommitted"
+                    ):
                         raise
         finally:
-            result = self.close()
+            # Required evidence is an unfinished durable commit barrier. One-shot convenience
+            # releases that committed park for another activation and lets TurnNotSettled escape;
+            # closing would promote it to a terminal failure that recovery rejects at entry.
+            session = self._session
+            evidence_recovery = (
+                _evidence_recovery(session, self.spec.run_id) if session is not None else None
+            )
+            if evidence_recovery is not None and evidence_recovery.blocks_new_input:
+                self.release_parked()
+            else:
+                result = self.close()
         return result
 
     async def aopen(self) -> None:

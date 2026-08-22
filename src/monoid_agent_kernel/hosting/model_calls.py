@@ -139,13 +139,16 @@ class FencedModelCallLifecycle:
         self,
         invocation: DurableModelInvocation,
         blobs: Mapping[str, bytes] | None = None,
+        *,
+        require_evidence: bool = False,
     ) -> None:
+        evidence_policy = "required" if require_evidence else self.evidence_policy
         self._commit(
             invocation,
             blobs,
-            stage_evidence=self.evidence_policy == "outbox",
+            stage_evidence=evidence_policy == "outbox",
         )
-        if self.evidence_policy == "required":
+        if evidence_policy == "required":
             self._commit_evidence(invocation)
 
     @staticmethod
@@ -229,7 +232,10 @@ class FencedModelCallLifecycle:
             # An exact idempotent mutation is the host contract's authenticated ownership check.
             # Fencing precedes idempotency, so a stale activation cannot expose a recovered
             # settlement even though the preceding checked load is intentionally token-free.
-            self._commit_settled(invocation)
+            self._commit_settled(
+                invocation,
+                require_evidence=query.require_evidence,
+            )
             return RecoveredModelDispatch(
                 reservation=reservation,
                 receipt=invocation.receipt,
@@ -255,7 +261,11 @@ class FencedModelCallLifecycle:
             )
         # Replay the exact settlement through the fenced mutation path before returning any
         # private result. Supplying the original blob preserves full content identity.
-        self._commit_settled(invocation, {sha256: result_blob})
+        self._commit_settled(
+            invocation,
+            {sha256: result_blob},
+            require_evidence=query.require_evidence,
+        )
         return RecoveredModelDispatch(
             reservation=reservation,
             receipt=invocation.receipt,

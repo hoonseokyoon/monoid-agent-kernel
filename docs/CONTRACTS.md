@@ -166,11 +166,12 @@ The run lifecycle is:
   success it was; an acknowledged cancel is the operator's stronger verdict and
   wins over the unsettled promotion.
 - `run_once(user_input) -> AgentRunResult` — one-shot convenience equal to
-  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, a non-settling
-  park does not raise here: the closing `finally` promotes an unrecovered
-  `turn_failed` park to the terminal failure record, and that failed
-  `AgentRunResult` is the return value — for `turn_failed` only, the one park
-  absorbed; an `interrupted` or `paused` park still surfaces as
+  `open()` + `submit(user_input)` + `close()`. Unlike `submit`, an ordinary recoverable
+  provider/config `turn_failed` park does not raise here: the closing `finally` promotes it
+  to the terminal failure record and returns that failed `AgentRunResult`.
+  `evidence_uncommitted` surfaces as `TurnNotSettled` after releasing the committed park
+  without terminalizing it, so another activation can complete sink-only recovery. An
+  `interrupted` or `paused` park also surfaces as
   `TurnNotSettled` after the same close, and that close records the honest
   outcome underneath the raise: `run.finished` carries `status="limited"`,
   `error_code="closed_unsettled"` (the turn never settled — a user stop is not
@@ -2860,7 +2861,10 @@ execution setup. Runtime-config drift cannot block evidence delivery or applicat
 outcome. The provider call count does not increase. Passive model-I/O observers and requested
 model-call sidecars receive the authoritative call during its original settlement, including when
 required evidence fails afterward. Evidence recovery does not publish the passive call a second
-time. Repeated evidence parks, transcript
+time. Its marker sets `ModelDispatchRecoveryQuery.require_evidence=True`, so the host performs
+required delivery even when the replacement activation uses the passive default or another policy.
+`run_once()` releases this durable park and surfaces `TurnNotSettled` instead of closing it into a
+terminal checkpoint. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected
 by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
 no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.

@@ -27,6 +27,7 @@ from monoid_agent_kernel.errors import (
     DurableModelCallError,
     ModelDispatchRefused,
     NativeAgentError,
+    TurnNotSettled,
 )
 from monoid_agent_kernel.hosting import CommitResult, ModelInvocationRecord, WriterToken
 from monoid_agent_kernel.loop import AgentLoop
@@ -679,7 +680,7 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
     assert [event["data"]["provider_usage"] for event in failed_turns] == [usage, {}]
 
 
-def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_changes(
+def test_required_evidence_recovery_preserves_policy_and_identity_across_config_changes(
     tmp_path: Path,
 ) -> None:
     harness = DeterministicFencedRunHarness()
@@ -713,7 +714,7 @@ def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_cha
         user_input=None,
         sink=sink,
         model=ModelConfig(model="changed-model"),
-        model_evidence_policy="required",
+        model_evidence_policy="passive",
     )
 
     assert restored.reason == "settled"
@@ -721,6 +722,51 @@ def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_cha
     assert final_checkpoint is not None
     assert len(adapter.requests) == 1
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+
+
+def test_run_once_releases_required_evidence_park_for_sink_only_recovery(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+
+    with pytest.raises(TurnNotSettled) as raised:
+        loop.run_once("hello")
+
+    assert raised.value.reason == "turn_failed"
+    assert raised.value.suspension.error_code == "evidence_uncommitted"
+    assert RUN_ID not in harness.sink._terminals
+    loaded = harness.sink.latest_checked(RUN_ID)
+    assert loaded.ok and loaded.value is not None
+    checkpoint = loaded.value.checkpoint
+    assert checkpoint.terminal is False
+    assert checkpoint.last_suspension is not None
+    assert checkpoint.last_suspension["error_code"] == "evidence_uncommitted"
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.terminal is False
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
 
 
 def test_required_evidence_recovery_applies_stored_final_before_dynamic_context(

@@ -124,7 +124,10 @@ out in commit messages and here.
   Passive observers and requested model-call sidecars receive the original settled call once even
   when required evidence parks the run; recovery does not republish it. Repeated evidence parks,
   transcript rows, and public events carry only newly billable usage, preventing provider replay
-  and usage duplication. Model step limits and cooperative pause cannot preempt this commit
+  and usage duplication. The durable recovery marker forces required delivery even when a new
+  activation is configured as passive. `run_once()` releases this park and raises
+  `TurnNotSettled` instead of promoting it to an unrecoverable terminal checkpoint. Model step
+  limits and cooperative pause cannot preempt this commit
   barrier. Cancellation and deadline apply after the fenced evidence mutation; an interrupt before
   result application retains the same logical call and its tool-follow-up observations for a
   `None` resume.

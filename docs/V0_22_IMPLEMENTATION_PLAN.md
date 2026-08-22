@@ -843,6 +843,8 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   적용한 뒤 현재 runtime config, context provider, tool surface, media를 조회한다. 최종 응답은 이
   지점에서 정산하고, tool call turn은 message log에 반영한 뒤 현재 tool 실행 환경을 구성한다.
   현재 runtime config, context provider, tool surface, media wire payload는 evidence commit의 입력이 아니다.
+  Recovery query의 `require_evidence` marker가 새 activation의 `passive` 또는 다른 설정을 덮어쓰고
+  원래 required delivery 의무를 유지한다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
@@ -852,6 +854,10 @@ Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
 기존처럼 결과 분류를 바꾸지 않는다. 최초 invocation settlement에서 passive observer와 활성화된
 model-call sidecar에 authoritative call을 한 번 전달한다. Required evidence 실패 뒤 복구는 이 passive
 전달을 반복하지 않는다.
+
+`run_once()`는 `evidence_uncommitted`를 일반 recoverable provider failure처럼 terminal로 승격하지
+않는다. Committed checkpoint boundary를 release하고 `TurnNotSettled`를 표면화한다. 새 activation은
+그 checkpoint를 restore한 뒤 `None`으로 resume해 sink-only recovery를 완료한다.
 
 첫 `evidence_uncommitted` park는 저장된 receipt usage를 run total에 반영한다. 같은 logical call의
 복구는 마지막 evidence-uncommitted checkpoint가 이미 반영한 usage를 읽고 이후 aggregate receipt와의

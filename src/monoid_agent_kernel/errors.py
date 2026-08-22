@@ -88,8 +88,10 @@ class TurnNotSettled(NativeAgentError):
     ``"paused"`` — outcomes that produce no ``AgentTurnResult`` because nothing settled. The
     session stays alive; the non-blocking pump (``run_until_suspended``) hands the same park
     back as a :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising, and
-    the one-shot ``run_once`` absorbs it — its closing ``finally`` promotes an unrecovered
-    park to the terminal failure record and returns that failed result. ``suspension``
+    the one-shot ``run_once`` absorbs ordinary recoverable provider/config failures — its closing
+    ``finally`` promotes that unrecovered park to the terminal failure record and returns the
+    failed result. An `evidence_uncommitted` park escapes one-shot after the activation releases
+    its durable recovery boundary, preserving sink-only recovery. ``suspension``
     carries the full evidence (reason, error, ``retryable``, ``http_status``,
     ``config_recoverable``, ``provider_error_code``, ``provider_retried``) so a driver can
     decide between re-attempt, config fix, and giving up — the same decision the

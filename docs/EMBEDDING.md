@@ -219,7 +219,10 @@ current request-building configuration. A recovered final settles immediately. A
 tool-call turn enters the message log before the current tool surface is resolved for execution.
 Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
 model-call sidecars receive the authoritative call at the original settlement even when required
-evidence parks afterward; recovery does not duplicate that passive publication. Treat
+evidence parks afterward; recovery does not duplicate that passive publication. The checkpoint
+marker forces required delivery on the replacement activation even when its configured policy is
+`passive`. One-shot `run_once()` releases this committed park and raises `TurnNotSettled`; restore
+the checkpoint and resume with `None`. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
