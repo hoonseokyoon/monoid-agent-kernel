@@ -9,12 +9,15 @@ import pytest
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
     ModelStreamOutcome,
+    ModelStreamStatus,
 )
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
@@ -248,6 +251,65 @@ def test_stream_model_calls_forces_streaming_and_token_boundary_interrupt(tmp_pa
         assert interrupted.parent_id == started.event_id
     finally:
         loop.close()
+
+
+@pytest.mark.parametrize(
+    ("cause", "suspension_reason", "stream_status", "stream_error_code"),
+    (
+        (InterruptionCause.DEADLINE, "terminal", "timed_out", "run_timeout"),
+        (
+            InterruptionCause.GRACEFUL_DRAIN,
+            "interrupted",
+            "interrupted",
+            "graceful_drain",
+        ),
+        (
+            InterruptionCause.HOST_SHUTDOWN,
+            "interrupted",
+            "interrupted",
+            "host_shutdown",
+        ),
+    ),
+)
+def test_typed_run_cancellation_closes_the_model_stream_with_the_same_classification(
+    tmp_path: Path,
+    cause: InterruptionCause,
+    suspension_reason: str,
+    stream_status: ModelStreamStatus,
+    stream_error_code: str,
+) -> None:
+    token = CancellationToken()
+    observer = _RecordingObserver()
+
+    class CancellingAdapter(_ScriptedStreamAdapter):
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            yield TextDelta("partial")
+            token.cancel(cause)
+            await asyncio.Event().wait()
+
+    loop = _loop(
+        tmp_path,
+        CancellingAdapter([]),
+        observer_factories=(lambda: observer,),
+    )
+    loop.cancellation_token = token
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.discard_uncommitted()
+
+    assert suspension.reason == suspension_reason
+    assert suspension.interruption_cause is cause
+    assert observer.writers[0].outcomes == [
+        ModelStreamOutcome(
+            status=stream_status,
+            final_text="partial",
+            error_code=stream_error_code,
+        )
+    ]
 
 
 def test_partial_output_closes_observer_as_failed(tmp_path: Path) -> None:

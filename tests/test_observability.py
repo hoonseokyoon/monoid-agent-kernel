@@ -1050,6 +1050,28 @@ def test_a_settled_recovery_clears_the_interruption_cause_on_both_readers(
     assert "interruption_cause" not in sink.state
 
 
+def test_a_pause_supersedes_an_old_interruption_cause_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    events = (
+        {
+            "type": "turn.interrupted",
+            "data": {"reason": "user_stop", "interruption_cause": "user_cancel"},
+        },
+        {"type": "turn.paused", "data": {"reason": "user_pause"}},
+    )
+    run_dir = tmp_path / "run_reparked_as_pause"
+    run_dir.mkdir()
+    _write_events(run_dir, *events)
+
+    assert project_run_status(run_dir)["interruption_cause"] is None
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert "interruption_cause" not in sink.state
+
+
 def test_the_status_sink_records_the_classification_of_a_recoverable_turn_failure(
     tmp_path: Path,
 ) -> None:

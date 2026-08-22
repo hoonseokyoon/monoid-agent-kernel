@@ -1175,6 +1175,11 @@ evidence를 다음 step 뒤에 남기지 않는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.
 - Token `deadline`과 wall-clock timeout은 `run_timeout` terminal projection을 공유한다.
   Settled park의 close는 기존 turn settlement를 재실행하지 않는다.
+- Model stream 종료 상태도 typed cause를 따른다. `user_cancel`은 `cancelled`, `deadline`은
+  `timed_out`, drain/shutdown은 `interrupted`로 닫는다. `lease_lost`는 stale stream close를
+  금지한다.
+- `turn.paused`는 현재 cause-less park로서 이전 `turn.interrupted` cause를 status와 offline
+  event projection에서 지운다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
 
 종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal

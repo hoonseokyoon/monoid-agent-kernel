@@ -255,6 +255,10 @@ class StatusJsonSink:
             )
             self.state.pop("provider_retried", None)
             self.state.pop("interruption_cause", None)
+        elif event.type == "turn.paused":
+            # The current turn park owns this projection. A cause-less pause supersedes any
+            # interruption cause carried by the preceding park.
+            self.state.pop("interruption_cause", None)
         elif event.type == "turn.settled":
             cause = data.get("interruption_cause")
             if isinstance(cause, str) and cause:

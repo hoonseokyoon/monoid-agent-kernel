@@ -2912,6 +2912,13 @@ Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection
 run. A previously settled park keeps its single turn settlement; close adds the timeout terminal
 projection without emitting `turn.settled` again.
 
+Model-stream observers apply the same typed boundary. `user_cancel` closes as
+`cancelled/cancelled`, `deadline` closes as `timed_out/run_timeout`, and
+`graceful_drain` or `host_shutdown` closes as `interrupted/<cause>`. Lease loss suppresses the
+stream close under the stale-writer fence. A new `turn.paused` park clears an older interruption
+cause in both `status.json` and offline event-log projection because the current park owns the
+projected cause.
+
 ### Model evidence delivery policy
 
 `AgentLoop.model_evidence_policy` selects one of three opt-in host delivery contracts:

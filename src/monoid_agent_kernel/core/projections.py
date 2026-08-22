@@ -316,6 +316,10 @@ def _apply_event_projection(
             projection["error"] = _event_text(data, "error")
             projection["error_code"] = _event_text(data, "error_code")
             _assign_failure_classification(projection, data)
+        elif event_type == "turn.paused":
+            # The newest turn park is authoritative. A pause has no interruption cause, so it
+            # clears the cause projected from an older interrupted park.
+            projection["interruption_cause"] = None
         elif event_type == "turn.settled":
             projection["interruption_cause"] = _event_interruption_cause(data)
         elif event_type == "turn.interrupted":

@@ -2775,10 +2775,14 @@ class AgentLoop:
             # for; the interrupt did not un-spend them.
             raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
         except RunCancelled as exc:
-            outcome_status = "cancelled"
+            cause = (
+                exc.interruption_cause
+                if isinstance(exc.interruption_cause, InterruptionCause)
+                else InterruptionCause.USER_CANCEL
+            )
+            outcome_status, outcome_error_code = _cancelled_model_stream_outcome(cause)
             outcome_final_text = "".join(output_fragments) or None
-            outcome_error_code = "cancelled"
-            lease_lost = exc.interruption_cause is InterruptionCause.LEASE_LOST
+            lease_lost = cause is InterruptionCause.LEASE_LOST
             raise
         except RunTimeout:
             outcome_status = "timed_out"
@@ -6756,6 +6760,23 @@ def _billed_usage(exc: BaseException) -> dict[str, int]:
     """
 
     return provider_usage_of(exc)
+
+
+def _cancelled_model_stream_outcome(
+    cause: InterruptionCause,
+) -> tuple[ModelStreamStatus, str]:
+    """Project a typed run cancellation onto the model-stream vocabulary.
+
+    Stream observers close at the provider boundary, before the loop builds its suspension.
+    Applying the same cause mapping here keeps that live projection aligned with the durable
+    turn and run projections.
+    """
+
+    if cause is InterruptionCause.DEADLINE:
+        return "timed_out", "run_timeout"
+    if cause is InterruptionCause.USER_CANCEL:
+        return "cancelled", "cancelled"
+    return "interrupted", cause.value
 
 
 def _as_model_adapter_error(exc: BaseException) -> BaseException:

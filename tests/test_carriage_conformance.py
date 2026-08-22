@@ -5762,12 +5762,12 @@ EVENT_CONSUMER_PROGRESS = frozenset(
         "workspace.proposal.updated",
     }
 )
-# The pause park's session-lane projection, handled by the two status-file readers. NOT part of
-# ``EVENT_CONSUMER_CORE``: the backend record's pause state is owned by session_drive (the
-# driver observes the ``paused`` Suspension directly and a ``record_event`` state write would
-# race it — the same reason its ``turn.failed`` branch never touches state), so the record
-# deliberately has no branch for this event.
-EVENT_CONSUMER_PAUSE = frozenset({"session.state.changed"})
+# The pause park's turn and session projections, handled by the two status-file readers. The turn
+# event clears the prior cause; the session event changes lifecycle state. The backend record's
+# pause state is owned by session_drive: the driver observes the ``paused`` Suspension directly,
+# and a ``record_event`` state write would race it. The record therefore has no branch for either
+# pause event.
+EVENT_CONSUMER_PAUSE = frozenset({"turn.paused", "session.state.changed"})
 EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
     # The offline projection reads the *committed log*, so it can also fold the durable proposal
     # lifecycle that the two live sinks never see (they fire before the artifacts are written).
