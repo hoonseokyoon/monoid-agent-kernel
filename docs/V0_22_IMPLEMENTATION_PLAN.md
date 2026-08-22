@@ -853,6 +853,9 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   첫 reservation은 invocation journal에 `requires_evidence=true`를 저장한다. Settlement와 이 의무는
   같은 journal transaction에서 확정된다. Settlement commit 뒤 evidence commit 또는 checkpoint
   publication 전에 process가 종료되어도 새 activation은 journal field를 읽고 delivery를 완료한다.
+  Journal field가 required이면 replacement config와 dynamic context로 다시 계산한 request digest를
+  검증하기 전에 sink delivery를 먼저 완료한다. 이후 request drift는 result 적용을 중단할 수 있지만
+  required evidence를 남겨두지 않는다.
   Recovery query의 `require_evidence` marker는 이미 저장된 evidence park에서 같은 의무를 보강한다.
   두 표식 모두 새 activation의 `passive` 설정보다 우선한다.
   기존 invocation의 journal field가 `false`이면 현재 activation 설정만으로 `required`로 승격하지

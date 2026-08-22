@@ -154,6 +154,7 @@ class FencedModelCallLifecycle:
         blobs: Mapping[str, bytes] | None = None,
         *,
         require_evidence: bool = False,
+        evidence_committed: bool = False,
     ) -> None:
         if require_evidence or invocation.requires_evidence:
             evidence_policy = "required"
@@ -166,7 +167,7 @@ class FencedModelCallLifecycle:
             blobs,
             stage_evidence=evidence_policy == "outbox",
         )
-        if evidence_policy == "required":
+        if evidence_policy == "required" and not evidence_committed:
             self._commit_evidence(invocation)
 
     @staticmethod
@@ -216,6 +217,13 @@ class FencedModelCallLifecycle:
         if record is None:
             return None
         invocation = record.invocation
+        evidence_committed = False
+        if invocation.dispatch_state == "settled" and invocation.requires_evidence:
+            # The journal obligation is authoritative without a checkpoint marker or a rebuilt
+            # request. Finish its fenced sink delivery before comparing the query digest that
+            # replacement config or dynamic context produced with the settled call.
+            self._commit_evidence(invocation)
+            evidence_committed = True
         if (
             invocation.request_digest != query.request_digest
             or invocation.digest_generation != query.digest_generation
@@ -253,6 +261,7 @@ class FencedModelCallLifecycle:
             self._commit_settled(
                 invocation,
                 require_evidence=query.require_evidence,
+                evidence_committed=evidence_committed,
             )
             return RecoveredModelDispatch(
                 reservation=reservation,
@@ -283,6 +292,7 @@ class FencedModelCallLifecycle:
             invocation,
             {sha256: result_blob},
             require_evidence=query.require_evidence,
+            evidence_committed=evidence_committed,
         )
         return RecoveredModelDispatch(
             reservation=reservation,

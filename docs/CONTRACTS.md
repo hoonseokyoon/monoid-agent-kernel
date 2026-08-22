@@ -2857,6 +2857,9 @@ invocation revision and retry preserves that stable field. Settlement and the ob
 share the authoritative invocation journal transaction. A crash after settlement commit and before
 evidence delivery or checkpoint publication leaves enough durable state for a replacement
 activation to finish required delivery, even when that activation uses the passive default.
+Recovery commits the journal-required evidence before comparing the settled request digest with a
+request rebuilt from replacement runtime config or dynamic context. Request drift may still stop
+result application, and it cannot strand the required sink delivery.
 
 Recovery uses the journal obligation or the checkpointed logical-call ID and request digest to
 re-commit the exact invocation revision and required evidence before it reads current runtime

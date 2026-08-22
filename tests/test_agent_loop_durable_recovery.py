@@ -485,6 +485,36 @@ def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
     assert evidence_key in harness.sink._model_evidence
 
 
+def test_pre_checkpoint_required_evidence_commits_before_rebuilt_request_drift(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    baseline, settled = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        model=ModelConfig(model="original-model"),
+        model_evidence_policy="required",
+    )
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled.invocation.revision)
+
+    suspension, _checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model=ModelConfig(model="replacement-model"),
+        model_evidence_policy="passive",
+    )
+
+    assert suspension.reason == "terminal"
+    assert suspension.error_code == "durable_invocation_request_conflict"
+    assert evidence_key in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+
+
 def test_required_policy_cannot_upgrade_a_passive_settled_invocation(
     tmp_path: Path,
 ) -> None:

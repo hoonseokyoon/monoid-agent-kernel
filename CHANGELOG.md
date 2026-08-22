@@ -119,6 +119,8 @@ out in commit messages and here.
   The first durable reservation records a stable `requires_evidence` obligation in every invocation
   revision. Settlement recovery honors that journal field independently of the replacement host's
   configured policy, closing the crash window before an evidence-failure checkpoint is published.
+  Journal-required recovery completes the fenced evidence mutation before checking a request digest
+  rebuilt from replacement config or dynamic context.
   An activation cannot upgrade an existing passive invocation to required delivery; it fails before
   provider or evidence mutation and applies the stronger policy to a new logical call.
   Recovery commits evidence from the stored logical-call ID and request digest before rebuilding

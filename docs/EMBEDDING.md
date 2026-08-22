@@ -214,7 +214,9 @@ invocation revision and preserve it across retries. A replacement worker must ho
 flag even when its configured policy is `passive`; this covers a crash before an
 `evidence_uncommitted` checkpoint exists. Reject a `passive` to `required` policy change for an
 existing logical call before provider or evidence mutation. Apply the stronger policy to a new
-logical call. For `outbox`, reject the complete transaction when either
+logical call. On recovery, deliver a journal-required settlement before validating a request digest
+rebuilt from replacement config or dynamic context. For `outbox`, reject the complete transaction
+when either
 the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
 violates the declared capability.
 
