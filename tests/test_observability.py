@@ -1050,6 +1050,34 @@ def test_a_settled_recovery_clears_the_interruption_cause_on_both_readers(
     assert "interruption_cause" not in sink.state
 
 
+def test_a_legacy_interruption_clears_an_older_typed_cause_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    legacy_payloads = (
+        {"reason": "user_stop"},
+        {"reason": "user_stop", "interruption_cause": ""},
+        {"reason": "user_stop", "interruption_cause": 1},
+    )
+    for index, legacy_payload in enumerate(legacy_payloads):
+        events = (
+            {
+                "type": "turn.interrupted",
+                "data": {"reason": "drain", "interruption_cause": "graceful_drain"},
+            },
+            {"type": "turn.interrupted", "data": legacy_payload},
+        )
+        run_dir = tmp_path / f"run_legacy_interrupt_{index}"
+        run_dir.mkdir()
+        _write_events(run_dir, *events)
+
+        assert project_run_status(run_dir)["interruption_cause"] is None
+
+        sink = StatusJsonSink(tmp_path / f"status_{index}.json")
+        for payload in events:
+            sink.emit(_event(payload["type"], dict(payload["data"])))
+        assert "interruption_cause" not in sink.state
+
+
 def test_a_pause_supersedes_an_old_interruption_cause_on_both_readers(
     tmp_path: Path,
 ) -> None:

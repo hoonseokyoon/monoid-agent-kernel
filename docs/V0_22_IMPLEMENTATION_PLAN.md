@@ -1191,6 +1191,8 @@ evidence를 다음 step 뒤에 남기지 않는다.
   금지한다.
 - `turn.paused`는 현재 cause-less park로서 이전 `turn.interrupted` cause를 status와 offline
   event projection에서 지운다.
+- cause가 없는 legacy `turn.interrupted`도 현재 cause-less park로 읽어 이전 typed cause를
+  status와 offline projection에서 지운다.
 - turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
 
 종료 조건: lease-lost worker가 usage/metric/observer/sidecar/checkpoint/event/projection/terminal

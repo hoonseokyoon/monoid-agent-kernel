@@ -269,6 +269,10 @@ class StatusJsonSink:
             cause = data.get("interruption_cause")
             if isinstance(cause, str) and cause:
                 self.state["interruption_cause"] = cause
+            else:
+                # Legacy producers emit only the reason. The newest park is still authoritative,
+                # so absence or malformed input clears an older typed cause instead of inheriting it.
+                self.state.pop("interruption_cause", None)
         elif event.type == "run.waiting":
             self.state["state"] = session_state_value(SessionState.AWAITING_TASKS)
             self.state["terminal"] = False

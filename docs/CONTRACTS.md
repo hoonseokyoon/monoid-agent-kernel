@@ -1633,8 +1633,9 @@ the config) from a `rate_limit` (wait). The classification remains for as long a
 a `model.turn.started` clears it (the new turn supersedes the dead one, including on the
 no-park retry path), and terminal events assign rather than or-fallback, so a completed run
 never keeps a recovered turn's error. Typed `interruption_cause` follows the same park lifetime:
-`turn.interrupted` sets it, `turn.settled` clears the completed park, a new `model.turn.started`
-clears it before provider work, and terminal events assign it.
+`turn.interrupted` assigns the current valid cause and clears it when a legacy event omits the
+field, `turn.settled` clears the completed park, a new `model.turn.started` clears it before
+provider work, and terminal events assign it.
 A failed terminal keeps the `run.failed` classification —
 minus `provider_retried`, the per-call fact the terminal vocabulary deliberately drops.
 `GET /v1/runs/{id}/status` and `/result` serve the same five off the record, on the live branch
@@ -2888,7 +2889,8 @@ A turn-level `Stop` creates a resumable interrupted park with `user_cancel` and 
 open. The cause travels through `Suspension`, `AgentTurnResult`, `AgentRunResult`,
 `RunCheckpoint`, `turn.interrupted`, `run.finished`, `turn.settled`, cumulative metrics, status
 projection, and the Reference backend record/result surfaces. An absent cause remains compatible
-with older checkpoints and events.
+with older checkpoints and events and projects as no current cause rather than inheriting an older
+park's value.
 
 Lease loss can race with a model settlement. A `settled` invocation committed before the lease-loss
 signal remains authoritative paid-call evidence. The runner rechecks lease authority immediately
