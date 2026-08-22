@@ -22,9 +22,12 @@ from support.http import LINE_SEPARATORS, serving, sse_data_frames_by_line
 from support.runtime import runtime_config
 
 from monoid_agent_kernel.errors import ModelAdapterError
+from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.result import AgentRunResult
 from monoid_agent_kernel.providers.base import ModelRequest, ModelStreamChunk, ModelTurn, TextDelta, TurnComplete
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
 from monoid_agent_kernel.reference.backend.http import create_backend_server
+from monoid_agent_kernel.reference.backend.run_execution import result_frame
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 
 _SETTLE_TYPES = {"turn.settled", "run.finished"}
@@ -90,6 +93,30 @@ def _read_sse(base_url: str, payload: dict[str, Any], *, token: str = "admin") -
 
 async def _collect(backend: RunnerBackend, request: BackendRunRequest) -> list[dict[str, Any]]:
     return [frame async for frame in backend.astream_run(request)]
+
+
+def test_stream_result_frame_serializes_the_typed_interruption_cause(tmp_path: Path) -> None:
+    result = AgentRunResult(
+        run_id="run_drain",
+        status="limited",
+        final_text="",
+        run_dir=tmp_path,
+        diff_path=tmp_path / "diff.patch",
+        proposal_path=tmp_path / "proposal.json",
+        interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+    )
+
+    assert result_frame(result, None)["interruption_cause"] == "graceful_drain"
+
+    clean = AgentRunResult(
+        run_id="run_clean",
+        status="completed",
+        final_text="done",
+        run_dir=tmp_path,
+        diff_path=tmp_path / "diff.patch",
+        proposal_path=tmp_path / "proposal.json",
+    )
+    assert result_frame(clean, None)["interruption_cause"] is None
 
 
 # --- HTTP SSE transport ----------------------------------------------------------------

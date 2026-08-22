@@ -43,6 +43,11 @@ def result_frame(result: AgentRunResult, suspension: Suspension | None) -> dict[
         "final_text": result.final_text,
         "error": result.error,
         "error_code": result.error_code,
+        "interruption_cause": (
+            None
+            if result.interruption_cause is None
+            else result.interruption_cause.value
+        ),
     }
     if suspension is not None and suspension.has_external:
         frame["awaiting_task_ids"] = list(suspension.awaiting_task_ids)

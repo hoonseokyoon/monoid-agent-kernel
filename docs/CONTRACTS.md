@@ -2925,6 +2925,10 @@ stream close under the stale-writer fence. A new `turn.paused` park clears an ol
 cause in both `status.json` and offline event-log projection because the current park owns the
 projected cause.
 
+The Reference backend terminal stream frame carries `interruption_cause` from
+`AgentRunResult`, using the enum value or `null`. Stream-only clients therefore receive the same
+typed cause as REST status/result projections.
+
 ### Model evidence delivery policy
 
 `AgentLoop.model_evidence_policy` selects one of three opt-in host delivery contracts:
