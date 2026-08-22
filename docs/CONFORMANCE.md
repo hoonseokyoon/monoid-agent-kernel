@@ -96,6 +96,41 @@ Python test integrations. Store and broker implementers call
 directly from their own pytest suites or CI tools. These functions return the same typed rule
 outcomes and carry no pytest dependency.
 
+### Fenced run sink contract
+
+Production hosts with overlapping or replaceable workers implement `FencedRunSink` and run the
+composite contract against their real storage adapter:
+
+```python
+from monoid_agent_kernel.conformance import run_fenced_run_sink_contract
+
+outcomes = run_fenced_run_sink_contract(create_fenced_run_sink_harness)
+assert all(outcome.status == "passed" for outcome in outcomes), outcomes
+```
+
+The factory returns a `FencedRunSinkHarness`. The harness installs an exact current `WriterToken`,
+opens a fresh sink facade over the same durable backing, injects checked-load faults, reads complete
+event and terminal winners, coordinates conflicting CAS publications, coordinates writer handoff at
+the storage publication point, and closes every facade it owns. Race hooks use backend transactions
+or deterministic test barriers at the compare-and-publish boundary. That boundary supplies the
+atomicity evidence.
+
+The contract executes seven stable rule families:
+
+- `FENCED-00` verifies fail-closed capability declarations.
+- `FENCED-01` verifies complete checkpoint content identity and blob integrity.
+- `FENCED-02` verifies that writer fencing precedes idempotency and conflict checks.
+- `FENCED-03` verifies event sequencing and terminal first-writer-wins behavior.
+- `FENCED-04` verifies durable model-invocation lifecycle, evidence, and replay blobs.
+- `FENCED-05` rejects illegal invocation transitions and retry coordinates.
+- `FENCED-06` binds every canonical resource and blob to the writer token's run.
+
+Each execution also covers reopened-facade durability, same-coordinate retries with complete
+canonical payload comparison, malformed and unresolved blob maps, conflicting CAS races, and owner
+or generation handoff races. A passing in-memory fake proves the harness wiring. Production evidence
+comes from the adapter that owns the canonical database, object store, lease state, and transaction
+boundary.
+
 ## Provenance and retained evidence
 
 An evidence-retaining v2 report marks provenance `available` only while the caller owns the exact

@@ -12,6 +12,17 @@
       }
     },
     {
+      "fixture_id": "checkpoint-v021-cancelled-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v1",
+        "run_id": "fixture_cancelled_run",
+        "seq": 3,
+        "cancellation_requested": true
+      }
+    },
+    {
       "fixture_id": "checkpoint-v022-additive-v1",
       "artifact": "checkpoint",
       "expected_status": "loaded",

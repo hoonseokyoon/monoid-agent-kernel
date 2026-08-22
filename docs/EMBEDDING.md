@@ -489,12 +489,14 @@ Before production traffic:
 3. run the external `minimal-agent` profile against each product implementation, then call
    `run_checkpoint_store_contract(factory, root)` and `run_capability_broker_contract(factory)`
    directly for each replacement store or broker;
-4. execute the durability fault matrix for the selected checkpoint, activation, input, and effect
+4. run `run_fenced_run_sink_contract(factory)` against the canonical storage transaction and lease
+   boundary used by every host with overlapping or replaceable workers;
+5. execute the durability fault matrix for the selected checkpoint, activation, input, and effect
    paths;
-5. verify the compatibility ledger and package contents from the built wheel;
-6. rehearse fenced recovery, gateway outage, cursor reconnect, drain, rollback, and credential
+6. verify the compatibility ledger and package contents from the built wheel;
+7. rehearse fenced recovery, gateway outage, cursor reconnect, drain, rollback, and credential
    rotation for the selected runtime;
-7. complete [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md).
+8. complete [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md).
 
 For the Reference inbox fixture, run `tests/test_backend_command_inbox.py` and its shared-store
 recovery tests. For DBOS evaluation, install `reference-dbos`, run the owned-runtime, shared-host,

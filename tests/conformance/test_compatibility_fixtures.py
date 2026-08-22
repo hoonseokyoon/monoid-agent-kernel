@@ -11,7 +11,7 @@ from monoid_agent_kernel.core.outcome import TerminalOutcome
 def test_packaged_compatibility_fixtures_have_stable_unique_ids() -> None:
     fixtures = load_compatibility_fixtures()
 
-    assert len(fixtures) == 9
+    assert len(fixtures) == 10
     assert len({fixture.fixture_id for fixture in fixtures}) == len(fixtures)
 
 
@@ -45,6 +45,20 @@ def test_v021_checkpoint_fixture_defaults_v022_additive_fields() -> None:
 
     assert checkpoint is not None
     assert checkpoint.last_model_invocation is None
+    assert checkpoint.interruption_cause == ""
+
+
+def test_v021_cancelled_checkpoint_fixture_leaves_cause_migration_to_restore() -> None:
+    fixture = next(
+        item
+        for item in load_compatibility_fixtures()
+        if item.fixture_id == "checkpoint-v021-cancelled-v1"
+    )
+
+    checkpoint = decode_checkpoint(fixture.payload).value
+
+    assert checkpoint is not None
+    assert checkpoint.cancellation_requested is True
     assert checkpoint.interruption_cause == ""
 
 

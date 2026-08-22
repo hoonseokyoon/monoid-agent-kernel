@@ -6,6 +6,14 @@ from pathlib import Path
 from monoid_agent_kernel._version import FALLBACK_VERSION
 
 
+EXPECTED_BASE_DEPENDENCIES = (
+    "click>=8.1",
+    "jsonschema>=4.21",
+    "pathspec>=1.1,<2",
+    "pydantic>=2.6",
+)
+
+
 def test_release_version_metadata_is_consistent() -> None:
     project_root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads(project_root.joinpath("pyproject.toml").read_text(encoding="utf-8"))
@@ -14,6 +22,19 @@ def test_release_version_metadata_is_consistent() -> None:
     assert FALLBACK_VERSION == project_version
     assert f"## [{project_version}]" in project_root.joinpath("CHANGELOG.md").read_text(
         encoding="utf-8"
+    )
+
+
+def test_v022_base_dependency_set_is_frozen_and_platform_neutral() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads(project_root.joinpath("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = tuple(pyproject["project"]["dependencies"])
+
+    assert dependencies == EXPECTED_BASE_DEPENDENCIES
+    lowered = "\n".join(dependencies).lower()
+    assert all(
+        platform_dependency not in lowered
+        for platform_dependency in ("dbos", "psycopg", "redis", "temporal")
     )
 
 
