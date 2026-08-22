@@ -2869,6 +2869,15 @@ rows, and public events carry only the non-negative usage delta beyond the amoun
 by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
 no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.
 
+An interrupt may arrive after a recovered assistant tool-call turn enters the canonical message
+log and before all of its tools finish. The interruption suspension persists
+`model_tool_calls_pending=true`. `pending_observations` then carries the completed calls in that
+batch. A `None` resume reloads the same settled model result, recognizes the already-projected
+assistant turn, skips tool call IDs with completed observations, and executes the remaining calls.
+The assistant turn is never appended twice. A new user input explicitly abandons this pending turn
+and clears the marker. Tool handlers still need stable external idempotency for process loss before
+a call returns an observation.
+
 `core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
 `TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects
 `dispatch_unknown` to `after_reconciliation`. The projection copies safe taxonomy fields and

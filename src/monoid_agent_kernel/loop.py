@@ -451,13 +451,23 @@ def _unapplied_settled_invocation(
     invocation = getattr(session, "last_model_invocation", None)
     state = getattr(session, "state", None)
     messages = getattr(state, "messages", None)
+    projected_tool_turn = False
+    if isinstance(messages, list) and messages:
+        last_message = messages[-1]
+        tool_calls = last_message.get("tool_calls")
+        projected_tool_turn = (
+            getattr(session, "model_tool_calls_pending", False) is True
+            and last_message.get("role") == "assistant"
+            and isinstance(tool_calls, list)
+            and bool(tool_calls)
+        )
     if (
         type(step) is not int
         or step < 1
         or not isinstance(invocation, DurableModelInvocation)
         or invocation.dispatch_state != "settled"
         or not isinstance(messages, list)
-        or (messages and messages[-1].get("role") == "assistant")
+        or (messages and messages[-1].get("role") == "assistant" and not projected_tool_turn)
     ):
         return None
     turn_id = f"turn_{step:04d}"
@@ -491,6 +501,10 @@ def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
         step=step,
         invocation=invocation,
         blocks_new_input=evidence_uncommitted,
+        outcome_projected=bool(
+            isinstance(suspension, Mapping)
+            and suspension.get("model_tool_calls_pending") is True
+        ),
     )
 
 
@@ -1156,6 +1170,9 @@ class _Session:
     # Latest invocation evidence observed by this activation. The sink remains authoritative;
     # this is the compact summary carried by the next checkpoint.
     last_model_invocation: DurableModelInvocation | None = None
+    # A durable assistant tool-call turn is already projected while one or more calls still need
+    # execution. The interruption suspension carries this bit across activations.
+    model_tool_calls_pending: bool = False
 
 
 @dataclass
@@ -1800,6 +1817,7 @@ class AgentLoop:
             # A new user turn intentionally abandons a prior interrupted result. Required evidence
             # is already committed; only an explicit None resume applies the stored model turn.
             session.state.pending_observations = ()
+            session.model_tool_calls_pending = False
             evidence_recovery = None
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
@@ -1987,7 +2005,11 @@ class AgentLoop:
             # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
             # no later settle refuses to finalize this abandoned turn as a clean success.
             session.midturn_park = "interrupted"
-            result = Suspension(reason="interrupted", status="completed")
+            result = Suspension(
+                reason="interrupted",
+                status="completed",
+                model_tool_calls_pending=session.model_tool_calls_pending,
+            )
             self._persist_checkpoint(session, result)
             return result
         except TurnPaused:
@@ -3328,6 +3350,10 @@ class AgentLoop:
                 if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
             },
             last_model_invocation=restored_invocation,
+            model_tool_calls_pending=bool(
+                isinstance(cp.last_suspension, Mapping)
+                and cp.last_suspension.get("model_tool_calls_pending") is True
+            ),
         )
         manager.restore_state(
             [
@@ -4016,19 +4042,22 @@ class AgentLoop:
             )
         step = recovery.step
         turn_id = f"turn_{step:04d}"
-        turn_started = res.recorder.emit(
-            "model.turn.started",
-            turn_id=turn_id,
-            data={
-                "step": step,
-                "previous_turn_handle": (
-                    public_identifier(state.previous_turn_handle)
-                    if state.previous_turn_handle
-                    else state.previous_turn_handle
-                ),
-            },
-        )
-        parent_id = turn_started.event_id
+        if recovery.outcome_projected:
+            parent_id = None
+        else:
+            turn_started = res.recorder.emit(
+                "model.turn.started",
+                turn_id=turn_id,
+                data={
+                    "step": step,
+                    "previous_turn_handle": (
+                        public_identifier(state.previous_turn_handle)
+                        if state.previous_turn_handle
+                        else state.previous_turn_handle
+                    ),
+                },
+            )
+            parent_id = turn_started.event_id
         session.active_turn_id = turn_id
         session.active_turn_parent_id = parent_id
 
@@ -4045,6 +4074,11 @@ class AgentLoop:
             recovery,
             recovery.invocation.logical_call_id,
         )
+        if recovery.outcome_projected and recovered.failure_code:
+            raise DurableModelCallError(
+                "projected model outcome recovery restored a failure",
+                error_code="durable_invocation_recovery_conflict",
+            )
         if recovered.failure_code:
             recovered_error = ModelDispatchRefused(
                 "durable model dispatch restored a settled refusal",
@@ -4091,20 +4125,48 @@ class AgentLoop:
         original_config = state.previous_runtime_config or AgentRuntimeConfig(
             definition_id="recovered-model-outcome"
         )
-        self._project_successful_model_turn(
-            state,
-            res,
-            turn,
-            call_receipt,
-            original_config,
-            step=step,
-            turn_id=turn_id,
-            parent_id=parent_id,
-            already_accounted_usage=already_accounted_usage,
-            replayed_without_provider=True,
-        )
+        if not recovery.outcome_projected:
+            self._project_successful_model_turn(
+                state,
+                res,
+                turn,
+                call_receipt,
+                original_config,
+                step=step,
+                turn_id=turn_id,
+                parent_id=parent_id,
+                already_accounted_usage=already_accounted_usage,
+                replayed_without_provider=True,
+            )
+        elif not turn.tool_calls:
+            raise DurableModelCallError(
+                "projected model outcome recovery has no pending tool calls",
+                error_code="durable_invocation_recovery_conflict",
+            )
 
         if turn.tool_calls:
+            if recovery.outcome_projected:
+                durable_calls = {call.id: call.name for call in turn.tool_calls}
+                completed_call_ids = [
+                    observation.call_id for observation in state.pending_observations
+                ]
+                if (
+                    len(durable_calls) != len(turn.tool_calls)
+                    or len(set(completed_call_ids)) != len(completed_call_ids)
+                    or any(
+                        durable_calls.get(observation.call_id) != observation.tool_name
+                        for observation in state.pending_observations
+                    )
+                ):
+                    raise DurableModelCallError(
+                        "projected model tool progress conflicts with its stored result",
+                        error_code="durable_invocation_recovery_conflict",
+                    )
+            if not recovery.outcome_projected:
+                # The recovered model turn consumed these inputs. From this point the durable
+                # pending observations are only completed outputs of its tool calls.
+                state.pending_observations = ()
+            session.model_tool_calls_pending = True
             return (
                 replace(
                     recovery,
@@ -4792,6 +4854,14 @@ class AgentLoop:
                     replayed_without_provider=False,
                 )
 
+            if turn.tool_calls:
+                if not outcome_already_projected:
+                    # The model already consumed the prior observations. Reuse this durable field
+                    # as an incremental journal of completed calls until the whole tool batch ends.
+                    state.pending_observations = ()
+                if res.model_runner.lifecycle_hook is not None or outcome_already_projected:
+                    session.model_tool_calls_pending = True
+
             if not turn.tool_calls:
                 if context.job_manager.has_resume_jobs():
                     # Park without blocking: clear the consumed observations and hand
@@ -4819,8 +4889,11 @@ class AgentLoop:
                     return settled
                 raise ModelAdapterError("model returned neither final text nor tool calls")
 
-            observations: list[ToolObservation] = []
+            observations = list(state.pending_observations)
+            completed_call_ids = {observation.call_id for observation in observations}
             for call in turn.tool_calls:
+                if call.id in completed_call_ids:
+                    continue
                 self._check_run_boundary(deadline)
                 state.total_tool_calls += 1
                 if state.total_tool_calls > self.spec.limits.max_tool_calls:
@@ -4851,11 +4924,13 @@ class AgentLoop:
                     deadline=deadline,
                 )
                 observations.append(observation)
+                state.pending_observations = tuple(observations)
                 self._check_run_boundary(deadline)
             state.pending_binding_loads = _dedupe(
                 (*state.pending_binding_loads, *context.consume_tool_load_requests())
             )
             state.pending_observations = tuple(observations)
+            session.model_tool_calls_pending = False
 
             if context.pending_finish is not None:
                 # ``summary`` is an argument the model passed to the ``run.finish`` tool, so this is

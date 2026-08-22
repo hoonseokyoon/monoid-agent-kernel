@@ -81,6 +81,19 @@ class _RaisingDynamicContextProvider:
         raise AssertionError("dynamic context must not run before stored outcome application")
 
 
+class _InterruptingDynamicContextProvider:
+    loop: AgentLoop | None = None
+
+    def static_segment(self) -> None:
+        return None
+
+    def dynamic_segment(self, turn: Any) -> None:
+        del turn
+        assert self.loop is not None
+        self.loop.interrupt_turn()
+        return None
+
+
 @dataclass
 class _CrashAfterInvocationCommit:
     inner: Any
@@ -1045,6 +1058,181 @@ def test_required_evidence_recovery_survives_interrupt_before_result_application
     assert settled.reason == "settled"
     assert settled.turn is not None and settled.turn.final_text == "durable answer"
     assert len(adapter.requests) == 1
+
+
+def test_projected_recovered_tool_calls_resume_after_context_interrupt(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(ToolCall(id="missing-1", name="missing.tool", arguments={}),),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after resumed tool", stop_reason="stop"),
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("hello")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    interrupting_provider = _InterruptingDynamicContextProvider()
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+        context_providers=(interrupting_provider,),
+    )
+    interrupting_provider.loop = interrupted_loop
+    interrupted_loop.restore(evidence_checkpoint)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted.model_tool_calls_pending is True
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.last_suspension is not None
+    assert interrupted_checkpoint.last_suspension["model_tool_calls_pending"] is True
+    projected_tool_turns = [
+        message
+        for message in interrupted_checkpoint.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert len(projected_tool_turns) == 1
+    assert len(adapter.requests) == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "done after resumed tool"
+    assert final_checkpoint is not None
+    assert final_checkpoint.last_suspension is not None
+    assert final_checkpoint.last_suspension["model_tool_calls_pending"] is False
+    final_tool_turns = [
+        message
+        for message in final_checkpoint.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert len(final_tool_turns) == 1
+    assert len(adapter.requests) == 2
+    assert {observation.call_id for observation in adapter.requests[1].observations} == {
+        "missing-1"
+    }
+
+
+def test_projected_recovered_tool_calls_skip_checkpointed_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(
+                ToolCall(id="missing-1", name="missing.tool", arguments={}),
+                ToolCall(id="missing-2", name="missing.tool", arguments={}),
+            ),
+            stop_reason="tool_calls",
+        ),
+        ModelTurn(final_text="done after both tools", stop_reason="stop"),
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("hello")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+    )
+    interrupted_loop.restore(evidence_checkpoint)
+    execute_tool_call = interrupted_loop._aexecute_tool_call
+
+    async def interrupt_after_first_tool(**kwargs: Any):
+        observation = await execute_tool_call(**kwargs)
+        if kwargs["call_id"] == "missing-1":
+            interrupted_loop.interrupt_turn()
+        return observation
+
+    monkeypatch.setattr(interrupted_loop, "_aexecute_tool_call", interrupt_after_first_tool)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert [
+        observation["call_id"] for observation in interrupted_checkpoint.pending_observations
+    ] == ["missing-1"]
+    assert interrupted_checkpoint.total_tool_calls == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+    )
+
+    assert settled.reason == "settled"
+    assert final_checkpoint is not None
+    assert final_checkpoint.total_tool_calls == 2
+    assert len(adapter.requests) == 2
+    assert [
+        observation.call_id for observation in adapter.requests[1].observations
+    ] == ["missing-1", "missing-2"]
 
 
 def test_interrupted_evidence_recovery_preserves_tool_follow_up_request(

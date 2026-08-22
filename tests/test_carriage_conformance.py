@@ -640,6 +640,7 @@ def _maximal_suspension() -> Suspension:
         config_recoverable=True,
         provider_error_code="insufficient_quota",
         provider_retried=True,
+        model_tool_calls_pending=True,
     )
 
 

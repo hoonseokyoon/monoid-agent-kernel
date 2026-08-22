@@ -362,7 +362,13 @@ def _validate_counter_mapping(value: object, field_name: str) -> None:
 # ``core/result.py:suspension_from_checkpoint_payload`` expects to read back. Named here so the
 # validator and the reader cannot drift into disagreeing about one payload.
 _SUSPENSION_STRING_FIELDS = ("final_text", "error", "error_code", "provider_error_code")
-_SUSPENSION_BOOL_FIELDS = ("has_external", "retryable", "config_recoverable", "provider_retried")
+_SUSPENSION_BOOL_FIELDS = (
+    "has_external",
+    "retryable",
+    "config_recoverable",
+    "provider_retried",
+    "model_tool_calls_pending",
+)
 
 
 def _validate_suspension_payload(value: object, field_name: str) -> None:

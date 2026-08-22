@@ -103,6 +103,8 @@ class Suspension:
     the next user message. ``paused`` — a cooperative pause froze the turn at the start of
     a step; unlike ``interrupted`` the in-flight ``pending_observations`` are kept, so a
     ``run_until_suspended(None)`` re-pump resumes the same turn where it left off. The
+    ``model_tool_calls_pending`` flag marks the narrower interrupted state where a durable
+    assistant tool-call turn is already in the message log and its remaining calls must resume.
     non-terminal-ness is carried by ``reason`` alone — ``status`` mirrors the failure
     (``"failed"``) for ``turn_failed`` since ``RunStatus`` has no non-terminal value, so
     callers must branch on ``reason``, not ``status``, to detect a live run. Every reason
@@ -135,6 +137,9 @@ class Suspension:
     # attempt; this is a fact about attempts already made, and the two are independent (an
     # exhausted budget leaves a retryable error nobody will retry again).
     provider_retried: bool = False
+    # A durable model turn has already entered the message log with tool calls, while execution of
+    # those calls remains incomplete. True only on a resumable interruption boundary.
+    model_tool_calls_pending: bool = False
 
 
 # The park vocabulary and the durable status vocabulary, one definition each. Public because the
@@ -177,6 +182,7 @@ def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
         "config_recoverable": suspension.config_recoverable,
         "provider_error_code": suspension.provider_error_code,
         "provider_retried": suspension.provider_retried,
+        "model_tool_calls_pending": suspension.model_tool_calls_pending,
     }
 
 
@@ -211,6 +217,7 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
         # no adapter-side retry was known to have happened.
         provider_error_code=parse_str(payload, "provider_error_code"),
         provider_retried=parse_bool(payload, "provider_retried"),
+        model_tool_calls_pending=parse_bool(payload, "model_tool_calls_pending"),
     )
 
 
