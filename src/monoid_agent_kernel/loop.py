@@ -25,7 +25,6 @@ from monoid_agent_kernel.core._sync_bridge import (
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_timestamp
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
-    _recovered_failure_can_retry,
     _recovered_receipt,
     _recovered_result_matches_evidence,
 )
@@ -350,7 +349,6 @@ def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[boo
 class _EvidenceRecovery:
     step: int
     invocation: DurableModelInvocation
-    instruction_message_index: int | None = None
     blocks_new_input: bool = True
     recovered_dispatch: RecoveredModelDispatch | None = None
 
@@ -485,54 +483,7 @@ def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
     return _EvidenceRecovery(
         step=step,
         invocation=invocation,
-        instruction_message_index=getattr(
-            session,
-            "last_model_instruction_message_index",
-            None,
-        ),
         blocks_new_input=evidence_uncommitted,
-    )
-
-
-def _instruction_from_replayed_user_message(
-    messages: list[dict[str, Any]],
-    message_index: int | None,
-) -> str | None:
-    """Rebuild the instruction projection for an evidence-only model-call replay.
-
-    The original input has already moved from ``pending_user_input`` into the durable
-    by-value message log before required evidence is published.  Reconstructing only
-    its text projection keeps the retried request digest identical without adding a
-    second raw-prompt field to the checkpoint or public journal.
-    """
-
-    if message_index is None:
-        return None
-    if (
-        type(message_index) is not int
-        or message_index < 0
-        or message_index >= len(messages)
-        or messages[message_index].get("role") != "user"
-    ):
-        raise NativeAgentError(
-            "invalid durable instruction coordinate for evidence recovery",
-            error_code="invalid_checkpoint",
-        )
-    content = messages[message_index].get("content")
-    if isinstance(content, str):
-        return content or None
-    if isinstance(content, list):
-        try:
-            parts = tuple(content_part_from_json(part) for part in content)
-        except (TypeError, ValueError) as exc:
-            raise NativeAgentError(
-                "invalid durable user message for evidence recovery",
-                error_code="invalid_checkpoint",
-            ) from exc
-        return text_from_parts(parts) or None
-    raise NativeAgentError(
-        "invalid durable user message for evidence recovery",
-        error_code="invalid_checkpoint",
     )
 
 
@@ -1198,9 +1149,6 @@ class _Session:
     # Latest invocation evidence observed by this activation. The sink remains authoritative;
     # this is the compact summary carried by the next checkpoint.
     last_model_invocation: DurableModelInvocation | None = None
-    # Content-free coordinate paired with ``last_model_invocation``. It identifies the existing
-    # message projected into ModelRequest.instruction without copying prompt content.
-    last_model_instruction_message_index: int | None = None
 
 
 @dataclass
@@ -3053,9 +3001,6 @@ class AgentLoop:
                 if session.last_model_invocation is not None
                 else None
             ),
-            last_model_instruction_message_index=(
-                session.last_model_instruction_message_index
-            ),
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -3353,9 +3298,6 @@ class AgentLoop:
                 if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
             },
             last_model_invocation=restored_invocation,
-            last_model_instruction_message_index=(
-                cp.last_model_instruction_message_index
-            ),
         )
         manager.restore_state(
             [
@@ -4266,20 +4208,9 @@ class AgentLoop:
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
                 state.messages.append(normalize_json_ingress(user_message))
-                instruction_message_index: int | None = len(state.messages) - 1
-            else:
-                instruction_message_index = None
             if not recovering_evidence:
                 for observation in state.pending_observations:
                     state.messages.append(_observation_message(observation, state.media_blobs))
-                session.last_model_instruction_message_index = instruction_message_index
-            if recovering_evidence:
-                instruction = _instruction_from_replayed_user_message(
-                    state.messages,
-                    evidence_recovery.instruction_message_index
-                    if evidence_recovery is not None
-                    else None,
-                )
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
@@ -4336,7 +4267,6 @@ class AgentLoop:
                     error_code=delta_limit_code,
                 )
             recovered_receipt: ModelCallReceipt | None = None
-            resume_kernel_retry = False
             if recovered_dispatch is not None:
                 try:
                     recovered_receipt = _recovered_receipt(
@@ -4346,19 +4276,7 @@ class AgentLoop:
                 except DurableModelCallError as exc:
                     mark_recovered_model_usage(exc, recovered_dispatch.receipt)
                     raise
-                model_config = runtime_config.model or ModelConfig()
-                retry_plan = (
-                    model_config.retry if model_config.retry.layer == "kernel" else None
-                )
-                resume_kernel_retry = bool(
-                    recovered_dispatch.failure_code
-                    and _recovered_failure_can_retry(
-                        recovered_receipt,
-                        recovered_dispatch.receipt,
-                        retry_plan,
-                    )
-                )
-            use_stored_outcome = recovered_dispatch is not None and not resume_kernel_retry
+            use_stored_outcome = recovered_dispatch is not None
 
             # By-value wire copy: the durable log stays by-reference; a multimodal adapter
             # gets media resolved to wire blocks here (once per turn, not per retry). A

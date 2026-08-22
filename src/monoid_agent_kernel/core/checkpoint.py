@@ -171,10 +171,6 @@ class RunCheckpoint:
     # A compact copy of the latest durable model-call journal revision at the next safe checkpoint.
     # The fenced run sink remains crash-window authority; this is recovery context and inspection.
     last_model_invocation: dict[str, Any] | None = None
-    # Content-free coordinate of the message projected into ModelRequest.instruction for that
-    # invocation. ``None`` means the request had no standalone instruction. The prompt itself
-    # remains only in the existing provider-neutral message log.
-    last_model_instruction_message_index: int | None = None
     # Empty until a typed interruption is observed. PR 6 connects the cancellation token and host
     # lifecycle to this already-versioned checkpoint carriage.
     interruption_cause: str = ""
@@ -236,9 +232,6 @@ class RunCheckpoint:
             "skill_activation_count": self.skill_activation_count,
             "skills_activated": self.skills_activated,
             "last_model_invocation": self.last_model_invocation,
-            "last_model_instruction_message_index": (
-                self.last_model_instruction_message_index
-            ),
             "interruption_cause": self.interruption_cause,
         }
         normalized = normalize_json_ingress(
@@ -304,7 +297,6 @@ _CHECKPOINT_NONNEGATIVE_INT_FIELDS = frozenset(
         "output_retries",
         "session_step",
         "submit_local_step",
-        "last_model_instruction_message_index",
         "subagent_count",
         "skill_activation_count",
     }
@@ -494,13 +486,6 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             raise ValueError("checkpoint last_model_invocation is invalid")
         if invocation.value is None or invocation.value.run_id != payload.get("run_id"):
             raise ValueError("checkpoint last_model_invocation run_id must match checkpoint run_id")
-    instruction_index = payload.get("last_model_instruction_message_index")
-    if instruction_index is not None:
-        messages = payload.get("messages")
-        if not isinstance(messages, list) or instruction_index >= len(messages):
-            raise ValueError(
-                "checkpoint last_model_instruction_message_index must address messages"
-            )
     if "interruption_cause" in payload:
         interruption_cause = payload["interruption_cause"]
         if not isinstance(interruption_cause, str):

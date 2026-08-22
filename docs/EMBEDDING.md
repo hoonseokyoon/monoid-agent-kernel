@@ -217,15 +217,13 @@ with the same run ID and a current writer token. The loop commits evidence from 
 call ID and request digest before consulting the current request-building configuration. Stored
 success and final-refusal replay therefore survive runtime-config changes. Treat
 `dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
+Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes
 the fenced settlement/evidence mutation before applying a pending cancellation or expired deadline.
 An interrupt can still park before the recovered result is applied; a `None` resume reloads that
 same logical call with its checkpointed tool observations, while a new user input intentionally
 abandons the interrupted result.
-The checkpoint also stores `last_model_instruction_message_index`, a content-free coordinate into
-the existing message log. A recovered retryable refusal uses this coordinate when it must rebuild
-the original request for a remaining paid attempt. Background and hosted-task results also use the
-provider-neutral `user` role, so role alone cannot identify raw user input.
 
 ## Model and tool wiring
 

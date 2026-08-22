@@ -416,7 +416,6 @@ def test_additive_checkpoint_fields_preserve_existing_positional_order() -> None
     assert checkpoint.last_suspension is None
     assert checkpoint.applied_input_ids == []
     assert checkpoint.last_model_invocation is None
-    assert checkpoint.last_model_instruction_message_index is None
     assert checkpoint.interruption_cause == ""
 
 
@@ -619,9 +618,7 @@ def test_v022_additive_checkpoint_fields_round_trip_under_v1_schema(tmp_path: Pa
     checkpoint = RunCheckpoint(
         run_id="run_1",
         seq=2,
-        messages=[{"role": "user", "content": "hello"}],
         last_model_invocation=invocation.to_json(),
-        last_model_instruction_message_index=0,
         interruption_cause="lease_lost",
     )
 
@@ -659,7 +656,6 @@ def test_checkpoint_writer_rejects_overflowing_float_fields(tmp_path: Path, fiel
         ("applied_input_receipts", {"input": {"terminal": "false"}}),
         ("remaining_duration_s", 10**400),
         ("last_model_invocation", {"schema_version": "monoid.model-invocation.v1"}),
-        ("last_model_instruction_message_index", "zero"),
         ("interruption_cause", "worker_stop"),
     ),
 )
@@ -671,16 +667,6 @@ def test_checkpoint_decoder_rejects_malformed_current_payload(field: str, value:
         "unknown_additive_field": {"preserved_by_format": True},
     }
     payload[field] = value
-
-    assert decode_checkpoint(payload).status == "corrupt"
-
-
-def test_checkpoint_rejects_instruction_coordinate_outside_messages() -> None:
-    payload = RunCheckpoint(
-        run_id="run_1",
-        messages=[{"role": "user", "content": "hello"}],
-    ).to_json()
-    payload["last_model_instruction_message_index"] = 1
 
     assert decode_checkpoint(payload).status == "corrupt"
 

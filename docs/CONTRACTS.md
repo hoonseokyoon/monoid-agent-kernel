@@ -2827,10 +2827,8 @@ Every non-task suspension commits its checkpoint through `FencedRunSink.commit_c
 AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,
 invalid, and raising results escape as checkpoint-persistence failures. Durable mode has no local
 checkpoint fallback. `RunCheckpoint.last_model_invocation` carries the latest compact summary for
-diagnostics and blob reachability. `last_model_instruction_message_index` identifies which existing
-provider-neutral message supplied `ModelRequest.instruction`; it contains no prompt text and keeps
-background user-role observations from changing recovery identity. The invocation head loaded from
-`FencedRunSink` remains the authority for recovery.
+diagnostics and blob reachability. The invocation head loaded from `FencedRunSink` remains the
+authority for recovery.
 
 The concrete adapter is `monoid_agent_kernel.hosting.model_calls.FencedModelCallLifecycle`. Its
 module path is explicit while stable hosting import expansion remains an M2 decision. It performs
@@ -2859,9 +2857,8 @@ surface, or media. A stored success or final refusal then reaches the loop witho
 provider-facing request. Runtime-config drift cannot block evidence delivery or replay of that
 stored outcome. The provider call count does not increase. Repeated evidence parks, transcript
 rows, and public events carry only the non-negative usage delta beyond the amount already projected
-by the prior park. A recovered retryable refusal may consume its remaining kernel attempt budget
-after evidence delivery. That paid continuation rebuilds and verifies the original request identity
-before provider entry and preserves the prior attempt usage.
+by the prior park. Recovery surfaces a stored retryable refusal after evidence delivery and starts
+no automatic paid continuation. A later driver-controlled retry begins at a new model-step boundary.
 
 `core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
 `TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects

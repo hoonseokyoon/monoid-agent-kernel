@@ -4298,7 +4298,6 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "output_retries",
             "session_step",
             "submit_local_step",
-            "last_model_instruction_message_index",
             # The context-owned roll-ups, checkpointed in the burn-down so metrics.json
             # reports one epoch rather than two.
             "subagent_count",

@@ -3117,20 +3117,9 @@ class _IgnoringIdentityFieldSink(DeterministicFencedRunSink):
         stored = self._checkpoints.get((checkpoint.run_id, checkpoint.seq))
         if self.record_family == "checkpoint" and stored is not None:
             winner = stored[1].checkpoint
-            changes = {self.ignored_field: getattr(winner, self.ignored_field)}
-            if (
-                self.ignored_field == "last_model_instruction_message_index"
-                and winner.last_model_instruction_message_index is not None
-                and len(checkpoint.messages)
-                <= winner.last_model_instruction_message_index
-            ):
-                # Keep the deliberately broken sink's substituted coordinate structurally valid
-                # when another same-sequence challenge has no message log. The conformance
-                # observation still isolates the ignored coordinate on its own legal variant.
-                changes["messages"] = winner.messages
             checkpoint = replace(
                 checkpoint,
-                **changes,
+                **{self.ignored_field: getattr(winner, self.ignored_field)},
             )
         return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
 

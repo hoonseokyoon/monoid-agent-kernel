@@ -537,7 +537,6 @@ def _contract_checkpoint_identity_variants(
             revision=1,
             dispatch_state="reserved",
         ).to_json(),
-        "last_model_instruction_message_index": None,
         "interruption_cause": InterruptionCause.USER_CANCEL.value,
     }
     variants: dict[str, RunCheckpoint] = {}
@@ -2292,8 +2291,6 @@ def _run_fenced_run_sink_contract(
             run_id=run_id,
             seq=1,
             final_text="winner",
-            messages=[{"role": "user", "content": "contract instruction"}],
-            last_model_instruction_message_index=0,
             workspace_delta=[
                 {
                     "path": "contract.txt",

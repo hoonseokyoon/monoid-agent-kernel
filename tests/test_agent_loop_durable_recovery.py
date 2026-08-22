@@ -41,7 +41,6 @@ from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     ToolCall,
-    ToolObservation,
     mark_provider_usage,
     provider_usage_of,
 )
@@ -695,7 +694,7 @@ def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_cha
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
 
 
-def test_required_evidence_recovery_rebuilds_multimodal_instruction_identity(
+def test_required_evidence_recovery_replays_multimodal_result_without_rebuilding_request(
     tmp_path: Path,
 ) -> None:
     harness = DeterministicFencedRunHarness()
@@ -726,58 +725,6 @@ def test_required_evidence_recovery_rebuilds_multimodal_instruction_identity(
     assert checkpoint is not None
     assert adapter.requests[0].instruction == "describe this"
     assert isinstance(adapter.requests[0].messages[0]["content"], list)
-
-    restored, _final_checkpoint = _restore(
-        tmp_path,
-        harness,
-        adapter,
-        checkpoint,
-        user_input=None,
-        sink=sink,
-        model_evidence_policy="required",
-    )
-
-    assert restored.reason == "settled"
-    assert restored.turn is not None and restored.turn.final_text == "durable answer"
-    assert len(adapter.requests) == 1
-
-
-def test_required_evidence_recovery_distinguishes_instruction_from_background_message(
-    tmp_path: Path,
-) -> None:
-    harness = DeterministicFencedRunHarness()
-    sink = _RejectModelEvidence(harness.sink)
-    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
-    token = harness.claim_writer(RUN_ID, "worker-1")
-    loop = _loop(
-        tmp_path,
-        adapter,
-        sink=sink,
-        writer_token=token,
-        model_evidence_policy="required",
-    )
-    loop.open()
-    assert loop._session is not None
-    loop._session.state.pending_observations = (
-        ToolObservation(
-            call_id="background-1",
-            tool_name="hosted.task",
-            output={"status": "completed"},
-            is_background=True,
-        ),
-    )
-    try:
-        evidence_park = loop.run_until_suspended("hello")
-        checkpoint = loop.snapshot()
-    finally:
-        with suppress(BaseException):
-            loop.discard_uncommitted()
-
-    assert evidence_park.error_code == "evidence_uncommitted"
-    assert checkpoint is not None
-    assert checkpoint.last_model_instruction_message_index == 0
-    assert checkpoint.messages[0]["content"] == "hello"
-    assert checkpoint.messages[1]["role"] == "user"
 
     restored, _final_checkpoint = _restore(
         tmp_path,
@@ -1286,7 +1233,7 @@ def test_required_evidence_recovery_restores_provider_refusal_without_double_bil
     assert len(adapter.requests) == 1
 
 
-def test_required_evidence_recovery_can_resume_remaining_kernel_attempt_without_double_billing(
+def test_required_evidence_recovery_surfaces_retryable_refusal_without_paid_retry(
     tmp_path: Path,
 ) -> None:
     harness = DeterministicFencedRunHarness()
@@ -1347,15 +1294,16 @@ def test_required_evidence_recovery_can_resume_remaining_kernel_attempt_without_
         model=model,
         model_evidence_policy="required",
     )
-    assert restored.reason == "settled"
-    assert restored.turn is not None and restored.turn.final_text == "second attempt"
+    assert restored.reason == "turn_failed"
+    assert restored.error_code == "model_error"
+    assert restored.retryable is True
     assert final_checkpoint is not None
     assert final_checkpoint.total_usage == {
-        "input_tokens": 5,
-        "output_tokens": 3,
-        "total_tokens": 8,
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 3,
     }
-    assert len(adapter.requests) == 2
+    assert len(adapter.requests) == 1
 
 
 def test_outbox_policy_stages_evidence_with_the_settled_invocation(tmp_path: Path) -> None:
