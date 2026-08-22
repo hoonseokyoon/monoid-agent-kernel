@@ -2853,13 +2853,15 @@ is absent. The core defines the atomic mutation flag. The host owns the outbox s
 backoff, dead-letter handling, and destination credentials.
 
 An invocation settlement remains authoritative when a later required evidence commit fails.
-Recovery rebuilds the same logical-call request identity from checkpointed conversation state,
-re-commits the exact invocation revision to prove the current writer fence, and retries only the
-evidence mutation. It replays the stored success or typed refusal after evidence delivery succeeds.
-The provider call count does not increase. Repeated evidence parks carry the same invocation
-receipt and add only the non-negative usage delta beyond the amount already charged by the prior
-park. A recovered retryable refusal may consume its remaining kernel attempt budget after evidence
-delivery, while preserving the prior attempt usage.
+Recovery uses the checkpointed logical-call ID and request digest to re-commit the exact invocation
+revision and required evidence before it reads current runtime config, context providers, tool
+surface, or media. A stored success or final refusal then reaches the loop without rebuilding a
+provider-facing request. Runtime-config drift cannot block evidence delivery or replay of that
+stored outcome. The provider call count does not increase. Repeated evidence parks, transcript
+rows, and public events carry only the non-negative usage delta beyond the amount already projected
+by the prior park. A recovered retryable refusal may consume its remaining kernel attempt budget
+after evidence delivery. That paid continuation rebuilds and verifies the original request identity
+before provider entry and preserves the prior attempt usage.
 
 `core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
 `TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects

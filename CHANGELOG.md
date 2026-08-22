@@ -116,15 +116,17 @@ out in commit messages and here.
   through `commit_invocation(..., stage_evidence=True)` and requires the sink's
   `transactional_outbox` capability.
 - Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
-  Recovery reuses the exact settled success or refusal, proves the current writer fence, and
-  retries only evidence delivery. Repeated evidence parks and resumed kernel retries subtract
-  previously charged receipt usage, preventing both provider replay and usage duplication. Model
-  step limits and cooperative pause cannot preempt this commit barrier. Cancellation and deadline
-  apply after the fenced evidence mutation; an interrupt before result application retains the
-  same logical call and its tool-follow-up observations for a `None` resume.
+  Recovery commits evidence from the stored logical-call ID and request digest before rebuilding
+  any runtime-dependent provider request. Stored success and final-refusal replay survive config
+  drift. Repeated evidence parks, transcript rows, public events, and resumed kernel retries carry
+  only newly billable usage, preventing provider replay and usage duplication. Model step limits
+  and cooperative pause cannot preempt this commit barrier. Cancellation and deadline apply after
+  the fenced evidence mutation; an interrupt before result application retains the same logical
+  call and its tool-follow-up observations for a `None` resume.
 - Checkpoints carry a content-free `last_model_instruction_message_index` beside the latest model
-  invocation. Evidence recovery rebuilds `ModelRequest.instruction` from that exact existing
-  message instead of mistaking a background or hosted-task `user`-role observation for raw input.
+  invocation. A recovered retryable refusal rebuilds `ModelRequest.instruction` from that exact
+  existing message instead of mistaking a background or hosted-task `user`-role observation for
+  raw input.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal, remaining kernel attempts, multimodal

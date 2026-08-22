@@ -23,7 +23,18 @@ from monoid_agent_kernel.core._sync_bridge import (
     start_abandonable_sync_call,
 )
 from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_timestamp
-from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_call import (
+    ModelCallRunner,
+    _recovered_failure_can_retry,
+    _recovered_receipt,
+    _recovered_result_matches_evidence,
+)
+from monoid_agent_kernel.model_lifecycle import (
+    RecoveredModelDispatch,
+    durable_model_turn,
+    mark_recovered_model_usage,
+    recover_model_dispatch,
+)
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     CheckpointStore,
@@ -154,8 +165,11 @@ from monoid_agent_kernel.core.side_effect_policy import (
 )
 from monoid_agent_kernel.env import OUTPUT_DELTAS_ENV, getenv_bool
 from monoid_agent_kernel.errors import (
+    DurableModelCallError,
     ModelAdapterError,
     ModelCallAborted,
+    ModelDispatchRefused,
+    ModelEvidenceUncommitted,
     AgentConfigError,
     NativeAgentError,
     PermissionDenied,
@@ -338,6 +352,66 @@ class _EvidenceRecovery:
     invocation: DurableModelInvocation
     instruction_message_index: int | None = None
     blocks_new_input: bool = True
+    recovered_dispatch: RecoveredModelDispatch | None = None
+
+
+def _replace_provider_usage_projection(
+    error: BaseException,
+    usage: Mapping[str, int],
+) -> None:
+    """Replace an existing aggregate usage stamp with this projection's billable delta.
+
+    ``mark_provider_usage`` intentionally treats an empty mapping as "no report" and leaves an
+    existing stamp untouched. Evidence replay needs a different operation: the recovered receipt
+    remains aggregate authority while transcript/event projections must explicitly carry zero.
+    """
+
+    try:
+        error.provider_usage = dict(usage)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _recover_evidence_dispatch(
+    runner: ModelCallRunner,
+    recovery: _EvidenceRecovery,
+) -> _EvidenceRecovery:
+    """Commit required evidence from stored identity before rebuilding a model request."""
+
+    hook = runner.lifecycle_hook
+    if hook is None:
+        raise DurableModelCallError(
+            "required model evidence recovery has no durable lifecycle hook",
+            error_code="durable_invocation_recovery_unavailable",
+        )
+    invocation = recovery.invocation
+    try:
+        recovered = recover_model_dispatch(
+            hook,
+            logical_call_id=invocation.logical_call_id,
+            request_digest=invocation.request_digest,
+        )
+    except ModelEvidenceUncommitted as exc:
+        # The provider bill was recorded on the first failed evidence delivery. A later
+        # projection-only attempt has no provider spend of its own.
+        _replace_provider_usage_projection(exc, {})
+        raise
+    if recovered is None:
+        raise DurableModelCallError(
+            "settled model evidence recovery returned no stored outcome",
+            error_code="durable_invocation_recovery_missing",
+        )
+    reservation = recovered.reservation
+    if (
+        reservation.dispatch_attempt != invocation.dispatch_attempt
+        or reservation.dispatch_id != invocation.dispatch_id
+        or reservation.idempotency_key != invocation.idempotency_key
+    ):
+        raise DurableModelCallError(
+            "settled model evidence recovery changed dispatch identity",
+            error_code="durable_invocation_recovery_conflict",
+        )
+    return replace(recovery, recovered_dispatch=recovered)
 
 
 def _accounted_evidence_usage(
@@ -1815,6 +1889,14 @@ class AgentLoop:
                 # activation snapshot captured above.
                 suspension = await self._apump_turn(state, res, session)
             else:
+                # Required evidence belongs to the stored dispatch, not to a request rebuilt from
+                # today's runtime config, context providers, tool surface, or media resolver. Use
+                # the durable logical id + digest first. The returned private result/refusal can
+                # then be applied without asking the provider or re-keying the original call.
+                evidence_recovery = _recover_evidence_dispatch(
+                    res.model_runner,
+                    evidence_recovery,
+                )
                 suspension = await self._apump_turn(
                     state,
                     res,
@@ -3946,6 +4028,11 @@ class AgentLoop:
         )
         while evidence_recovery_step is not None or session.submit_local_step < max_steps:
             recovering_evidence = evidence_recovery_step is not None
+            recovered_dispatch = (
+                evidence_recovery.recovered_dispatch
+                if recovering_evidence and evidence_recovery is not None
+                else None
+            )
             # Cooperative pause is checked ONLY here, at the start of a step — never inside
             # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
             # tool results sit in state.pending_observations not-yet-sent, so a paused park is
@@ -4248,6 +4335,31 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=delta_limit_code,
                 )
+            recovered_receipt: ModelCallReceipt | None = None
+            resume_kernel_retry = False
+            if recovered_dispatch is not None:
+                try:
+                    recovered_receipt = _recovered_receipt(
+                        ModelCallReceipt(),
+                        recovered_dispatch,
+                    )
+                except DurableModelCallError as exc:
+                    mark_recovered_model_usage(exc, recovered_dispatch.receipt)
+                    raise
+                model_config = runtime_config.model or ModelConfig()
+                retry_plan = (
+                    model_config.retry if model_config.retry.layer == "kernel" else None
+                )
+                resume_kernel_retry = bool(
+                    recovered_dispatch.failure_code
+                    and _recovered_failure_can_retry(
+                        recovered_receipt,
+                        recovered_dispatch.receipt,
+                        retry_plan,
+                    )
+                )
+            use_stored_outcome = recovered_dispatch is not None and not resume_kernel_retry
+
             # By-value wire copy: the durable log stays by-reference; a multimodal adapter
             # gets media resolved to wire blocks here (once per turn, not per retry). A
             # text-only adapter receives the by-reference log and projects it to text.
@@ -4261,8 +4373,12 @@ class AgentLoop:
             # seam every request is built through, so the prune binds all of them: the sync
             # facade runs this same coroutine, and the streaming path builds its request from
             # this same ``wire_messages``.
-            wire_messages = prune_dead_reasoning(state.messages)
-            if getattr(self.model_adapter, "supports_multimodal", False):
+            request: ModelRequest | None = None
+            if not use_stored_outcome:
+                wire_messages = prune_dead_reasoning(state.messages)
+            if not use_stored_outcome and getattr(
+                self.model_adapter, "supports_multimodal", False
+            ):
                 # Tool-result image eviction runs on the by-reference copy BEFORE resolution,
                 # so dropped images are never read/encoded. Off unless a keep-N is configured.
                 evicted = 0
@@ -4304,15 +4420,16 @@ class AgentLoop:
                         final_text=state.final_text,
                         error_code=wire_limit_code,
                     )
-            request = ModelRequest(
-                instruction=instruction,
-                system_prompt=turn_system_prompt,
-                tools=surface_snapshot.immediate_tools,
-                previous_turn_handle=state.previous_turn_handle,
-                observations=state.pending_observations,
-                model=runtime_config.model or ModelConfig(),
-                messages=wire_messages,
-            )
+            if not use_stored_outcome:
+                request = ModelRequest(
+                    instruction=instruction,
+                    system_prompt=turn_system_prompt,
+                    tools=surface_snapshot.immediate_tools,
+                    previous_turn_handle=state.previous_turn_handle,
+                    observations=state.pending_observations,
+                    model=runtime_config.model or ModelConfig(),
+                    messages=wire_messages,
+                )
             logical_call_id = (
                 logical_model_call_id(self.spec.run_id, turn_id)
                 if res.model_runner.lifecycle_hook is not None
@@ -4323,24 +4440,70 @@ class AgentLoop:
                 if logical_call_id
                 else {}
             )
-            recorder.transcript(
-                {
-                    "kind": "model_request",
-                    "step": step,
-                    "previous_turn_handle": state.previous_turn_handle,
-                    "observations": [obs.__dict__ for obs in state.pending_observations],
-                    "tool_surface_hash": surface_snapshot.surface_hash,
-                }
-            )
-            try:
-                turn, call_receipt = await self._acall_model(
-                    request,
-                    deadline,
-                    res.model_runner,
-                    invocation_context=self._model_invocation_context(turn_id),
-                    step=step,
-                    turn_id=turn_id,
+            if request is not None:
+                recorder.transcript(
+                    {
+                        "kind": "model_request",
+                        "step": step,
+                        "previous_turn_handle": state.previous_turn_handle,
+                        "observations": [obs.__dict__ for obs in state.pending_observations],
+                        "tool_surface_hash": surface_snapshot.surface_hash,
+                    }
                 )
+            replayed_without_provider = False
+            try:
+                if use_stored_outcome:
+                    if recovered_dispatch is None or recovered_receipt is None:
+                        raise DurableModelCallError(
+                            "stored model outcome recovery state is incomplete",
+                            error_code="durable_invocation_recovery_missing",
+                        )
+                    call_receipt = recovered_receipt
+                    if recovered_dispatch.failure_code:
+                        recovered_error = ModelDispatchRefused(
+                            "durable model dispatch restored a settled refusal",
+                            error_code=recovered_dispatch.failure_code,
+                            provider_error_code=call_receipt.provider_error_code,
+                            retryable=call_receipt.retryable,
+                            config_recoverable=call_receipt.config_recoverable,
+                            http_status=call_receipt.http_status,
+                            provider_retried=call_receipt.provider_retried,
+                        )
+                        mark_provider_usage(recovered_error, call_receipt.usage)
+                        raise recovered_error
+                    try:
+                        turn = durable_model_turn(recovered_dispatch.result_blob)  # type: ignore[arg-type]
+                    except DurableModelCallError as exc:
+                        mark_recovered_model_usage(exc, recovered_dispatch.receipt)
+                        raise
+                    if not _recovered_result_matches_evidence(
+                        turn,
+                        recovered_dispatch.receipt,
+                    ):
+                        recovery_error = DurableModelCallError(
+                            "durable model result conflicts with its receipt",
+                            error_code="durable_invocation_result_corrupt",
+                        )
+                        mark_recovered_model_usage(
+                            recovery_error,
+                            recovered_dispatch.receipt,
+                        )
+                        raise recovery_error
+                    replayed_without_provider = True
+                else:
+                    if request is None:
+                        raise DurableModelCallError(
+                            "model request was not built for provider dispatch",
+                            error_code="durable_invocation_recovery_missing",
+                        )
+                    turn, call_receipt = await self._acall_model(
+                        request,
+                        deadline,
+                        res.model_runner,
+                        invocation_context=self._model_invocation_context(turn_id),
+                        step=step,
+                        turn_id=turn_id,
+                    )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
@@ -4357,7 +4520,10 @@ class AgentLoop:
                         "response_id": None,
                         "final_text": None,
                         "tool_calls": [],
-                        "usage": dict(_billed_usage(exc)),
+                        "usage": _usage_delta(
+                            _billed_usage(exc),
+                            already_accounted_usage,
+                        ),
                         "error": str(exc),
                         "error_code": exc.error_code,
                         "provider_error_code": exc.provider_error_code,
@@ -4376,6 +4542,13 @@ class AgentLoop:
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
                     already_accounted_usage=already_accounted_usage,
+                )
+                # The outer turn-failure event is a second projection of this attempt. Stamp the
+                # delta back onto the exception so it cannot publish the aggregate provider bill
+                # a second time during evidence-only recovery.
+                _replace_provider_usage_projection(
+                    exc,
+                    _usage_delta(_billed_usage(exc), already_accounted_usage),
                 )
                 raise
             except NativeAgentError as exc:
@@ -4472,6 +4645,7 @@ class AgentLoop:
                         "items": [dict(item) for item in turn.reasoning],
                     }
             state.messages.append(normalize_json_ingress(assistant_message))
+            projected_usage = {} if replayed_without_provider else turn.usage
             recorder.transcript(
                 {
                     "kind": "model_turn",
@@ -4484,7 +4658,9 @@ class AgentLoop:
                     "response_id": turn.response_id,
                     "final_text": turn.final_text,
                     "tool_calls": [call.__dict__ for call in turn.tool_calls],
-                    "usage": turn.usage,
+                    # Evidence replay applies a result already billed and projected by the first
+                    # attempt. Delta semantics keep transcript rows directly summable.
+                    "usage": projected_usage,
                     # Carried by ``ModelTurn`` and by the call receipt, and dropped here: the
                     # replay artifact of a retried-then-successful call read as a clean single
                     # attempt. Its failure twin above records the same fact.
@@ -4506,7 +4682,7 @@ class AgentLoop:
                     else turn.response_id,
                     "tool_calls": len(turn.tool_calls),
                     "has_final": bool(turn.final_text),
-                    "usage": turn.usage,
+                    "usage": projected_usage,
                 },
             )
             self._emit_metrics_updated(
@@ -6199,7 +6375,11 @@ def _usage_delta(
                 "durable model usage regressed across evidence recovery",
                 error_code="durable_invocation_usage_regressed",
             )
-        if current > previous:
+        # The first projection preserves provider-reported zero counters. On replay, a key
+        # already projected at zero has no delta and disappears with every other unchanged key.
+        if key in aggregate and key not in already_accounted:
+            delta[key] = current
+        elif current > previous:
             delta[key] = current - previous
     return delta
 

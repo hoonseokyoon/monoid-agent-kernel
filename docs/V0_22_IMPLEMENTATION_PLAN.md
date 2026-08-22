@@ -841,7 +841,9 @@ Authoritative invocation settle과 evidence projection을 구분한다.
 - Invocation settle 실패: paid call의 durable 상태를 확정하지 못했으므로 crash-safe path는
   `dispatch_unknown`이다.
 - Invocation settle 성공 + required evidence 실패: `evidence_uncommitted`다.
-- `evidence_uncommitted` 복구: settled invocation result를 재사용하고 evidence delivery만 다시 한다.
+- `evidence_uncommitted` 복구: checkpoint의 logical call ID와 request digest로 evidence delivery를
+  먼저 확정하고 settled invocation result를 재사용한다. 현재 runtime config, context provider,
+  tool surface, media wire payload는 이 evidence commit의 입력이 아니다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
@@ -853,7 +855,8 @@ Lifecycle bridge는 invocation commit 성공과 evidence commit 실패를 typed
 첫 `evidence_uncommitted` park는 저장된 receipt usage를 run total에 반영한다. 같은 logical call의
 복구는 마지막 evidence-uncommitted checkpoint가 이미 반영한 usage를 읽고 이후 aggregate receipt와의
 non-negative delta만 더한다. 같은 evidence 재시도, settled failure 재표면화, 남은 kernel attempt
-재개가 usage를 중복 계상하지 않는다.
+재개가 usage를 중복 계상하지 않는다. Transcript와 public event도 같은 delta를 기록한다. 저장된
+결과를 provider 호출 없이 적용한 행의 usage는 빈 mapping이다.
 
 기존 반환형을 유지하기 위해 AgentLoop는 `evidence_uncommitted`를 non-terminal
 `Suspension(reason="turn_failed", error_code="evidence_uncommitted")`로 표면화한다.

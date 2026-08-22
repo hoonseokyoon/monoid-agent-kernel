@@ -634,6 +634,65 @@ def test_required_evidence_retries_only_projection_and_deduplicates_usage(
     assert final_checkpoint is not None and final_checkpoint.total_usage == usage
     assert len(adapter.requests) == 1
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
+    transcript_path = next((tmp_path / "runs").rglob("transcript.jsonl"))
+    model_turns = [
+        record
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+        if (record := json.loads(line)).get("kind") == "model_turn"
+    ]
+    assert [record["usage"] for record in model_turns] == [usage, {}]
+    assert sum(record["usage"].get("total_tokens", 0) for record in model_turns) == 6
+    events_path = next((tmp_path / "runs").rglob("events.jsonl"))
+    failed_turns = [
+        event
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if (event := json.loads(line)).get("type") == "turn.failed"
+    ]
+    assert [event["data"]["provider_usage"] for event in failed_turns] == [usage, {}]
+
+
+def test_required_evidence_recovery_uses_stored_identity_when_runtime_config_changes(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model=ModelConfig(model="original-model"),
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model=ModelConfig(model="changed-model"),
+        model_evidence_policy="required",
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None
+    assert len(adapter.requests) == 1
+    assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
 
 
 def test_required_evidence_recovery_rebuilds_multimodal_instruction_identity(
