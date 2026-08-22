@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -24,6 +25,7 @@ from monoid_agent_kernel.core.model_io import (
     ModelIOSubscription,
 )
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
@@ -1000,6 +1002,37 @@ def test_cancellation_releases_a_slow_adapter() -> None:
     with pytest.raises(RunCancelled):
         asyncio.run(run())
     assert time.monotonic() - started < 2.0
+
+
+def test_lease_loss_supersedes_an_earlier_stop_before_standalone_publication() -> None:
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    token.cancel(InterruptionCause.USER_CANCEL)
+    authority.revoke()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert observer.captures == []
+    assert sidecar == []
 
 
 def test_the_token_is_read_per_call_not_captured_at_construction() -> None:
@@ -5245,6 +5278,67 @@ def test_durable_runner_requires_an_explicit_logical_call_id_before_dispatch() -
     assert lifecycle._loaded("call-durable-1").status == "missing"
 
 
+@pytest.mark.parametrize(
+    ("lose_after", "expected_states"),
+    (
+        ("reserve", ["reserved"]),
+        ("dispatch_started", ["reserved", "dispatch_started"]),
+    ),
+)
+def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
+    lose_after: str,
+    expected_states: list[str],
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def _lose_authority(self, transition: str) -> None:
+            if transition == lose_after:
+                token.cancel(InterruptionCause.USER_CANCEL)
+                authority.revoke()
+
+        def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
+            effective = super().reserve(proposed)
+            self._lose_authority("reserve")
+            return effective
+
+        def dispatch_started(self, reservation: ModelDispatchReservation) -> None:
+            super().dispatch_started(reservation)
+            self._lose_authority("dispatch_started")
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert lifecycle.states == expected_states
+    assert adapter.calls == 0
+    assert observer.captures == []
+    assert sidecar == []
+
+
 def test_durable_resume_abort_gate_runs_after_recovery_probe_before_dispatch() -> None:
     harness = DeterministicFencedRunHarness()
     lifecycle = _JournalLifecycle(harness)
@@ -5375,6 +5469,150 @@ def test_durable_success_commits_the_canonical_private_result_before_passive_del
     assert body["reasoning"] == [{"type": "encrypted_reasoning", "id": "reasoning-1"}]
     assert "raw" not in body
     assert adapter.keys == [invocation.idempotency_key]
+
+
+def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def settled(self, settlement: ModelDispatchSettlement) -> None:
+            super().settled(settlement)
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+            authority.revoke()
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert authority.revoked is True
+    assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "settled"
+    assert observer.captures == []
+    assert sidecar == []
+
+
+def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None:
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    entered, release = threading.Event(), threading.Event()
+    first_captures: list[ModelCallCapture] = []
+
+    class BlockingObserver:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            first_captures.append(capture)
+            entered.set()
+            assert release.wait(5)
+
+    second = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    def lose_authority() -> None:
+        assert entered.wait(5)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        authority.revoke()
+        release.set()
+
+    racer = threading.Thread(target=lose_authority)
+    racer.start()
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=BlockingObserver(),
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                    ModelIOSubscription(
+                        observer=second,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+    racer.join(5)
+
+    assert not racer.is_alive()
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(first_captures) == 1
+    assert second.captures == []
+    assert sidecar == []
+
+
+def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensation() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    lifecycle = _JournalLifecycle(harness)
+
+    class RacingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+            stale_exception = RunCancelled(
+                "run cancelled",
+                interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+            )
+            authority.revoke()
+            raise stale_exception
+
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=RacingAdapter(),
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert authority.revoked is True
+    assert lifecycle.states == ["reserved", "dispatch_started"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "dispatch_started"
+    assert observer.captures == []
+    assert sidecar == []
 
 
 @pytest.mark.parametrize(

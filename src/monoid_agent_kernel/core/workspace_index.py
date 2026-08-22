@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from monoid_agent_kernel.core._util import sha256_bytes, utc_timestamp
-from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.workspace import Workspace, _workspace_root_path
 from monoid_agent_kernel.identifiers import namespaced_id
 from monoid_agent_kernel.workspace.paths import is_within
 
@@ -21,7 +21,7 @@ def build_workspace_index(
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     excluded: list[dict[str, str]] = []
-    root = workspace.root.resolve()
+    root = _workspace_root_path(workspace).resolve()
     truncated = False
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):

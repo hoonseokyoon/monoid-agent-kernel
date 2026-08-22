@@ -7,17 +7,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import NoReturn
 
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
     ModelEvidencePolicy,
 )
 from monoid_agent_kernel.errors import DurableModelCallError, ModelEvidenceUncommitted
 from monoid_agent_kernel.hosting.contracts import (
-    CommitResult,
     FencedRunSink,
     ModelInvocationRecord,
     WriterToken,
 )
+from monoid_agent_kernel.hosting.commit_results import accept_fenced_commit_result
 from monoid_agent_kernel.model_lifecycle import (
     ModelDispatchRecoveryQuery,
     ModelDispatchReservation,
@@ -35,6 +39,7 @@ class FencedModelCallLifecycle:
     sink: FencedRunSink
     writer_token: WriterToken
     evidence_policy: ModelEvidencePolicy = "passive"
+    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
     last_invocation: DurableModelInvocation | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -43,7 +48,15 @@ class FencedModelCallLifecycle:
 
     def _load(self, logical_call_id: str) -> ModelInvocationRecord | None:
         try:
-            loaded = self.sink.load_invocation(self.writer_token.run_id, logical_call_id)
+            loaded = self.write_authority.guard_external_call(
+                lambda: self.sink.load_invocation(
+                    self.writer_token.run_id,
+                    logical_call_id,
+                )
+            )
+        except WriteAuthorityRevoked:
+            self.write_authority.revoke()
+            raise
         except Exception as exc:
             raise DurableModelCallError(
                 "durable model invocation load failed",
@@ -83,56 +96,66 @@ class FencedModelCallLifecycle:
     ) -> None:
         try:
             if stage_evidence:
-                result = self.sink.commit_invocation(
-                    invocation,
-                    blobs or {},
-                    writer_token=self.writer_token,
-                    stage_evidence=True,
+                result = self.write_authority.guard_external_call(
+                    lambda: self.sink.commit_invocation(
+                        invocation,
+                        blobs or {},
+                        writer_token=self.writer_token,
+                        stage_evidence=True,
+                    )
                 )
             else:
-                result = self.sink.commit_invocation(
-                    invocation,
-                    blobs or {},
-                    writer_token=self.writer_token,
+                result = self.write_authority.guard_external_call(
+                    lambda: self.sink.commit_invocation(
+                        invocation,
+                        blobs or {},
+                        writer_token=self.writer_token,
+                    )
                 )
+        except WriteAuthorityRevoked:
+            self.write_authority.revoke()
+            raise
         except Exception as exc:
             raise DurableModelCallError(
                 "durable model invocation commit failed",
                 error_code="durable_invocation_commit_failed",
             ) from exc
-        if not isinstance(result, CommitResult):
+        try:
+            status = accept_fenced_commit_result(
+                result,
+                write_authority=self.write_authority,
+            )
+        except WriteAuthorityRevoked:
+            self.write_authority.revoke()
+            raise
+        except (TypeError, ValueError) as exc:
             raise DurableModelCallError(
                 "durable model invocation commit returned an invalid result",
                 error_code="durable_invocation_commit_failed",
-            )
-        if result.status == "fenced":
-            raise DurableModelCallError(
-                "durable model invocation writer was fenced",
-                error_code="durable_invocation_fenced",
-            )
-        if result.status == "conflict":
+            ) from exc
+        if status == "conflict":
             raise DurableModelCallError(
                 "durable model invocation conflicted with authoritative state",
                 error_code="durable_invocation_conflict",
-            )
-        if result.status not in {"committed", "already_committed"}:
-            raise DurableModelCallError(
-                "durable model invocation commit returned an unsupported status",
-                error_code="durable_invocation_commit_failed",
             )
         self.last_invocation = invocation
 
     def _commit_evidence(self, invocation: DurableModelInvocation) -> None:
         try:
-            result = self.sink.commit_model_evidence(
-                invocation,
-                writer_token=self.writer_token,
+            result = self.write_authority.guard_external_call(
+                lambda: self.sink.commit_model_evidence(
+                    invocation,
+                    writer_token=self.writer_token,
+                )
             )
-            if not isinstance(result, CommitResult) or result.status not in {
-                "committed",
-                "already_committed",
-            }:
+            status = accept_fenced_commit_result(
+                result,
+                write_authority=self.write_authority,
+            )
+            if status not in {"committed", "already_committed"}:
                 raise RuntimeError("required evidence commit was not accepted")
+        except WriteAuthorityRevoked:
+            raise
         except Exception as exc:
             failed = ModelEvidenceUncommitted()
             mark_recovered_model_usage(failed, invocation.receipt or {})

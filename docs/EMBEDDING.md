@@ -138,6 +138,12 @@ mount and filesystem semantics that support atomic replace and locking. Read che
 `unsupported_version` outcomes. The executable example asserts a checked `loaded` outcome.
 It also returns `runtime_profile="embedded-local"` so test output names the selected topology.
 
+The bundled LocalFS and SQLite checkpoint stores are single-writer adapters. Their atomic commit
+protects checkpoint integrity, and the Reference host serializes each in-process commit with its
+activation write authority. A topology where an old writer can resume after another writer takes
+over uses a `FencedRunSink` and passes a `WriterToken` into every canonical mutation. The storage
+adapter validates owner and generation in the same transaction as the write.
+
 Reconstruct the loop with the same run ID, compatible runtime definition, workspace mapping, and
 blob store. Restore the checked checkpoint before accepting a new input. Stop recovery and surface
 an actionable failure for corrupt or unsupported state.
@@ -246,6 +252,29 @@ the checkpoint and resume with `None`. Treat
 The kernel accounts an authoritative settled receipt before a stop or deadline can park its result
 as unapplied. Persisted interruption checkpoints therefore include the paid usage even when the
 assistant turn remains absent; resume projects the stored result without adding that usage again.
+Lease loss uses the stricter ownership boundary. The runner rechecks authority immediately after
+durable settlement and suppresses stale usage accounting, metrics, passive model-I/O delivery,
+model-call sidecars, and model-stream completion. The replacement owner recovers the stored receipt
+and publishes it without another provider dispatch.
+Treat `CancellationToken.cause` as first-cause execution-control history. Inject one
+`ActivationWriteAuthority` into AgentLoop and every activation-owned adapter. Revoke that authority
+when lease ownership moves. Revocation wakes the loop while preserving an earlier Stop or drain
+cause, and the stale activation returns an ephemeral `lease_lost` disposition. Required-evidence
+recovery checks the authority before and after its lifecycle hook. Token-based deadlines use the
+same `run_timeout` terminal projection as elapsed wall-clock deadlines.
+
+Keep the host's `WriterToken(run_id, owner_id, generation)` beside the process-local authority.
+Checkpoint, invocation, canonical event, and terminal adapters validate that token atomically with
+each durable mutation. When any adapter reports `fenced`, revoke the shared authority immediately.
+Host adapters also fence or deduplicate external shell, MCP, memory, and custom effects that can
+continue after an activation loses authority.
+Revocation synchronously disables the recorder's private model-content store. Stale activation
+cleanup cancels pending flush timers, drops buffered deltas, and closes its handle without appending
+segments or a stream terminal record.
+Ordinary cleanup while authority remains active cancels hosted tasks created after the last
+committed checkpoint and writes their normal cancel marker. It preserves hosted tasks already
+owned by that checkpoint. Revoked cleanup releases in-process handles only and delegates hosted
+task cancellation to the fenced/idempotent host adapter.
 Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes
@@ -304,8 +333,9 @@ Every hosted assembly follows these portable rules:
 
 For the Reference inbox assembly, every instance shares durable checkpoint and lease stores plus
 one transactional command store. A fresh backend can call `recover_runs()` and start its watchdog
-after an atomic stale-owner claim. Queue limits and claim TTLs bound durable command admission and
-recovery. The bundled SQLite composition remains a single-host Reference fixture.
+after an atomic stale-owner claim once the previous writer has stopped. Queue limits and claim TTLs
+bound durable command admission and recovery. The bundled SQLite composition remains a
+single-host, single-writer Reference fixture.
 
 For the experimental DBOS profile, the private host is the sole DBOS lifecycle authority in one
 process. A supervisor fences the previous process and restarts the same stable executor slot with
@@ -400,6 +430,8 @@ Apply these boundaries:
 - validate token kind, audience, run ID, tenant, user, task metadata, and expiry;
 - keep provider keys and capability secrets in a gateway, broker, or secret manager;
 - persist hashes or opaque handles in checkpoints, events, commands, receipts, and logs;
+- give Python tool extensions only the method-only `ToolContext` façade; keep workspace roots,
+  native paths, recorder/task handles, lifecycle state, and counters behind the trusted kernel edge;
 - restrict workspace roots and resolve paths through the `Workspace` contract;
 - isolate run artifacts, projections, quotas, and retention by tenant;
 - run the production checklist and relevant conformance profiles before external traffic.

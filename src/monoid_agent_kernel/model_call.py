@@ -54,6 +54,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     is_async_callable,
     start_abandonable_sync_call,
 )
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
@@ -69,6 +70,7 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
@@ -517,6 +519,9 @@ class ModelCallRunner:
     runner holding a snapshot would watch a token nobody cancels and silently lose cancellation on
     the streaming path."""
 
+    current_write_authority: Callable[[], ActivationWriteAuthority | None] | None = None
+    """Returns the activation's independent process-local mutation capability, when present."""
+
     cancel_grace_s: float = 1.0
     """How long an abandoned call's worker is given to settle before it is reported as leaked.
 
@@ -661,11 +666,29 @@ class ModelCallRunner:
         and has no meaning for a one-shot call, which cannot be stopped part-way.
         """
 
+        self._assert_write_authority()
         token = self._token()
         if token is not None and token.requested:
-            raise RunCancelled("run cancelled")
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=token.cause or InterruptionCause.USER_CANCEL,
+            )
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
+
+    def _assert_write_authority(self) -> None:
+        """Fence publication immediately after a durable host mutation returns.
+
+        A lifecycle commit can be the operation that discovers or concurrently observes lease
+        loss. Its durable settlement remains authoritative, while every receipt observer and
+        sidecar after that commit belongs to the stale activation and must stay untouched.
+        """
+
+        authority = (
+            None if self.current_write_authority is None else self.current_write_authority()
+        )
+        if authority is not None:
+            authority.assert_active()
 
     async def acall(
         self,
@@ -776,6 +799,11 @@ class ModelCallRunner:
                 # existing authoritative settlement/evidence barrier below.
                 if lifecycle_hook is None:
                     self._check_cancel_or_deadline(deadline)
+                else:
+                    # Lease loss is an authority boundary, not a recoverable cancellation.
+                    # Other terminal requests intentionally wait for an already-settled required
+                    # evidence barrier below; a stale owner may not attempt that mutation.
+                    self._assert_write_authority()
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -1003,6 +1031,7 @@ class ModelCallRunner:
                             request_digest=receipt.request_digest,
                             idempotency_key=request.idempotency_key,
                         )
+                        self._assert_write_authority()
                         # A restored reservation owns the key. The request digest excludes this
                         # carriage field, so replacing it does not invalidate the identity already
                         # checked above.
@@ -1016,6 +1045,7 @@ class ModelCallRunner:
                         # The commit sits immediately before adapter entry. A hook failure leaves
                         # attempts_made unchanged, so the receipt does not claim provider work.
                         lifecycle_hook.dispatch_started(reservation)
+                        self._assert_write_authority()
                     attempts_made = next_attempt
                     reports_before = progress.count
                     attempt_started = time.monotonic()
@@ -1050,10 +1080,18 @@ class ModelCallRunner:
                             stream_committed=delivered,
                             backoff_ms=pending_backoff_ms,
                         )
+                        # The provider exception records the interruption cause that existed when
+                        # it was raised. Lease loss can become sticky while that exception unwinds;
+                        # re-read authority before any dispatch-unknown or failure transition.
+                        self._assert_write_authority()
                         if (
                             lifecycle_hook is not None
                             and reservation is not None
                             and isinstance(exc, Exception)
+                            and not (
+                                isinstance(exc, RunCancelled)
+                                and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                            )
                         ):
                             if dispatch_evidence(exc) != "refused":
                                 raise_model_dispatch_unknown(
@@ -1099,6 +1137,7 @@ class ModelCallRunner:
                                 failure_code=durable_failure.error_code,
                                 stream_committed=delivered,
                             )
+                            self._assert_write_authority()
                         if (
                             retry_plan is None
                             or attempts_made >= retry_plan.max_attempts
@@ -1146,6 +1185,16 @@ class ModelCallRunner:
                 if lifecycle_hook is None:
                     turn = normalize_model_turn(turn)
             except BaseException as exc:
+                # Any lifecycle mutation above may be the operation that observes concurrent lease
+                # loss. Authority supersedes the exception taxonomy before passive publication.
+                self._assert_write_authority()
+                if (
+                    isinstance(exc, RunCancelled)
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                ):
+                    # A durable settlement may have won immediately before lease loss. Preserve
+                    # that journal fact and skip every stale observer/sidecar publication below.
+                    raise
                 # Process-control exceptions preserve already-observed accounting but never become
                 # model outcomes or lifecycle compensation. Prefer a complete receipt prepared
                 # immediately before durable settle. If the stop arrived earlier, carry the usage
@@ -1169,16 +1218,13 @@ class ModelCallRunner:
                                 usage=crash_usage,
                             )
                     if crash_receipt is not None:
-                        with contextlib.suppress(Exception):
-                            self._publish(
-                                request,
-                                None,
-                                crash_receipt,
-                                elapsed_ms=(
-                                    elapsed_before_recovery_ms + self._ms_since(started)
-                                ),
-                                request_preimage=request_preimage,
-                            )
+                        self._publish_best_effort(
+                            request,
+                            None,
+                            crash_receipt,
+                            elapsed_ms=(elapsed_before_recovery_ms + self._ms_since(started)),
+                            request_preimage=request_preimage,
+                        )
                         if crash_receipt.usage:
                             mark_provider_usage(exc, crash_receipt.usage)
                     raise
@@ -1189,24 +1235,22 @@ class ModelCallRunner:
                     # original request/preimage is in hand; the projection failure itself never
                     # becomes a fabricated model-call failure and never enters the retry loop.
                     if durable_outcome_receipt is not None:
-                        with contextlib.suppress(Exception):
-                            self._publish(
-                                request,
-                                None,
-                                durable_outcome_receipt,
-                                elapsed_ms=durable_outcome_receipt.latency_ms,
-                                request_preimage=request_preimage,
-                            )
-                    raise
-                if recovered_failure_receipt is not None:
-                    with contextlib.suppress(Exception):
-                        self._publish(
+                        self._publish_best_effort(
                             request,
                             None,
-                            recovered_failure_receipt,
-                            elapsed_ms=recovered_failure_receipt.latency_ms,
+                            durable_outcome_receipt,
+                            elapsed_ms=durable_outcome_receipt.latency_ms,
                             request_preimage=request_preimage,
                         )
+                    raise
+                if recovered_failure_receipt is not None:
+                    self._publish_best_effort(
+                        request,
+                        None,
+                        recovered_failure_receipt,
+                        elapsed_ms=recovered_failure_receipt.latency_ms,
+                        request_preimage=request_preimage,
+                    )
                     if recovered_failure_receipt.usage:
                         mark_provider_usage(exc, recovered_failure_receipt.usage)
                     raise
@@ -1270,14 +1314,13 @@ class ModelCallRunner:
                     attempt_log=tuple(attempt_log),
                     usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
                 )
-                with contextlib.suppress(Exception):
-                    self._publish(
-                        request,
-                        None,
-                        failed,
-                        elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
-                        request_preimage=request_preimage,
-                    )
+                self._publish_best_effort(
+                    request,
+                    None,
+                    failed,
+                    elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
+                    request_preimage=request_preimage,
+                )
                 # The terminal error leaves carrying what the whole logical call cost: the
                 # loop's failure accounting reads this stamp (`_billed_usage`), and a stamp
                 # naming only the last attempt under-counts every absorbed one. Stamped AFTER
@@ -1350,19 +1393,20 @@ class ModelCallRunner:
                         result_blob=result_blob,
                         stream_committed=delivered,
                     )
+                    self._assert_write_authority()
                 except ModelEvidenceUncommitted as evidence_error:
                     # The success settlement is finalized after the provider try/except above.
                     # Publish it here so passive observers and sidecars see the paid call even
                     # though required evidence parks the loop before the ordinary publish below.
+                    self._assert_write_authority()
                     _carry_settled_model_stream_outcome(evidence_error, turn)
-                    with contextlib.suppress(Exception):
-                        self._publish(
-                            request,
-                            turn,
-                            durable_completed,
-                            elapsed_ms=durable_completed.latency_ms,
-                            request_preimage=request_preimage,
-                        )
+                    self._publish_best_effort(
+                        request,
+                        turn,
+                        durable_completed,
+                        elapsed_ms=durable_completed.latency_ms,
+                        request_preimage=request_preimage,
+                    )
                     raise
             settled = self._publish(
                 request,
@@ -1439,15 +1483,45 @@ class ModelCallRunner:
         timed = replace(receipt, latency_ms=elapsed_ms)
         settled = timed
         try:
+            self._assert_write_authority()
             if self.subscriptions:
+                content = _call_content(request, turn)
+                self._assert_write_authority()
                 settled = dispatch_model_call(
                     receipt=timed,
-                    content=_call_content(request, turn),
+                    content=content,
                     subscriptions=self.subscriptions,
+                    check_authority=self._assert_write_authority,
                 )
         finally:
+            self._assert_write_authority()
             self._record(settled, request_preimage, turn)
+            self._assert_write_authority()
         return settled
+
+    def _publish_best_effort(
+        self,
+        request: ModelRequest,
+        turn: ModelTurn | None,
+        receipt: ModelCallReceipt,
+        *,
+        elapsed_ms: int,
+        request_preimage: bytes | None = None,
+    ) -> ModelCallReceipt | None:
+        """Contain diagnostic publication failures while preserving writer-authority loss."""
+
+        try:
+            return self._publish(
+                request,
+                turn,
+                receipt,
+                elapsed_ms=elapsed_ms,
+                request_preimage=request_preimage,
+            )
+        except RunCancelled:
+            raise
+        except Exception:
+            return None
 
     def _record(
         self, receipt: ModelCallReceipt, request_preimage: bytes | None, turn: Any | None
@@ -1467,14 +1541,18 @@ class ModelCallRunner:
         sink = self.settled_sink
         if sink is None:
             return
+        self._assert_write_authority()
         try:
             sink(
                 SettledModelCall(
                     receipt=receipt, request_preimage=request_preimage, turn=turn
                 )
             )
+        except RunCancelled:
+            raise
         except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
             _LOGGER.debug("model call settled sink failed", exc_info=True)
+        self._assert_write_authority()
 
     async def _adrive(
         self,

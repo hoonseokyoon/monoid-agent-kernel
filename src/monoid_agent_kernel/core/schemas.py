@@ -146,6 +146,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "status": _STR,
             "error": _STR,
             "error_code": _STR,
+            "interruption_cause": _STR,
             # ``final_text`` stays accepted after v0.20 stops emitting model-authored text here.
             # ``validate_run_dir`` replays committed logs against these schemas, so removing the
             # property would fail every run directory written before the change — and kernel
@@ -200,6 +201,7 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
             "final_text_digest": _STR,
             "final_text_len": _INT,
             "error_code": _STR,
+            "interruption_cause": _STR,
             "changed_paths": _STR_ARRAY,
             "output_validators": _INT,
             "output_retries": _INT,
@@ -259,10 +261,12 @@ EVENT_DATA_SCHEMAS: dict[str, dict[str, Any]] = {
     # answers "why did this stop", the park answers "where is the run now". A reader that joins
     # them by name is reading two different questions. See docs/CONTRACTS.md, event reads.
     "turn.interrupted": _data_schema(
-        {"reason": _STR},
+        {"reason": _STR, "interruption_cause": _STR},
+        # Both fields stay optional in the unchanged v1 reader. Retained events can predate the
+        # typed cause, and the earliest v1 schema also accepted an absent reason.
         required=(),
     ),
-    # The interrupt's twin, and the same cause vocabulary ("user_pause"). The pause park used to
+    # The interrupt's park twin, with its own cause vocabulary ("user_pause"). The pause park used to
     # emit no event of its own — only a ``session.state.changed`` — so two sibling parks were not
     # observable the same way: a consumer watching the turn lane saw the stop and missed the
     # pause. Observability only; no projection consumes it.
@@ -1315,6 +1319,7 @@ METRICS_SCHEMA: dict[str, Any] = {
         "provider_http_status": {"type": ["integer", "null"]},
         "retryable": {"type": "boolean"},
         "config_recoverable": {"type": "boolean"},
+        "interruption_cause": {"type": "string"},
     },
     "additionalProperties": True,
 }
@@ -1343,6 +1348,7 @@ STATUS_SCHEMA: dict[str, Any] = {
         "retryable": {"type": "boolean"},
         "config_recoverable": {"type": "boolean"},
         "provider_retried": {"type": "boolean"},
+        "interruption_cause": {"type": "string"},
     },
     "additionalProperties": True,
 }

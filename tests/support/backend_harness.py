@@ -206,7 +206,7 @@ def _running_hitl_tasks(backend: RunnerBackend, run_id: str) -> list:
     loop = record.loop
     if loop is None or loop._session is None:
         return []
-    manager = loop._session.res.context.job_manager
+    manager = loop._session.res.context._job_manager
     return [task for task in list(manager.jobs.values()) if task.kind == "hitl" and task.status == "running"]
 
 

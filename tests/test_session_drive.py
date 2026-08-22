@@ -5,12 +5,20 @@ import json
 import sys
 import time
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
+import pytest
+
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.spec import ModelRetryConfig
 from monoid_agent_kernel.reference.backend.projection import (
@@ -45,7 +53,7 @@ def _service(
     close_signal: object | None = None,
     resume_signal: object | None = None,
     limits_provider: Any | None = None,
-    store: LocalFsCheckpointStore | None = None,
+    store: Any | None = None,
     drain_calls: list[tuple[Any, Any]] | None = None,
 ) -> SessionDriveService:
     checkpoint_store = store or LocalFsCheckpointStore(tmp_path / "runs")
@@ -56,10 +64,19 @@ def _service(
         if drain_calls is not None:
             drain_calls.append((record, loop))
 
+    def commit_checkpoint(
+        record: Any,
+        checkpoint: RunCheckpoint,
+        blobs: dict[str, bytes],
+    ) -> None:
+        record.write_authority.guard_local_mutation(
+            lambda: checkpoint_store.put(checkpoint, blobs)
+        )
+
     return SessionDriveService(
         SessionDriveContext(
             limits_provider=limits_provider or (lambda: _limits()),
-            checkpoint_store_provider=lambda: checkpoint_store,
+            commit_checkpoint=commit_checkpoint,
             drain_outbox=drain_outbox,
             close_signal=close,
             resume_signal=resume,
@@ -74,6 +91,7 @@ class _Record:
         self.seen_inbox_ids: set[str] = set()
         self.loop: Any = None
         self.cancellation_token = CancellationToken()
+        self.write_authority = ActivationWriteAuthority()
 
 
 def test_session_drive_wait_ignores_stray_resume_without_backend(tmp_path: Path) -> None:
@@ -116,6 +134,67 @@ def test_session_drive_persist_uses_context_store_and_drain_callback(tmp_path: P
     assert drain_calls == [(record, loop)]
 
 
+def test_session_drive_stops_before_outbox_when_lease_is_lost_during_store(
+    tmp_path: Path,
+) -> None:
+    entered, release, revoke_returned = Event(), Event(), Event()
+    drain_calls: list[tuple[Any, Any]] = []
+    committed: list[int] = []
+
+    class _BlockingStore:
+        def put(self, checkpoint: RunCheckpoint, blobs: dict[str, bytes]) -> None:
+            del blobs
+            entered.set()
+            assert release.wait(5)
+            committed.append(checkpoint.seq)
+
+    service = _service(tmp_path, store=_BlockingStore(), drain_calls=drain_calls)
+    record = _Record("run_checkpoint_lease_loss")
+
+    class _Loop:
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id=record.run_id, seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    record.loop = _Loop()
+    caught: list[BaseException] = []
+
+    def persist() -> None:
+        try:
+            service.persist_run_checkpoint(record)
+        except BaseException as exc:
+            caught.append(exc)
+
+    thread = Thread(target=persist)
+    thread.start()
+    assert entered.wait(5)
+
+    def revoke() -> None:
+        record.write_authority.revoke()
+        revoke_returned.set()
+
+    revoke_thread = Thread(target=revoke)
+    revoke_thread.start()
+    assert not revoke_returned.wait(0.05)
+    release.set()
+    thread.join(5)
+    revoke_thread.join(5)
+
+    assert not thread.is_alive()
+    assert not revoke_thread.is_alive()
+    assert revoke_returned.is_set()
+    assert len(caught) == 1
+    assert isinstance(caught[0], WriteAuthorityRevoked)
+    assert committed == [1]
+    assert drain_calls == []
+
+    with pytest.raises(WriteAuthorityRevoked):
+        service.persist_run_checkpoint(record)
+    assert committed == [1]
+
+
 def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=10)
     service = _service(tmp_path, limits_provider=lambda: current_limits)
@@ -127,6 +206,56 @@ def test_session_drive_limits_provider_is_live(tmp_path: Path) -> None:
     current_limits = _limits(max_turns=2)
 
     assert service.session_should_stop(record, started=started, turns=2) is True
+
+
+def test_session_drive_rejects_lease_loss_before_projecting_or_closing(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    record = _Record("run_stale")
+    record.state = SessionState.RUNNING
+    record.terminal = False
+    record.error = "prior"
+    record.error_code = "prior_code"
+    record.interruption_cause = InterruptionCause.GRACEFUL_DRAIN
+
+    class _Request:
+        multi_turn = False
+
+    class _Loop:
+        close_calls = 0
+
+        async def aclose(self) -> AgentRunResult:
+            self.close_calls += 1
+            raise AssertionError("a stale activation must not close")
+
+    loop = _Loop()
+    record.write_authority.revoke()
+
+    with pytest.raises(WriteAuthorityRevoked):
+        asyncio.run(
+            service.drive_open_session(
+                record,
+                _Request(),
+                loop,
+                Suspension(
+                    reason="interrupted",
+                    status="completed",
+                    error="run lease was lost",
+                    error_code="lease_lost",
+                    interruption_cause=InterruptionCause.LEASE_LOST,
+                ),
+                started=time.time(),
+                turns=1,
+            )
+        )
+
+    assert loop.close_calls == 0
+    assert record.state is SessionState.RUNNING
+    assert record.terminal is False
+    assert record.error == "prior"
+    assert record.error_code == "prior_code"
+    assert record.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
 
 
 def test_turn_retry_backoff_saturates_at_the_cap_instead_of_overflowing(

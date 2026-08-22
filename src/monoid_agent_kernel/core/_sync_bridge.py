@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.errors import RunCancelled, RunTimeout
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.core.sync_bridge")
@@ -389,7 +390,14 @@ async def await_abandonable_call(
             except asyncio.CancelledError as exc:
                 raise CalleeCancelled from exc
         if cancelled.done():
-            raise RunCancelled("run cancelled")
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=(
+                    token.cause
+                    if token is not None and token.cause is not None
+                    else InterruptionCause.USER_CANCEL
+                ),
+            )
         raise RunTimeout("run exceeded max duration")
     finally:
         remove_callback()

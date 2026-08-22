@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -305,6 +306,88 @@ def test_artifact_recorder_preserves_metadata(tmp_path: Path) -> None:
         recorder.close()
 
     assert artifact.metadata == {"source": "unit"}
+
+
+def test_reopened_recorder_claims_a_new_artifact_directory_without_overwrite(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs"
+    first_recorder = AgentRecorder(run_root, "run_artifacts_reopen", status_file=False)
+    try:
+        first = first_recorder.emit_artifact_bytes(
+            workspace_path="report.txt",
+            content=b"first",
+            kind="text/plain",
+            label=None,
+        )
+    finally:
+        first_recorder.close()
+
+    second_recorder = AgentRecorder(
+        run_root,
+        "run_artifacts_reopen",
+        status_file=False,
+        reopen=True,
+    )
+    try:
+        second = second_recorder.emit_artifact_bytes(
+            workspace_path="report.txt",
+            content=b"second",
+            kind="text/plain",
+            label=None,
+        )
+    finally:
+        second_recorder.close()
+
+    run_dir = run_root / "run_artifacts_reopen"
+    assert first.artifact_id == "artifact_0001"
+    assert second.artifact_id == "artifact_0002"
+    assert run_dir.joinpath(first.path).read_bytes() == b"first"
+    assert run_dir.joinpath(second.path).read_bytes() == b"second"
+
+
+def test_two_activations_claim_distinct_artifact_directories(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs"
+    seed = AgentRecorder(run_root, "run_artifact_race", status_file=False)
+    seed.close()
+    recorders = [
+        AgentRecorder(run_root, "run_artifact_race", status_file=False, reopen=True)
+        for _ in range(2)
+    ]
+    barrier = threading.Barrier(2)
+    artifacts = []
+
+    def write(recorder: AgentRecorder, content: bytes) -> None:
+        barrier.wait(timeout=5)
+        artifacts.append(
+            recorder.emit_artifact_bytes(
+                workspace_path="report.txt",
+                content=content,
+                kind="text/plain",
+                label=None,
+            )
+        )
+
+    threads = [
+        threading.Thread(target=write, args=(recorders[0], b"activation-a")),
+        threading.Thread(target=write, args=(recorders[1], b"activation-b")),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+    finally:
+        for recorder in recorders:
+            recorder.close()
+
+    assert {artifact.artifact_id for artifact in artifacts} == {
+        "artifact_0001",
+        "artifact_0002",
+    }
+    assert {
+        run_root.joinpath("run_artifact_race", artifact.path).read_bytes()
+        for artifact in artifacts
+    } == {b"activation-a", b"activation-b"}
 
 
 def test_file_copy_move_delete_tools_in_propose_mode(tmp_path: Path) -> None:

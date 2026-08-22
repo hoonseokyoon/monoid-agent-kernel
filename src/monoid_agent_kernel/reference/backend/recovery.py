@@ -39,6 +39,7 @@ from monoid_agent_kernel.reference.backend.ports import (
     MutableRunRecordPort,
     RunRequestPort,
 )
+from monoid_agent_kernel.reference.backend.activation import is_activation_lease_loss
 from monoid_agent_kernel.reference.backend.run_state import write_failure_status_artifact
 from monoid_agent_kernel.reference.backend.runtime_config import runtime_config_from_meta
 
@@ -87,8 +88,8 @@ class RecoveryContext:
     call_soon: Callable[..., None]
     spawn: Callable[[Awaitable[Any]], object]
     drive_open_session: DriveOpenSessionPort
-    record_run_result: Callable[[str, AgentRunResult], None]
-    record_run_failure: Callable[[str, Exception], None]
+    record_run_result: Callable[[MutableRunRecordPort, AgentRunResult], None]
+    record_run_failure: Callable[[MutableRunRecordPort, Exception], None]
     # ``(run_id, tenant_id)`` — the record-free metering seam for the give-up paths, which end
     # a run that was never re-registered (RunStateMutationService.meter_abandoned_run).
     meter_abandoned_run: Callable[[str, str], None]
@@ -307,9 +308,14 @@ class RecoveryService:
         acquired = False
         released = False
         discarded = False
+        record: MutableRunRecordPort | None = None
         try:
             await self._context.acquire_run_slot()
             acquired = True
+            # Recovery already registered this activation before scheduling this coroutine. Fetch
+            # its record before the first loop call: that call may observe a concurrent authority
+            # revocation, and the lease-loss disposition must still unregister the stale claim.
+            record = self._context.record(run_id)
             if loop.has_pending_tasks():
                 # ``status="completed"``, not ``"running"``. The durable status vocabulary is
                 # completed/failed/limited (core/result.py), and this synthetic park used to be
@@ -321,7 +327,6 @@ class RecoveryService:
                 suspension = Suspension(
                     reason="awaiting_tasks", status="completed", has_external=True
                 )
-            record = self._context.record(run_id)
             result = await self._context.drive_open_session(
                 record,
                 request,
@@ -330,9 +335,17 @@ class RecoveryService:
                 started=time.time(),
                 turns=1,
             )
+            record.write_authority.assert_active()
+            self._context.record_run_result(record, result)
             released = True
-            self._context.record_run_result(run_id, result)
         except Exception as exc:
+            lease_lost = is_activation_lease_loss(exc) or (
+                record is not None and record.write_authority.revoked
+            )
+            if lease_lost and record is not None:
+                # The local host record is an activation claim. Drop it before cleanup so a stale
+                # worker cannot keep advertising or heartbeating ownership while discard runs.
+                self._context.unregister_record(record)
             try:
                 await asyncio.to_thread(loop.discard_uncommitted)
                 discarded = True
@@ -340,7 +353,17 @@ class RecoveryService:
                 # Preserve the recovered execution failure. AgentLoop has already attempted every
                 # owned activation resource before surfacing a cleanup error.
                 pass
-            self._context.record_run_failure(run_id, exc)
+            if not lease_lost and record is not None:
+                try:
+                    record.write_authority.assert_active()
+                    self._context.record_run_failure(record, exc)
+                except Exception as publication_exc:
+                    if record.write_authority.revoked or is_activation_lease_loss(
+                        publication_exc
+                    ):
+                        self._context.unregister_record(record)
+                    else:
+                        raise
         finally:
             # Task cancellation bypasses ``except Exception`` but still owns the recovered loop.
             if not released and not discarded:

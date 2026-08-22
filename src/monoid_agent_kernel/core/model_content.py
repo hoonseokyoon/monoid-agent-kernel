@@ -279,6 +279,33 @@ class ModelContentStore:
                 pass
         _remove_active_store(self._registry_key, self._registry_ref)
 
+    def discard(self) -> None:
+        """Release owned handles and buffered writers without publishing their pending data.
+
+        Revoked activation cleanup uses this path. Setting ``_disabled`` while holding the store
+        lock makes every timer or concurrent close that has not already entered ``_append`` fail
+        closed. An append already holding the lock completes before this method can return.
+        """
+
+        with self._lock:
+            if self._closed:
+                return
+            self._disabled = True
+            self._closing = True
+            writers = tuple(self._writers)
+        for writer in writers:
+            writer._discard()
+        with self._lock:
+            self._closed = True
+            self._closing = False
+            handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        _remove_active_store(self._registry_key, self._registry_ref)
+
     def flush(self) -> bool:
         """Persist every currently buffered stream segment without closing its writer.
 
@@ -520,6 +547,17 @@ class _ModelContentWriter:
             if self._closed:
                 return
             self._flush_locked()
+            self._closed = True
+            self._cancel_timer_locked()
+        self._store._unregister(self)
+
+    def _discard(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._buffer_channel = None
+            self._buffer_parts.clear()
+            self._buffer_bytes = 0
             self._closed = True
             self._cancel_timer_locked()
         self._store._unregister(self)

@@ -19,6 +19,10 @@ from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     SubagentDefinition,
 )
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.control import ControlCommand, ControlResult
 from monoid_agent_kernel.core.durable_metadata import (
     ACCEPTED_RUN_METADATA_SCHEMA_VERSIONS,
@@ -36,6 +40,7 @@ from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
 )
 from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
@@ -109,6 +114,7 @@ from monoid_agent_kernel.reference.backend.projection import (
 )
 from monoid_agent_kernel.reference.backend.proposal import ProposalService, ProposalServiceContext
 from monoid_agent_kernel.reference.backend.proposal_reader import read_proposal_snapshot
+from monoid_agent_kernel.reference.backend.ports import MutableRunRecordPort
 from monoid_agent_kernel.reference.backend.recovery import (
     RecoveryContext,
     RecoveryService,
@@ -520,6 +526,7 @@ class RunnerBackend:
     command_claim_ttl_s: float = 30.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _admission_quiesced: bool = field(default=False, init=False, repr=False)
     _command_drain_locks: dict[str, threading.RLock] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -745,8 +752,8 @@ class RunnerBackend:
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
                 spawn=self._spawn,
                 drive_open_session=self._drive_open_session,
-                record_run_result=self._record_run_result,
-                record_run_failure=self._record_run_failure,
+                record_run_result=self._record_activation_result,
+                record_run_failure=self._record_activation_failure,
                 meter_abandoned_run=self._run_state.meter_abandoned_run,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
@@ -763,7 +770,7 @@ class RunnerBackend:
                     cap_s=self.outbox_retry_cap_s,
                 ),
                 max_message_queue_depth_provider=lambda: self.max_message_queue_depth,
-                checkpoint_store_provider=self._checkpoint_store,
+                commit_checkpoint=self._commit_reference_checkpoint,
                 rng_provider=lambda: self._outbox_rng,
                 live_outbox_runs=self._live_outbox_runs,
                 call_soon=lambda fn, *args: self._call_soon(fn, *args),
@@ -775,7 +782,7 @@ class RunnerBackend:
         return SessionDriveService(
             SessionDriveContext(
                 limits_provider=self._session_drive_limits,
-                checkpoint_store_provider=self._checkpoint_store,
+                commit_checkpoint=self._commit_reference_checkpoint,
                 drain_outbox=self._drain_outbox,
                 close_signal=_CLOSE_SESSION,
                 resume_signal=_RESUME_SESSION,
@@ -787,10 +794,11 @@ class RunnerBackend:
             RunExecutionContext(
                 build_loop=self._build_loop_build,
                 attach_loop=self._attach_loop_build,
+                unregister_record=self._unregister_recovered_record,
                 record=self._record,
                 drive_open_session=self._drive_open_session,
-                record_run_result=self._record_run_result,
-                record_run_failure=self._record_run_failure,
+                record_run_result=self._record_activation_result,
+                record_run_failure=self._record_activation_failure,
                 acquire_run_slot=self._acquire_run_slot,
                 release_run_slot=self._release_run_slot,
                 submission_json=lambda prepared: self._submission_for(prepared).to_json(),
@@ -855,6 +863,21 @@ class RunnerBackend:
     def _checkpoint_store(self) -> CheckpointStore:
         assert self.checkpoint_store is not None
         return self.checkpoint_store
+
+    def _commit_reference_checkpoint(
+        self,
+        record: MutableRunRecordPort,
+        checkpoint: RunCheckpoint,
+        blobs: Mapping[str, bytes],
+    ) -> None:
+        """Linearize a legacy Reference-store commit with local authority revocation.
+
+        ``CheckpointStore`` is a single-writer compatibility seam. Shared canonical stores use
+        ``FencedRunSink`` so owner/generation validation occurs atomically with the mutation.
+        """
+
+        authority = cast(ActivationWriteAuthority, record.write_authority)
+        authority.guard_local_mutation(lambda: self._checkpoint_store().put(checkpoint, blobs))
 
     def _with_record_lock(self, fn: Callable[[], Any]) -> Any:
         with self._lock:
@@ -974,12 +997,15 @@ class RunnerBackend:
         """Atomically claim one in-process activation for a recovered run id."""
 
         with self._lock:
-            if record.run_id in self._records:
+            if self._admission_quiesced or record.run_id in self._records:
                 return False
             self._records[record.run_id] = record
             return True
 
     def _unregister_recovered_record(self, record: BackendRunRecord) -> None:
+        # Removal retires an activation capability. Publish revocation before dropping the host
+        # record so every entered mutation drains before a replacement can be registered.
+        record.write_authority.revoke()
         with self._lock:
             if self._records.get(record.run_id) is record:
                 self._records.pop(record.run_id, None)
@@ -1033,11 +1059,12 @@ class RunnerBackend:
 
     def _mark_cancel_requested(self, record: BackendRunRecord) -> bool:
         with self._lock:
-            if _record_terminal(record):
+            if _record_terminal(record) or record.cancellation_token.requested:
                 return False
-            record.cancellation_token.cancel()
+            record.cancellation_token.cancel(InterruptionCause.USER_CANCEL)
             record.error = "run cancellation requested"
             record.error_code = "cancelled"
+            record.interruption_cause = InterruptionCause.USER_CANCEL
             return True
 
     def _ensure_message_enqueue_allowed(self, record: BackendRunRecord) -> None:
@@ -1136,7 +1163,7 @@ class RunnerBackend:
         with self._lock:
             record = self._records.get(run_id)
         if record is not None:
-            record.cancellation_token.cancel()
+            record.cancellation_token.cancel(InterruptionCause.USER_CANCEL)
 
     def shutdown(self, *, drain: bool = False, drain_timeout_s: float = 5.0) -> None:
         """Stop this backend's watchdog. The run loop is process-shared (one per process,
@@ -1154,21 +1181,44 @@ class RunnerBackend:
         self.stop_watchdog()
 
     def drain(self, *, timeout_s: float = 5.0) -> list[str]:
-        """Cooperatively end every non-terminal run this backend owns: cancel it and wake any
-        session parked on its message queue, then wait (bounded by ``timeout_s``) for each to
-        reach a terminal state.
+        """Quiesce admission and cooperatively park every non-terminal run this backend owns.
+
+        The close signal wakes a session parked on its message queue. The backend then waits,
+        bounded by ``timeout_s``, for each run to reach a terminal state.
 
         Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
         drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
-        counterpart to issuing a ``cancel_run`` per run and sleeping."""
+        counterpart to issuing a typed graceful-drain interruption per run and sleeping."""
         with self._lock:
-            records = [record for record in self._records.values() if not _record_terminal(record)]
-        for record in records:
-            with self._lock:
-                record.cancellation_token.cancel()
+            self._admission_quiesced = True
+            records: list[BackendRunRecord] = []
+            for record in self._records.values():
+                if _record_terminal(record):
+                    continue
+                record.cancellation_token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+                # Cancellation callbacks may complete a run synchronously. Keep admission,
+                # terminal observation, and interruption stamping in one critical section, and
+                # re-read after cancellation before projecting a drain cause onto the record.
+                if _record_terminal(record):
+                    continue
+                cause = (
+                    record.cancellation_token.cause
+                    or InterruptionCause.GRACEFUL_DRAIN
+                )
                 if not record.error_code:
-                    record.error = "run drained on shutdown"
-                    record.error_code = "cancelled"
+                    record.error = (
+                        "run cancellation requested"
+                        if cause is InterruptionCause.USER_CANCEL
+                        else "run drained on shutdown"
+                    )
+                    record.error_code = (
+                        "cancelled"
+                        if cause is InterruptionCause.USER_CANCEL
+                        else cause.value
+                    )
+                record.interruption_cause = cause
+                records.append(record)
+        for record in records:
             # Wake a session parked on its message queue (put runs on the shared loop).
             self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
         deadline = time.time() + timeout_s
@@ -1198,7 +1248,13 @@ class RunnerBackend:
         return self._submission_for(prepared)
 
     def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
-        return self._run_preparation.prepare(request)
+        with self._lock:
+            if self._admission_quiesced:
+                raise NativeAgentError(
+                    "backend admission is quiesced for worker drain",
+                    error_code="backend_draining",
+                )
+            return self._run_preparation.prepare(request)
 
     def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
         return self._run_preparation.submission_for(prepared)
@@ -2000,6 +2056,39 @@ class RunnerBackend:
 
     def _record_run_failure(self, run_id: str, exc: Exception) -> None:
         self._run_state.record_run_failure(run_id, exc)
+
+    def _guard_activation_settlement(
+        self,
+        record: BackendRunRecord,
+        operation: Callable[[], None],
+    ) -> None:
+        def settle_current_record() -> None:
+            with self._lock:
+                if self._records.get(record.run_id) is not record:
+                    raise WriteAuthorityRevoked()
+                operation()
+
+        record.write_authority.guard_local_mutation(settle_current_record)
+
+    def _record_activation_result(
+        self,
+        record: BackendRunRecord,
+        result: AgentRunResult,
+    ) -> None:
+        self._guard_activation_settlement(
+            record,
+            lambda: self._record_run_result(record.run_id, result),
+        )
+
+    def _record_activation_failure(
+        self,
+        record: BackendRunRecord,
+        exc: Exception,
+    ) -> None:
+        self._guard_activation_settlement(
+            record,
+            lambda: self._record_run_failure(record.run_id, exc),
+        )
 
     def _write_failure_bundle(
         self,

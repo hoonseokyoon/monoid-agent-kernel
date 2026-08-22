@@ -4,7 +4,8 @@ The core defines the seams (``CheckpointStore``; the backend defines ``LeaseStor
 are integrator implementations of the HOW. ``SqliteCheckpointStore``/``SqliteLeaseStore``
 are zero-dependency (stdlib ``sqlite3``) durable backends — a DB transaction gives atomic
 last-good commits and CAS leases for free, and a single shared db can host both, which is
-what lets a different worker reclaim a run across process/host boundaries.
+what lets a different worker recover a run after its previous writer has stopped. The checkpoint
+store declares a single-writer capability; overlapping writers use a ``FencedRunSink``.
 """
 
 from __future__ import annotations

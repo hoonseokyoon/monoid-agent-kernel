@@ -17,6 +17,8 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel import tool
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
@@ -412,6 +414,326 @@ def test_run_cancellation_abandons_blocking_sync_tool(tmp_path: Path) -> None:
     assert workers[0].is_alive() is True
 
 
+def test_lease_loss_fences_late_artifact_from_abandoned_sync_tool(tmp_path: Path) -> None:
+    token = CancellationToken()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    late_errors: list[BaseException] = []
+    spec = _spec(tmp_path)
+    spec.workspace_root.joinpath("artifact.txt").write_text("late", encoding="utf-8")
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                started.set()
+                assert release.wait(timeout=10)
+                try:
+                    ctx.emit_artifact("artifact.txt", "text/plain", None, {})
+                except BaseException as exc:
+                    late_errors.append(exc)
+                finally:
+                    finished.set()
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="sync.late_artifact",
+                    description="sync tool that emits after its activation loses the lease",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    loop = AgentLoop(
+        spec=spec,
+        model_adapter=FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_artifact", {}, "c1"),))]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("sync.late_artifact"),))
+        ),
+        tool_providers=(Provider(),),
+        cancellation_token=token,
+        async_tool_cancel_grace_s=0.05,
+    )
+    loop.open()
+    assert loop._session is not None
+    recorder = loop._session.res.recorder
+
+    async def drive() -> object:
+        pending = asyncio.create_task(loop.arun_until_suspended("go"))
+        assert await asyncio.to_thread(started.wait, 5)
+        loop.lose_writer_authority()
+        suspension = await asyncio.wait_for(pending, timeout=10)
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        return suspension
+
+    try:
+        suspension = asyncio.run(drive())
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert len(late_errors) == 1
+        assert isinstance(late_errors[0], RunCancelled)
+        assert not list(recorder.artifacts_dir.glob("artifact_*"))
+        assert recorder.artifacts == []
+    finally:
+        loop.discard_uncommitted()
+
+
+@pytest.mark.parametrize("mutation", ("plan", "finish"))
+def test_lease_loss_fences_context_mutation_from_abandoned_sync_tool(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    token = CancellationToken()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    late_errors: list[BaseException] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                started.set()
+                assert release.wait(timeout=10)
+                try:
+                    if mutation == "plan":
+                        ctx.update_plan([{"step": "late", "status": "pending"}])
+                    else:
+                        ctx.finish("late", [], None)
+                except BaseException as exc:
+                    late_errors.append(exc)
+                finally:
+                    finished.set()
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="sync.late_context_mutation",
+                    description="sync tool that mutates context after lease loss",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(
+                    tool_calls=(fake_tool_call("sync_late_context_mutation", {}, "c1"),)
+                )
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("sync.late_context_mutation"),))
+        ),
+        tool_providers=(Provider(),),
+        cancellation_token=token,
+        async_tool_cancel_grace_s=0.05,
+    )
+    loop.open()
+    assert loop._session is not None
+    context = loop._session.res.context
+
+    async def drive() -> object:
+        pending = asyncio.create_task(loop.arun_until_suspended("go"))
+        assert await asyncio.to_thread(started.wait, 5)
+        loop.lose_writer_authority()
+        suspension = await asyncio.wait_for(pending, timeout=10)
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        return suspension
+
+    try:
+        suspension = asyncio.run(drive())
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert len(late_errors) == 1
+        assert isinstance(late_errors[0], RunCancelled)
+        assert context.plan == []
+        assert context.pending_finish is None
+        assert not loop.spec.workspace_root.joinpath("late.txt").exists()
+    finally:
+        loop.discard_uncommitted()
+
+
+def test_extension_context_exposes_methods_without_mutable_engine_capabilities(
+    tmp_path: Path,
+) -> None:
+    forbidden = {
+        "workspace",
+        "recorder",
+        "job_manager",
+        "outbox",
+        "plan",
+        "pending_finish",
+        "subagent_usage",
+        "skills_activated",
+    }
+    provider_leaks: list[str] = []
+    handler_leaks: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            provider_leaks.extend(name for name in forbidden if hasattr(context, name))
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                handler_leaks.extend(name for name in forbidden if hasattr(ctx, name))
+                ctx.update_plan([{"step": "safe façade", "status": "completed"}])
+                return ToolResult(ok=True, content={})
+
+            return [
+                ToolSpec(
+                    id="context.inspect",
+                    description="inspect the extension context boundary",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="read",
+                    handler=handler,
+                )
+            ]
+
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(
+            turns=[
+                ModelTurn(tool_calls=(fake_tool_call("context_inspect", {}, "c1"),)),
+                ModelTurn(final_text="done"),
+            ]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("context.inspect"),))
+        ),
+        tool_providers=(Provider(),),
+    )
+    loop.open()
+    assert loop._session is not None
+    workspace = loop._session.res.workspace
+
+    try:
+        assert not hasattr(workspace, "root")
+        assert not hasattr(workspace, "resolve_existing_or_parent")
+        assert loop.run_until_suspended("go").reason == "settled"
+        loop.close()
+    finally:
+        if loop._session is not None:
+            loop.discard_uncommitted()
+
+    assert provider_leaks == []
+    assert handler_leaks == []
+
+
+def test_retained_builtin_workspace_handler_is_fenced_without_exporting_a_path(
+    tmp_path: Path,
+) -> None:
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(turns=[]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    loop.open()
+    assert loop._session is not None
+    resources = loop._session.res
+    write_tool = next(spec for spec in resources.base_tool_specs if spec.id == "fs.write")
+    loop.lose_writer_authority()
+
+    try:
+        with pytest.raises(RunCancelled):
+            write_tool.handler(
+                resources.context._extension_context,
+                {"path": "late.txt", "content": "stale"},
+            )
+        assert not loop.spec.workspace_root.joinpath("late.txt").exists()
+    finally:
+        loop.discard_uncommitted()
+
+
+def test_external_effect_may_finish_after_revoke_but_its_result_is_not_published(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    external_effect: list[str] = []
+
+    class Provider:
+        def get_tools(self, context: ToolContext) -> list[ToolSpec]:
+            del context
+
+            def handler(ctx: ToolContext, args: dict) -> ToolResult:
+                del ctx, args
+                external_effect.append("started")
+                started.set()
+                assert release.wait(timeout=10)
+                external_effect.append("completed")
+                finished.set()
+                return ToolResult(ok=True, content={"external": "completed"})
+
+            return [
+                ToolSpec(
+                    id="sync.external_effect",
+                    description="external effect that can outlive its activation",
+                    input_schema={"type": "object", "additionalProperties": True},
+                    capability="",
+                    side_effect="write",
+                    handler=handler,
+                )
+            ]
+
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(
+            turns=[ModelTurn(tool_calls=(fake_tool_call("sync_external_effect", {}, "c1"),))]
+        ),
+        runtime_config_provider=runtime_provider(
+            runtime_config(bindings=(tool_binding("sync.external_effect"),))
+        ),
+        tool_providers=(Provider(),),
+        async_tool_cancel_grace_s=0.05,
+    )
+    loop.open()
+    assert loop._session is not None
+    recorder = loop._session.res.recorder
+
+    async def drive() -> object:
+        pending = asyncio.create_task(loop.arun_until_suspended("go"))
+        assert await asyncio.to_thread(started.wait, 5)
+        loop.lose_writer_authority()
+        suspension = await asyncio.wait_for(pending, timeout=10)
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        return suspension
+
+    try:
+        suspension = asyncio.run(drive())
+        event_types = {
+            json.loads(line)["type"]
+            for line in recorder.run_dir.joinpath("events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        }
+        assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+        assert external_effect == ["started", "completed"]
+        assert "tool.call.finished" not in event_types
+        assert "tool.call.failed" not in event_types
+        assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
+    finally:
+        loop.discard_uncommitted()
+
+
 def test_sync_tool_finishing_within_the_grace_is_not_abandoned(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -529,7 +851,7 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     all, so the abandoned worker would widen to the run-level permission policy.
     """
     workers: list[threading.Thread] = []
-    late_tool_id: list[str] = []
+    late_scope_results: list[tuple[bool, bool]] = []
 
     class Provider:
         def get_tools(self, context: ToolContext) -> list[ToolSpec]:
@@ -538,9 +860,14 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
             def handler(ctx: ToolContext, args: dict) -> ToolResult:
                 del args
                 workers.append(threading.current_thread())
-                # Outlive the deadline and the grace window, then read the call back.
+                # Outlive the deadline and the grace window, then exercise the retained scope.
                 threading.Event().wait(timeout=1.5)
-                late_tool_id.append(ctx._current_call.tool_id)  # type: ignore[attr-defined]
+                late_scope_results.append(
+                    (
+                        ctx.path_allowed("notes/kept.txt", "read"),
+                        ctx.path_allowed("secrets/key.txt", "read"),
+                    )
+                )
                 return ToolResult(ok=True, content={})
 
             return [
@@ -561,7 +888,13 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
                 turns=[ModelTurn(tool_calls=(fake_tool_call("sync_late_scope", {}, "c1"),))]
             ),
             runtime_config_provider=runtime_provider(
-                runtime_config(bindings=(tool_binding("sync.late_scope"),))
+                runtime_config(
+                    bindings=(
+                        tool_binding(
+                            "sync.late_scope", scope=ToolScope(allowed_paths=("notes/*",))
+                        ),
+                    )
+                )
             ),
             tool_providers=(Provider(),),
             async_tool_cancel_grace_s=0.05,
@@ -571,7 +904,7 @@ def test_abandoned_sync_tool_keeps_its_call_authorization(tmp_path: Path) -> Non
     assert result.status == "limited"
     assert result.error_code == "run_timeout"
     workers[0].join(timeout=10)
-    assert late_tool_id == ["sync.late_scope"]
+    assert late_scope_results == [(True, False)]
 
 
 def test_failed_tool_outcome_is_consumed_when_a_run_boundary_wins_the_turn(tmp_path: Path) -> None:

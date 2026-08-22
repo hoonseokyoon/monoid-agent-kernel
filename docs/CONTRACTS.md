@@ -134,9 +134,10 @@ The run lifecycle is:
   `turn_handle`. A park that settles nothing — a *recoverable* turn failure
   (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
   (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
-  `suspension` carries the reason plus the `retryable` / `http_status` /
-  `config_recoverable` / `provider_error_code` / `provider_retried`
-  classification — all five re-stamped onto the exception itself, because a
+  `suspension` carries the reason, typed `interruption_cause`, and the `retryable` /
+  `http_status` / `config_recoverable` / `provider_error_code` / `provider_retried`
+  classification. The cause and all five provider fields are re-stamped onto the exception,
+  because a
   driver on this facade holds an exception and nothing else. The last two are
   what separates an `insufficient_quota` (a human fixes the billing) from a
   `rate_limit_exceeded` (back off and re-issue) and an exhausted adapter retry
@@ -160,7 +161,7 @@ The run lifecycle is:
   (`paused`/`interrupted` — a turn that never settled) must not finalize a clean
   success either: it promotes to `status="limited"`,
   `error_code="closed_unsettled"` (one code for both variants), with an empty
-  failure classification (nothing here is a provider failure) and its checkpoints
+  failure classification and no interruption cause (the resumable park has ended), with its checkpoints
   kept, so the frozen turn's only restore point survives the close. A settled
   `awaiting_input` park is not this — its turn completed and close finalizes the
   success it was; an acknowledged cancel is the operator's stronger verdict and
@@ -1609,7 +1610,9 @@ redrive.
 ### Event Reads
 
 **`data.reason` is two vocabularies, on purpose.** On `turn.interrupted` and `turn.paused` it is a
-**cause** — what stopped the turn (`"user_stop"`, `"user_pause"`). On `Suspension.reason` (and on
+**cause** — what stopped the turn (`"user_stop"`, `"graceful_drain"`, `"user_pause"`). A
+`turn.interrupted` event also carries the normalized `interruption_cause`; readers use that typed
+field for policy and retain `reason` as human-oriented event context. On `Suspension.reason` (and on
 the durable `last_suspension` payload) it is a **park** — the state the session came to rest in
 (`"interrupted"`, `"paused"`, `"turn_failed"`, `"awaiting_tasks"`, `"settled"`, `"limited"`,
 `"terminal"`). The two sets are disjoint and neither is derivable from the other: the event answers
@@ -1629,7 +1632,11 @@ parks the run, because `config_recoverable` alone cannot separate an `insufficie
 the config) from a `rate_limit` (wait). The classification remains for as long as the park does;
 a `model.turn.started` clears it (the new turn supersedes the dead one, including on the
 no-park retry path), and terminal events assign rather than or-fallback, so a completed run
-never keeps a recovered turn's error. A failed terminal keeps the `run.failed` classification —
+never keeps a recovered turn's error. Typed `interruption_cause` follows the same park lifetime:
+`turn.interrupted` assigns the current valid cause and clears it when a legacy event omits the
+field, `turn.settled` clears the completed park, a new `model.turn.started` clears it before
+provider work, and terminal events assign it.
+A failed terminal keeps the `run.failed` classification —
 minus `provider_retried`, the per-call fact the terminal vocabulary deliberately drops.
 `GET /v1/runs/{id}/status` and `/result` serve the same five off the record, on the live branch
 and on the post-restart (status.json-backed) branch alike; `provider_usage` on `turn.failed` is
@@ -2308,6 +2315,14 @@ Replacement request:
 The backend validates schema, registry resolvability, duplicate binding ids,
 and duplicate model names. A version mismatch returns HTTP 400.
 
+`RunnerBackend.drain()` is a one-way admission barrier for that backend instance. Under the same
+backend lock, it marks admission quiesced and snapshots every currently owned non-terminal run.
+A concurrent submission therefore either registers before the snapshot and joins the drain, or
+observes the barrier and fails with `backend_draining`; recovered-run activation follows the same
+rule. The backend sends the typed `graceful_drain` cause, wakes parked sessions, and waits up to the
+requested timeout for terminal close. `drain()` returns the IDs still pending at the deadline.
+Repeated calls are idempotent, and a drained instance stays closed to new admission.
+
 ### Multi-turn Sessions And Tasks
 
 The run loop is suspend-return at its core: `AgentLoop.run_until_suspended()` runs
@@ -2627,10 +2642,20 @@ backend = RunnerBackend(
 )
 ```
 
+`LocalFsCheckpointStore` and `SqliteCheckpointStore` declare `single_writer=True`. Their
+transaction and file-lock boundaries protect atomic publication and a monotonic latest pointer.
+The Reference host also serializes an in-process checkpoint commit with
+`ActivationWriteAuthority.revoke()`, so revocation waits for an entered local commit and prevents
+the next one from starting. These stores carry no owner/generation identity in `put()` and declare
+`lease_fencing=False`, `concurrent_writers=False`, and `compare_and_set=False`. A deployment with
+overlapping or partitioned writers uses `FencedRunSink.commit_checkpoint(...,
+writer_token=WriterToken(...))`; that adapter validates owner and generation atomically with every
+canonical mutation.
+
 **Legacy profile limitation / follow-up:** SQLite is single-host. A legacy cross-host deployment
-can supply a networked `CheckpointStore` / `LeaseStore` behind these seams. This capability is a
-Reference implementation option; the Core contract and the initial DBOS profile do not promise
-automatic host takeover.
+requires a fenced adapter and the hosting conformance suite. The legacy `CheckpointStore` /
+`LeaseStore` pair supports recovery after the previous writer has stopped. The Core contract and
+the initial DBOS profile do not promise automatic host takeover.
 
 ### HTTP hardening & request bounds
 
@@ -2753,9 +2778,12 @@ The synchronous lifecycle sequence is:
 ```text
 normalize + request digest
   -> reserve effective key
+  -> recheck lease authority
   -> commit dispatch_started
+  -> recheck lease authority
   -> enter adapter
   -> commit settled success/refusal OR commit unknown
+  -> recheck lease authority
   -> deliver passive observer/sidecar evidence
 ```
 
@@ -2834,16 +2862,198 @@ closed and surfaces the stored refusal. Resumed receipts retain aggregate usage 
 unavailable historical per-attempt log empty. Provider exception text is never reconstructed.
 
 Every non-task suspension commits its checkpoint through `FencedRunSink.commit_checkpoint()`.
-AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,
-invalid, and raising results escape as checkpoint-persistence failures. Durable mode has no local
-checkpoint fallback. `RunCheckpoint.last_model_invocation` carries the latest compact summary for
-diagnostics and blob reachability. The invocation head loaded from `FencedRunSink` remains the
-authority for recovery.
+AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`. A `fenced`
+result revokes the activation's shared `ActivationWriteAuthority` and raises
+`WriteAuthorityRevoked`. A `conflict` retains its existing storage/conflict classification. An
+unknown result is an adapter-contract error. Durable mode has no local checkpoint fallback.
+`RunCheckpoint.last_model_invocation` carries the latest compact summary for diagnostics and blob
+reachability. The invocation head loaded from `FencedRunSink` remains the authority for recovery.
 
 The concrete adapter is `monoid_agent_kernel.hosting.model_calls.FencedModelCallLifecycle`. Its
 module path is explicit while stable hosting import expansion remains an M2 decision. It performs
 checked loads, monotonic revision writes, content-addressed result settlement, and writer-token
 fencing through the host-owned sink. It contains no database, queue, or Temporal runtime.
+
+### Typed interruption and worker drain
+
+`CancellationToken.cancel(cause=InterruptionCause.USER_CANCEL)` records one typed cause. The first
+accepted cause wins; later cancellation requests are no-ops, including callbacks.
+The no-argument call retains the `user_cancel` behavior. Checkpoint capture reads the request flag
+and cause atomically; a pending token cause takes precedence over the prior park's state cause.
+The token accepts `user_cancel | graceful_drain | deadline | host_shutdown`.
+`lease_lost | provider_failure | validation_failure | unknown` remain in the portable outcome
+vocabulary and token ingress rejects them before changing state or firing callbacks.
+
+`ActivationWriteAuthority` is the process-local write capability for one activation. It is sticky,
+thread-safe, and idempotent. `revoke()` wakes the loop through an internal token signal while
+preserving any first token cause. `cancel(USER_CANCEL)` followed by `revoke()` therefore retains
+`token.cause == USER_CANCEL` and sets `authority.revoked == true`. A stale activation is always
+observed as an ephemeral `lease_lost` suspension. That suspension does not update `RunState`, a
+checkpoint, status, event, projection, or terminal outcome.
+
+`ActivationWriteAuthority` and `WriterToken` cover separate halves of the boundary. The authority
+prevents new process-local kernel mutations. The writer token identifies `(run_id, owner_id,
+generation)` so a durable store can validate ownership atomically with its mutation.
+
+| Mutation surface | Kernel/host guard | Result after revocation |
+|---|---|---|
+| plan, finish, counters, outbox staging | authority local guard | rejected without a side effect |
+| workspace API | authority-bound proxy | new reads and mutations are rejected |
+| recorder, event sequence, sidecars, artifacts | shared authority; exclusive artifact claim | new publication is rejected; existing artifacts remain intact |
+| checkpoint and model invocation | writer-token fence in the store | `fenced` revokes the activation |
+| canonical event and terminal storage | writer-token fence in the host adapter | stale write is rejected and the activation is revoked |
+| observer, sink, and extension callbacks | authority external guard per callback | current callback may finish; later callbacks stop |
+| shell, MCP, memory, and custom external effects | authority before/after plus adapter contract | an in-flight effect may finish; its result is not published |
+| stale activation cleanup | local handle/process release path | no event, marker, projection, or terminal write |
+
+| Cause | Kernel boundary | Durable mutation |
+|---|---|---|
+| `user_cancel` | terminal `limited` / `cancelled` | checkpoint and terminal write while the writer token remains valid |
+| `deadline` | terminal `limited` / `run_timeout` | checkpoint and terminal write while the writer token remains valid |
+| `graceful_drain` | non-terminal interrupted park; the host decides whether to hand off or close | interruption event and checkpoint are allowed |
+| `host_shutdown` | non-terminal interrupted park with the same handoff contract | interruption event and checkpoint are allowed |
+| `lease_lost` | in-memory interrupted observation only; the activation must be discarded | checkpoint, event, projection, and terminal writes are forbidden |
+
+A turn-level `Stop` creates a resumable interrupted park with `user_cancel` and keeps the session
+open. The cause travels through `Suspension`, `AgentTurnResult`, `AgentRunResult`,
+`RunCheckpoint`, `turn.interrupted`, `run.finished`, `turn.settled`, cumulative metrics, status
+projection, and the Reference backend record/result surfaces. An absent cause remains compatible
+with older checkpoints and events and projects as no current cause rather than inheriting an older
+park's value. Event v1 keeps the cause field string-compatible for retained and rolling-version
+producers. Live status, offline replay, and backend projection all pass that string through the
+shared portable-cause parser; an unknown non-empty value also projects as no current cause.
+
+Lease loss can race with a model settlement. A `settled` invocation committed before the lease-loss
+signal remains authoritative paid-call evidence. The runner rechecks lease authority immediately
+after that commit and before it publishes the receipt. The stale activation leaves run usage
+unchanged and emits no metric, event, passive model-I/O observation, model-call sidecar record, or
+model-stream completion. It returns the in-memory `lease_lost` park without a checkpoint,
+projection, or terminal mutation. A replacement owner loads the committed invocation, accounts and
+publishes it under current authority, and continues recovery without redispatching the provider
+call.
+
+The Reference host treats this observation as an activation disposition. Session driving checks
+for `lease_lost` before copying any suspension field onto the backend record. Autonomous,
+streaming, and recovered execution paths then call `discard_uncommitted()` and omit
+`record_run_result`, `record_run_failure`, stream result frames, and `aclose`. This preserves the
+replacement owner's sole projection authority. Each path also removes its identity-matched local
+run record. The stale record therefore cannot serve status, block recovery, consume commands, or
+heartbeat a lease now owned by another worker. Identity matching protects a replacement record
+that registered concurrently.
+
+The loop rechecks the shared authority when a `RunCancelled` reaches its handler. This closes the
+unwind race where the exception carried an earlier user-cancel or drain cause and lease loss arrived
+before event, metric, checkpoint, or terminal projection. The model-call attempt handler and model
+stream finalizer apply the same rule before dispatch compensation or stream closure. A stale
+cancellation is replaced with a fresh `lease_lost` boundary without carrying usage stamps into the
+stale activation's accounting path; durable invocation evidence remains the bill authority.
+
+Every external validation, tool, and child-agent await is followed by a run-boundary check before
+result application. Model, usage, settle, and tool projection gateways also assert current write
+authority. The outer pump gives sticky lease loss precedence over every exception and returned park
+before it emits or checkpoints. A slow validator or handler therefore cannot reopen mutation after
+an earlier fence passed.
+
+A synchronous tool handler may remain alive in its dedicated daemon thread after the loop abandons
+its await. `AgentToolContext`, `AuthorityBoundWorkspace`, `AgentRecorder`, `EventBus`, and
+`TaskManager` share one `ActivationWriteAuthority`. Tool providers and handlers receive a slotted,
+method-only `ToolContext` façade. Workspace, recorder, task manager, service, outbox, lifecycle
+state, and counters remain behind private implementation fields. The façade exposes the supported
+extension operations and no reusable native workspace `Path`; the authority-bound workspace itself
+has no public `root` or absolute-path resolver. Reads assert active authority. Short memory and
+filesystem mutations use `guard_local_mutation`; callbacks and I/O edges use
+`guard_external_call`.
+
+This boundary covers artifact emission, plan and finish state, workspace mutation, shell and web
+execution, job cancellation and task creation, skill activation, tool-search load requests, and
+outbox staging. A handler that resumes after lease loss receives `WriteAuthorityRevoked` before the
+service call or local mutation starts. Artifact persistence claims each `artifact_NNNN` directory
+with exclusive creation. Recovered and overlapping activations advance to a new ID and preserve
+every existing artifact.
+
+Model observation fan-out applies the authority per callback. Receipt capture-policy resolution,
+receipt subscribers, the settled sidecar, stream delta sinks/writers, and stream outcome writers
+all check authority before and after each external call. Returned model stream writers are
+authority-aware proxies, so `push` and `close` are guarded independently from `open`. A callback
+that overlaps lease loss
+may finish its own in-flight operation; no later subscriber, sidecar, delta writer, or close writer
+runs under the stale activation. Best-effort diagnostic publication contains extension failures
+while always re-raising lease-loss control flow.
+
+Bootstrap applies the same operation boundary before a session exists. It checks authority before
+workspace and recorder creation, around each extension callback, and around workspace-index,
+workspace-base, manifest, and `run.started` publication. `AgentRecorder` checks between its own
+directory repair and file-open operations. Constructor failure releases recorder-owned handles
+without invoking extension sinks. An already stale activation creates no run artifacts; a lease loss
+overlapping one bootstrap operation stops every later artifact and callback.
+
+Model-stream writer creation is fenced independently from stream delivery. The private content
+writer and each custom observer writer receive a before/after authority check around `open`. Lease
+loss during one open prevents every later writer open and prevents provider dispatch.
+
+Settle finalization applies the same rule to durable projection writes. One common projection writer
+serves turn settle and run finalization, fencing job cancellation, proposal revision, metrics,
+settled-text persistence, and every event before and after the operation. `EventBus` also fences each
+sink callback, so a sink that overlaps lease loss may finish while every later sink and finalization
+write stays untouched. The same fence applies to each event-sink close callback because close may
+flush buffered projection data. `AgentRecorder` still releases its private transcript and sidecar
+handles through unconditional local teardown after event-sink close stops.
+
+Normal task shutdown applies authority per running job. Stale `discard_uncommitted()` cleanup only
+terminates activation-owned in-process executors and releases handles. It writes no event, cancel
+marker, projection, or terminal record. Hosted task cancellation and external cleanup belong to a
+fenced/idempotent host adapter.
+
+Kernel-owned composite recorder operations expose the same internal boundary. Proposal revision
+checks between diff, per-file snapshots, and the proposal manifest; settled-text persistence checks
+between the private transcript and content sidecar. Model-call ledger and replay-payload recording
+also fence lazy handle creation, every append, offloaded chunk publication, and nested request and
+response records. Diagnostic persistence errors remain best-effort while lease-loss control flow
+escapes their containment boundaries. Final recorder close is itself fenced, and a completed run
+checks around checkpoint deletion. These checks prevent a composite helper from hiding later durable
+mutations behind one outer fence.
+
+Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
+`FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop
+checks authority after snapshot/blob collection, immediately after the external commit returns,
+and before accepting the suspension into activation-local projection state. Lease loss during the
+commit restores the prior local park observation and the public pump returns only the in-memory
+`lease_lost` disposition. The Reference host repeats the fence around its queue/inbox augmentation
+and stops before outbox draining when ownership changed. Outbox dispatch checks authority before
+and after each send; a send overlapping lease loss retains its durable idempotency identity and
+stays unprojected for replacement-owner reconciliation or redrive.
+
+The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
+the authoritative reservation and blocks `dispatch_started`. Lease loss observed by
+`dispatch_started()` leaves that journal state for reconciliation and blocks adapter entry. The
+stale activation publishes no failure receipt or sidecar in either case.
+
+Evidence recovery uses a two-sided fence. It checks authority before calling the lifecycle recovery
+hook and again after the hook returns. A pre-existing lease loss cannot enter required-evidence
+delivery, and a loss racing with that delivery cannot reach result application or later
+publication. Every fenced sink mutation remains the final storage-level authority check.
+
+Host-owned event and terminal adapters apply the same result rule. A `fenced` response from
+`append_event()` or `settle_terminal()` revokes the activation authority immediately. Canonical
+event and terminal storage remains a host responsibility; AgentLoop directly wires checkpoint and
+model-invocation sink operations in v0.22.
+
+Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
+`status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
+`interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
+run. A previously settled park keeps its single turn settlement; close adds the timeout terminal
+projection without emitting `turn.settled` again.
+
+Model-stream observers apply the same typed boundary. `user_cancel` closes as
+`cancelled/cancelled`, `deadline` closes as `timed_out/run_timeout`, and
+`graceful_drain` or `host_shutdown` closes as `interrupted/<cause>`. Lease loss suppresses the
+stream close under the stale-writer fence. A new `turn.paused` park clears an older interruption
+cause in both `status.json` and offline event-log projection because the current park owns the
+projected cause.
+
+The Reference backend terminal stream frame carries `interruption_cause` from
+`AgentRunResult`, using the enum value or `null`. Stream-only clients therefore receive the same
+typed cause as REST status/result projections.
 
 ### Model evidence delivery policy
 
@@ -2879,10 +3089,11 @@ config, context providers, tool surface, or media. It then applies a stored succ
 to loop state before those current request-building dependencies run. A recovered final settles
 from the stored outcome; a recovered tool-call turn enters the canonical message log before current
 tool resolution and execution setup. Runtime-config drift cannot block evidence delivery or
-application of the stored outcome. The provider call count does not increase. Passive model-I/O
-observers and requested model-call sidecars receive the authoritative call during its original
-settlement, including when required evidence fails afterward. Evidence recovery does not publish
-the passive call a second time. A successful provider result closes live model-stream observers
+application of the stored outcome. The provider call count does not increase. While the activation
+retains lease authority, passive model-I/O observers and requested model-call sidecars receive the
+authoritative call during its original settlement, including when required evidence fails
+afterward. Evidence recovery does not publish the passive call a second time. A successful provider
+result closes live model-stream observers
 and `model-content.jsonl` as `completed` with its normalized final text and usage before the run
 parks on `evidence_uncommitted`; the projection failure preserves the paid stream's settled state.
 A settled provider refusal retains the failed stream classification. The checkpoint marker sets
@@ -2923,6 +3134,9 @@ opaque references; it has no raw prompt, model output, reasoning, replay body, o
 field.
 Run-limit exhaustion projects to `TerminalOutcome(kind="limited",
 retry_eligibility="forbidden")`. Cooperative pause and task-wait boundaries project to `paused`.
+Typed `user_cancel` and `deadline` interruptions project to `cancelled` with forbidden retry.
+`graceful_drain`, `host_shutdown`, and `lease_lost` project to `interrupted` with safe retry; the
+host still applies ownership fencing before resuming or settling a run.
 
 ## Run Artifacts
 

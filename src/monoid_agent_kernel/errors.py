@@ -117,6 +117,7 @@ class TurnNotSettled(NativeAgentError):
         self.config_recoverable = suspension.config_recoverable
         self.provider_error_code = suspension.provider_error_code
         self.provider_retried = suspension.provider_retried
+        self.interruption_cause = suspension.interruption_cause
 
 
 class PermissionDenied(NativeAgentError):
@@ -158,6 +159,10 @@ class RunCancelled(NativeAgentError):
     """Raised when a run is cancelled by an external caller."""
 
     error_code = "cancelled"
+
+    def __init__(self, message: str, *, interruption_cause: object = None) -> None:
+        super().__init__(message)
+        self.interruption_cause = interruption_cause
 
 
 class TurnInterrupted(NativeAgentError):

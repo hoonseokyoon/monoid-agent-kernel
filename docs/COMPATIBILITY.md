@@ -108,10 +108,11 @@ the canonical writer emits only `evidence_policy`. Deploy the current checked re
 writer because the earlier prerelease reader used a closed top-level vocabulary.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
-`pending_finish`, and `pending_tool_loads` fields. A
-v0.21 checkpoint omits them and restores with empty/default values. The writer keeps the checkpoint
-version and emits an explicit field projection copied through the iterative portable JSON
-normalizer.
+`pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
+`interruption_cause`. A v0.21 checkpoint omits these fields and restores them with empty/default
+values. Current readers accept the absent suspension cause; current writers emit the normalized
+typed value when an interruption has one. The writer keeps the checkpoint version and emits an
+explicit field projection copied through the iterative portable JSON normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed
@@ -612,3 +613,15 @@ identity or receipt ledger can redrive an applied input or return the wrong boun
 experimental DBOS adapter, keep `application_version` stable while same-slot recovery of pending
 workflow history is required. That operational version never replaces checkpoint schema/version
 compatibility or the checkpoint receipt as semantic authority.
+
+Checkpoints produced before v0.22 may encode `lease_lost` as a cancellation request. A v0.22
+reader detects that value before bootstrap and revokes the activation's
+`ActivationWriteAuthority`, leaving recorder, workspace replay, task restore, and extension
+callbacks unopened. The public `CancellationToken.cancel()` API receives only operational causes.
+Checkpoint validation rejects `cancellation_requested=true` when its cause is
+`provider_failure`, `validation_failure`, or `unknown`; those values describe outcomes and cannot
+drive execution cancellation. Direct `AgentLoop.restore()` applies the same check before
+bootstrap.
+The Reference recovery service also resolves the registered activation record before its first
+authority-sensitive loop call, so a concurrent revocation still unregisters and discards the
+stale activation.
