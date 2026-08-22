@@ -27,6 +27,7 @@ from monoid_agent_kernel.core.lifecycle import (
     lifecycle_from_status_artifact,
     session_state_value,
 )
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.projections import status_artifact_records_close
 from monoid_agent_kernel.core.subagent_runtime import (
     subagent_diagnostics_from_events,
@@ -134,6 +135,11 @@ def _status_payload_classification(status_payload: Mapping[str, Any] | None) -> 
         return value if type(value) is bool else False
 
     http_status = payload.get("http_status")
+    raw_cause = _text("interruption_cause")
+    try:
+        interruption_cause = InterruptionCause(raw_cause).value if raw_cause else None
+    except ValueError:
+        interruption_cause = None
     return {
         "error": _text("error"),
         "error_code": _text("error_code"),
@@ -142,6 +148,7 @@ def _status_payload_classification(status_payload: Mapping[str, Any] | None) -> 
         "config_recoverable": _flag("config_recoverable"),
         "provider_error_code": _text("provider_error_code"),
         "provider_retried": _flag("provider_retried"),
+        "interruption_cause": interruption_cause,
     }
 
 
@@ -227,6 +234,11 @@ class RunProjectionService:
             "config_recoverable": record.config_recoverable,
             "provider_error_code": record.provider_error_code,
             "provider_retried": record.provider_retried,
+            "interruption_cause": (
+                None
+                if record.interruption_cause is None
+                else record.interruption_cause.value
+            ),
             "final_output": _json_safe(
                 record.last_final_output
                 if record.last_final_output is not None
@@ -251,6 +263,11 @@ class RunProjectionService:
                 "config_recoverable": record.config_recoverable,
                 "provider_error_code": record.provider_error_code,
                 "provider_retried": record.provider_retried,
+                "interruption_cause": (
+                    None
+                    if record.interruption_cause is None
+                    else record.interruption_cause.value
+                ),
             }
         result = record.result
         diff_text = (
@@ -279,6 +296,11 @@ class RunProjectionService:
             "config_recoverable": record.config_recoverable,
             "provider_error_code": record.provider_error_code,
             "provider_retried": record.provider_retried,
+            "interruption_cause": (
+                None
+                if result.interruption_cause is None
+                else result.interruption_cause.value
+            ),
             "run_dir": str(result.run_dir),
             "manifest_path": str(result.run_dir / "manifest.json"),
             "diff_path": str(result.diff_path),

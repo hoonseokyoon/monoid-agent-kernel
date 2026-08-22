@@ -69,6 +69,7 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
@@ -663,7 +664,10 @@ class ModelCallRunner:
 
         token = self._token()
         if token is not None and token.requested:
-            raise RunCancelled("run cancelled")
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=token.cause or InterruptionCause.USER_CANCEL,
+            )
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
 
@@ -776,6 +780,17 @@ class ModelCallRunner:
                 # existing authoritative settlement/evidence barrier below.
                 if lifecycle_hook is None:
                     self._check_cancel_or_deadline(deadline)
+                else:
+                    # Lease loss is an authority boundary, not a recoverable cancellation.
+                    # Other terminal requests intentionally wait for an already-settled required
+                    # evidence barrier below; a stale owner may not attempt that mutation.
+                    token = self._token()
+                    if (
+                        token is not None
+                        and token.requested
+                        and token.cause is InterruptionCause.LEASE_LOST
+                    ):
+                        self._check_cancel_or_deadline(deadline)
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -1054,6 +1069,10 @@ class ModelCallRunner:
                             lifecycle_hook is not None
                             and reservation is not None
                             and isinstance(exc, Exception)
+                            and not (
+                                isinstance(exc, RunCancelled)
+                                and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                            )
                         ):
                             if dispatch_evidence(exc) != "refused":
                                 raise_model_dispatch_unknown(

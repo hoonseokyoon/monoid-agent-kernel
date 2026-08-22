@@ -36,6 +36,7 @@ from monoid_agent_kernel.core.event_sequencing import (
     RunEventSequencer,
 )
 from monoid_agent_kernel.core.outbox import OutboxSender, OutboxReceipt
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.output_validator import OutputValidator
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
@@ -520,6 +521,7 @@ class RunnerBackend:
     command_claim_ttl_s: float = 30.0
     _records: dict[str, BackendRunRecord] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _admission_quiesced: bool = field(default=False, init=False, repr=False)
     _command_drain_locks: dict[str, threading.RLock] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -974,7 +976,7 @@ class RunnerBackend:
         """Atomically claim one in-process activation for a recovered run id."""
 
         with self._lock:
-            if record.run_id in self._records:
+            if self._admission_quiesced or record.run_id in self._records:
                 return False
             self._records[record.run_id] = record
             return True
@@ -1033,11 +1035,12 @@ class RunnerBackend:
 
     def _mark_cancel_requested(self, record: BackendRunRecord) -> bool:
         with self._lock:
-            if _record_terminal(record):
+            if _record_terminal(record) or record.cancellation_token.requested:
                 return False
-            record.cancellation_token.cancel()
+            record.cancellation_token.cancel(InterruptionCause.USER_CANCEL)
             record.error = "run cancellation requested"
             record.error_code = "cancelled"
+            record.interruption_cause = InterruptionCause.USER_CANCEL
             return True
 
     def _ensure_message_enqueue_allowed(self, record: BackendRunRecord) -> None:
@@ -1136,7 +1139,7 @@ class RunnerBackend:
         with self._lock:
             record = self._records.get(run_id)
         if record is not None:
-            record.cancellation_token.cancel()
+            record.cancellation_token.cancel(InterruptionCause.USER_CANCEL)
 
     def shutdown(self, *, drain: bool = False, drain_timeout_s: float = 5.0) -> None:
         """Stop this backend's watchdog. The run loop is process-shared (one per process,
@@ -1154,21 +1157,36 @@ class RunnerBackend:
         self.stop_watchdog()
 
     def drain(self, *, timeout_s: float = 5.0) -> list[str]:
-        """Cooperatively end every non-terminal run this backend owns: cancel it and wake any
-        session parked on its message queue, then wait (bounded by ``timeout_s``) for each to
-        reach a terminal state.
+        """Quiesce admission and cooperatively park every non-terminal run this backend owns.
+
+        The close signal wakes a session parked on its message queue. The backend then waits,
+        bounded by ``timeout_s``, for each run to reach a terminal state.
 
         Returns the run ids still non-terminal when the timeout elapsed (empty on a clean
         drain). Idempotent; safe to call before :meth:`shutdown`. This is the one-call
-        counterpart to issuing a ``cancel_run`` per run and sleeping."""
+        counterpart to issuing a typed graceful-drain interruption per run and sleeping."""
         with self._lock:
+            self._admission_quiesced = True
             records = [record for record in self._records.values() if not _record_terminal(record)]
         for record in records:
             with self._lock:
-                record.cancellation_token.cancel()
+                record.cancellation_token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+                cause = (
+                    record.cancellation_token.cause
+                    or InterruptionCause.GRACEFUL_DRAIN
+                )
                 if not record.error_code:
-                    record.error = "run drained on shutdown"
-                    record.error_code = "cancelled"
+                    record.error = (
+                        "run cancellation requested"
+                        if cause is InterruptionCause.USER_CANCEL
+                        else "run drained on shutdown"
+                    )
+                    record.error_code = (
+                        "cancelled"
+                        if cause is InterruptionCause.USER_CANCEL
+                        else cause.value
+                    )
+                record.interruption_cause = cause
             # Wake a session parked on its message queue (put runs on the shared loop).
             self._call_soon(record.message_queue.put_nowait, _CLOSE_SESSION)
         deadline = time.time() + timeout_s
@@ -1198,7 +1216,13 @@ class RunnerBackend:
         return self._submission_for(prepared)
 
     def _prepare_run_record(self, request: BackendRunRequest) -> _PreparedRun:
-        return self._run_preparation.prepare(request)
+        with self._lock:
+            if self._admission_quiesced:
+                raise NativeAgentError(
+                    "backend admission is quiesced for worker drain",
+                    error_code="backend_draining",
+                )
+            return self._run_preparation.prepare(request)
 
     def _submission_for(self, prepared: _PreparedRun) -> BackendRunSubmission:
         return self._run_preparation.submission_for(prepared)

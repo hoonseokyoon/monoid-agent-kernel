@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.outbox import OutboxSender
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 
@@ -19,6 +20,7 @@ class TokenClaimsPort(Protocol):
 
 class CancellationTokenPort(Protocol):
     requested: bool
+    cause: InterruptionCause | None
 
 
 class MessageQueuePort(Protocol):
@@ -127,6 +129,7 @@ class RunRecordPort(Protocol):
     last_event_type: str
     error: str
     error_code: str
+    interruption_cause: InterruptionCause | None
     # The full park classification, one vocabulary with the Suspension/event spellings.
     config_recoverable: bool
     retryable: bool

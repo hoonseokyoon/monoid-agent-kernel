@@ -125,6 +125,7 @@ import pytest
 
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.lifecycle import REASON_TO_STATE
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.manifest import _tool_spec_payload as _manifest_tool_spec_payload
 from monoid_agent_kernel.core.result import (
     AgentTurnResult,
@@ -641,6 +642,7 @@ def _maximal_suspension() -> Suspension:
         provider_error_code="insufficient_quota",
         provider_retried=True,
         model_tool_calls_pending=True,
+        interruption_cause=InterruptionCause.PROVIDER_FAILURE,
     )
 
 
@@ -2034,6 +2036,7 @@ TURN_NOT_SETTLED_RESTAMPED = frozenset(
         # ``rate_limit_exceeded`` is the same retryable/http_status pair with opposite answers.
         "provider_error_code",
         "provider_retried",
+        "interruption_cause",
     }
 )
 
@@ -5742,6 +5745,7 @@ EVENT_CONSUMER_CORE = frozenset(
         "run.awaiting_input",
         "run.resumed",
         "turn.failed",
+        "turn.interrupted",
         "model.turn.started",
     }
 )
@@ -5973,30 +5977,24 @@ def test_each_status_consumer_branch_copies_its_pinned_classification_subset(
     }
 
 
-def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
-    """Registered BY DESIGN: one key name, two vocabularies, on two sibling events.
+def test_by_design_the_turn_lane_reason_and_park_reason_are_distinct_vocabularies() -> None:
+    """Registered BY DESIGN: one key name has distinct event-cause and park vocabularies.
 
     ``data.reason`` on ``turn.interrupted``/``turn.paused`` names the CAUSE (``user_stop`` /
     ``user_pause``); ``Suspension.reason`` names the PARK (``interrupted`` / ``paused``). The
-    assertions are unchanged from when this was a burn-down entry — they pin the emit's literals
-    and the proof that neither value is a member of the park vocabulary it shares a field name
-    with — but what they pin is now a declared fact rather than a defect: merging the two would
-    make one field answer two questions.
-
-    The genuine half of the old entry is closed below: the pause park emits a turn-lane event of
-    its own now, so the two sibling parks ARE observable the same way.
+    ``turn.interrupted`` additionally carries the typed interruption cause used by durable hosts.
     """
 
-    for event_type, cause in (("turn.interrupted", "user_stop"), ("turn.paused", "user_pause")):
-        emitted = _emit_data_keys("loop.py", event_type)
-        assert emitted == {"reason"}, {"event": event_type, "emitted": sorted(emitted)}
-        values = _literal_dict_keys_where("loop.py", "reason", cause)
-        assert len(values) == 1, {"event": event_type, "reason_literals": len(values)}
-        assert values[0] == {"reason"}
+    for cause in ("user_stop", "user_pause"):
         assert cause not in _SUSPENSION_REASONS, {
-            "event": event_type,
+            "cause": cause,
             "hint": "the cause and park vocabularies merged — this entry says they must not",
         }
+    assert _emit_data_keys("loop.py", "turn.interrupted") == {
+        "reason",
+        "interruption_cause",
+    }
+    assert _emit_data_keys("loop.py", "turn.paused") == {"reason"}
     assert {"interrupted", "paused"} <= _SUSPENSION_REASONS
     # The asymmetry that WAS a defect: the pause park emitted only a session-lane event.
     paused_emits = [
@@ -6013,15 +6011,16 @@ def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot(
         "turn_paused_emit_sites": len(paused_emits),
         "hint": "the pause park's turn-lane event is the interrupt's twin: exactly one site",
     }
-    # Both are declared event types with a data schema, and the schemas are the same shape.
+    # Both are declared event types and strictly schema-bound.
     from monoid_agent_kernel.core.events import AgentEventType
     from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
 
     assert {"turn.interrupted", "turn.paused"} <= set(get_args(AgentEventType))
-    assert (
-        EVENT_DATA_SCHEMAS["turn.paused"]["properties"]
-        == EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]
-    )
+    assert set(EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]) == {
+        "reason",
+        "interruption_cause",
+    }
+    assert set(EVENT_DATA_SCHEMAS["turn.paused"]["properties"]) == {"reason"}
     assert EVENT_DATA_SCHEMAS["turn.paused"]["additionalProperties"] is False
 
 
@@ -6224,7 +6223,10 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "cancel"
     ]
-    assert cancels == ["self.cancellation_token.cancel()"], {"cancel_calls": cancels}
+    assert cancels == [
+        "self.cancellation_token.cancel(InterruptionCause(cp.interruption_cause) if "
+        "cp.interruption_cause else InterruptionCause.USER_CANCEL)"
+    ], {"cancel_calls": cancels}
 
 
 def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
@@ -6523,6 +6525,7 @@ STATUS_SCHEMA_KEYS = frozenset(
         "retryable",
         "config_recoverable",
         "provider_retried",
+        "interruption_cause",
     }
 )
 

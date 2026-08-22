@@ -141,6 +141,7 @@ class SessionDriveService:
             record.provider_retried = bool(suspension.provider_retried)
             record.error = str(suspension.error or "")
             record.error_code = str(suspension.error_code or "")
+            record.interruption_cause = suspension.interruption_cause
             if suspension.turn is not None:
                 record.last_final_output = suspension.turn.final_output
             if suspension.reason in {"terminal", "limited"}:

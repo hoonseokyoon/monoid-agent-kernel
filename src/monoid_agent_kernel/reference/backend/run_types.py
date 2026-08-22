@@ -13,6 +13,7 @@ from monoid_agent_kernel.core.content import ContentPart, normalize_content_part
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 from monoid_agent_kernel.core.lifecycle import SessionState, session_state_value
 from monoid_agent_kernel.core.outbox import OutboxSender
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.result import AgentRunResult
 from monoid_agent_kernel.core.spec import RunMode, WorkspaceBackendKind
 from monoid_agent_kernel.loop import AgentLoop
@@ -206,6 +207,7 @@ class BackendRunRecord:
     finished_at: float | None = None
     error: str = ""
     error_code: str = ""
+    interruption_cause: InterruptionCause | None = None
     # The failure classification the last observed park carried — one vocabulary, all five,
     # because ``config_recoverable`` alone cannot separate an ``insufficient_quota`` (fix the
     # config) from a ``rate_limit`` (wait). Read off the Suspension by the session driver at

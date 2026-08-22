@@ -222,6 +222,11 @@ class StatusJsonSink:
                     "error_code": data.get("error_code", ""),
                 }
             )
+            cause = data.get("interruption_cause")
+            if isinstance(cause, str) and cause:
+                self.state["interruption_cause"] = cause
+            else:
+                self.state.pop("interruption_cause", None)
             # The terminal heal: ASSIGNED error/error_code above, and a non-failed terminal
             # clears the parked classification — a completed run must not keep a dead turn's
             # ``retryable``. A failed terminal keeps it: ``run.finished{status:"failed"}``
@@ -249,6 +254,11 @@ class StatusJsonSink:
                 }
             )
             self.state.pop("provider_retried", None)
+            self.state.pop("interruption_cause", None)
+        elif event.type == "turn.interrupted":
+            cause = data.get("interruption_cause")
+            if isinstance(cause, str) and cause:
+                self.state["interruption_cause"] = cause
         elif event.type == "run.waiting":
             self.state["state"] = session_state_value(SessionState.AWAITING_TASKS)
             self.state["terminal"] = False
@@ -286,6 +296,7 @@ class StatusJsonSink:
                 self.state["terminal"] = False
                 self.state["waiting_for_background_jobs"] = False
                 self.state.pop("awaiting_input", None)
+            self.state.pop("interruption_cause", None)
             # The unpark clear, unconditional on purpose: a retried turn never passes through
             # a parked state (the driver re-pumps straight from ``turn_failed``), so guarding
             # this behind the parked-state check kept a dead turn's error beside

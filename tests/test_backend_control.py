@@ -22,6 +22,7 @@ from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.events import make_agent_event
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.core.tool_surface import ToolScope
@@ -861,17 +862,21 @@ def test_cancelling_a_parked_run_records_cancelled_and_keeps_checkpoints(
 
     record = backend._record(run_id)
     assert record.error_code == "cancelled"
+    assert record.interruption_cause is InterruptionCause.USER_CANCEL
     result = record.result
     assert result is not None
     assert (result.status, result.error_code) == ("limited", "cancelled")
+    assert result.interruption_cause is InterruptionCause.USER_CANCEL
     # A cancelled run keeps its checkpoints — only a clean completion has nothing to restore.
     stored = backend.checkpoint_store.latest(run_id)
     assert stored is not None
     assert stored.checkpoint.terminal is True
     assert stored.checkpoint.cancellation_requested is True
+    assert stored.checkpoint.interruption_cause == InterruptionCause.USER_CANCEL.value
     finished = [e for e in _events(backend, run_id) if e["type"] == "run.finished"]
     assert finished and finished[-1]["data"]["status"] == "limited"
     assert finished[-1]["data"]["error_code"] == "cancelled"
+    assert finished[-1]["data"]["interruption_cause"] == "user_cancel"
 
 
 def test_cancel_of_a_parked_run_is_durable_at_the_ack(

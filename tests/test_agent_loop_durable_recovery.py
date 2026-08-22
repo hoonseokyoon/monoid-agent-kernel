@@ -15,6 +15,7 @@ from support.fenced_hosting import DeterministicFencedRunHarness
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.content import ImagePart, TextPart
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
@@ -23,6 +24,7 @@ from monoid_agent_kernel.core.model_invocation import (
 )
 from monoid_agent_kernel.core.model_content import read_model_content
 from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig, RunLimits
 from monoid_agent_kernel.errors import (
     AgentConfigError,
@@ -131,6 +133,44 @@ class _CrashAfterInvocationCommit:
         ):
             self.armed = False
             raise _HardCrash(invocation.dispatch_state)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@dataclass
+class _CancelAfterInvocationCommit:
+    inner: Any
+    cancellation_token: CancellationToken
+    target_state: str = "settled"
+    armed: bool = True
+
+    @property
+    def capabilities(self):
+        return self.inner.capabilities
+
+    def commit_invocation(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes],
+        *,
+        writer_token: WriterToken,
+        stage_evidence: bool = False,
+    ) -> CommitResult:
+        result = self.inner.commit_invocation(
+            invocation,
+            blobs,
+            writer_token=writer_token,
+            stage_evidence=stage_evidence,
+        )
+        if (
+            self.armed
+            and invocation.dispatch_state == self.target_state
+            and result.status in {"committed", "already_committed"}
+        ):
+            self.armed = False
+            self.cancellation_token.cancel(InterruptionCause.LEASE_LOST)
         return result
 
     def __getattr__(self, name: str) -> Any:
@@ -292,6 +332,7 @@ def _loop(
     model_content_file: bool = False,
     model_stream_observer_factories: tuple[Any, ...] = (),
     tool_ids: tuple[str, ...] = (),
+    cancellation_token: CancellationToken | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         spec=_spec(tmp_path, limits=limits),
@@ -306,6 +347,7 @@ def _loop(
         model_calls_file=model_calls_file,
         model_content_file=model_content_file,
         model_stream_observer_factories=model_stream_observer_factories,
+        cancellation_token=cancellation_token,
     )
 
 
@@ -1828,6 +1870,37 @@ def test_required_evidence_commits_before_terminal_run_boundary(
     assert terminal.error_code == expected_error_code
     assert (RUN_ID, LOGICAL_CALL_ID, 3) in harness.sink._model_evidence
     assert len(adapter.requests) == 1
+
+
+def test_lease_loss_after_invocation_settle_does_not_commit_a_checkpoint_or_terminal(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    cancellation_token = CancellationToken()
+    sink = _CancelAfterInvocationCommit(harness.sink, cancellation_token)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    writer_token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=writer_token,
+        cancellation_token=cancellation_token,
+    )
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    invocation = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert invocation.ok and invocation.value is not None
+    assert invocation.value.invocation.dispatch_state == "settled"
+    assert harness.sink.latest_checked(RUN_ID).status == "missing"
+    assert harness.read_terminal(RUN_ID) is None
 
 
 def test_required_evidence_recovery_preserves_tool_observations_without_replaying_provider(

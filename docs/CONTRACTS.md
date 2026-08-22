@@ -134,9 +134,10 @@ The run lifecycle is:
   `turn_handle`. A park that settles nothing — a *recoverable* turn failure
   (`turn_failed`), an interrupt, or a pause — raises `TurnNotSettled`
   (`monoid_agent_kernel.errors`): the session stays alive, and the exception's
-  `suspension` carries the reason plus the `retryable` / `http_status` /
-  `config_recoverable` / `provider_error_code` / `provider_retried`
-  classification — all five re-stamped onto the exception itself, because a
+  `suspension` carries the reason, typed `interruption_cause`, and the `retryable` /
+  `http_status` / `config_recoverable` / `provider_error_code` / `provider_retried`
+  classification. The cause and all five provider fields are re-stamped onto the exception,
+  because a
   driver on this facade holds an exception and nothing else. The last two are
   what separates an `insufficient_quota` (a human fixes the billing) from a
   `rate_limit_exceeded` (back off and re-issue) and an exhausted adapter retry
@@ -1609,7 +1610,9 @@ redrive.
 ### Event Reads
 
 **`data.reason` is two vocabularies, on purpose.** On `turn.interrupted` and `turn.paused` it is a
-**cause** — what stopped the turn (`"user_stop"`, `"user_pause"`). On `Suspension.reason` (and on
+**cause** — what stopped the turn (`"user_stop"`, `"graceful_drain"`, `"user_pause"`). A
+`turn.interrupted` event also carries the normalized `interruption_cause`; readers use that typed
+field for policy and retain `reason` as human-oriented event context. On `Suspension.reason` (and on
 the durable `last_suspension` payload) it is a **park** — the state the session came to rest in
 (`"interrupted"`, `"paused"`, `"turn_failed"`, `"awaiting_tasks"`, `"settled"`, `"limited"`,
 `"terminal"`). The two sets are disjoint and neither is derivable from the other: the event answers
@@ -1629,7 +1632,9 @@ parks the run, because `config_recoverable` alone cannot separate an `insufficie
 the config) from a `rate_limit` (wait). The classification remains for as long as the park does;
 a `model.turn.started` clears it (the new turn supersedes the dead one, including on the
 no-park retry path), and terminal events assign rather than or-fallback, so a completed run
-never keeps a recovered turn's error. A failed terminal keeps the `run.failed` classification —
+never keeps a recovered turn's error. Typed `interruption_cause` follows the same park lifetime:
+`turn.interrupted` sets it, a new `model.turn.started` clears it, and terminal events assign it.
+A failed terminal keeps the `run.failed` classification —
 minus `provider_retried`, the per-call fact the terminal vocabulary deliberately drops.
 `GET /v1/runs/{id}/status` and `/result` serve the same five off the record, on the live branch
 and on the post-restart (status.json-backed) branch alike; `provider_usage` on `turn.failed` is
@@ -2308,6 +2313,14 @@ Replacement request:
 The backend validates schema, registry resolvability, duplicate binding ids,
 and duplicate model names. A version mismatch returns HTTP 400.
 
+`RunnerBackend.drain()` is a one-way admission barrier for that backend instance. Under the same
+backend lock, it marks admission quiesced and snapshots every currently owned non-terminal run.
+A concurrent submission therefore either registers before the snapshot and joins the drain, or
+observes the barrier and fails with `backend_draining`; recovered-run activation follows the same
+rule. The backend sends the typed `graceful_drain` cause, wakes parked sessions, and waits up to the
+requested timeout for terminal close. `drain()` returns the IDs still pending at the deadline.
+Repeated calls are idempotent, and a drained instance stays closed to new admission.
+
 ### Multi-turn Sessions And Tasks
 
 The run loop is suspend-return at its core: `AgentLoop.run_until_suspended()` runs
@@ -2845,6 +2858,31 @@ module path is explicit while stable hosting import expansion remains an M2 deci
 checked loads, monotonic revision writes, content-addressed result settlement, and writer-token
 fencing through the host-owned sink. It contains no database, queue, or Temporal runtime.
 
+### Typed interruption and worker drain
+
+`CancellationToken.cancel(cause=InterruptionCause.USER_CANCEL)` records one typed cause. The first
+accepted cause wins; later cancellation requests are no-ops, including callbacks.
+The no-argument call retains the `user_cancel` behavior.
+
+| Cause | Kernel boundary | Durable mutation |
+|---|---|---|
+| `user_cancel` | terminal `limited` / `cancelled` | checkpoint and terminal write while the writer token remains valid |
+| `deadline` | terminal `limited` / `run_timeout` | checkpoint and terminal write while the writer token remains valid |
+| `graceful_drain` | non-terminal interrupted park; the host decides whether to hand off or close | interruption event and checkpoint are allowed |
+| `host_shutdown` | non-terminal interrupted park with the same handoff contract | interruption event and checkpoint are allowed |
+| `lease_lost` | in-memory interrupted observation only; the activation must be discarded | checkpoint, event, projection, and terminal writes are forbidden |
+
+A turn-level `Stop` creates a resumable interrupted park with `user_cancel` and keeps the session
+open. The cause travels through `Suspension`, `AgentTurnResult`, `AgentRunResult`,
+`RunCheckpoint`, `turn.interrupted`, `run.finished`, `turn.settled`, cumulative metrics, status
+projection, and the Reference backend record/result surfaces. An absent cause remains compatible
+with older checkpoints and events.
+
+Lease loss can race with a model settlement. A `settled` invocation committed before the lease-loss
+signal remains authoritative paid-call evidence. The stale activation returns the in-memory
+`lease_lost` park and performs no later checkpoint or terminal mutation. A replacement owner loads
+the committed invocation and continues recovery without redispatching the provider call.
+
 ### Model evidence delivery policy
 
 `AgentLoop.model_evidence_policy` selects one of three opt-in host delivery contracts:
@@ -2923,6 +2961,9 @@ opaque references; it has no raw prompt, model output, reasoning, replay body, o
 field.
 Run-limit exhaustion projects to `TerminalOutcome(kind="limited",
 retry_eligibility="forbidden")`. Cooperative pause and task-wait boundaries project to `paused`.
+Typed `user_cancel` and `deadline` interruptions project to `cancelled` with forbidden retry.
+`graceful_drain`, `host_shutdown`, and `lease_lost` project to `interrupted` with safe retry; the
+host still applies ownership fencing before resuming or settling a run.
 
 ## Run Artifacts
 

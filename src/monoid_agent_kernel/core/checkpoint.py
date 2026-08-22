@@ -371,7 +371,13 @@ def _validate_counter_mapping(value: object, field_name: str) -> None:
 # The park payload's own field families, mirroring what
 # ``core/result.py:suspension_from_checkpoint_payload`` expects to read back. Named here so the
 # validator and the reader cannot drift into disagreeing about one payload.
-_SUSPENSION_STRING_FIELDS = ("final_text", "error", "error_code", "provider_error_code")
+_SUSPENSION_STRING_FIELDS = (
+    "final_text",
+    "error",
+    "error_code",
+    "provider_error_code",
+    "interruption_cause",
+)
 _SUSPENSION_BOOL_FIELDS = (
     "has_external",
     "retryable",
@@ -410,6 +416,14 @@ def _validate_suspension_payload(value: object, field_name: str) -> None:
     for name in _SUSPENSION_STRING_FIELDS:
         if name in value and not isinstance(value[name], str):
             raise ValueError(f"checkpoint {field_name}.{name} must be a string")
+    interruption_cause = value.get("interruption_cause", "")
+    if interruption_cause:
+        try:
+            InterruptionCause(interruption_cause)
+        except ValueError as exc:
+            raise ValueError(
+                f"checkpoint {field_name}.interruption_cause is outside the portable vocabulary"
+            ) from exc
     for name in _SUSPENSION_BOOL_FIELDS:
         if name in value and not isinstance(value[name], bool):
             raise ValueError(f"checkpoint {field_name}.{name} must be boolean")

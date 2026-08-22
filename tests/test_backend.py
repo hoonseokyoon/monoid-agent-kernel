@@ -33,6 +33,8 @@ from support.backend_harness import (
     tool_binding,
 )
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference.backend.run_types import normalize_backend_run_request
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
@@ -674,7 +676,27 @@ def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     pending = backend.drain(timeout_s=20)
     assert pending == []
-    assert backend._record(run_id).terminal is True
+    record = backend._record(run_id)
+    assert record.terminal is True
+    assert record.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
+    assert record.result is not None
+    assert record.result.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
+    assert backend.status(run_id, submission.run_token)["interruption_cause"] == "graceful_drain"
+    assert backend.result(run_id, submission.run_token)["interruption_cause"] == "graceful_drain"
+
+    existing_run_dirs = set(backend.run_root.iterdir())
+    with pytest.raises(NativeAgentError) as exc_info:
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="must be rejected after drain",
+                runtime_config=_default_config(),
+            )
+        )
+    assert exc_info.value.error_code == "backend_draining"
+    assert set(backend.run_root.iterdir()) == existing_run_dirs
 
 
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:

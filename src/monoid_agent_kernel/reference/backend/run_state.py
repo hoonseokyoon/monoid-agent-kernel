@@ -17,6 +17,7 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.projections import FAILURE_QUARANTINE_MARKERS
 from monoid_agent_kernel.core.result import AgentRunResult
 from monoid_agent_kernel.public_view import public_error_message
@@ -133,6 +134,7 @@ def write_failure_status_artifact(
         }
     )
     state.pop("provider_retried", None)
+    state.pop("interruption_cause", None)
     try:
         write_json_atomic(status_path, state)
     except OSError:
@@ -152,6 +154,16 @@ def _event_http_status(data: Mapping[str, Any]) -> int | None:
 
     value = data.get("http_status")
     return value if type(value) is int else None
+
+
+def _event_interruption_cause(data: Mapping[str, Any]) -> InterruptionCause | None:
+    value = data.get("interruption_cause")
+    if not isinstance(value, str):
+        return None
+    try:
+        return InterruptionCause(value)
+    except ValueError:
+        return None
 
 
 def _nonnegative_metric(metrics: Mapping[str, Any], key: str) -> int:
@@ -342,6 +354,8 @@ class RunStateMutationService:
                 record.retryable = _event_flag(event.data, "retryable")
                 record.config_recoverable = _event_flag(event.data, "config_recoverable")
                 record.provider_retried = _event_flag(event.data, "provider_retried")
+            elif event.type == "turn.interrupted":
+                record.interruption_cause = _event_interruption_cause(event.data)
             elif event.type in {"run.resumed", "model.turn.started"}:
                 if record.state in {
                     SessionState.AWAITING_INPUT,
@@ -362,12 +376,14 @@ class RunStateMutationService:
                     record.retryable = False
                     record.config_recoverable = False
                     record.provider_retried = False
+                    record.interruption_cause = None
             elif event.type == "run.finished":
                 # Terminal readiness is owned by record_run_result(), which flips lifecycle and
                 # stores the result under the same lock.
                 record.finished_at = self._context.now()
                 record.error = str(event.data.get("error") or "")
                 record.error_code = str(event.data.get("error_code") or "")
+                record.interruption_cause = _event_interruption_cause(event.data)
             elif event.type == "run.failed":
                 set_record_state(record, SessionState.FAILED, terminal=True)
                 record.error = str(event.data.get("error") or "")
@@ -384,6 +400,7 @@ class RunStateMutationService:
                 record.retryable = _event_flag(event.data, "retryable")
                 record.config_recoverable = _event_flag(event.data, "config_recoverable")
                 record.provider_retried = False
+                record.interruption_cause = None
 
         self._context.with_record_lock(_mutate)
 
@@ -456,6 +473,7 @@ class RunStateMutationService:
             # provider response body in it, which is not the run's own data to hand back.
             record.error = public_error_message(result.error)
             record.error_code = result.error_code
+            record.interruption_cause = result.interruption_cause
             # The record-side terminal heal — the third consumer of the rule the status sink
             # and the offline projection already bind at their terminal branches. Terminals
             # minted at the CLOSE boundary (a pending-cancel promotion, the unrecovered
@@ -623,6 +641,7 @@ class RunStateMutationService:
             record.http_status = _provider_http_status(exc)
             record.provider_error_code = _error_text(exc, "provider_error_code")
             record.provider_retried = False
+            record.interruption_cause = None
             record.finished_at = self._context.now()
             # A run that dies of a driver exception after N billed turns used to leave the
             # ledger reporting zero for every one of them -- not even the run count -- while

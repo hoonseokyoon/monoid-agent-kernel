@@ -1158,6 +1158,16 @@ evidence를 다음 step 뒤에 남기지 않는다.
 - Reference backend drain adoption
 - Stop/completion/lease-loss race test
 
+구현 계약:
+
+- cancellation cause는 first-writer-wins이며 checkpoint, suspension, result, event, metrics,
+  status projection을 같은 값으로 통과한다.
+- `graceful_drain`과 `host_shutdown`은 checkpoint 가능한 non-terminal interrupt를 만든다.
+  Reference backend는 admission barrier를 먼저 닫고, 이 park를 terminal close로 정리한다.
+- `lease_lost` activation은 in-memory park만 반환하며 checkpoint, event, projection, terminal을
+  쓰지 않는다. 신호 전에 commit된 model invocation settlement는 권위 evidence로 남는다.
+- turn-level `Stop`은 `user_cancel` cause를 가진 resumable interrupt다.
+
 종료 조건: lease-lost worker가 checkpoint/event/terminal mutation을 만들지 않는다.
 
 ### PR 7 — Conformance와 release closure

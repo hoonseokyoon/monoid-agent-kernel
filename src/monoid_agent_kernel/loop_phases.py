@@ -603,6 +603,8 @@ class LoopFinalizer:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
+        if state.interruption_cause is not None:
+            metrics["interruption_cause"] = state.interruption_cause.value
         if state.status == "failed":
             # The verdict beside the code/status pair above: retryable (waiting may help) and
             # config_recoverable (configuration will) are two facts, and this artifact carried
@@ -662,6 +664,9 @@ class LoopFinalizer:
                 "status": state.status,
                 "error": public_error_message(state.error),
                 "error_code": state.error_code,
+                "interruption_cause": (
+                    "" if state.interruption_cause is None else state.interruption_cause.value
+                ),
                 **_settled_text_fields(recorder, state),
                 "duration_s": metrics["duration_s"],
                 "diff_path": str(diff_path.relative_to(recorder.run_dir)),
@@ -689,6 +694,7 @@ class LoopFinalizer:
             error=state.error,
             error_code=state.error_code,
             final_turn_handle=state.previous_turn_handle,
+            interruption_cause=state.interruption_cause,
         )
 
     def checkpoint_on_settle(self, state: Any, res: _RunResources) -> AgentTurnResult:
@@ -719,6 +725,9 @@ class LoopFinalizer:
                 "status": state.status,
                 **_settled_text_fields(recorder, state),
                 "error_code": state.error_code,
+                "interruption_cause": (
+                    "" if state.interruption_cause is None else state.interruption_cause.value
+                ),
                 "changed_paths": public_changed,
                 "output_validators": len(
                     loop._active_output_validators(state.previous_runtime_config)
@@ -738,4 +747,5 @@ class LoopFinalizer:
             final_output=state.final_output,
             outputs=dict(state.output_values),
             metrics=metrics,
+            interruption_cause=state.interruption_cause,
         )

@@ -63,6 +63,7 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamWriter,
     safe_open_model_stream,
 )
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.content import (
     ContentPart,
     content_part_from_json,
@@ -1071,6 +1072,7 @@ class RunState:
     # from — so the restore path has one authority rather than two that can disagree.
     retryable: bool = False
     config_recoverable: bool = False
+    interruption_cause: InterruptionCause | None = None
     final_text: str = ""
     # Whether ``final_text`` came from the model — its response text, or the ``summary`` argument of
     # a ``run.finish`` tool call — rather than being authored by the kernel. Only model-authored text
@@ -1845,6 +1847,7 @@ class AgentLoop:
             state.provider_http_status = None
             state.retryable = False
             state.config_recoverable = False
+            state.interruption_cause = None
             state.final_text = ""
             state.final_text_is_model_output = False
             # A fresh user turn gets a fresh output-validation budget and a clean result value.
@@ -1897,15 +1900,49 @@ class AgentLoop:
             # last durable snapshot and let the lifecycle owner decide retry/recovery; converting
             # this into a terminal agent failure could commit past the failed barrier.
             raise
-        except (RunCancelled, RunTimeout) as exc:
+        except RunCancelled as exc:
+            cause = (
+                exc.interruption_cause
+                if isinstance(exc.interruption_cause, InterruptionCause)
+                else InterruptionCause.USER_CANCEL
+            )
+            state.interruption_cause = cause
+            if cause is InterruptionCause.LEASE_LOST:
+                # Lease loss removes this activation's write authority. Return an in-memory
+                # observation only; the new owner or reconciler decides durable terminal state.
+                state.error = "run lease was lost"
+                state.error_code = cause.value
+                session.midturn_park = "interrupted"
+                return Suspension(
+                    reason="interrupted",
+                    status="completed",
+                    error=state.error,
+                    error_code=state.error_code,
+                    interruption_cause=cause,
+                )
+            if cause in {
+                InterruptionCause.GRACEFUL_DRAIN,
+                InterruptionCause.HOST_SHUTDOWN,
+            }:
+                state.error = ""
+                state.error_code = cause.value
+                session.midturn_park = "interrupted"
+                self._emit_turn_interrupted(res, session, cause.value, cause)
+                result = Suspension(
+                    reason="interrupted",
+                    status="completed",
+                    error_code=state.error_code,
+                    model_tool_calls_pending=session.model_tool_calls_pending,
+                    interruption_cause=cause,
+                )
+                self._persist_checkpoint(session, result)
+                return result
             state.status = "limited"
             state.error = str(exc)
-            state.error_code = error_code_for_exception(exc)
-            state.final_text = (
-                "Stopped because the run was cancelled."
-                if state.error_code == "cancelled"
-                else "Stopped after reaching max duration."
+            state.error_code = (
+                "cancelled" if cause is InterruptionCause.USER_CANCEL else cause.value
             )
+            state.final_text = "Stopped because the run was cancelled."
             state.final_text_is_model_output = False
             session.terminal = True
             result = replace(
@@ -1913,6 +1950,25 @@ class AgentLoop:
                 final_text=state.final_text,
                 error=state.error,
                 error_code=state.error_code,
+                interruption_cause=cause,
+                turn=self._checkpoint_on_settle(state, res),
+            )
+            self._persist_checkpoint(session, result)
+            return result
+        except RunTimeout as exc:
+            state.status = "limited"
+            state.error = str(exc)
+            state.error_code = error_code_for_exception(exc)
+            state.interruption_cause = InterruptionCause.DEADLINE
+            state.final_text = "Stopped after reaching max duration."
+            state.final_text_is_model_output = False
+            session.terminal = True
+            result = replace(
+                Suspension(reason="terminal", status="limited"),
+                final_text=state.final_text,
+                error=state.error,
+                error_code=state.error_code,
+                interruption_cause=InterruptionCause.DEADLINE,
                 turn=self._checkpoint_on_settle(state, res),
             )
             self._persist_checkpoint(session, result)
@@ -1995,12 +2051,11 @@ class AgentLoop:
             # pending_observations so a re-issue doesn't re-append tool outputs. The driver parks
             # for the next user message. ``status`` is cosmetic here; branch on ``reason``.
             self._interrupt_requested = False
-            res.recorder.emit(
-                "turn.interrupted",
-                turn_id=session.active_turn_id,
-                parent_id=session.active_turn_parent_id,
-                data={"reason": "user_stop"},
-                level="info",
+            self._emit_turn_interrupted(
+                res,
+                session,
+                "user_stop",
+                InterruptionCause.USER_CANCEL,
             )
             # A settled durable result interrupted before assistant-message application must replay
             # the exact request on a None resume. Tool-follow-up observations are part of that
@@ -2011,10 +2066,12 @@ class AgentLoop:
             # Remembered on the session (like ``unrecovered_turn_failure``) so a close() with
             # no later settle refuses to finalize this abandoned turn as a clean success.
             session.midturn_park = "interrupted"
+            state.interruption_cause = InterruptionCause.USER_CANCEL
             result = Suspension(
                 reason="interrupted",
                 status="completed",
                 model_tool_calls_pending=session.model_tool_calls_pending,
+                interruption_cause=InterruptionCause.USER_CANCEL,
             )
             self._persist_checkpoint(session, result)
             return result
@@ -2133,11 +2190,20 @@ class AgentLoop:
         token = self.cancellation_token
         if session.terminal or token is None or not token.requested:
             return
+        cause = token.cause or InterruptionCause.USER_CANCEL
+        if cause is InterruptionCause.LEASE_LOST:
+            raise NativeAgentError(
+                "lease-lost activation must be discarded without finalization",
+                error_code="lease_lost",
+            )
         state = session.state
-        exc = RunCancelled("run cancelled")
+        exc = RunCancelled("run cancelled", interruption_cause=cause)
         state.status = "limited"
         state.error = str(exc)
-        state.error_code = error_code_for_exception(exc)
+        state.error_code = (
+            "cancelled" if cause is InterruptionCause.USER_CANCEL else cause.value
+        )
+        state.interruption_cause = cause
         # A settled park's final text SURVIVES the cancel: the answer the turn produced is
         # the run's, and the cancel statement already lives in error/error_code ("cancelled").
         # v0.20 returned the answer with the wrong COMPLETED status; the status fix must not
@@ -2147,7 +2213,11 @@ class AgentLoop:
         # Preserved text keeps its provenance flag, so a model answer stays digested on
         # ``run.finished`` rather than being republished inline.
         if not state.final_text:
-            state.final_text = "Stopped because the run was cancelled."
+            state.final_text = (
+                "Stopped because the run was cancelled."
+                if cause is InterruptionCause.USER_CANCEL
+                else "Stopped while the host was draining the run."
+            )
             state.final_text_is_model_output = False
         session.terminal = True
         self._persist_checkpoint(
@@ -2158,6 +2228,7 @@ class AgentLoop:
                 final_text=state.final_text,
                 error=state.error,
                 error_code=state.error_code,
+                interruption_cause=cause,
             ),
         )
 
@@ -3080,6 +3151,9 @@ class AgentLoop:
                 if session.last_model_invocation is not None
                 else None
             ),
+            interruption_cause=(
+                "" if state.interruption_cause is None else state.interruption_cause.value
+            ),
             plan=[dict(item) for item in res.context.plan],
             pending_finish=(
                 {
@@ -3121,6 +3195,15 @@ class AgentLoop:
         """Best-effort durable checkpoint at a park point. No-op when ``snapshot()``
         refuses (a live shell job is parked-on) — that park is simply not durable yet.
         Advances the per-run sequence so the store commits a new last-good checkpoint."""
+        if (
+            self.cancellation_token is not None
+            and self.cancellation_token.requested
+            and self.cancellation_token.cause is InterruptionCause.LEASE_LOST
+        ):
+            raise NativeAgentError(
+                "lease-lost activation cannot persist a checkpoint",
+                error_code="lease_lost",
+            )
         prior_suspension = session.last_suspension
         if suspension is not None:
             session.last_suspension = suspension_checkpoint_payload(suspension)
@@ -3304,6 +3387,9 @@ class AgentLoop:
             pending_tool_approval_replays=tuple(
                 dict(replay) for replay in cp.pending_tool_approval_replays
             ),
+            interruption_cause=(
+                InterruptionCause(cp.interruption_cause) if cp.interruption_cause else None
+            ),
         )
         # The context-owned roll-ups, restored beside their RunState twins above so
         # ``build_metrics`` reports one epoch. The context is rebuilt per activation, so these
@@ -3428,7 +3514,11 @@ class AgentLoop:
             # checkpoint clears ``cancellation_requested`` before restoring.
             if self.cancellation_token is None:
                 self.cancellation_token = CancellationToken()
-            self.cancellation_token.cancel()
+            self.cancellation_token.cancel(
+                InterruptionCause(cp.interruption_cause)
+                if cp.interruption_cause
+                else InterruptionCause.USER_CANCEL
+            )
 
     @staticmethod
     def _apply_workspace_delta(
@@ -6449,12 +6539,32 @@ class AgentLoop:
 
     def _check_run_boundary(self, deadline: float | None) -> None:
         if self.cancellation_token is not None and self.cancellation_token.requested:
-            raise RunCancelled("run cancelled")
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=(
+                    self.cancellation_token.cause or InterruptionCause.USER_CANCEL
+                ),
+            )
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
             raise TurnInterrupted("turn interrupted")
+
+    @staticmethod
+    def _emit_turn_interrupted(
+        res: _RunResources,
+        session: _Session,
+        reason: str,
+        cause: InterruptionCause,
+    ) -> None:
+        res.recorder.emit(
+            "turn.interrupted",
+            turn_id=session.active_turn_id,
+            parent_id=session.active_turn_parent_id,
+            data={"reason": reason, "interruption_cause": cause.value},
+            level="info",
+        )
 
     def _emit_side_effect_event(
         self,

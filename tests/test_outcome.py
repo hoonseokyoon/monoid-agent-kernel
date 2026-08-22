@@ -429,3 +429,47 @@ def test_suspension_outcome_projection_uses_the_portable_classification(
     assert outcome.kind == kind
     assert outcome.retry_eligibility is retry
     assert outcome.interruption_cause is cause
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_kind", "expected_retry"),
+    (
+        (InterruptionCause.USER_CANCEL, "cancelled", RetryEligibility.FORBIDDEN),
+        (InterruptionCause.DEADLINE, "cancelled", RetryEligibility.FORBIDDEN),
+        (InterruptionCause.GRACEFUL_DRAIN, "interrupted", RetryEligibility.SAFE),
+        (InterruptionCause.HOST_SHUTDOWN, "interrupted", RetryEligibility.SAFE),
+        (InterruptionCause.LEASE_LOST, "interrupted", RetryEligibility.SAFE),
+    ),
+)
+def test_terminal_outcome_uses_typed_interruption_cause(
+    cause: InterruptionCause,
+    expected_kind: TerminalOutcomeKind,
+    expected_retry: RetryEligibility,
+) -> None:
+    outcome = terminal_outcome_from_suspension(
+        Suspension(
+            reason="terminal",
+            status="limited",
+            error_code=cause.value,
+            interruption_cause=cause,
+        ),
+        run_id="run_1",
+    )
+
+    assert outcome.kind == expected_kind
+    assert outcome.retry_eligibility is expected_retry
+    assert outcome.interruption_cause is cause
+
+
+def test_turn_stop_remains_nonterminal_interrupted_even_with_user_cancel_cause() -> None:
+    outcome = terminal_outcome_from_suspension(
+        Suspension(
+            reason="interrupted",
+            status="completed",
+            interruption_cause=InterruptionCause.USER_CANCEL,
+        ),
+        run_id="run_1",
+    )
+
+    assert outcome.kind == "interrupted"
+    assert outcome.retry_eligibility is RetryEligibility.SAFE

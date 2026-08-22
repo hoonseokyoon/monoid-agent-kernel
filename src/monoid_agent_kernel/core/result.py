@@ -9,6 +9,7 @@ from monoid_agent_kernel.core.json_ingress import (
     portable_class_name,
     portable_type_name,
 )
+from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.wire_validation import (
     optional_list,
     parse_bool,
@@ -71,6 +72,7 @@ class AgentTurnResult:
     # All validators' values keyed by validator id (``final_output`` is the last of these).
     outputs: dict[str, object] = field(default_factory=dict)
     metrics: dict[str, object] = field(default_factory=dict)
+    interruption_cause: InterruptionCause | None = None
 
     def output_as(self, model: type[_T]) -> _T:
         """``final_output`` typed as ``model`` — see :meth:`AgentRunResult.output_as`."""
@@ -140,6 +142,7 @@ class Suspension:
     # A durable model turn has already entered the message log with tool calls, while execution of
     # those calls remains incomplete. True only on a resumable interruption boundary.
     model_tool_calls_pending: bool = False
+    interruption_cause: InterruptionCause | None = None
 
 
 # The park vocabulary and the durable status vocabulary, one definition each. Public because the
@@ -183,6 +186,11 @@ def suspension_checkpoint_payload(suspension: Suspension) -> dict[str, Any]:
         "provider_error_code": suspension.provider_error_code,
         "provider_retried": suspension.provider_retried,
         "model_tool_calls_pending": suspension.model_tool_calls_pending,
+        "interruption_cause": (
+            ""
+            if suspension.interruption_cause is None
+            else suspension.interruption_cause.value
+        ),
     }
 
 
@@ -200,6 +208,7 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
         raise ValueError("durable suspension task ids must be strings")
     raw_http_status = payload.get("http_status")
     http_status = None if raw_http_status is None else parse_int(payload, "http_status")
+    raw_cause = parse_str(payload, "interruption_cause")
     return Suspension(
         reason=reason,  # type: ignore[arg-type]
         status=status,  # type: ignore[arg-type]
@@ -218,6 +227,7 @@ def suspension_from_checkpoint_payload(payload: Mapping[str, Any]) -> Suspension
         provider_error_code=parse_str(payload, "provider_error_code"),
         provider_retried=parse_bool(payload, "provider_retried"),
         model_tool_calls_pending=parse_bool(payload, "model_tool_calls_pending"),
+        interruption_cause=(InterruptionCause(raw_cause) if raw_cause else None),
     )
 
 
@@ -241,6 +251,7 @@ class AgentRunResult:
     error: str = ""
     error_code: str = ""
     final_turn_handle: str | None = None
+    interruption_cause: InterruptionCause | None = None
 
     def output_as(self, model: type[_T]) -> _T:
         """``final_output`` typed as ``model`` — restores the static type a validator erased into

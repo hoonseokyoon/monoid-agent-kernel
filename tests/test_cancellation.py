@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
@@ -69,6 +73,15 @@ def test_cancel_callbacks_are_one_shot_and_removable() -> None:
 
     assert calls == ["kept"]
     assert token.requested is True
+
+
+def test_first_interruption_cause_wins() -> None:
+    token = CancellationToken()
+
+    token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+    token.cancel(InterruptionCause.USER_CANCEL)
+
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
 
 
 def test_callback_added_after_cancellation_runs_immediately() -> None:
@@ -145,6 +158,49 @@ def test_a_restore_into_an_existing_token_still_cancels_it(tmp_path: Path) -> No
 
     assert loop.cancellation_token is token
     assert token.requested is True
+
+
+def test_a_restored_loop_reinstalls_the_durable_interruption_cause(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+
+    loop.restore(
+        RunCheckpoint(
+            run_id=loop.spec.run_id,
+            seq=1,
+            cancellation_requested=True,
+            interruption_cause=InterruptionCause.GRACEFUL_DRAIN.value,
+        )
+    )
+
+    assert loop.cancellation_token is not None
+    assert loop.cancellation_token.cause is InterruptionCause.GRACEFUL_DRAIN
+    suspension = loop.run_until_suspended("go")
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
+    stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+    assert stored is not None
+    assert stored.checkpoint.interruption_cause == InterruptionCause.GRACEFUL_DRAIN.value
+
+
+def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    token.cancel(InterruptionCause.LEASE_LOST)
+
+    suspension = loop.run_until_suspended("go")
+
+    assert suspension.reason == "interrupted"
+    assert suspension.error_code == InterruptionCause.LEASE_LOST.value
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
+    with pytest.raises(NativeAgentError, match="lease-lost activation") as exc_info:
+        loop.close()
+    assert exc_info.value.error_code == "lease_lost"
+    assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
 
 
 def test_close_promotes_a_cancel_acknowledged_at_a_park(tmp_path: Path) -> None:

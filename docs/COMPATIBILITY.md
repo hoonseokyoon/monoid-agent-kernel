@@ -108,10 +108,11 @@ the canonical writer emits only `evidence_policy`. Deploy the current checked re
 writer because the earlier prerelease reader used a closed top-level vocabulary.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
-`pending_finish`, and `pending_tool_loads` fields. A
-v0.21 checkpoint omits them and restores with empty/default values. The writer keeps the checkpoint
-version and emits an explicit field projection copied through the iterative portable JSON
-normalizer.
+`pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
+`interruption_cause`. A v0.21 checkpoint omits these fields and restores them with empty/default
+values. Current readers accept the absent suspension cause; current writers emit the normalized
+typed value when an interruption has one. The writer keeps the checkpoint version and emits an
+explicit field projection copied through the iterative portable JSON normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed

@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
+from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_address,
@@ -62,17 +63,6 @@ class RetryEligibility(StrEnum):
     AFTER_CONFIGURATION = "after_configuration"
     AFTER_RECONCILIATION = "after_reconciliation"
     FORBIDDEN = "forbidden"
-
-
-class InterruptionCause(StrEnum):
-    USER_CANCEL = "user_cancel"
-    GRACEFUL_DRAIN = "graceful_drain"
-    LEASE_LOST = "lease_lost"
-    DEADLINE = "deadline"
-    HOST_SHUTDOWN = "host_shutdown"
-    PROVIDER_FAILURE = "provider_failure"
-    VALIDATION_FAILURE = "validation_failure"
-    UNKNOWN = "unknown"
 
 
 def _require_optional_nonnegative_int(value: object, field_name: str) -> None:
@@ -242,12 +232,18 @@ def terminal_outcome_from_suspension(
         kind = "dispatch_unknown"
         retry = RetryEligibility.AFTER_RECONCILIATION
         cause = None
-    elif suspension.error_code == "cancelled":
+    elif suspension.reason == "interrupted":
+        kind = "interrupted"
+        retry = RetryEligibility.SAFE
+    elif suspension.error_code == "cancelled" or cause is InterruptionCause.USER_CANCEL:
         kind = "cancelled"
         retry = RetryEligibility.FORBIDDEN
-    elif suspension.error_code == "run_timeout":
+    elif suspension.error_code == "run_timeout" or cause is InterruptionCause.DEADLINE:
         kind = "cancelled"
         retry = RetryEligibility.FORBIDDEN
+    elif cause is not None:
+        kind = "interrupted"
+        retry = RetryEligibility.SAFE
     elif suspension.reason == "settled":
         kind = "completed"
         retry = RetryEligibility.NOT_APPLICABLE
@@ -257,9 +253,6 @@ def terminal_outcome_from_suspension(
     elif suspension.reason == "limited":
         kind = "limited"
         retry = RetryEligibility.FORBIDDEN
-    elif suspension.reason == "interrupted":
-        kind = "interrupted"
-        retry = RetryEligibility.SAFE
     elif suspension.config_recoverable:
         kind = "failed_config"
         retry = RetryEligibility.AFTER_CONFIGURATION
