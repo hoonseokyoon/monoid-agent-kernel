@@ -85,6 +85,7 @@ from monoid_agent_kernel.model_lifecycle import (
     dispatch_evidence,
     durable_model_result_blob,
     durable_model_turn,
+    mark_recovered_model_usage,
     raise_model_dispatch_unknown,
     recover_model_dispatch,
     reserve_model_dispatch,
@@ -819,7 +820,11 @@ class ModelCallRunner:
                             "idempotency_key",
                             recovered.reservation.idempotency_key,
                         )
-                        receipt = _recovered_receipt(receipt, recovered)
+                        try:
+                            receipt = _recovered_receipt(receipt, recovered)
+                        except DurableModelCallError as recovery_error:
+                            mark_recovered_model_usage(recovery_error, recovered.receipt)
+                            raise
                         if recovered.failure_code:
                             recovered_failure_receipt = receipt
                             raise ModelDispatchRefused(
@@ -831,12 +836,18 @@ class ModelCallRunner:
                                 http_status=receipt.http_status,
                                 provider_retried=receipt.provider_retried,
                             )
-                        turn = durable_model_turn(recovered.result_blob)
+                        try:
+                            turn = durable_model_turn(recovered.result_blob)
+                        except DurableModelCallError as recovery_error:
+                            mark_recovered_model_usage(recovery_error, recovered.receipt)
+                            raise
                         if not _recovered_result_matches_evidence(turn, recovered.receipt):
-                            raise DurableModelCallError(
+                            recovery_error = DurableModelCallError(
                                 "durable model result conflicts with its receipt",
                                 error_code="durable_invocation_result_corrupt",
                             )
+                            mark_recovered_model_usage(recovery_error, recovered.receipt)
+                            raise recovery_error
                         settled = self._publish(
                             request,
                             turn,

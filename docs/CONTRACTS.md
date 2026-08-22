@@ -2804,15 +2804,20 @@ entry:
 
 Every existing head must match the current request digest and digest generation. A mismatch raises
 `durable_invocation_request_conflict` before provider entry. Corrupt and unsupported invocation
-heads fail closed. Successful result recovery verifies the `blob:<sha256>` address, blob bytes, and
-strict recorded-turn shape. It compares stop reason when that fact survived the public-safe receipt
-projection. Recovered turns contain an empty `raw` mapping. The public receipt describes the whole
-logical call, including usage absorbed by kernel retries and provider-retry evidence folded across
-attempts. The private result describes the final provider turn. Recovery keeps these two evidence
-scopes separate, and run accounting consumes the public receipt's canonical usage counters,
-including `cache_creation_tokens` and `audio_tokens`. Failed result recovery preserves the failure
-code, provider code, HTTP status, retryability, configuration recoverability, provider-retry fact,
-and usage recorded in the public-safe receipt. Provider exception text is never reconstructed.
+heads fail closed. Before exposing either settled arm, recovery re-commits the exact authoritative
+revision through `commit_invocation()`. The fence check precedes idempotency in that mutation, so a
+stale activation cannot replay a successful turn or execute its tool calls. Successful result
+recovery verifies the `blob:<sha256>` address, blob bytes, and strict recorded-turn shape. It
+compares stop reason when that fact survived the public-safe receipt projection. Recovered turns
+contain an empty `raw` mapping. The public receipt describes the whole logical call, including usage
+absorbed by kernel retries and provider-retry evidence folded across attempts. The private result
+describes the final provider turn. Recovery keeps these two evidence scopes separate, and run
+accounting consumes the public receipt's canonical usage counters, including
+`cache_creation_tokens` and `audio_tokens`. Missing, tampered, undecodable, and receipt-conflicting
+results raise a typed integrity error carrying that already-billed public usage. Failed result
+recovery preserves the failure code, provider code, HTTP status, retryability, configuration
+recoverability, provider-retry fact, and usage recorded in the public-safe receipt. Provider
+exception text is never reconstructed.
 
 Every non-task suspension commits its checkpoint through `FencedRunSink.commit_checkpoint()`.
 AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,

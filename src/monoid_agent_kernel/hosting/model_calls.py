@@ -20,6 +20,7 @@ from monoid_agent_kernel.model_lifecycle import (
     ModelDispatchSettlement,
     RecoveredModelDispatch,
     UnknownModelDispatch,
+    mark_recovered_model_usage,
 )
 
 
@@ -129,6 +130,18 @@ class FencedModelCallLifecycle:
             error_code="dispatch_unknown",
         )
 
+    @staticmethod
+    def _result_error(
+        message: str,
+        invocation: DurableModelInvocation,
+    ) -> DurableModelCallError:
+        error = DurableModelCallError(
+            message,
+            error_code="durable_invocation_result_corrupt",
+        )
+        mark_recovered_model_usage(error, invocation.receipt or {})
+        return error
+
     def recover(
         self,
         query: ModelDispatchRecoveryQuery,
@@ -168,6 +181,10 @@ class FencedModelCallLifecycle:
             idempotency_key=invocation.idempotency_key,
         )
         if invocation.failure_code:
+            # An exact idempotent mutation is the host contract's authenticated ownership check.
+            # Fencing precedes idempotency, so a stale activation cannot expose a recovered
+            # settlement even though the preceding checked load is intentionally token-free.
+            self._commit(invocation)
             return RecoveredModelDispatch(
                 reservation=reservation,
                 receipt=invocation.receipt,
@@ -175,22 +192,25 @@ class FencedModelCallLifecycle:
             )
         sha256 = invocation.result_ref.removeprefix("blob:")
         if not sha256 or invocation.result_ref != f"blob:{sha256}":
-            raise DurableModelCallError(
+            raise self._result_error(
                 "settled durable model invocation has no private result",
-                error_code="durable_invocation_result_corrupt",
+                invocation,
             )
         try:
             result_blob = record.blob(sha256)
         except Exception as exc:
-            raise DurableModelCallError(
+            raise self._result_error(
                 "durable model invocation result is unavailable",
-                error_code="durable_invocation_result_corrupt",
+                invocation,
             ) from exc
         if type(result_blob) is not bytes or hashlib.sha256(result_blob).hexdigest() != sha256:
-            raise DurableModelCallError(
+            raise self._result_error(
                 "durable model invocation result failed content verification",
-                error_code="durable_invocation_result_corrupt",
+                invocation,
             )
+        # Replay the exact settlement through the fenced mutation path before returning any
+        # private result. Supplying the original blob preserves full content identity.
+        self._commit(invocation, {sha256: result_blob})
         return RecoveredModelDispatch(
             reservation=reservation,
             receipt=invocation.receipt,

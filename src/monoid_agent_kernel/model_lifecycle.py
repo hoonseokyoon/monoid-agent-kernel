@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
 )
 from monoid_agent_kernel.core.model_invocation import (
+    MODEL_INVOCATION_RECEIPT_USAGE_FIELDS,
     MODEL_REQUEST_DIGEST_GENERATION,
     model_dispatch_id,
     model_invocation_receipt,
@@ -168,6 +169,26 @@ def dispatch_evidence(exc: BaseException) -> str:
 
 def safe_failure_code(value: object, *, default: str) -> str:
     return value if is_safe_taxonomy_code(value) else default
+
+
+def mark_recovered_model_usage(
+    error: BaseException,
+    receipt: Mapping[str, Any],
+) -> None:
+    """Carry already-billed public usage when recovered result verification fails."""
+
+    raw_usage = receipt.get("usage")
+    if not isinstance(raw_usage, Mapping):
+        return
+    usage = {
+        key: value
+        for key, value in raw_usage.items()
+        if type(key) is str
+        and key in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+        and is_portable_json_integer(value)
+        and value >= 0
+    }
+    mark_provider_usage(error, usage)
 
 
 def reserve_model_dispatch(

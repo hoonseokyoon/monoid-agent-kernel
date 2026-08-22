@@ -798,8 +798,10 @@ Process crash 뒤 남은 kernel retry history를 추측해 자동 재개하지 �
 Host hook은 result blob의 content digest와 canonical body shape를 검증한다. Public receipt에
 보존된 stop reason은 result와 교차 검증한다. Receipt usage와 provider-retry evidence는 logical call
 전체를 나타내고 private turn의 두 필드는 최종 provider turn을 나타내므로 서로 같다고 비교하지
-않는다. Run accounting은 public receipt의 canonical usage를 사용한다. 불일치, missing blob,
-corrupt/unsupported load는 provider를 호출하지 않고 typed durable error로 끝낸다.
+않는다. Settled result를 반환하기 전에 권위 revision을 동일 content로 다시 commit해 현재 writer
+fence를 검증한다. Run accounting은 public receipt의 canonical usage를 사용한다. 불일치, missing
+blob, corrupt/unsupported load는 provider를 호출하지 않고 typed durable error로 끝내며 이미 지불된
+receipt usage를 오류에 보존한다.
 
 ## 8. Sink delivery policy
 

@@ -96,6 +96,10 @@ out in commit messages and here.
   logical-call usage across kernel retries, including cache-creation and audio tokens, while the
   private result retains final-turn evidence. Passive model-I/O consumers receive the recovered
   settlement once.
+- Settled recovery now proves current writer ownership through an exact fenced invocation retry
+  before exposing either terminal arm. Result-integrity failures retain authoritative billed usage,
+  so missing, tampered, malformed, and receipt-conflicting replay data remain visible to run
+  accounting without another provider call.
 - Added AgentLoop crash-injection coverage for reserved, dispatch-started, successful settled, and
   failed settled heads, plus request drift, unreadable heads, tampered result bytes, fenced
   checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Mapping
@@ -17,6 +18,7 @@ from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_invocation import (
     DurableModelInvocation,
     logical_model_call_id,
+    model_dispatch_id,
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec, ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
@@ -26,8 +28,19 @@ from monoid_agent_kernel.errors import (
 )
 from monoid_agent_kernel.hosting import CommitResult, ModelInvocationRecord, WriterToken
 from monoid_agent_kernel.loop import AgentLoop
-from monoid_agent_kernel.model_lifecycle import durable_model_turn
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, mark_provider_usage
+from monoid_agent_kernel.model_call import ModelCallRunner
+from monoid_agent_kernel.model_lifecycle import (
+    ModelDispatchReservation,
+    RecoveredModelDispatch,
+    durable_model_result_blob,
+    durable_model_turn,
+)
+from monoid_agent_kernel.providers.base import (
+    ModelRequest,
+    ModelTurn,
+    mark_provider_usage,
+    provider_usage_of,
+)
 
 
 RUN_ID = "run-durable-recovery"
@@ -134,6 +147,26 @@ class _TamperInvocationResultLoad:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
+
+
+@dataclass
+class _RecoveredResultHook:
+    result_blob: bytes
+    receipt: Mapping[str, Any]
+
+    def recover(self, query: Any) -> RecoveredModelDispatch:
+        return RecoveredModelDispatch(
+            reservation=ModelDispatchReservation(
+                logical_call_id=query.logical_call_id,
+                dispatch_attempt=1,
+                dispatch_id=model_dispatch_id(query.logical_call_id, 1),
+                request_digest=query.request_digest,
+                digest_generation=query.digest_generation,
+                idempotency_key="idem_recovered_result",
+            ),
+            receipt=self.receipt,
+            result_blob=self.result_blob,
+        )
 
 
 def _spec(tmp_path: Path) -> AgentRunSpec:
@@ -449,12 +482,21 @@ def test_changed_request_is_blocked_before_provider_reentry(tmp_path: Path) -> N
 
 def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path) -> None:
     harness = DeterministicFencedRunHarness()
-    adapter = _ScriptedAdapter(ModelTurn(final_text="first"))
+    turn = ModelTurn(
+        final_text="first",
+        usage={
+            "input_tokens": 4,
+            "output_tokens": 2,
+            "total_tokens": 6,
+            "cache_creation_tokens": 1,
+        },
+    )
+    adapter = _ScriptedAdapter(turn)
     baseline, settled = _crash_at(tmp_path, harness, adapter, "settled")
     result_sha = settled.invocation.result_ref.removeprefix("blob:")
     assert hashlib.sha256(settled.blob(result_sha)).hexdigest() == result_sha
 
-    suspension, _checkpoint = _restore(
+    suspension, checkpoint = _restore(
         tmp_path,
         harness,
         adapter,
@@ -464,7 +506,73 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
 
     assert suspension.reason == "terminal"
     assert suspension.error_code == "durable_invocation_result_corrupt"
+    assert checkpoint is not None and checkpoint.total_usage == turn.usage
     assert len(adapter.requests) == 1
+
+
+def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must stay fenced", stop_reason="stop"))
+    baseline, _settled = _crash_at(tmp_path, harness, adapter, "settled")
+    stale_token = WriterToken(run_id=RUN_ID, owner_id="worker-1", generation=1)
+    harness.claim_writer(RUN_ID, "worker-2")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=harness.sink,
+        writer_token=stale_token,
+    )
+    loop.restore(baseline)
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
+            loop.run_until_suspended("hello")
+        assert len(adapter.requests) == 1
+        assert loop._session is not None
+        assert not any(
+            message.get("role") == "assistant" for message in loop._session.state.messages
+        )
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+
+@pytest.mark.parametrize(
+    "result_blob",
+    [
+        pytest.param(b"not-json", id="malformed-result"),
+        pytest.param(
+            durable_model_result_blob(ModelTurn(final_text="answer", stop_reason="length")),
+            id="receipt-conflict",
+        ),
+    ],
+)
+def test_recovered_result_integrity_failure_carries_authoritative_usage(
+    result_blob: bytes,
+) -> None:
+    usage = {
+        "input_tokens": 5,
+        "output_tokens": 3,
+        "total_tokens": 8,
+        "audio_tokens": 2,
+    }
+    hook = _RecoveredResultHook(
+        result_blob=result_blob,
+        receipt={"attempts": 1, "stop_reason": "stop", "usage": usage},
+    )
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook)
+
+    with pytest.raises(DurableModelCallError) as caught:
+        asyncio.run(
+            runner.acall(
+                ModelRequest(instruction="hello", system_prompt="system", tools=()),
+                logical_call_id=LOGICAL_CALL_ID,
+            )
+        )
+
+    assert caught.value.error_code == "durable_invocation_result_corrupt"
+    assert provider_usage_of(caught.value) == usage
+    assert adapter.requests == []
 
 
 @pytest.mark.parametrize(
