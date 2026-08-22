@@ -2745,15 +2745,19 @@ class AgentLoop:
                 observer_writers = tuple(writers)
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
+                self._check_lease_authority()
                 if stream_sink_active and sink is not None:
                     sink.push_delta(chunk)
+                    self._check_lease_authority()
 
                 stream_delta: ModelStreamDelta | None = None
                 if isinstance(chunk, TextDelta) and chunk.text:
                     if durable_delta_mirror and recorder is not None:
+                        self._check_lease_authority()
                         recorder.emit(
                             "model.output.delta", data={"text": chunk.text}, level="debug"
                         )
+                        self._check_lease_authority()
                     if observer_writers:
                         output_fragments.append(chunk.text)
                         stream_delta = ModelStreamDelta(channel="output", text=chunk.text)
@@ -2761,18 +2765,22 @@ class AgentLoop:
                     if durable_delta_mirror and recorder is not None:
                         # Display-only reasoning summary (DX-13b): a separate event so a consumer
                         # renders it in a "thinking" view, distinct from the answer text.
+                        self._check_lease_authority()
                         recorder.emit(
                             "model.reasoning.delta", data={"text": chunk.text}, level="debug"
                         )
+                        self._check_lease_authority()
                     if observer_writers:
                         stream_delta = ModelStreamDelta(channel="reasoning", text=chunk.text)
 
                 if stream_delta is not None:
                     for writer in observer_writers:
+                        self._check_lease_authority()
                         try:
                             writer.push(stream_delta)
                         except Exception:  # observers cannot fail a paid provider call
                             _LOGGER.debug("model stream observer push failed", exc_info=True)
+                        self._check_lease_authority()
 
             if not stream_sink_active:
                 should_abort = lambda: self._interrupt_requested  # noqa: E731
@@ -2783,7 +2791,6 @@ class AgentLoop:
         outcome_error_code: str | None = None
         outcome_retryable = False
         outcome_config_recoverable = False
-        lease_lost = False
         try:
             turn, receipt = await runner.acall(
                 request,
@@ -2819,7 +2826,6 @@ class AgentLoop:
                 cause = InterruptionCause.LEASE_LOST
             outcome_status, outcome_error_code = _cancelled_model_stream_outcome(cause)
             outcome_final_text = "".join(output_fragments) or None
-            lease_lost = cause is InterruptionCause.LEASE_LOST
             raise
         except RunTimeout:
             outcome_status = "timed_out"
@@ -2887,7 +2893,8 @@ class AgentLoop:
                 latest_invocation = getattr(lifecycle, "last_invocation", None)
                 if isinstance(latest_invocation, DurableModelInvocation):
                     session.last_model_invocation = latest_invocation
-            if outcome_status is not None and observer_writers and not lease_lost:
+            if outcome_status is not None and observer_writers:
+                self._check_lease_authority()
                 try:
                     outcome = ModelStreamOutcome(
                         status=outcome_status,
@@ -2903,10 +2910,12 @@ class AgentLoop:
                     _LOGGER.debug("model stream outcome normalization failed", exc_info=True)
                     outcome = ModelStreamOutcome(status=outcome_status)
                 for writer in observer_writers:
+                    self._check_lease_authority()
                     try:
                         writer.close(outcome)
                     except Exception:  # observers cannot replace the provider outcome
                         _LOGGER.debug("model stream observer close failed", exc_info=True)
+                    self._check_lease_authority()
         return turn, receipt
 
     def _model_invocation_context(self, turn_id: str) -> InvocationContext:

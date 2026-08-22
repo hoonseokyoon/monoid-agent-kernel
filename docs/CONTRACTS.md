@@ -2925,6 +2925,13 @@ authority. The outer pump gives sticky lease loss precedence over every exceptio
 before it emits or checkpoints. A slow validator or handler therefore cannot reopen mutation after
 an earlier fence passed.
 
+Model observation fan-out applies the fence per callback. Receipt capture-policy resolution,
+receipt subscribers, the settled sidecar, stream delta sinks/writers, and stream outcome writers
+all check sticky authority before and after each external call. A callback that overlaps lease loss
+may finish its own in-flight operation; no later subscriber, sidecar, delta writer, or close writer
+runs under the stale activation. Best-effort diagnostic publication contains extension failures
+while always re-raising lease-loss control flow.
+
 Checkpoint persistence is a two-sided authority boundary on all three kernel surfaces:
 `FencedRunSink.commit_checkpoint`, a host persistence callback, and `CheckpointStore.put`. The loop
 checks authority after snapshot/blob collection, immediately after the external commit returns,

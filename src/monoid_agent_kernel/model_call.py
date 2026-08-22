@@ -1215,16 +1215,13 @@ class ModelCallRunner:
                                 usage=crash_usage,
                             )
                     if crash_receipt is not None:
-                        with contextlib.suppress(Exception):
-                            self._publish(
-                                request,
-                                None,
-                                crash_receipt,
-                                elapsed_ms=(
-                                    elapsed_before_recovery_ms + self._ms_since(started)
-                                ),
-                                request_preimage=request_preimage,
-                            )
+                        self._publish_best_effort(
+                            request,
+                            None,
+                            crash_receipt,
+                            elapsed_ms=(elapsed_before_recovery_ms + self._ms_since(started)),
+                            request_preimage=request_preimage,
+                        )
                         if crash_receipt.usage:
                             mark_provider_usage(exc, crash_receipt.usage)
                     raise
@@ -1235,24 +1232,22 @@ class ModelCallRunner:
                     # original request/preimage is in hand; the projection failure itself never
                     # becomes a fabricated model-call failure and never enters the retry loop.
                     if durable_outcome_receipt is not None:
-                        with contextlib.suppress(Exception):
-                            self._publish(
-                                request,
-                                None,
-                                durable_outcome_receipt,
-                                elapsed_ms=durable_outcome_receipt.latency_ms,
-                                request_preimage=request_preimage,
-                            )
-                    raise
-                if recovered_failure_receipt is not None:
-                    with contextlib.suppress(Exception):
-                        self._publish(
+                        self._publish_best_effort(
                             request,
                             None,
-                            recovered_failure_receipt,
-                            elapsed_ms=recovered_failure_receipt.latency_ms,
+                            durable_outcome_receipt,
+                            elapsed_ms=durable_outcome_receipt.latency_ms,
                             request_preimage=request_preimage,
                         )
+                    raise
+                if recovered_failure_receipt is not None:
+                    self._publish_best_effort(
+                        request,
+                        None,
+                        recovered_failure_receipt,
+                        elapsed_ms=recovered_failure_receipt.latency_ms,
+                        request_preimage=request_preimage,
+                    )
                     if recovered_failure_receipt.usage:
                         mark_provider_usage(exc, recovered_failure_receipt.usage)
                     raise
@@ -1316,14 +1311,13 @@ class ModelCallRunner:
                     attempt_log=tuple(attempt_log),
                     usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
                 )
-                with contextlib.suppress(Exception):
-                    self._publish(
-                        request,
-                        None,
-                        failed,
-                        elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
-                        request_preimage=request_preimage,
-                    )
+                self._publish_best_effort(
+                    request,
+                    None,
+                    failed,
+                    elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
+                    request_preimage=request_preimage,
+                )
                 # The terminal error leaves carrying what the whole logical call cost: the
                 # loop's failure accounting reads this stamp (`_billed_usage`), and a stamp
                 # naming only the last attempt under-counts every absorbed one. Stamped AFTER
@@ -1403,14 +1397,13 @@ class ModelCallRunner:
                     # though required evidence parks the loop before the ordinary publish below.
                     self._check_lease_authority()
                     _carry_settled_model_stream_outcome(evidence_error, turn)
-                    with contextlib.suppress(Exception):
-                        self._publish(
-                            request,
-                            turn,
-                            durable_completed,
-                            elapsed_ms=durable_completed.latency_ms,
-                            request_preimage=request_preimage,
-                        )
+                    self._publish_best_effort(
+                        request,
+                        turn,
+                        durable_completed,
+                        elapsed_ms=durable_completed.latency_ms,
+                        request_preimage=request_preimage,
+                    )
                     raise
             settled = self._publish(
                 request,
@@ -1487,15 +1480,45 @@ class ModelCallRunner:
         timed = replace(receipt, latency_ms=elapsed_ms)
         settled = timed
         try:
+            self._check_lease_authority()
             if self.subscriptions:
+                content = _call_content(request, turn)
+                self._check_lease_authority()
                 settled = dispatch_model_call(
                     receipt=timed,
-                    content=_call_content(request, turn),
+                    content=content,
                     subscriptions=self.subscriptions,
+                    check_authority=self._check_lease_authority,
                 )
         finally:
+            self._check_lease_authority()
             self._record(settled, request_preimage, turn)
+            self._check_lease_authority()
         return settled
+
+    def _publish_best_effort(
+        self,
+        request: ModelRequest,
+        turn: ModelTurn | None,
+        receipt: ModelCallReceipt,
+        *,
+        elapsed_ms: int,
+        request_preimage: bytes | None = None,
+    ) -> ModelCallReceipt | None:
+        """Contain diagnostic publication failures while preserving writer-authority loss."""
+
+        try:
+            return self._publish(
+                request,
+                turn,
+                receipt,
+                elapsed_ms=elapsed_ms,
+                request_preimage=request_preimage,
+            )
+        except RunCancelled:
+            raise
+        except Exception:
+            return None
 
     def _record(
         self, receipt: ModelCallReceipt, request_preimage: bytes | None, turn: Any | None
@@ -1515,6 +1538,7 @@ class ModelCallRunner:
         sink = self.settled_sink
         if sink is None:
             return
+        self._check_lease_authority()
         try:
             sink(
                 SettledModelCall(
@@ -1523,6 +1547,7 @@ class ModelCallRunner:
             )
         except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
             _LOGGER.debug("model call settled sink failed", exc_info=True)
+        self._check_lease_authority()
 
     async def _adrive(
         self,

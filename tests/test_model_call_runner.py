@@ -5505,6 +5505,55 @@ def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars(
     assert sidecar == []
 
 
+def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None:
+    token = CancellationToken()
+    entered, release = threading.Event(), threading.Event()
+    first_captures: list[ModelCallCapture] = []
+
+    class BlockingObserver:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            first_captures.append(capture)
+            entered.set()
+            assert release.wait(5)
+
+    second = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    def lose_authority() -> None:
+        assert entered.wait(5)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        token.cancel(InterruptionCause.LEASE_LOST)
+        release.set()
+
+    racer = threading.Thread(target=lose_authority)
+    racer.start()
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=BlockingObserver(),
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                    ModelIOSubscription(
+                        observer=second,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+    racer.join(5)
+
+    assert not racer.is_alive()
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(first_captures) == 1
+    assert second.captures == []
+    assert sidecar == []
+
+
 def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensation() -> None:
     harness = DeterministicFencedRunHarness()
     token = CancellationToken()

@@ -1681,6 +1681,7 @@ def dispatch_model_call(
     receipt: ModelCallReceipt,
     content: Mapping[str, Any],
     subscriptions: Sequence[ModelIOSubscription],
+    check_authority: Callable[[], None] | None = None,
 ) -> ModelCallReceipt:
     """Deliver one settled model call to every subscription under its own policy.
 
@@ -1700,9 +1701,16 @@ def dispatch_model_call(
 
     An observer that raises is skipped and the rest still run. The call already happened and the
     provider has already been paid; a broken exporter does not get to undo that.
+
+    A durable host may pass ``check_authority``. It runs around every policy resolver and observer
+    callback so one blocking subscriber cannot keep the rest of the fan-out alive after writer
+    ownership moves. Authority exceptions are never contained as observer failures.
     """
     if not subscriptions:
         return receipt
+
+    if check_authority is not None:
+        check_authority()
 
     full_content = (
         _detached_content(content)
@@ -1710,12 +1718,18 @@ def dispatch_model_call(
         else content
     )
 
-    resolved = [
-        _resolve_capture(
-            subscription.policy, full_content if subscription.policy.mode == "full" else content
+    resolved: list[tuple[CaptureMode, str, Mapping[str, Any] | None]] = []
+    for subscription in subscriptions:
+        if check_authority is not None:
+            check_authority()
+        resolved.append(
+            _resolve_capture(
+                subscription.policy,
+                full_content if subscription.policy.mode == "full" else content,
+            )
         )
-        for subscription in subscriptions
-    ]
+        if check_authority is not None:
+            check_authority()
     downgrades = sum(1 for _mode, downgraded_from, _payload in resolved if downgraded_from)
 
     # Only if somebody will actually see them. Hashing walks every field and, for a value with no JSON
@@ -1740,6 +1754,8 @@ def dispatch_model_call(
     settled = replace(receipt, capture_downgrades=receipt.capture_downgrades + downgrades)
 
     for subscription, (mode, downgraded_from, payload) in zip(subscriptions, resolved, strict=True):
+        if check_authority is not None:
+            check_authority()
         reveals_metadata = mode != "none"
         capture = ModelCallCapture(
             receipt=_receipt_for_subscription(settled, mode=mode, policy=subscription.policy),
@@ -1752,7 +1768,9 @@ def dispatch_model_call(
         try:
             subscription.observer.on_model_call(capture)
         except Exception:
-            continue
+            pass
+        if check_authority is not None:
+            check_authority()
     return settled
 
 

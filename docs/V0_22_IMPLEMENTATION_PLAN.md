@@ -1186,6 +1186,9 @@ evidence를 다음 step 뒤에 남기지 않는다.
   augmentation도 store 반환 뒤 outbox로 넘어가기 전에 같은 fence를 적용한다. outbox send와
   receipt projection 사이에 lease를 잃으면 request는 idempotency identity를 유지한 pending
   상태로 남아 replacement owner가 reconcile/redrive한다.
+  receipt policy/subscriber/sidecar와 stream delta/outcome writer fan-out은 각 callback 전·후에
+  authority를 다시 확인한다. 첫 callback과 겹친 lease loss는 이후 callback을 모두 중단하며,
+  best-effort observer containment은 lease-loss control flow를 삼키지 않는다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는
   dispatch-start를 막고, dispatch-start 뒤 loss는 provider 진입을 막는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.
