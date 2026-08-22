@@ -65,6 +65,12 @@ class DeterministicFencedRunSink:
         default_factory=dict
     )
     _invocation_heads: dict[tuple[str, str], int] = field(default_factory=dict)
+    _model_evidence: dict[
+        tuple[str, str, int], tuple[str, DurableModelInvocation]
+    ] = field(default_factory=dict)
+    _model_evidence_outbox: dict[
+        tuple[str, str, int], tuple[str, DurableModelInvocation]
+    ] = field(default_factory=dict)
     _terminals: dict[str, tuple[str, TerminalOutcome]] = field(default_factory=dict)
     _blobs: dict[tuple[str, str], bytes] = field(default_factory=dict)
     _checkpoint_load_faults: dict[
@@ -309,9 +315,72 @@ class DeterministicFencedRunSink:
         blobs: Mapping[str, bytes],
         *,
         writer_token: WriterToken,
+        stage_evidence: bool = False,
     ) -> CommitResult:
         with self._lock:
-            return self._commit_invocation(invocation, blobs, writer_token=writer_token)
+            if type(stage_evidence) is not bool:
+                return CommitResult(status="conflict", sequence=invocation.revision)
+            result = self._commit_invocation(invocation, blobs, writer_token=writer_token)
+            if not stage_evidence or result.status not in {"committed", "already_committed"}:
+                return result
+            evidence = self._commit_model_evidence(
+                invocation,
+                writer_token=writer_token,
+                outbox=True,
+            )
+            if evidence.status not in {"committed", "already_committed"}:
+                raise AssertionError("atomic evidence staging rejected a committed invocation")
+            return result
+
+    def commit_model_evidence(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        with self._lock:
+            return self._commit_model_evidence(
+                invocation,
+                writer_token=writer_token,
+                outbox=False,
+            )
+
+    def _commit_model_evidence(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        writer_token: WriterToken,
+        outbox: bool,
+    ) -> CommitResult:
+        if not self._is_current(invocation.run_id, writer_token):
+            return CommitResult(status="fenced", sequence=invocation.revision)
+        if invocation.dispatch_state != "settled" or invocation.receipt is None:
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        head = self._invocation_heads.get((invocation.run_id, invocation.logical_call_id))
+        if head != invocation.revision:
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        authoritative = self._invocations.get(
+            (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        )
+        if authoritative is None or authoritative[1].invocation != invocation:
+            return CommitResult(status="conflict", sequence=invocation.revision)
+        records = self._model_evidence_outbox if outbox else self._model_evidence
+        digest = _record_digest(invocation.to_json())
+        key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
+        existing = self._stored_result(
+            records,
+            key,
+            digest,
+            sequence=invocation.revision,
+        )
+        if existing is not None:
+            return existing
+        records[key] = (digest, invocation)
+        return CommitResult(
+            status="committed",
+            sequence=invocation.revision,
+            content_digest=digest,
+        )
 
     def _commit_invocation(
         self,

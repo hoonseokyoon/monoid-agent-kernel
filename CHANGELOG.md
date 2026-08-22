@@ -108,6 +108,22 @@ out in commit messages and here.
   checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call
   counts at every recovery boundary.
 
+### Added — model evidence delivery policy
+
+- Added opt-in `passive`, `required`, and `outbox` model-evidence policies. Passive delivery keeps
+  the existing failure-contained `settled_sink`. Required delivery commits public-safe evidence
+  after the authoritative invocation settlement. Outbox delivery stages evidence with settlement
+  through `commit_invocation(..., stage_evidence=True)` and requires the sink's
+  `transactional_outbox` capability.
+- Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
+  Recovery reuses the exact settled success or refusal, proves the current writer fence, and
+  retries only evidence delivery. Repeated evidence parks and resumed kernel retries subtract
+  previously charged receipt usage, preventing both provider replay and usage duplication.
+- Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
+  to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
+  repeated required failure, settled provider refusal, remaining kernel attempts, multimodal
+  request identity, transactional outbox staging, atomic-stage rejection, and capability gates.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path

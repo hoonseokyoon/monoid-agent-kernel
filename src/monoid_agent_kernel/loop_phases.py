@@ -176,7 +176,11 @@ class LoopBootstrapper:
             # pair and its declared capabilities before bootstrap reaches this point.
             from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
 
-            lifecycle_hook = FencedModelCallLifecycle(loop.run_sink, loop.writer_token)
+            lifecycle_hook = FencedModelCallLifecycle(
+                loop.run_sink,
+                loop.writer_token,
+                evidence_policy=loop.model_evidence_policy,
+            )
         model_runner = ModelCallRunner(
             adapter=loop.model_adapter,
             current_adapter=lambda: loop.model_adapter,

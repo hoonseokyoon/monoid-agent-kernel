@@ -10,7 +10,9 @@ from monoid_agent_kernel.core.outcome import (
     TERMINAL_OUTCOME_SCHEMA_VERSION,
     TerminalOutcome,
     TerminalOutcomeKind,
+    terminal_outcome_from_suspension,
 )
+from monoid_agent_kernel.core.result import Suspension
 
 
 def test_terminal_outcome_round_trips_the_portable_record() -> None:
@@ -279,3 +281,121 @@ def test_terminal_outcome_constructor_is_keyword_only() -> None:
             "completed",
             "not_applicable",
         )
+
+
+def test_evidence_uncommitted_suspension_maps_to_safe_sink_only_recovery() -> None:
+    outcome = terminal_outcome_from_suspension(
+        Suspension(
+            reason="turn_failed",
+            status="failed",
+            error="private infrastructure detail",
+            error_code="evidence_uncommitted",
+            retryable=True,
+        ),
+        run_id="run_1",
+        checkpoint_seq=8,
+        last_evidence_ref="invocation:call_1:3",
+    )
+
+    assert outcome == TerminalOutcome(
+        run_id="run_1",
+        kind="evidence_uncommitted",
+        retry_eligibility=RetryEligibility.SAFE,
+        checkpoint_seq=8,
+        last_evidence_ref="invocation:call_1:3",
+        error_code="evidence_uncommitted",
+    )
+    assert "private infrastructure detail" not in str(outcome.to_json())
+
+
+def test_dispatch_unknown_suspension_requires_reconciliation_before_retry() -> None:
+    outcome = terminal_outcome_from_suspension(
+        Suspension(
+            reason="terminal",
+            status="failed",
+            error_code="dispatch_unknown",
+            retryable=True,
+        ),
+        run_id="run_1",
+    )
+
+    assert outcome.kind == "dispatch_unknown"
+    assert outcome.retry_eligibility is RetryEligibility.AFTER_RECONCILIATION
+
+
+@pytest.mark.parametrize(
+    ("suspension", "kind", "retry", "cause"),
+    (
+        (
+            Suspension(reason="settled", status="completed"),
+            "completed",
+            RetryEligibility.NOT_APPLICABLE,
+            None,
+        ),
+        (
+            Suspension(reason="paused", status="completed"),
+            "paused",
+            RetryEligibility.NOT_APPLICABLE,
+            None,
+        ),
+        (
+            Suspension(reason="interrupted", status="completed"),
+            "interrupted",
+            RetryEligibility.SAFE,
+            None,
+        ),
+        (
+            Suspension(
+                reason="turn_failed",
+                status="failed",
+                error_code="bad_configuration",
+                config_recoverable=True,
+            ),
+            "failed_config",
+            RetryEligibility.AFTER_CONFIGURATION,
+            None,
+        ),
+        (
+            Suspension(
+                reason="turn_failed",
+                status="failed",
+                error_code="rate_limited",
+                retryable=True,
+            ),
+            "failed_retryable",
+            RetryEligibility.SAFE,
+            None,
+        ),
+        (
+            Suspension(
+                reason="terminal",
+                status="limited",
+                error_code="cancelled",
+            ),
+            "cancelled",
+            RetryEligibility.FORBIDDEN,
+            None,
+        ),
+        (
+            Suspension(
+                reason="terminal",
+                status="limited",
+                error_code="run_timeout",
+            ),
+            "cancelled",
+            RetryEligibility.FORBIDDEN,
+            None,
+        ),
+    ),
+)
+def test_suspension_outcome_projection_uses_the_portable_classification(
+    suspension: Suspension,
+    kind: TerminalOutcomeKind,
+    retry: RetryEligibility,
+    cause: InterruptionCause | None,
+) -> None:
+    outcome = terminal_outcome_from_suspension(suspension, run_id="run_1")
+
+    assert outcome.kind == kind
+    assert outcome.retry_eligibility is retry
+    assert outcome.interruption_cause is cause

@@ -2835,6 +2835,36 @@ module path is explicit while stable hosting import expansion remains an M2 deci
 checked loads, monotonic revision writes, content-addressed result settlement, and writer-token
 fencing through the host-owned sink. It contains no database, queue, or Temporal runtime.
 
+### Model evidence delivery policy
+
+`AgentLoop.model_evidence_policy` selects one of three opt-in host delivery contracts:
+
+| Policy | Durable mutation | Failure result |
+|---|---|---|
+| `passive` | No additional host mutation. Existing `settled_sink` observers remain failure-contained. | The model result keeps its original classification. |
+| `required` | Commit the invocation first, then call `FencedRunSink.commit_model_evidence()` for that exact settled revision. | `Suspension(reason="turn_failed", error_code="evidence_uncommitted")` |
+| `outbox` | Call `commit_invocation(..., stage_evidence=True)` so the settled revision and host-owned evidence outbox entry share one transaction. | A rejected settlement follows the existing `dispatch_unknown` path. |
+
+`required` and `outbox` need `run_sink` plus `writer_token`. `outbox` also needs the sink to
+declare `transactional_outbox=True`; configuration fails before the run opens when that guarantee
+is absent. The core defines the atomic mutation flag. The host owns the outbox schema, poller,
+backoff, dead-letter handling, and destination credentials.
+
+An invocation settlement remains authoritative when a later required evidence commit fails.
+Recovery rebuilds the same logical-call request identity from checkpointed conversation state,
+re-commits the exact invocation revision to prove the current writer fence, and retries only the
+evidence mutation. It replays the stored success or typed refusal after evidence delivery succeeds.
+The provider call count does not increase. Repeated evidence parks carry the same invocation
+receipt and add only the non-negative usage delta beyond the amount already charged by the prior
+park. A recovered retryable refusal may consume its remaining kernel attempt budget after evidence
+delivery, while preserving the prior attempt usage.
+
+`core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
+`TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects
+`dispatch_unknown` to `after_reconciliation`. The projection copies safe taxonomy fields and
+opaque references; it has no raw prompt, model output, reasoning, replay body, or exception-text
+field.
+
 ## Run Artifacts
 
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:

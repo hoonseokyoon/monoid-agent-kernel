@@ -75,6 +75,7 @@ from monoid_agent_kernel.errors import (
     ModelAdapterError,
     ModelCallAborted,
     ModelDispatchRefused,
+    ModelEvidenceUncommitted,
     RunCancelled,
     RunTimeout,
 )
@@ -1125,6 +1126,12 @@ class ModelCallRunner:
                             )
                         if crash_receipt.usage:
                             mark_provider_usage(exc, crash_receipt.usage)
+                    raise
+                if isinstance(exc, ModelEvidenceUncommitted):
+                    # The paid dispatch and its canonical result/refusal are already settled.
+                    # Required evidence is a separate recovery lane: do not publish a fabricated
+                    # failed model call or let the kernel retry loop absorb this infrastructure
+                    # outcome as another provider attempt.
                     raise
                 if recovered_failure_receipt is not None:
                     with contextlib.suppress(Exception):

@@ -30,7 +30,11 @@ from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_id,
     is_safe_taxonomy_code,
 )
-from monoid_agent_kernel.errors import DurableModelCallError, ModelDispatchRefused
+from monoid_agent_kernel.errors import (
+    DurableModelCallError,
+    ModelDispatchRefused,
+    ModelEvidenceUncommitted,
+)
 from monoid_agent_kernel.providers.base import (
     ModelTurn,
     ToolCall,
@@ -319,6 +323,10 @@ def settle_model_dispatch(
                 failure_code=safe_failure,
             )
         )
+    except ModelEvidenceUncommitted:
+        # The invocation is already authoritative. Reclassifying a projection failure as an
+        # ambiguous paid dispatch would both lose that fact and invite the wrong recovery path.
+        raise
     except Exception as persistence_error:
         raise_model_dispatch_unknown(
             hook,

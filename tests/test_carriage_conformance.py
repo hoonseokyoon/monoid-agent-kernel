@@ -6585,6 +6585,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # v0.22's durable invocation receipt preserves this failure classification through
             # crash recovery without carrying provider exception text.
             "core/model_invocation.py",
+            # v0.22 PR5's content-free terminal projection distinguishes a configuration repair
+            # from a safe same-call retry when it maps a durable Suspension.
+            "core/outcome.py",
             "core/model_stream.py",
             # Joined in the burn-down's carriage sweep: the offline run-status projection
             # carries the full classification a parked turn.failed emits.

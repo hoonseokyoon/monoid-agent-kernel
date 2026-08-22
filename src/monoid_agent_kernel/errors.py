@@ -66,6 +66,20 @@ class DurableModelCallError(NativeAgentError):
     error_code = "durable_model_call_error"
 
 
+class ModelEvidenceUncommitted(ModelAdapterError):
+    """A model dispatch settled authoritatively while required evidence did not.
+
+    The session may retry evidence delivery, but it must reuse the stored invocation instead of
+    paying for another provider call. The durable invocation retains the original success or
+    provider-refusal classification until delivery succeeds.
+    """
+
+    error_code = "evidence_uncommitted"
+
+    def __init__(self, message: str = "required model evidence was not committed") -> None:
+        super().__init__(message, error_code=self.error_code, retryable=True)
+
+
 class TurnNotSettled(NativeAgentError):
     """A blocking submit facade parked without a settled turn to return.
 

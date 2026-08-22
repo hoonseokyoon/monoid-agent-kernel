@@ -192,6 +192,30 @@ The Reference inbox assembly realizes the activation and input rows with leases,
 command store, a recovery service, and a watchdog. A product-owned scheduler can realize the same
 obligations through different storage and recovery mechanisms.
 
+### Choose the model evidence delivery policy
+
+Hosted products that configure `AgentLoop(run_sink=..., writer_token=...)` also choose
+`model_evidence_policy`:
+
+- `passive` preserves the existing observer and sidecar behavior. Export failure does not alter the
+  model result.
+- `required` makes the public-safe evidence projection a checked post-settlement mutation. An
+  evidence failure parks as `evidence_uncommitted`; resume the same checkpoint without a new user
+  input. The loop reloads the settled invocation and retries the sink without calling the provider.
+- `outbox` asks the sink to stage evidence in the invocation-settlement transaction. Enable it only
+  on a sink that declares `transactional_outbox=True`. The host runs the sender and its retry or
+  dead-letter policy.
+
+Keep invocation settlement and evidence delivery in separate tables or record families for
+`required`. Make `commit_model_evidence()` fence-first, idempotent on
+`(run_id, logical_call_id, revision)`, and valid only for the current authoritative settled
+revision. For `outbox`, reject the complete transaction when either the invocation revision or the
+outbox entry cannot commit. A partial invocation-only commit violates the declared capability.
+
+On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
+with the same run ID, request-building configuration, and current writer token. Treat
+`dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+
 ## Model and tool wiring
 
 The offline examples inject a fake adapter, so no gateway is contacted. A hosted deployment places
@@ -372,6 +396,8 @@ state as operational diagnostics.
 | Lost task-secret response | Keep the secret absent from durable state and require explicit replacement. | Hosted golden path scans durable files for callback bearers. |
 | Gateway credential expiry | Mint a new scoped gateway token and keep provider keys at the gateway. | Gateway contract and token tests cover expiry and scope. |
 | Telemetry exporter failure | Drop, buffer, or retry telemetry without changing run semantics. | Event sink boundaries isolate exporter failure. |
+| Required model-evidence delivery failure | Commit the settled invocation, park as `evidence_uncommitted`, and redrive the same checkpoint. | Fenced recovery retries only `commit_model_evidence`; provider call count stays fixed. |
+| Transactional evidence outbox failure | Publish neither the settlement nor the outbox entry; close paid-call ambiguity through `dispatch_unknown`. | `transactional_outbox` capability gate and atomic-stage recovery tests cover the boundary. |
 
 ## Conformance and release gate
 

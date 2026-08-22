@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from typing import Literal
 
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
-from monoid_agent_kernel.errors import DurableModelCallError
+from monoid_agent_kernel.errors import DurableModelCallError, ModelEvidenceUncommitted
 from monoid_agent_kernel.hosting.contracts import (
     CommitResult,
     FencedRunSink,
@@ -30,7 +31,12 @@ class FencedModelCallLifecycle:
 
     sink: FencedRunSink
     writer_token: WriterToken
+    evidence_policy: Literal["passive", "required", "outbox"] = "passive"
     last_invocation: DurableModelInvocation | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.evidence_policy not in {"passive", "required", "outbox"}:
+            raise ValueError("model evidence policy is outside the portable vocabulary")
 
     def _load(self, logical_call_id: str) -> ModelInvocationRecord | None:
         try:
@@ -69,13 +75,23 @@ class FencedModelCallLifecycle:
         self,
         invocation: DurableModelInvocation,
         blobs: Mapping[str, bytes] | None = None,
+        *,
+        stage_evidence: bool = False,
     ) -> None:
         try:
-            result = self.sink.commit_invocation(
-                invocation,
-                blobs or {},
-                writer_token=self.writer_token,
-            )
+            if stage_evidence:
+                result = self.sink.commit_invocation(
+                    invocation,
+                    blobs or {},
+                    writer_token=self.writer_token,
+                    stage_evidence=True,
+                )
+            else:
+                result = self.sink.commit_invocation(
+                    invocation,
+                    blobs or {},
+                    writer_token=self.writer_token,
+                )
         except Exception as exc:
             raise DurableModelCallError(
                 "durable model invocation commit failed",
@@ -102,6 +118,35 @@ class FencedModelCallLifecycle:
                 error_code="durable_invocation_commit_failed",
             )
         self.last_invocation = invocation
+
+    def _commit_evidence(self, invocation: DurableModelInvocation) -> None:
+        try:
+            result = self.sink.commit_model_evidence(
+                invocation,
+                writer_token=self.writer_token,
+            )
+            if not isinstance(result, CommitResult) or result.status not in {
+                "committed",
+                "already_committed",
+            }:
+                raise RuntimeError("required evidence commit was not accepted")
+        except Exception as exc:
+            failed = ModelEvidenceUncommitted()
+            mark_recovered_model_usage(failed, invocation.receipt or {})
+            raise failed from exc
+
+    def _commit_settled(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: Mapping[str, bytes] | None = None,
+    ) -> None:
+        self._commit(
+            invocation,
+            blobs,
+            stage_evidence=self.evidence_policy == "outbox",
+        )
+        if self.evidence_policy == "required":
+            self._commit_evidence(invocation)
 
     @staticmethod
     def _same_dispatch(
@@ -184,7 +229,7 @@ class FencedModelCallLifecycle:
             # An exact idempotent mutation is the host contract's authenticated ownership check.
             # Fencing precedes idempotency, so a stale activation cannot expose a recovered
             # settlement even though the preceding checked load is intentionally token-free.
-            self._commit(invocation)
+            self._commit_settled(invocation)
             return RecoveredModelDispatch(
                 reservation=reservation,
                 receipt=invocation.receipt,
@@ -210,7 +255,7 @@ class FencedModelCallLifecycle:
             )
         # Replay the exact settlement through the fenced mutation path before returning any
         # private result. Supplying the original blob preserves full content identity.
-        self._commit(invocation, {sha256: result_blob})
+        self._commit_settled(invocation, {sha256: result_blob})
         return RecoveredModelDispatch(
             reservation=reservation,
             receipt=invocation.receipt,
@@ -316,7 +361,7 @@ class FencedModelCallLifecycle:
             sha256 = hashlib.sha256(settlement.result_blob).hexdigest()
             blobs[sha256] = settlement.result_blob
             result_ref = f"blob:{sha256}"
-        self._commit(
+        self._commit_settled(
             replace(
                 invocation,
                 revision=invocation.revision + 1,

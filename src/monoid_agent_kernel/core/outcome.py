@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
+from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_address,
     is_safe_opaque_id,
@@ -211,6 +212,73 @@ class TerminalOutcome:
         )
 
 
+def terminal_outcome_from_suspension(
+    suspension: Suspension,
+    *,
+    run_id: str,
+    checkpoint_seq: int | None = None,
+    final_output_ref: str = "",
+    partial_output_ref: str = "",
+    last_evidence_ref: str = "",
+) -> TerminalOutcome:
+    """Project a pump boundary into the content-free durable outcome vocabulary.
+
+    Classification-specific errors take precedence over the broad suspension reason.  In
+    particular, a required evidence failure remains safely recoverable and an unknown paid
+    dispatch always requires reconciliation, even though both can otherwise resemble ordinary
+    model failures.
+    """
+
+    raw_cause = getattr(suspension, "interruption_cause", None)
+    cause = None if raw_cause is None else InterruptionCause(raw_cause)
+    if suspension.error_code == "evidence_uncommitted":
+        kind: TerminalOutcomeKind = "evidence_uncommitted"
+        retry = RetryEligibility.SAFE
+        cause = None
+    elif suspension.error_code == "dispatch_unknown":
+        kind = "dispatch_unknown"
+        retry = RetryEligibility.AFTER_RECONCILIATION
+        cause = None
+    elif suspension.error_code == "cancelled":
+        kind = "cancelled"
+        retry = RetryEligibility.FORBIDDEN
+    elif suspension.error_code == "run_timeout":
+        kind = "cancelled"
+        retry = RetryEligibility.FORBIDDEN
+    elif suspension.reason == "settled":
+        kind = "completed"
+        retry = RetryEligibility.NOT_APPLICABLE
+    elif suspension.reason in {"paused", "awaiting_tasks", "limited"}:
+        kind = "paused"
+        retry = RetryEligibility.NOT_APPLICABLE
+    elif suspension.reason == "interrupted":
+        kind = "interrupted"
+        retry = RetryEligibility.SAFE
+    elif suspension.config_recoverable:
+        kind = "failed_config"
+        retry = RetryEligibility.AFTER_CONFIGURATION
+    elif suspension.retryable:
+        kind = "failed_retryable"
+        retry = RetryEligibility.SAFE
+    else:
+        kind = "failed_terminal"
+        retry = RetryEligibility.FORBIDDEN
+
+    return TerminalOutcome(
+        run_id=run_id,
+        kind=kind,
+        retry_eligibility=retry,
+        interruption_cause=cause,
+        checkpoint_seq=checkpoint_seq,
+        final_output_ref=final_output_ref,
+        partial_output_ref=partial_output_ref,
+        last_evidence_ref=last_evidence_ref,
+        error_code=suspension.error_code,
+        provider_error_code=suspension.provider_error_code,
+        http_status=suspension.http_status,
+    )
+
+
 __all__ = [
     "TERMINAL_OUTCOME_SCHEMA_VERSION",
     "ACCEPTED_TERMINAL_OUTCOME_SCHEMA_VERSIONS",
@@ -218,4 +286,5 @@ __all__ = [
     "RetryEligibility",
     "InterruptionCause",
     "TerminalOutcome",
+    "terminal_outcome_from_suspension",
 ]

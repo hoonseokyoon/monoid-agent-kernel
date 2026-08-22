@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
@@ -329,6 +329,84 @@ def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[boo
     return (
         bool(last_suspension.get("retryable", False)),
         bool(last_suspension.get("config_recoverable", False)),
+    )
+
+
+@dataclass(frozen=True)
+class _EvidenceRecovery:
+    step: int
+    invocation: DurableModelInvocation
+
+
+def _accounted_evidence_usage(
+    recovery: _EvidenceRecovery | None,
+    logical_call_id: str,
+) -> dict[str, int]:
+    """Usage already charged at the preceding evidence-uncommitted park for this call."""
+
+    if (
+        recovery is None
+        or (invocation := recovery.invocation).logical_call_id != logical_call_id
+        or not isinstance(invocation.receipt, Mapping)
+    ):
+        return {}
+    raw_usage = invocation.receipt.get("usage")
+    if not isinstance(raw_usage, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in raw_usage.items()
+        if type(key) is str and portable_usage_value(value)
+    }
+
+
+def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
+    """Capture a prior settled call whose required evidence is the only unfinished work."""
+
+    step = getattr(session, "session_step", 0)
+    invocation = getattr(session, "last_model_invocation", None)
+    suspension = getattr(session, "last_suspension", None)
+    if (
+        type(step) is not int
+        or step < 1
+        or not isinstance(suspension, Mapping)
+        or suspension.get("error_code") != "evidence_uncommitted"
+        or not isinstance(invocation, DurableModelInvocation)
+        or invocation.dispatch_state != "settled"
+    ):
+        return None
+    turn_id = f"turn_{step:04d}"
+    if invocation.logical_call_id != logical_model_call_id(run_id, turn_id):
+        return None
+    return _EvidenceRecovery(step=step, invocation=invocation)
+
+
+def _instruction_from_replayed_user_message(messages: list[dict[str, Any]]) -> str | None:
+    """Rebuild the instruction projection for an evidence-only model-call replay.
+
+    The original input has already moved from ``pending_user_input`` into the durable
+    by-value message log before required evidence is published.  Reconstructing only
+    its text projection keeps the retried request digest identical without adding a
+    second raw-prompt field to the checkpoint or public journal.
+    """
+
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    content = messages[-1].get("content")
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        try:
+            parts = tuple(content_part_from_json(part) for part in content)
+        except (TypeError, ValueError) as exc:
+            raise NativeAgentError(
+                "invalid durable user message for evidence recovery",
+                error_code="invalid_checkpoint",
+            ) from exc
+        return text_from_parts(parts) or None
+    raise NativeAgentError(
+        "invalid durable user message for evidence recovery",
+        error_code="invalid_checkpoint",
     )
 
 
@@ -1081,6 +1159,9 @@ class AgentLoop:
     # scoped to this exact run; hosts issue a fresh generation when ownership moves.
     run_sink: FencedRunSink | None = None
     writer_token: WriterToken | None = None
+    # Delivery of public-safe settled invocation evidence. Passive preserves the historical
+    # recorder/observer containment. Required and outbox are fenced host mutations.
+    model_evidence_policy: Literal["passive", "required", "outbox"] = "passive"
     # Optional capability broker: a bound tool that declares ``runtime.requires_lease=True``
     # must hold a valid lease (granted by the broker, scoped to the binding) before it runs.
     # Secrets stay in the broker; the core only gates on the lease. If no broker is configured,
@@ -1167,7 +1248,17 @@ class AgentLoop:
         self._finalizer = LoopFinalizer(self)
 
     def _validate_durable_hosting(self) -> None:
+        if type(self.model_evidence_policy) is not str or self.model_evidence_policy not in {
+            "passive",
+            "required",
+            "outbox",
+        }:
+            raise AgentConfigError("model_evidence_policy must be passive, required, or outbox")
         if self.run_sink is None and self.writer_token is None:
+            if self.model_evidence_policy != "passive":
+                raise AgentConfigError(
+                    "required and outbox model evidence policies need run_sink and writer_token"
+                )
             return
         if self.run_sink is None or self.writer_token is None:
             raise AgentConfigError("run_sink and writer_token must be configured together")
@@ -1194,6 +1285,10 @@ class AgentLoop:
         if missing:
             raise AgentConfigError(
                 "run_sink is missing required capabilities: " + ", ".join(missing)
+            )
+        if self.model_evidence_policy == "outbox" and capabilities.transactional_outbox is not True:
+            raise AgentConfigError(
+                "outbox model evidence policy requires transactional_outbox capability"
             )
 
     def _materialize_model_stream_observers(self) -> tuple[ModelStreamObserver, ...]:
@@ -1611,6 +1706,12 @@ class AgentLoop:
                 "run reached a terminal state and cannot accept more input",
                 error_code="run_terminal",
             )
+        evidence_recovery = _evidence_recovery(session, self.spec.run_id)
+        if evidence_recovery is not None and user_input is not None:
+            raise NativeAgentError(
+                "required model evidence must be recovered before accepting new input",
+                error_code="evidence_recovery_requires_resume",
+            )
         # This activation is now in progress. Internal safety checkpoints must not masquerade as
         # the prior completed suspension; a new observation is attached only at the return boundary.
         session.last_suspension = None
@@ -1648,7 +1749,18 @@ class AgentLoop:
             self._warn_on_unforwarded_multimodal(state.pending_user_input, res.recorder)
             session.submit_local_step = 0
         try:
-            suspension = await self._apump_turn(state, res, session)
+            if evidence_recovery is None:
+                # Preserve the historical three-argument seam for embedders/tests that wrap the
+                # private pump to inject a safety checkpoint. Evidence recovery alone needs the
+                # activation snapshot captured above.
+                suspension = await self._apump_turn(state, res, session)
+            else:
+                suspension = await self._apump_turn(
+                    state,
+                    res,
+                    session,
+                    evidence_recovery=evidence_recovery,
+                )
         except _CheckpointPersistError:
             # A failed safety checkpoint leaves activation ownership uncertain. Preserve the
             # last durable snapshot and let the lifecycle owner decide retry/recovery; converting
@@ -1704,6 +1816,8 @@ class AgentLoop:
             # state.messages (appended before the model call); the assistant reply was never
             # appended (success-only). The ONLY leftover to clear for an idempotent re-attempt
             # is pending_observations — otherwise a re-issue re-appends the same tool outputs.
+            # Required-evidence recovery keeps them because it must reconstruct the exact settled
+            # request; its replay path suppresses their second append into the durable message log.
             state.provider_error_code = exc.provider_error_code
             state.provider_http_status = exc.http_status
             state.retryable = exc.retryable
@@ -1727,7 +1841,8 @@ class AgentLoop:
                 },
                 level="warning",
             )
-            state.pending_observations = ()
+            if exc.error_code != "evidence_uncommitted":
+                state.pending_observations = ()
             result = replace(
                 Suspension(reason="turn_failed", status="failed"),
                 error=public_error_message(str(exc)),
@@ -3657,6 +3772,7 @@ class AgentLoop:
         step: int,
         turn_id: str,
         parent_id: str | None,
+        already_accounted_usage: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
         """The one route a failed model call's already-billed spend takes into the run's totals.
 
@@ -3673,7 +3789,10 @@ class AgentLoop:
         model calls all failed billed reporting a cost of zero.
         """
 
-        billed = _billed_usage(exc)
+        billed = _usage_delta(
+            _billed_usage(exc),
+            already_accounted_usage or {},
+        )
         if not billed:
             return {}
         _accumulate_usage_mapping(state.total_usage, billed)
@@ -3734,7 +3853,12 @@ class AgentLoop:
         )
 
     async def _apump_turn(
-        self, state: RunState, res: _RunResources, session: _Session
+        self,
+        state: RunState,
+        res: _RunResources,
+        session: _Session,
+        *,
+        evidence_recovery: _EvidenceRecovery | None = None,
     ) -> Suspension:
         context = res.context
         recorder = res.recorder
@@ -3746,7 +3870,10 @@ class AgentLoop:
         # The per-submit step budget continues across task-wait suspensions within one
         # submit; session_step is the global, monotonic turn counter for turn ids.
         max_steps = self.spec.limits.max_steps
-        while session.submit_local_step < max_steps:
+        evidence_recovery_step = (
+            evidence_recovery.step if evidence_recovery is not None else None
+        )
+        while evidence_recovery_step is not None or session.submit_local_step < max_steps:
             self._check_run_boundary(deadline)
             # Cooperative pause is checked ONLY here, at the start of a step — never inside
             # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
@@ -3754,12 +3881,21 @@ class AgentLoop:
             # clean and a None re-pump resumes the same turn without losing or double-sending them.
             if self._pause_requested:
                 raise TurnPaused("turn paused")
-            session.submit_local_step += 1
-            local_step = session.submit_local_step
-            session.session_step += 1
-            step = session.session_step
-            background_observations = self._pop_background_observations(
-                context, recorder, step, state
+            if evidence_recovery_step is not None:
+                recovering_evidence = True
+                step = evidence_recovery_step
+                local_step = session.submit_local_step
+                evidence_recovery_step = None
+            else:
+                recovering_evidence = False
+                session.submit_local_step += 1
+                local_step = session.submit_local_step
+                session.session_step += 1
+                step = session.session_step
+            background_observations = (
+                ()
+                if recovering_evidence
+                else self._pop_background_observations(context, recorder, step, state)
             )
             if background_observations:
                 state.pending_observations = (*state.pending_observations, *background_observations)
@@ -3967,8 +4103,11 @@ class AgentLoop:
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
                 state.messages.append(normalize_json_ingress(user_message))
-            for observation in state.pending_observations:
-                state.messages.append(_observation_message(observation, state.media_blobs))
+            if not recovering_evidence:
+                for observation in state.pending_observations:
+                    state.messages.append(_observation_message(observation, state.media_blobs))
+            if recovering_evidence and instruction is None:
+                instruction = _instruction_from_replayed_user_message(state.messages)
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
@@ -4078,6 +4217,16 @@ class AgentLoop:
                 model=runtime_config.model or ModelConfig(),
                 messages=wire_messages,
             )
+            logical_call_id = (
+                logical_model_call_id(self.spec.run_id, turn_id)
+                if res.model_runner.lifecycle_hook is not None
+                else ""
+            )
+            already_accounted_usage = (
+                _accounted_evidence_usage(evidence_recovery, logical_call_id)
+                if logical_call_id
+                else {}
+            )
             recorder.transcript(
                 {
                     "kind": "model_request",
@@ -4130,6 +4279,7 @@ class AgentLoop:
                     step=step,
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
+                    already_accounted_usage=already_accounted_usage,
                 )
                 raise
             except NativeAgentError as exc:
@@ -4149,6 +4299,7 @@ class AgentLoop:
                     step=step,
                     turn_id=turn_id,
                     parent_id=turn_started.event_id,
+                    already_accounted_usage=already_accounted_usage,
                 )
                 raise
             except Exception as exc:
@@ -4183,6 +4334,7 @@ class AgentLoop:
                         step=step,
                         turn_id=turn_id,
                         parent_id=turn_started.event_id,
+                        already_accounted_usage=already_accounted_usage,
                     )
                 raise
             except BaseException:
@@ -4201,7 +4353,10 @@ class AgentLoop:
             # about. The transcript row below keeps ``turn.usage`` -- the model's statement --
             # so the reconciliation rule is: totals == transcript rows + absorbed spend, and
             # the ledger's receipt is the per-call authority for both.
-            _accumulate_usage_mapping(state.total_usage, call_receipt.usage)
+            _accumulate_usage_mapping(
+                state.total_usage,
+                _usage_delta(call_receipt.usage, already_accounted_usage),
+            )
             state.previous_turn_handle = turn.response_id or state.previous_turn_handle
             # Append the assistant reply to the by-value log (text + any tool calls).
             assistant_message: dict[str, Any] = {
@@ -5926,6 +6081,31 @@ def _accumulate_usage_mapping(total_usage: dict[str, int], usage: Mapping[str, i
                 retryable=False,
             )
         total_usage[key] = total_usage.get(key, 0) + value
+
+
+def _usage_delta(
+    aggregate: Mapping[str, int],
+    already_accounted: Mapping[str, int],
+) -> dict[str, int]:
+    """Return the non-negative remainder of one recovered logical call's aggregate bill."""
+
+    delta: dict[str, int] = {}
+    for key in set(aggregate) | set(already_accounted):
+        current = aggregate.get(key, 0)
+        previous = already_accounted.get(key, 0)
+        if not portable_usage_value(current) or not portable_usage_value(previous):
+            raise NativeAgentError(
+                "durable model usage accounting evidence is malformed",
+                error_code="durable_invocation_usage_corrupt",
+            )
+        if current < previous:
+            raise NativeAgentError(
+                "durable model usage regressed across evidence recovery",
+                error_code="durable_invocation_usage_regressed",
+            )
+        if current > previous:
+            delta[key] = current - previous
+    return delta
 
 
 def _dedupe(items: tuple[str, ...]) -> tuple[str, ...]:
