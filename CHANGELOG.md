@@ -134,7 +134,9 @@ out in commit messages and here.
   lands, the interruption checkpoint marks that turn as pending and carries each completed tool
   observation. A later `None` resume reloads the same settled result, skips completed stable call
   IDs, executes the remaining calls, and appends no duplicate assistant turn. New user input is
-  rejected until this already-projected tool exchange completes.
+  rejected until this already-projected tool exchange completes. Checkpoints also carry the
+  context-owned plan, pending `run.finish` result, and pending `tool.search` loads, so skipping a
+  completed call after process restore preserves its kernel-owned effects.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal without paid continuation, multimodal stored

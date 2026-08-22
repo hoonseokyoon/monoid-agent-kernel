@@ -3053,6 +3053,17 @@ class AgentLoop:
                 if session.last_model_invocation is not None
                 else None
             ),
+            plan=[dict(item) for item in res.context.plan],
+            pending_finish=(
+                {
+                    "summary": res.context.pending_finish.summary,
+                    "outputs": list(res.context.pending_finish.outputs),
+                    "notes": res.context.pending_finish.notes,
+                }
+                if res.context.pending_finish is not None
+                else None
+            ),
+            pending_tool_loads=list(res.context._requested_tool_loads),
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -3274,6 +3285,14 @@ class AgentLoop:
         res.context.subagent_usage = dict(cp.subagent_usage)
         res.context.skill_activation_count = cp.skill_activation_count
         res.context.skills_activated = list(cp.skills_activated)
+        res.context.plan = [dict(item) for item in cp.plan]
+        if cp.pending_finish is not None:
+            res.context.pending_finish = FinishResult(
+                summary=cp.pending_finish["summary"],
+                outputs=tuple(cp.pending_finish["outputs"]),
+                notes=cp.pending_finish["notes"],
+            )
+        res.context._requested_tool_loads = list(cp.pending_tool_loads)
         # Reinstall durable (approved) capability leases so a human-approved capability is not
         # re-prompted after a restart. Ephemeral sync grants were never persisted; they re-broker.
         for lease_payload in cp.capability_leases:

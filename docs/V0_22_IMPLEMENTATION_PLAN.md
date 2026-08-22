@@ -351,13 +351,16 @@ Schema identifier는 `monoid.model-invocation.v1`로 둔다. Checked reader와 c
 ```python
 last_model_invocation: dict[str, Any] | None = None
 interruption_cause: str = ""
+plan: list[dict[str, Any]] = field(default_factory=list)
+pending_finish: dict[str, Any] | None = None
+pending_tool_loads: list[str] = field(default_factory=list)
 ```
 
-Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 두 필드는 additive/defaulted다.
-v0.21 fixture는 두 값의 기본값으로 복원한다.
+Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 필드는 additive/defaulted다.
+v0.21 fixture는 기본값으로 복원한다.
 
 `to_json()`은 hand-written field projection으로 교체한다. Reflection 기반 encoder를 새로 만들지
-않는다. Checkpoint decoder의 field validators에도 두 필드를 추가한다.
+않는다. Checkpoint decoder의 field validators에도 필드를 추가한다.
 
 ## 6. Hosting contract
 
@@ -850,6 +853,8 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   `pending_observations`에 누적한다. `None` resume은 같은 settled result를 다시 읽고 이미 완료된 call
   ID를 건너뛴 뒤 남은 call만 실행한다. Assistant turn은 중복 추가하지 않는다. 이 tool exchange가
   완료될 때까지 새 user input은 `evidence_recovery_requires_resume`으로 거부한다.
+  Checkpoint는 context-owned `plan`, pending `run.finish`, pending `tool.search` load도 저장한다.
+  Process restore는 이 상태를 먼저 복원한 뒤 완료된 call ID를 건너뛴다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.

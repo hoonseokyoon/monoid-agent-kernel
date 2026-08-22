@@ -174,6 +174,11 @@ class RunCheckpoint:
     # Empty until a typed interruption is observed. PR 6 connects the cancellation token and host
     # lifecycle to this already-versioned checkpoint carriage.
     interruption_cause: str = ""
+    # AgentToolContext state whose mutation can precede an observable interruption boundary.
+    # These fields make a completed tool observation sufficient to skip that call after restore.
+    plan: list[dict[str, Any]] = field(default_factory=list)
+    pending_finish: dict[str, Any] | None = None
+    pending_tool_loads: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         # Explicit rather than dataclasses.asdict: the latter recursively descends and deep-copies,
@@ -233,6 +238,9 @@ class RunCheckpoint:
             "skills_activated": self.skills_activated,
             "last_model_invocation": self.last_model_invocation,
             "interruption_cause": self.interruption_cause,
+            "plan": self.plan,
+            "pending_finish": self.pending_finish,
+            "pending_tool_loads": self.pending_tool_loads,
         }
         normalized = normalize_json_ingress(
             payload,
@@ -313,6 +321,7 @@ _CHECKPOINT_LIST_OF_DICT_FIELDS = frozenset(
         "pending_tool_approval_replays",
         "outbox_requests",
         "output_failure_history",
+        "plan",
     }
 )
 _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
@@ -325,6 +334,7 @@ _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
         "inbox_seen_ids",
         "applied_input_ids",
         "skills_activated",
+        "pending_tool_loads",
     }
 )
 
@@ -420,6 +430,20 @@ def _validate_active_input(value: object) -> None:
     _require_nonnegative_int(value.get("source_seq"), "active_input.source_seq")
 
 
+def _validate_pending_finish(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint pending_finish must be an object or null")
+    if set(value) != {"summary", "outputs", "notes"}:
+        raise ValueError("checkpoint pending_finish has an invalid object shape")
+    if not isinstance(value.get("summary"), str):
+        raise ValueError("checkpoint pending_finish.summary must be a string")
+    _require_list_of(value.get("outputs"), str, "pending_finish.outputs")
+    if value.get("notes") is not None and not isinstance(value.get("notes"), str):
+        raise ValueError("checkpoint pending_finish.notes must be a string or null")
+
+
 def _validate_receipts(value: object) -> None:
     if not isinstance(value, dict):
         raise ValueError("checkpoint applied_input_receipts must be an object")
@@ -486,6 +510,8 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             raise ValueError(f"checkpoint {field_name} must be an object or null")
     if "last_suspension" in payload:
         _validate_suspension_payload(payload["last_suspension"], "last_suspension")
+    if "pending_finish" in payload:
+        _validate_pending_finish(payload["pending_finish"])
     if payload.get("last_model_invocation") is not None:
         invocation = decode_model_invocation(payload["last_model_invocation"])
         if not invocation.ok:

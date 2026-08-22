@@ -286,11 +286,12 @@ def _loop(
     limits: RunLimits | None = None,
     context_providers: tuple[Any, ...] = (),
     model_calls_file: bool = False,
+    tool_ids: tuple[str, ...] = (),
 ) -> AgentLoop:
     return AgentLoop(
         spec=_spec(tmp_path, limits=limits),
         model_adapter=adapter,
-        runtime_config_provider=runtime_provider(runtime_config(model=model)),
+        runtime_config_provider=runtime_provider(runtime_config(*tool_ids, model=model)),
         run_sink=sink,
         writer_token=writer_token,
         checkpoint_persist_callback=checkpoint_persist_callback,
@@ -358,6 +359,7 @@ def _restore(
     limits: RunLimits | None = None,
     context_providers: tuple[Any, ...] = (),
     model_calls_file: bool = False,
+    tool_ids: tuple[str, ...] = (),
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -371,6 +373,7 @@ def _restore(
         limits=limits,
         context_providers=context_providers,
         model_calls_file=model_calls_file,
+        tool_ids=tool_ids,
     )
     loop.restore(baseline)
     try:
@@ -1236,6 +1239,102 @@ def test_projected_recovered_tool_calls_skip_checkpointed_progress(
     assert [
         observation.call_id for observation in adapter.requests[1].observations
     ] == ["missing-1", "missing-2"]
+
+
+def test_checkpointed_recovered_finish_restores_kernel_tool_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(
+        ModelTurn(
+            tool_calls=(
+                ToolCall(
+                    id="finish-1",
+                    name="run_finish",
+                    arguments={
+                        "summary": "durable finish",
+                        "outputs": ["result.md"],
+                        "notes": "kept across restore",
+                    },
+                ),
+            ),
+            stop_reason="tool_calls",
+        )
+    )
+    first_token = harness.claim_writer(RUN_ID, "worker-1")
+    first_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=first_token,
+        model_evidence_policy="required",
+        tool_ids=("run.finish",),
+    )
+    first_loop.open()
+    try:
+        evidence_park = first_loop.run_until_suspended("finish the run")
+        evidence_checkpoint = first_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            first_loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert evidence_checkpoint is not None
+    second_token = harness.claim_writer(RUN_ID, "worker-2")
+    interrupted_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=second_token,
+        model_evidence_policy="required",
+        tool_ids=("run.finish",),
+    )
+    interrupted_loop.restore(evidence_checkpoint)
+    execute_tool_call = interrupted_loop._aexecute_tool_call
+
+    async def interrupt_after_finish(**kwargs: Any):
+        observation = await execute_tool_call(**kwargs)
+        interrupted_loop.interrupt_turn()
+        return observation
+
+    monkeypatch.setattr(interrupted_loop, "_aexecute_tool_call", interrupt_after_finish)
+    try:
+        interrupted = interrupted_loop.run_until_suspended(None)
+        interrupted_checkpoint = interrupted_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            interrupted_loop.discard_uncommitted()
+
+    assert interrupted.reason == "interrupted"
+    assert interrupted_checkpoint is not None
+    assert interrupted_checkpoint.pending_finish == {
+        "summary": "durable finish",
+        "outputs": ["result.md"],
+        "notes": "kept across restore",
+    }
+    assert len(adapter.requests) == 1
+
+    settled, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        interrupted_checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="passive",
+        tool_ids=("run.finish",),
+    )
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None
+    assert settled.turn.final_text == "durable finish"
+    assert final_checkpoint is not None
+    assert final_checkpoint.pending_finish is not None
+    assert final_checkpoint.pending_finish["outputs"] == ["result.md"]
+    assert final_checkpoint.total_tool_calls == 1
+    assert len(adapter.requests) == 1
 
 
 def test_interrupted_evidence_recovery_preserves_tool_follow_up_request(

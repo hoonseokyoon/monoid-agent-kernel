@@ -236,7 +236,8 @@ with `None`: the loop reloads the settled result, skips completed call IDs, and 
 without adding a second assistant turn. The loop rejects new user input with
 `evidence_recovery_requires_resume` until this tool exchange completes. Give effectful tool handlers
 stable idempotency keys because a process can still disappear after an external effect and before
-its observation is returned.
+its observation is returned. The interruption checkpoint restores the kernel-owned plan, pending
+`run.finish` value, and pending `tool.search` loads before completed call IDs are skipped.
 
 ## Model and tool wiring
 

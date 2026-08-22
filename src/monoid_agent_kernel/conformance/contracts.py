@@ -516,6 +516,7 @@ def _contract_checkpoint_identity_variants(
         "inbox_seen_ids",
         "applied_input_ids",
         "skills_activated",
+        "pending_tool_loads",
     }
     special_values: dict[str, Any] = {
         "provider_http_status": 200,
@@ -538,6 +539,11 @@ def _contract_checkpoint_identity_variants(
             dispatch_state="reserved",
         ).to_json(),
         "interruption_cause": InterruptionCause.USER_CANCEL.value,
+        "pending_finish": {
+            "summary": "contract alternate finish",
+            "outputs": ["contract-alternate.md"],
+            "notes": "contract alternate notes",
+        },
     }
     variants: dict[str, RunCheckpoint] = {}
     for field_name in sorted(identity_fields):

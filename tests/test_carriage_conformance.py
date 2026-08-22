@@ -4264,6 +4264,7 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
         "workspace_base",
         "last_model_invocation",
         "interruption_cause",
+        "pending_finish",
         # No longer "an object or null": the park payload has a schema of its own now
         # (``_validate_suspension_payload``), shared with the receipt copy below.
         "last_suspension",
@@ -4318,6 +4319,8 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "outbox_requests",
             # The evidence behind ``output_retries``, which rode this snapshot without it.
             "output_failure_history",
+            # AgentToolContext state that must survive a post-tool interruption.
+            "plan",
         }
     ),
     "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
@@ -4330,6 +4333,7 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "inbox_seen_ids",
             "applied_input_ids",
             "skills_activated",
+            "pending_tool_loads",
         }
     ),
 }

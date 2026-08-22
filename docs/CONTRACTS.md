@@ -2876,8 +2876,10 @@ batch. A `None` resume reloads the same settled model result, recognizes the alr
 assistant turn, skips tool call IDs with completed observations, and executes the remaining calls.
 The assistant turn is never appended twice. New user input is rejected with
 `evidence_recovery_requires_resume` until a `None` resume completes the pending tool exchange.
-Tool handlers still need stable external idempotency for process loss before a call returns an
-observation.
+The same checkpoint carries the context-owned plan, pending `run.finish` value, and unconsumed
+`tool.search` binding loads. A process-level restore therefore reconstructs these kernel effects
+before it skips calls with completed observations. Tool handlers still need stable external
+idempotency for process loss before a call returns an observation.
 
 `core.outcome.terminal_outcome_from_suspension()` projects an evidence park to
 `TerminalOutcome(kind="evidence_uncommitted", retry_eligibility="safe")`. It projects
