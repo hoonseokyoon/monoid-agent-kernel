@@ -122,6 +122,9 @@ out in commit messages and here.
   step limits and cooperative pause cannot preempt this commit barrier. Cancellation and deadline
   apply after the fenced evidence mutation; an interrupt before result application retains the
   same logical call and its tool-follow-up observations for a `None` resume.
+- Checkpoints carry a content-free `last_model_instruction_message_index` beside the latest model
+  invocation. Evidence recovery rebuilds `ModelRequest.instruction` from that exact existing
+  message instead of mistaking a background or hosted-task `user`-role observation for raw input.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal, remaining kernel attempts, multimodal

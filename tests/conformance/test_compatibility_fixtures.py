@@ -45,6 +45,7 @@ def test_v021_checkpoint_fixture_defaults_v022_additive_fields() -> None:
 
     assert checkpoint is not None
     assert checkpoint.last_model_invocation is None
+    assert checkpoint.last_model_instruction_message_index is None
     assert checkpoint.interruption_cause == ""
 
 
@@ -60,6 +61,7 @@ def test_v022_additive_checkpoint_fixture_carries_invocation_and_cause() -> None
     assert checkpoint is not None
     assert checkpoint.last_model_invocation is not None
     assert checkpoint.last_model_invocation["dispatch_state"] == "unknown"
+    assert checkpoint.last_model_instruction_message_index is None
     assert checkpoint.interruption_cause == "lease_lost"
 
 

@@ -100,10 +100,12 @@ receipt request digest must equal the invocation request digest. Settled success
 result blob through a bounded `scheme:locator` address, and ambiguous dispatch has no automatic
 retry evidence.
 
-`monoid.checkpoint.v1` adds optional `last_model_invocation` and `interruption_cause` fields. A
-v0.21 checkpoint omits both and restores with `None` and the empty cause. The writer keeps the
-checkpoint version and emits an explicit field projection copied through the iterative portable
-JSON normalizer.
+`monoid.checkpoint.v1` adds optional `last_model_invocation`,
+`last_model_instruction_message_index`, and `interruption_cause` fields. The instruction coordinate
+points into the existing provider-neutral message log and carries no prompt content. A v0.21
+checkpoint omits all three and restores with `None`, `None`, and the empty cause. The writer keeps
+the checkpoint version and emits an explicit field projection copied through the iterative
+portable JSON normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed

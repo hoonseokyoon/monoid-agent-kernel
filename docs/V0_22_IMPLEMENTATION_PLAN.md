@@ -156,8 +156,10 @@ v0.22는 두 durability 층을 사용한다.
 | Semantic checkpoint | conversation, tool/task/workspace state, safe suspension | park/settle 경계 |
 | Fenced run journal | invocation reserve/start/settle/unknown, event, terminal | 외부 effect 전후 |
 
-`RunCheckpoint`에는 `last_model_invocation` optional field를 추가한다. 다음 safe checkpoint가 최신
-invocation 요약을 운반한다. Crash-window 판정은 `FencedRunSink.load_invocation()`이 소유한다.
+`RunCheckpoint`에는 `last_model_invocation`과 content-free
+`last_model_instruction_message_index` optional field를 추가한다. 다음 safe checkpoint가 최신
+invocation 요약과 기존 message log 안의 instruction 좌표를 운반한다. Crash-window 판정은
+`FencedRunSink.load_invocation()`이 소유한다.
 
 ### 4.2 복구 알고리즘
 
@@ -350,11 +352,12 @@ Schema identifier는 `monoid.model-invocation.v1`로 둔다. Checked reader와 c
 
 ```python
 last_model_invocation: dict[str, Any] | None = None
+last_model_instruction_message_index: int | None = None
 interruption_cause: str = ""
 ```
 
-Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 두 필드는 additive/defaulted다.
-v0.21 fixture는 두 값의 기본값으로 복원한다.
+Checkpoint schema identifier는 `monoid.checkpoint.v1`을 유지한다. 세 필드는 additive/defaulted다.
+v0.21 fixture는 세 값의 기본값으로 복원한다.
 
 `to_json()`은 hand-written field projection으로 교체한다. Reflection 기반 encoder를 새로 만들지
 않는다. Checkpoint decoder의 field validators에도 두 필드를 추가한다.

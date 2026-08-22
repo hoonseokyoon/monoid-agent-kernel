@@ -336,6 +336,7 @@ def _park_classification(last_suspension: Mapping[str, Any] | None) -> tuple[boo
 class _EvidenceRecovery:
     step: int
     invocation: DurableModelInvocation
+    instruction_message_index: int | None = None
     blocks_new_input: bool = True
 
 
@@ -410,11 +411,19 @@ def _evidence_recovery(session: Any, run_id: str) -> _EvidenceRecovery | None:
     return _EvidenceRecovery(
         step=step,
         invocation=invocation,
+        instruction_message_index=getattr(
+            session,
+            "last_model_instruction_message_index",
+            None,
+        ),
         blocks_new_input=evidence_uncommitted,
     )
 
 
-def _instruction_from_replayed_user_message(messages: list[dict[str, Any]]) -> str | None:
+def _instruction_from_replayed_user_message(
+    messages: list[dict[str, Any]],
+    message_index: int | None,
+) -> str | None:
     """Rebuild the instruction projection for an evidence-only model-call replay.
 
     The original input has already moved from ``pending_user_input`` into the durable
@@ -423,9 +432,19 @@ def _instruction_from_replayed_user_message(messages: list[dict[str, Any]]) -> s
     second raw-prompt field to the checkpoint or public journal.
     """
 
-    if not messages or messages[-1].get("role") != "user":
+    if message_index is None:
         return None
-    content = messages[-1].get("content")
+    if (
+        type(message_index) is not int
+        or message_index < 0
+        or message_index >= len(messages)
+        or messages[message_index].get("role") != "user"
+    ):
+        raise NativeAgentError(
+            "invalid durable instruction coordinate for evidence recovery",
+            error_code="invalid_checkpoint",
+        )
+    content = messages[message_index].get("content")
     if isinstance(content, str):
         return content or None
     if isinstance(content, list):
@@ -1105,6 +1124,9 @@ class _Session:
     # Latest invocation evidence observed by this activation. The sink remains authoritative;
     # this is the compact summary carried by the next checkpoint.
     last_model_invocation: DurableModelInvocation | None = None
+    # Content-free coordinate paired with ``last_model_invocation``. It identifies the existing
+    # message projected into ModelRequest.instruction without copying prompt content.
+    last_model_instruction_message_index: int | None = None
 
 
 @dataclass
@@ -2949,6 +2971,9 @@ class AgentLoop:
                 if session.last_model_invocation is not None
                 else None
             ),
+            last_model_instruction_message_index=(
+                session.last_model_instruction_message_index
+            ),
             # Revocation records so a revoked capability stays dead across the restart.
             **self._capability_vault.export_revocations(),
         )
@@ -3246,6 +3271,9 @@ class AgentLoop:
                 if isinstance(task, dict) and (task.get("task_id") or task.get("job_id"))
             },
             last_model_invocation=restored_invocation,
+            last_model_instruction_message_index=(
+                cp.last_model_instruction_message_index
+            ),
         )
         manager.restore_state(
             [
@@ -4151,11 +4179,20 @@ class AgentLoop:
             # here — it is regenerated per turn and travels via ``system_prompt``.
             if user_message is not None:
                 state.messages.append(normalize_json_ingress(user_message))
+                instruction_message_index: int | None = len(state.messages) - 1
+            else:
+                instruction_message_index = None
             if not recovering_evidence:
                 for observation in state.pending_observations:
                     state.messages.append(_observation_message(observation, state.media_blobs))
-            if recovering_evidence and instruction is None:
-                instruction = _instruction_from_replayed_user_message(state.messages)
+                session.last_model_instruction_message_index = instruction_message_index
+            if recovering_evidence:
+                instruction = _instruction_from_replayed_user_message(
+                    state.messages,
+                    evidence_recovery.instruction_message_index
+                    if evidence_recovery is not None
+                    else None,
+                )
             # Bound the by-value conversation log: a runaway multi-turn run must settle
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit

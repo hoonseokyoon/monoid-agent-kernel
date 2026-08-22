@@ -220,6 +220,9 @@ the fenced settlement/evidence mutation before applying a pending cancellation o
 An interrupt can still park before the recovered result is applied; a `None` resume reloads that
 same logical call with its checkpointed tool observations, while a new user input intentionally
 abandons the interrupted result.
+The checkpoint also stores `last_model_instruction_message_index`, a content-free coordinate into
+the existing message log. Recovery uses this coordinate because background and hosted-task results
+also use the provider-neutral `user` role and cannot identify raw user input by role alone.
 
 ## Model and tool wiring
 
