@@ -1176,7 +1176,11 @@ evidence를 다음 step 뒤에 남기지 않는다.
   recovery 실행은 activation을 discard하고 result/failure/stream frame/close를 생략하며,
   identity-matched local record를 해제해 stale status/heartbeat/recovery 차단을 끝낸다.
   `RunCancelled` handler도 exception의 과거 cause를 읽기 전에 sticky lease authority를 다시
-  확인한다. model-call dispatch compensation과 stream close도 같은 현재 authority를 읽는다.
+  확인한다. model-call dispatch compensation과 stream close도 같은 현재 authority를 읽으며,
+  stale cancellation의 usage stamp를 stale activation accounting으로 전달하지 않는다.
+  output validator, tool handler, child agent await 뒤에는 run boundary를 다시 확인하고,
+  model/usage/settle/tool projection gateway는 write authority를 자체 확인한다. outer pump는
+  모든 exception과 반환된 park보다 sticky lease loss를 먼저 처리한다.
 - Reservation과 dispatch-start commit 뒤에도 각각 authority를 다시 검사한다. Reserve 뒤 loss는
   dispatch-start를 막고, dispatch-start 뒤 loss는 provider 진입을 막는다.
 - Required evidence 복구는 lifecycle recovery 호출 전·후에 lease authority를 검사한다.

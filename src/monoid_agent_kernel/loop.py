@@ -1908,6 +1908,8 @@ class AgentLoop:
             # A failed safety checkpoint leaves activation ownership uncertain. Preserve the
             # last durable snapshot and let the lifecycle owner decide retry/recovery; converting
             # this into a terminal agent failure could commit past the failed barrier.
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             raise
         except RunCancelled as exc:
             # The exception carries the cause observed when it was raised. Lease authority can
@@ -1966,8 +1968,12 @@ class AgentLoop:
             self._persist_checkpoint(session, result)
             return result
         except RunTimeout as exc:
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             return self._settle_deadline(state, res, session, exc)
         except ModelAdapterError as exc:
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             if not _recoverable_turn_error(exc):
                 # Non-recoverable model error -> terminal (same bookkeeping as the generic
                 # handler below; a re-raise here would skip that handler, so inline it).
@@ -2040,6 +2046,8 @@ class AgentLoop:
             self._persist_checkpoint(session, result)
             return result
         except TurnInterrupted:
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             # Turn-level stop: keep the session alive (no error, not terminal). Same idempotency
             # as turn_failed — the user message/observations are already committed; only clear
             # pending_observations so a re-issue doesn't re-append tool outputs. The driver parks
@@ -2070,6 +2078,8 @@ class AgentLoop:
             self._persist_checkpoint(session, result)
             return result
         except TurnPaused:
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             # Cooperative pause: freeze the turn at a clean start-of-step boundary and keep
             # the session alive. Unlike interrupt, pending_observations are KEPT — the resumed
             # turn (a run_until_suspended(None) re-pump) re-sends them at the next step, so the
@@ -2101,6 +2111,8 @@ class AgentLoop:
             self._persist_checkpoint(session, result)
             return result
         except Exception as exc:  # controlled recording boundary for standalone CLI
+            if self._lease_authority_lost():
+                return self._lease_loss_suspension(session)
             self._record_failure(state, res, exc)
             session.terminal = True
             result = replace(
@@ -2117,6 +2129,8 @@ class AgentLoop:
             )
             self._persist_checkpoint(session, result)
             return result
+        if self._lease_authority_lost():
+            return self._lease_loss_suspension(session)
         if suspension.reason == "awaiting_tasks":
             if suspension.has_external:
                 # Parked on a hosted task awaiting an external report (hitl/automation).
@@ -2780,12 +2794,13 @@ class AgentLoop:
             # for; the interrupt did not un-spend them.
             raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
         except RunCancelled as exc:
+            lease_lost_now = self._lease_authority_lost()
             cause = (
                 exc.interruption_cause
                 if isinstance(exc.interruption_cause, InterruptionCause)
                 else InterruptionCause.USER_CANCEL
             )
-            if self._lease_authority_lost():
+            if lease_lost_now:
                 cause = InterruptionCause.LEASE_LOST
             outcome_status, outcome_error_code = _cancelled_model_stream_outcome(cause)
             outcome_final_text = "".join(output_fragments) or None
@@ -3801,6 +3816,7 @@ class AgentLoop:
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
         )
+        self._check_lease_authority()
         # The child's metrics FILTERED to the usage vocabulary. The authority is
         # ``providers/_common.py:NORMALIZED_USAGE_KEYS`` -- the whole emitted domain of
         # ``normalize_usage`` -- rather than a hand-written three-key tuple, which meant a
@@ -3950,7 +3966,13 @@ class AgentLoop:
         turn: ModelTurn,
         runtime_config: AgentRuntimeConfig,
     ) -> SettleDecision:
-        return await self._settle_coordinator.decide(state, res, context, turn, runtime_config)
+        decision = await self._settle_coordinator.decide(
+            state, res, context, turn, runtime_config
+        )
+        # Validators execute off-thread. Any operational boundary that arrives while they run
+        # must win before the pure decision reaches the mutating apply phase.
+        self._check_run_boundary(res.deadline)
+        return decision
 
     def _apply_settle(
         self,
@@ -3961,6 +3983,7 @@ class AgentLoop:
         *,
         from_finish: bool,
     ) -> Suspension | None:
+        self._check_lease_authority()
         return self._settle_coordinator.apply(
             decision, state, res, context, from_finish=from_finish
         )
@@ -4111,6 +4134,7 @@ class AgentLoop:
     ) -> None:
         """Project one already-accounted successful provider outcome into run state."""
 
+        self._assert_write_authority()
         state.previous_turn_handle = turn.response_id or state.previous_turn_handle
         assistant_message: dict[str, Any] = {
             "role": "assistant",
@@ -4169,6 +4193,7 @@ class AgentLoop:
     ) -> None:
         """Write the single canonical transcript shape for a failed model turn."""
 
+        self._assert_write_authority()
         res.recorder.transcript(
             {
                 "kind": "model_turn",
@@ -4415,6 +4440,7 @@ class AgentLoop:
         the totals moved, so the cumulative meter moves at the same ownership point.
         """
 
+        self._assert_write_authority()
         billed = _usage_delta(
             aggregate_usage,
             already_accounted_usage or {},
@@ -4962,6 +4988,7 @@ class AgentLoop:
                     )
                 self._check_lease_authority()
             except ModelAdapterError as exc:
+                self._check_lease_authority()
                 state.provider_error_code = exc.provider_error_code
                 state.provider_http_status = exc.http_status
                 # A failure after a billed answer still costs tokens. The proof refusals parse
@@ -4998,6 +5025,12 @@ class AgentLoop:
                 )
                 raise
             except NativeAgentError as exc:
+                if (
+                    isinstance(exc, RunCancelled)
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                ):
+                    raise
+                self._check_lease_authority()
                 # The twin of the arm above, and for a while the one that accounted for nothing.
                 # Every run boundary is a ``NativeAgentError`` -- ``RunCancelled``, ``RunTimeout``,
                 # the ``TurnInterrupted`` the abort is translated into -- so a call the run itself
@@ -5859,13 +5892,15 @@ class AgentLoop:
         """
 
         try:
-            return await await_abandonable_call(
+            result = await await_abandonable_call(
                 pending,
                 deadline=deadline,
                 token=self.cancellation_token,
                 grace_s=self.async_tool_cancel_grace_s,
                 check_boundary=self._check_run_boundary,
             )
+            self._check_run_boundary(deadline)
+            return result
         except CalleeCancelled as exc:
             # Distinct from the run boundaries the shared race raises: a handler cancelled from
             # inside keeps its own ``tool_handler_cancelled`` meaning rather than being reported as
@@ -5892,6 +5927,7 @@ class AgentLoop:
         turn_id: str,
         parent_id: str | None,
     ) -> ToolObservation:
+        self._assert_write_authority()
         observation = ToolObservation(
             call_id=call_id,
             tool_name=call_name,

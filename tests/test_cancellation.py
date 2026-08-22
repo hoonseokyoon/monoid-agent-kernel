@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -13,8 +14,9 @@ from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import NativeAgentError, RunCancelled
 from monoid_agent_kernel.loop import AgentLoop
-from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.base import ModelTurn, mark_provider_usage
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.tools.base import ToolResult
 
 
 class _ParkingAdapter(FakeModelAdapter):
@@ -306,6 +308,69 @@ def test_sticky_lease_loss_wins_while_an_older_cancellation_unwinds(
         None if stored is None else stored.checkpoint.to_json()
     ) == durable_before_loss["checkpoint"]
     loop.discard_uncommitted()
+
+
+def test_sticky_lease_loss_drops_stale_billing_before_nested_accounting(
+    tmp_path: Path,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    assert loop._session is not None
+    state = loop._session.state
+    durable_before_loss: dict[str, object] = {}
+
+    async def stale_model_call(*args, **kwargs):  # noqa: ANN202, ANN002, ANN003
+        del args, kwargs
+        events_path = next(loop.spec.run_root.rglob("events.jsonl"))
+        durable_before_loss["events"] = events_path.read_bytes()
+        stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+        durable_before_loss["checkpoint"] = (
+            None if stored is None else stored.checkpoint.to_json()
+        )
+        durable_before_loss["usage"] = dict(state.total_usage)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        stale_exception = RunCancelled(
+            "run cancelled",
+            interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+        )
+        mark_provider_usage(
+            stale_exception,
+            {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
+        )
+        token.cancel(InterruptionCause.LEASE_LOST)
+        raise stale_exception
+
+    loop._session.res.model_runner.acall = stale_model_call  # type: ignore[method-assign]
+
+    suspension = loop.run_until_suspended("go")
+
+    events_path = next(loop.spec.run_root.rglob("events.jsonl"))
+    stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert state.total_usage == durable_before_loss["usage"]
+    assert events_path.read_bytes() == durable_before_loss["events"]
+    assert (
+        None if stored is None else stored.checkpoint.to_json()
+    ) == durable_before_loss["checkpoint"]
+    loop.discard_uncommitted()
+
+
+def test_tool_await_rechecks_sticky_lease_before_returning_a_result(tmp_path: Path) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+
+    async def result_after_lease_loss() -> ToolResult:
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        token.cancel(InterruptionCause.LEASE_LOST)
+        return ToolResult(ok=True, content={"stale": True})
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(loop._await_native_tool_handler(result_after_lease_loss(), None))
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
 
 
 def test_token_deadline_uses_the_canonical_timeout_terminal(tmp_path: Path) -> None:

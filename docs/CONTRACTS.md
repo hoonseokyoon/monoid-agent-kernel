@@ -2911,7 +2911,15 @@ that registered concurrently.
 The loop rechecks sticky lease authority when a `RunCancelled` reaches its handler. This closes the
 unwind race where the exception carried an earlier user-cancel or drain cause and lease loss arrived
 before event, metric, checkpoint, or terminal projection. The model-call attempt handler and model
-stream finalizer apply the same rule before dispatch compensation or stream closure.
+stream finalizer apply the same rule before dispatch compensation or stream closure. A stale
+cancellation is replaced with a fresh `lease_lost` boundary without carrying usage stamps into the
+stale activation's accounting path; durable invocation evidence remains the bill authority.
+
+Every external validation, tool, and child-agent await is followed by a run-boundary check before
+result application. Model, usage, settle, and tool projection gateways also assert current write
+authority. The outer pump gives sticky lease loss precedence over every exception and returned park
+before it emits or checkpoints. A slow validator or handler therefore cannot reopen mutation after
+an earlier fence passed.
 
 The same commit/recheck rule protects provider entry. Lease loss observed by `reserve()` leaves only
 the authoritative reservation and blocks `dispatch_started`. Lease loss observed by
