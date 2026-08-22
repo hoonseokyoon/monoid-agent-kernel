@@ -100,6 +100,9 @@ out in commit messages and here.
   before exposing either terminal arm. Result-integrity failures retain authoritative billed usage,
   so missing, tampered, malformed, and receipt-conflicting replay data remain visible to run
   accounting without another provider call.
+- Recovered retryable refusals now restore their committed attempt count and aggregate usage before
+  entering the remaining kernel retry budget. Durable receipts carry explicit stream-delivery
+  evidence; continuation requires `stream_committed=false`, while missing evidence fails closed.
 - Added AgentLoop crash-injection coverage for reserved, dispatch-started, successful settled, and
   failed settled heads, plus request drift, unreadable heads, tampered result bytes, fenced
   checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call

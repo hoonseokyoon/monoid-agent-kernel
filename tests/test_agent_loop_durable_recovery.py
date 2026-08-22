@@ -426,6 +426,72 @@ def test_recovered_receipt_keeps_whole_call_usage_across_kernel_retry(tmp_path: 
     assert len(adapter.requests) == 2
 
 
+def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: Path) -> None:
+    harness = DeterministicFencedRunHarness()
+    refusal = ModelDispatchRefused("transient overload", retryable=True)
+    mark_provider_usage(
+        refusal,
+        {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "cache_read_tokens": 1,
+        },
+    )
+    final_turn = ModelTurn(
+        final_text="recovered after crash",
+        usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        stop_reason="stop",
+    )
+    adapter = _ScriptedAdapter(refusal, final_turn)
+    model = ModelConfig(
+        retry=ModelRetryConfig(
+            layer="kernel",
+            max_attempts=2,
+            initial_delay_s=0.0,
+            jitter_s=0.0,
+        )
+    )
+    baseline, failed = _crash_at(
+        tmp_path,
+        harness,
+        adapter,
+        "settled",
+        model=model,
+    )
+
+    suspension, checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        baseline,
+        model=model,
+    )
+
+    expected_usage = {
+        "input_tokens": 5,
+        "output_tokens": 3,
+        "total_tokens": 8,
+        "cache_read_tokens": 1,
+    }
+    assert failed.invocation.receipt is not None
+    assert failed.invocation.receipt["attempts"] == 1
+    assert failed.invocation.receipt["retryable"] is True
+    assert failed.invocation.receipt["stream_committed"] is False
+    assert suspension.reason == "settled"
+    assert suspension.turn is not None
+    assert suspension.turn.final_text == "recovered after crash"
+    assert checkpoint is not None and checkpoint.total_usage == expected_usage
+    assert len(adapter.requests) == 2
+
+    loaded = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert loaded.ok and loaded.value is not None
+    assert loaded.value.invocation.dispatch_attempt == 2
+    assert loaded.value.invocation.receipt is not None
+    assert loaded.value.invocation.receipt["attempts"] == 2
+    assert loaded.value.invocation.receipt["usage"] == expected_usage
+
+
 def test_settled_failure_replays_classification_without_provider_call(tmp_path: Path) -> None:
     harness = DeterministicFencedRunHarness()
     refusal = ModelDispatchRefused(

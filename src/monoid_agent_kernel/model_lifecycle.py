@@ -302,15 +302,19 @@ def settle_model_dispatch(
     *,
     result_blob: bytes | None = None,
     failure_code: str = "",
+    stream_committed: bool | None = None,
 ) -> None:
     """Commit a proven terminal result or turn a failed commit into ambiguity."""
 
     safe_failure = safe_failure_code(failure_code, default="model_error") if failure_code else ""
     try:
+        evidence = model_invocation_receipt(receipt)
+        if stream_committed is not None:
+            evidence["stream_committed"] = stream_committed
         hook.settled(
             ModelDispatchSettlement(
                 reservation=reservation,
-                receipt=model_invocation_receipt(receipt),
+                receipt=evidence,
                 result_blob=result_blob,
                 failure_code=safe_failure,
             )

@@ -1568,6 +1568,7 @@ def _contract_receipt_field_identity_evidence(
         "settled_at": ("2026-08-21T00:00:00Z", "2026-08-21T00:00:01Z"),
         "started_at": ("2026-08-21T00:00:00Z", "2026-08-21T00:00:01Z"),
         "stop_reason": ("end_turn", "max_tokens"),
+        "stream_committed": (False, True),
         "system_fingerprint": ("fingerprint_1", "fingerprint_2"),
         "usage": ({"input_tokens": 1}, {"input_tokens": 2}),
     }

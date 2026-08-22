@@ -792,8 +792,10 @@ assistant message append, tool call 실행은 기존 loop 경로를 사용한다
 복구 query의 request digest와 저장된 digest가 다르면 provider 진입 전에
 `durable_invocation_request_conflict`로 끝낸다. Settled failure는 저장된 failure code, provider code,
 retryability, config-recoverability, HTTP status, usage를 재생성해 같은 loop failure path로 보낸다.
-Process crash 뒤 남은 kernel retry history를 추측해 자동 재개하지 않는다. 복구된 failure를 먼저
-표면화하고 checkpoint한 뒤 다음 loop drive가 새 logical call로 정책을 다시 적용한다.
+Settled failure receipt는 attempt count와 `stream_committed`를 함께 보존한다. 현재 정책이 kernel
+retry를 소유하고, 저장된 refusal이 retryable이며 config 변경이 필요 없고, attempt budget이 남고,
+`stream_committed=false`가 명시된 경우에만 다음 dispatch attempt를 이어간다. 저장된 aggregate usage와
+idempotency key를 유지한다. Delivery evidence가 없으면 stored refusal을 표면화한다.
 
 Host hook은 result blob의 content digest와 canonical body shape를 검증한다. Public receipt에
 보존된 stop reason은 result와 교차 검증한다. Receipt usage와 provider-retry evidence는 logical call

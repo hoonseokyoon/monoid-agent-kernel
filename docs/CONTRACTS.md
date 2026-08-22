@@ -2800,7 +2800,7 @@ entry:
 | `dispatch_started` | commit `unknown`, raise `dispatch_unknown` | 0 |
 | `unknown` | raise `dispatch_unknown` | 0 |
 | successful `settled` | verify and replay the private result blob | 0 |
-| failed `settled` | restore the typed refusal and its safe receipt | 0 |
+| failed `settled` | restore attempt/usage evidence; resume an explicitly safe kernel retry or surface the refusal | 0 or remaining policy-bound attempts |
 
 Every existing head must match the current request digest and digest generation. A mismatch raises
 `durable_invocation_request_conflict` before provider entry. Corrupt and unsupported invocation
@@ -2816,8 +2816,12 @@ accounting consumes the public receipt's canonical usage counters, including
 `cache_creation_tokens` and `audio_tokens`. Missing, tampered, undecodable, and receipt-conflicting
 results raise a typed integrity error carrying that already-billed public usage. Failed result
 recovery preserves the failure code, provider code, HTTP status, retryability, configuration
-recoverability, provider-retry fact, and usage recorded in the public-safe receipt. Provider
-exception text is never reconstructed.
+recoverability, provider-retry fact, attempt count, usage, and explicit `stream_committed` evidence
+recorded in the public-safe receipt. A current kernel retry policy may continue from the next
+dispatch attempt only when the refusal is retryable, configuration-independent, below its attempt
+limit, and `stream_committed` is explicitly `false`. Missing historical delivery evidence fails
+closed and surfaces the stored refusal. Resumed receipts retain aggregate usage and leave the
+unavailable historical per-attempt log empty. Provider exception text is never reconstructed.
 
 Every non-task suspension commits its checkpoint through `FencedRunSink.commit_checkpoint()`.
 AgentLoop accepts an exact `CommitResult` with `committed` or `already_committed`; fenced, conflict,

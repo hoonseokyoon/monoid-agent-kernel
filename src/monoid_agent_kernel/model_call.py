@@ -69,7 +69,7 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
     DurableModelCallError,
     ModelAdapterError,
@@ -288,6 +288,22 @@ def _recovered_result_matches_evidence(
     """
 
     return "stop_reason" not in evidence or (turn.stop_reason or "") == evidence["stop_reason"]
+
+
+def _recovered_failure_can_retry(
+    receipt: ModelCallReceipt,
+    evidence: Mapping[str, Any],
+    retry_plan: ModelRetryConfig | None,
+) -> bool:
+    """Whether a proven refusal can safely resume the current kernel retry loop."""
+
+    return (
+        retry_plan is not None
+        and receipt.retryable
+        and not receipt.config_recoverable
+        and receipt.attempts < retry_plan.max_attempts
+        and evidence.get("stream_committed") is False
+    )
 
 
 def _safe_repr(value: Any) -> str:
@@ -693,6 +709,10 @@ class ModelCallRunner:
             # settles the call. Initialized beside `spent_usage` because the failure exit
             # reads both for calls refused before the loop was ever entered.
             attempt_log: list[ModelCallAttempt] = []
+            # A recovered public receipt carries aggregate usage but intentionally omits the
+            # private per-attempt log. Once recovery resumes a kernel retry, the final receipt
+            # keeps that log empty rather than fabricating the missing historical entries.
+            attempt_log_complete = True
             last_attempt_entry: ModelCallAttempt | None = None
             # The measured wait that preceded the NEXT dispatch: 0 until a backoff actually
             # runs, then re-measured after each one. Threaded into every entry-construction
@@ -700,6 +720,7 @@ class ModelCallRunner:
             pending_backoff_ms = 0
             recovered_failure_receipt: ModelCallReceipt | None = None
             durable_outcome_receipt: ModelCallReceipt | None = None
+            elapsed_before_recovery_ms = 0
             try:
                 if lifecycle_hook is not None and not is_safe_opaque_id(logical_call_id):
                     raise DurableModelCallError(
@@ -827,7 +848,7 @@ class ModelCallRunner:
                             raise
                         if recovered.failure_code:
                             recovered_failure_receipt = receipt
-                            raise ModelDispatchRefused(
+                            recovered_error = ModelDispatchRefused(
                                 "durable model dispatch restored a settled refusal",
                                 error_code=recovered.failure_code,
                                 provider_error_code=receipt.provider_error_code,
@@ -836,26 +857,64 @@ class ModelCallRunner:
                                 http_status=receipt.http_status,
                                 provider_retried=receipt.provider_retried,
                             )
-                        try:
-                            turn = durable_model_turn(recovered.result_blob)
-                        except DurableModelCallError as recovery_error:
-                            mark_recovered_model_usage(recovery_error, recovered.receipt)
-                            raise
-                        if not _recovered_result_matches_evidence(turn, recovered.receipt):
-                            recovery_error = DurableModelCallError(
-                                "durable model result conflicts with its receipt",
-                                error_code="durable_invocation_result_corrupt",
+                            if not _recovered_failure_can_retry(
+                                receipt,
+                                recovered.receipt,
+                                retry_plan,
+                            ):
+                                raise recovered_error
+                            delay = retry_delay_s(
+                                receipt.attempts,
+                                retry_plan.initial_delay_s,
+                                retry_plan.max_delay_s,
+                                retry_plan.backoff_multiplier,
+                                retry_plan.jitter_s,
                             )
-                            mark_recovered_model_usage(recovery_error, recovered.receipt)
-                            raise recovery_error
-                        settled = self._publish(
-                            request,
-                            turn,
-                            receipt,
-                            elapsed_ms=receipt.latency_ms,
-                            request_preimage=request_preimage,
-                        )
-                        return turn, settled
+                            if deadline is not None and time.time() + delay >= deadline:
+                                raise recovered_error
+                            attempts_made = receipt.attempts
+                            spent_usage = dict(receipt.usage)
+                            elapsed_before_recovery_ms = receipt.latency_ms
+                            attempt_log_complete = False
+                            receipt = replace(
+                                receipt,
+                                stop_reason="",
+                                usage={},
+                                latency_ms=0,
+                                error_code="",
+                                provider_error_code="",
+                                retryable=False,
+                                config_recoverable=False,
+                                http_status=None,
+                                attempt_log=(),
+                            )
+                            recovered_failure_receipt = None
+                            backoff_started = time.monotonic()
+                            await self._abackoff(delay, deadline)
+                            pending_backoff_ms = (
+                                self._ms_since(backoff_started) if delay > 0 else 0
+                            )
+                        else:
+                            try:
+                                turn = durable_model_turn(recovered.result_blob)
+                            except DurableModelCallError as recovery_error:
+                                mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                raise
+                            if not _recovered_result_matches_evidence(turn, recovered.receipt):
+                                recovery_error = DurableModelCallError(
+                                    "durable model result conflicts with its receipt",
+                                    error_code="durable_invocation_result_corrupt",
+                                )
+                                mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                raise recovery_error
+                            settled = self._publish(
+                                request,
+                                turn,
+                                receipt,
+                                elapsed_ms=receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
+                            return turn, settled
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is
@@ -959,11 +1018,17 @@ class ModelCallRunner:
                             durable_failure = replace(
                                 current_failure,
                                 attempts=attempts_made,
-                                latency_ms=self._ms_since(started),
+                                latency_ms=(
+                                    elapsed_before_recovery_ms + self._ms_since(started)
+                                ),
                                 provider_retried=(
                                     current_failure.provider_retried or progress.retried
                                 ),
-                                attempt_log=(*attempt_log, last_attempt_entry),
+                                attempt_log=(
+                                    (*attempt_log, last_attempt_entry)
+                                    if attempt_log_complete
+                                    else ()
+                                ),
                                 usage=(
                                     _merged_usage(spent_usage, current_failure.usage)
                                     if spent_usage
@@ -976,6 +1041,7 @@ class ModelCallRunner:
                                 reservation,
                                 durable_failure,
                                 failure_code=durable_failure.error_code,
+                                stream_committed=delivered,
                             )
                         if (
                             retry_plan is None
@@ -1010,7 +1076,8 @@ class ModelCallRunner:
                         # the wait below reports itself, not the provider failure it
                         # interrupted.
                         spent_usage = _merged_usage(spent_usage, probe.usage)
-                        attempt_log.append(last_attempt_entry)
+                        if attempt_log_complete:
+                            attempt_log.append(last_attempt_entry)
                         # Measured, not copied from the schedule -- a capped sleep must record
                         # what happened. Only when a wait was actually requested: for a zero
                         # schedule the boundary check is not a backoff, and timing it would
@@ -1051,7 +1118,9 @@ class ModelCallRunner:
                                 request,
                                 None,
                                 crash_receipt,
-                                elapsed_ms=self._ms_since(started),
+                                elapsed_ms=(
+                                    elapsed_before_recovery_ms + self._ms_since(started)
+                                ),
                                 request_preimage=request_preimage,
                             )
                         if crash_receipt.usage:
@@ -1087,7 +1156,7 @@ class ModelCallRunner:
                 # every dispatched attempt is already logged and the receipt alone carries the
                 # boundary's taxonomy. A refused call never dispatched, so its log stays empty
                 # beside `attempts == 0`.
-                if attempts_made > len(attempt_log):
+                if attempt_log_complete and attempts_made > len(attempt_log):
                     if (
                         last_attempt_entry is not None
                         and last_attempt_entry.index == attempts_made
@@ -1134,7 +1203,7 @@ class ModelCallRunner:
                         request,
                         None,
                         failed,
-                        elapsed_ms=self._ms_since(started),
+                        elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
                         request_preimage=request_preimage,
                     )
                 # The terminal error leaves carrying what the whole logical call cost: the
@@ -1176,7 +1245,9 @@ class ModelCallRunner:
             # is what makes "briefly" indistinguishable from "at all".
             completed = replace(
                 completed,
-                attempt_log=(*attempt_log, answering_entry),
+                attempt_log=(
+                    (*attempt_log, answering_entry) if attempt_log_complete else ()
+                ),
                 usage=(
                     _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
                 ),
@@ -1186,7 +1257,7 @@ class ModelCallRunner:
                     raise AssertionError("durable model call completed without a reservation")
                 durable_completed = replace(
                     completed,
-                    latency_ms=self._ms_since(started),
+                    latency_ms=elapsed_before_recovery_ms + self._ms_since(started),
                 )
                 durable_outcome_receipt = durable_completed
                 try:
@@ -1204,12 +1275,13 @@ class ModelCallRunner:
                     reservation,
                     durable_completed,
                     result_blob=result_blob,
+                    stream_committed=delivered,
                 )
             settled = self._publish(
                 request,
                 turn,
                 completed,
-                elapsed_ms=self._ms_since(started),
+                elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
                 request_preimage=request_preimage,
             )
         return turn, settled
@@ -1250,7 +1322,7 @@ class ModelCallRunner:
             # adapter with no retry loop. Combined with what the adapter reported through the
             # channel, since either alone is a partial view and neither can contradict the other:
             # both only ever say that a retry happened.
-            provider_retried=retried or turn_retried,
+            provider_retried=receipt.provider_retried or retried or turn_retried,
         )
 
     def _publish(

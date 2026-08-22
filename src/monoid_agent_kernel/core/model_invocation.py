@@ -77,6 +77,7 @@ _RECEIPT_FIELDS = {
     "settledat": "settled_at",
     "startedat": "started_at",
     "stopreason": "stop_reason",
+    "streamcommitted": "stream_committed",
     "systemfingerprint": "system_fingerprint",
     "usage": "usage",
 }
@@ -103,7 +104,7 @@ _RECEIPT_TIMESTAMP_FIELDS = frozenset(
     }
 )
 _RECEIPT_BOOLEAN_FIELDS = frozenset(
-    {"config_recoverable", "provider_retried", "retryable"}
+    {"config_recoverable", "provider_retried", "retryable", "stream_committed"}
 )
 _RECEIPT_DURATION_FIELDS = frozenset({"duration_ms", "latency_ms"})
 _USAGE_FIELDS = {
@@ -195,6 +196,16 @@ def model_invocation_receipt(receipt: Any) -> dict[str, Any]:
         value = getattr(receipt, source, "")
         if is_safe_taxonomy_code(value):
             projected[target] = value
+    attempt_log = getattr(receipt, "attempt_log", ())
+    attempts = getattr(receipt, "attempts", 0)
+    if (
+        isinstance(attempt_log, tuple)
+        and attempt_log
+        and len(attempt_log) == attempts
+    ):
+        projected["stream_committed"] = any(
+            entry.stream_committed is True for entry in attempt_log
+        )
     http_status = getattr(receipt, "http_status", None)
     if type(http_status) is int and 100 <= http_status <= 599:
         projected["http_status"] = http_status
