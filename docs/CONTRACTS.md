@@ -2349,6 +2349,15 @@ already represented in it. A crash inside an activation can redeliver effects th
 before a later checkpoint commit.
 `OR-12-DURABLE-SIDE-EFFECT` requires a stable idempotency key or durable outbox for those effects.
 
+A durable internal safety checkpoint with `last_suspension=null` records an activation in progress.
+When its model-step counter is already allocated, restore reuses that coordinate once before normal
+step advancement. The model-call lifecycle probes the authoritative invocation journal at the same
+logical-call ID. A settled head completes required evidence before request-digest validation or a
+terminal boundary; a missing head may proceed to a new dispatch under the ordinary boundary rules.
+This prevents recovery from querying step `N+1` while a settled step-`N` evidence obligation remains
+hidden. A streamed cooperative Stop can bar the new dispatch after the probe. One-shot calls keep
+their existing rule: an in-flight call completes before Stop reaches the next step boundary.
+
 **Division of responsibility:** the core defines *what* a checkpoint contains
 (`RunCheckpoint`) and how to `restore()` it; the integrator decides *how* it is
 stored by implementing `CheckpointStore`. Checkpoint I/O crosses the explicit store seam.

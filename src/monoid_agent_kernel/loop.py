@@ -1174,6 +1174,11 @@ class _Session:
     # A durable assistant tool-call turn is already projected while one or more calls still need
     # execution. The interruption suspension carries this bit across activations.
     model_tool_calls_pending: bool = False
+    # A durable internal safety checkpoint was committed after this model-step coordinate was
+    # allocated and before its provider outcome reached a park. ``last_suspension is None`` is the
+    # durable in-flight marker; restore turns it into this one-shot activation-local instruction so
+    # the pump probes the same journal coordinate instead of advancing to a fresh paid call.
+    resume_checkpointed_model_step: bool = False
 
 
 @dataclass
@@ -2552,6 +2557,7 @@ class AgentLoop:
         invocation_context: InvocationContext,
         step: int,
         turn_id: str,
+        abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one model call through the runner, choosing what this run wants to see of it.
 
@@ -2679,6 +2685,7 @@ class AgentLoop:
                     if runner.lifecycle_hook is not None
                     else ""
                 ),
+                abort_after_recovery_probe=abort_after_recovery_probe,
             )
         except ModelCallAborted as exc:
             outcome_status = "interrupted"
@@ -3392,6 +3399,11 @@ class AgentLoop:
             model_tool_calls_pending=bool(
                 isinstance(cp.last_suspension, Mapping)
                 and cp.last_suspension.get("model_tool_calls_pending") is True
+            ),
+            resume_checkpointed_model_step=bool(
+                res.model_runner.lifecycle_hook is not None
+                and cp.session_step > 0
+                and cp.last_suspension is None
             ),
         )
         manager.restore_state(
@@ -4378,8 +4390,15 @@ class AgentLoop:
         evidence_recovery_step = (
             evidence_recovery.step if evidence_recovery is not None else None
         )
-        while evidence_recovery_step is not None or session.submit_local_step < max_steps:
+        while (
+            evidence_recovery_step is not None
+            or session.resume_checkpointed_model_step
+            or session.submit_local_step < max_steps
+        ):
             recovering_evidence = evidence_recovery_step is not None
+            resuming_checkpointed_step = (
+                not recovering_evidence and session.resume_checkpointed_model_step
+            )
             outcome_already_projected = (
                 recovering_evidence
                 and evidence_recovery is not None
@@ -4394,15 +4413,24 @@ class AgentLoop:
             # exactly as it would when requested after an in-flight model call had started.
             # Preempting here would replace the durable evidence-recovery marker with a generic
             # paused suspension and strand the stored result.
-            if not recovering_evidence:
+            if not recovering_evidence and not resuming_checkpointed_step:
                 self._check_run_boundary(deadline)
                 if self._pause_requested:
                     raise TurnPaused("turn paused")
             else:
-                step = evidence_recovery_step
+                if recovering_evidence:
+                    step = evidence_recovery_step
+                    evidence_recovery_step = None
+                else:
+                    # ``last_suspension=None`` on the restored durable checkpoint proves that
+                    # this coordinate was allocated inside an unfinished pump. Reuse it once.
+                    # ModelCallRunner probes the authoritative journal before honoring terminal
+                    # boundaries; when no journal head exists, its pre-dispatch abort gate still
+                    # prevents a cooperative stop from starting a new provider call.
+                    step = session.session_step
+                    session.resume_checkpointed_model_step = False
                 local_step = session.submit_local_step
-                evidence_recovery_step = None
-            if not recovering_evidence:
+            if not recovering_evidence and not resuming_checkpointed_step:
                 session.submit_local_step += 1
                 local_step = session.submit_local_step
                 session.session_step += 1
@@ -4796,6 +4824,7 @@ class AgentLoop:
                         invocation_context=self._model_invocation_context(turn_id),
                         step=step,
                         turn_id=turn_id,
+                        abort_after_recovery_probe=resuming_checkpointed_step,
                     )
             except ModelAdapterError as exc:
                 state.provider_error_code = exc.provider_error_code

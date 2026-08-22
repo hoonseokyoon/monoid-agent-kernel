@@ -44,6 +44,7 @@ from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
     ToolCall,
+    ToolObservation,
     mark_provider_usage,
     provider_usage_of,
 )
@@ -939,6 +940,96 @@ def test_post_settlement_interrupt_accounts_usage_before_replay(
     assert settled.turn is not None and settled.turn.final_text == "settled answer"
     assert final_checkpoint is not None and final_checkpoint.total_usage == usage
     assert len(adapter.requests) == 1
+
+
+def test_internal_safety_checkpoint_reuses_step_and_delivers_required_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    crash_after_settle = _CrashAfterInvocationCommit(
+        harness.sink,
+        target_state="settled",
+    )
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="settled after replay", stop_reason="stop"),
+        ModelTurn(final_text="must not dispatch", stop_reason="stop"),
+    )
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=crash_after_settle,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    session = loop._require_open()
+    session.state.pending_tool_approval_replays = (
+        {
+            "call_name": "demo_approval",
+            "call_id": "approved-1",
+            "arguments": {"value": "approved"},
+            "binding_id": "demo.approval",
+            "tool_id": "demo.approval",
+            "task_id": "task-1",
+            "approval_key": "unused-by-injected-replay",
+        },
+    )
+
+    async def replay_approved_call(*_args: Any, **_kwargs: Any) -> ToolObservation:
+        return ToolObservation(
+            call_id="tool_approval_replay:approved-1",
+            tool_name="demo_approval",
+            output={"type": "tool_approval_replay_result", "value": "approved"},
+            is_background=True,
+        )
+
+    monkeypatch.setattr(loop, "_aexecute_tool_approval_replay", replay_approved_call)
+    try:
+        with pytest.raises(_HardCrash, match="^settled$"):
+            loop.run_until_suspended("hello")
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    checkpoint_load = harness.sink.latest_checked(RUN_ID)
+    assert checkpoint_load.ok and checkpoint_load.value is not None
+    safety_checkpoint = checkpoint_load.value.checkpoint
+    assert safety_checkpoint.session_step == 1
+    assert safety_checkpoint.submit_local_step == 1
+    assert safety_checkpoint.last_suspension is None
+    assert safety_checkpoint.pending_tool_approval_replays == []
+
+    settled_load = harness.sink.load_invocation(RUN_ID, LOGICAL_CALL_ID)
+    assert settled_load.ok and settled_load.value is not None
+    settled_invocation = settled_load.value.invocation
+    evidence_key = (RUN_ID, LOGICAL_CALL_ID, settled_invocation.revision)
+    assert settled_invocation.requires_evidence is True
+    assert evidence_key not in harness.sink._model_evidence
+
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=harness.sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(safety_checkpoint)
+    try:
+        recovered = restored_loop.run_until_suspended(None)
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert recovered.reason == "terminal"
+    assert recovered.error_code == "durable_invocation_request_conflict"
+    assert evidence_key in harness.sink._model_evidence
+    assert len(adapter.requests) == 1
+    next_call_id = logical_model_call_id(RUN_ID, "turn_0002")
+    next_load = harness.sink.load_invocation(RUN_ID, next_call_id)
+    assert next_load.status == "missing"
 
 
 def test_required_evidence_recovery_preserves_policy_and_identity_across_config_changes(

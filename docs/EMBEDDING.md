@@ -220,6 +220,12 @@ when either
 the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
 violates the declared capability.
 
+Treat a durable checkpoint whose `last_suspension` is null and whose model-step counter is positive
+as an in-progress internal checkpoint. Resume that allocated step once before advancing counters.
+The lifecycle then probes the same logical-call journal address, delivers any required evidence,
+and only enters a new provider dispatch when the head is missing. This rule covers a crash after an
+approval-replay safety checkpoint and after provider settlement but before an evidence-failure park.
+
 On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
 with the same run ID and a current writer token. The loop commits evidence from the stored logical
 call ID and request digest, then applies the stored success or final refusal before consulting the
@@ -242,6 +248,10 @@ Evidence recovery surfaces stored retryable refusals without consuming a remaini
 Let the driver decide whether to start a later model step.
 Evidence recovery is a commit barrier for a model step that already settled. The runner completes
 the fenced settlement/evidence mutation before applying a pending cancellation or expired deadline.
+An internal safety checkpoint taken after allocating step `N` and before a park restores step `N`
+once. Recovery queries that journal coordinate before incrementing either the run step or the
+submit-local step, so a crash before evidence delivery cannot strand the settled invocation behind
+step `N+1` or start a second paid call.
 An interrupt can still park before the recovered result is applied; a `None` resume reloads that
 same logical call with its checkpointed tool observations, while a new user input intentionally
 abandons the interrupted result. An interrupt after a recovered assistant tool-call turn is added

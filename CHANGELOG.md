@@ -151,6 +151,11 @@ out in commit messages and here.
   bills. A settled receipt updates cumulative usage and metrics before stop or deadline can persist
   an unapplied result. Resume projects that stored result with a zero delta, preserving billing and
   token-limit enforcement without a duplicate provider call.
+- A durable internal safety checkpoint now restores its already-allocated model-step coordinate
+  once before the pump advances. Recovery probes that same invocation journal head, completes any
+  required evidence obligation, and prevents a settled call from being hidden under the next
+  logical-call ID. Streamed cooperative Stop is polled after the recovery probe and before any new
+  provider dispatch; ordinary one-shot Stop semantics remain unchanged.
 - Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
   to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
   repeated required failure, settled provider refusal without paid continuation, multimodal stored

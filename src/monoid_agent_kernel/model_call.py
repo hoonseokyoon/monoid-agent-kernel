@@ -676,6 +676,7 @@ class ModelCallRunner:
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
         logical_call_id: str = "",
+        abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one call and return the turn with the receipt that describes it.
 
@@ -695,6 +696,11 @@ class ModelCallRunner:
         ``logical_call_id`` is required only when ``lifecycle_hook`` is configured. It is the
         caller-owned durable address of this call; standalone anonymous calls cannot invent a
         stable address across process restore.
+
+        ``abort_after_recovery_probe`` is the durable-resume seam for an already-started streamed
+        step. It polls ``should_abort`` once after authoritative recovery proves there is no
+        reusable outcome and before a new dispatch. The default preserves the ordinary contract:
+        one-shot calls never poll the streamed-call abort predicate before provider entry.
         """
 
         started = time.monotonic()
@@ -953,6 +959,18 @@ class ModelCallRunner:
                 # probing durable recovery above are local/idempotent work; every new provider
                 # dispatch remains barred once cancellation or the deadline has won.
                 self._check_cancel_or_deadline(deadline)
+                # Durable recovery above must run first so an already-settled required-evidence
+                # obligation cannot be stranded by a stop. Once that probe and every terminal
+                # boundary prove there is no reusable outcome, a cooperative turn stop bars
+                # reservation/provider entry too. The ordinary AgentLoop path checks this at its
+                # step boundary; this second gate covers a restored internal safety checkpoint
+                # that must reuse and probe its in-progress coordinate before honoring that signal.
+                if (
+                    abort_after_recovery_probe
+                    and should_abort is not None
+                    and should_abort()
+                ):
+                    raise ModelCallAborted("model call aborted before provider dispatch")
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is

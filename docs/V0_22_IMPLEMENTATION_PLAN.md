@@ -868,6 +868,11 @@ Authoritative invocation settle과 evidence projection을 구분한다.
   완료될 때까지 새 user input은 `evidence_recovery_requires_resume`으로 거부한다.
   Checkpoint는 context-owned `plan`, pending `run.finish`, pending `tool.search` load도 저장한다.
   Process restore는 이 상태를 먼저 복원한 뒤 완료된 call ID를 건너뛴다.
+- `last_suspension=null`인 durable 내부 safety checkpoint는 이미 할당된 model step을 한 번 재사용한다.
+  복구는 counter를 증가시키기 전에 같은 logical call journal을 조회한다. Step N settlement와 required
+  evidence 의무가 있으면 먼저 delivery를 완료하고, missing head일 때만 새 dispatch를 진행한다.
+  Approval replay consumption checkpoint 뒤 provider settlement와 evidence park 사이에서 process가
+  종료되어도 step N invocation이 step N+1 뒤에 숨지 않는다.
 - Provider failure + evidence failure: settled failure receipt를 재사용하고 evidence delivery만 다시 한다.
 
 Required evidence failure는 authoritative invocation settle을 `unknown`으로 되돌리지 않는다.
@@ -1139,8 +1144,10 @@ local store로 우회하지 않으며, 손상된 invocation/result가 provider �
 - required delivery 결과
 - outbox capability gate
 - `evidence_uncommitted` mapping과 sink-only recovery
+- 내부 safety checkpoint의 in-progress model step 재사용과 동일 journal coordinate 복구
 
-종료 조건: evidence failure가 provider 호출을 반복하지 않는다.
+종료 조건: evidence failure가 provider 호출을 반복하지 않고, park 전 crash도 settled step의 required
+evidence를 다음 step 뒤에 남기지 않는다.
 
 ### PR 6 — Typed interruption
 

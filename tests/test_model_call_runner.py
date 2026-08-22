@@ -5245,6 +5245,56 @@ def test_durable_runner_requires_an_explicit_logical_call_id_before_dispatch() -
     assert lifecycle._loaded("call-durable-1").status == "missing"
 
 
+def test_durable_resume_abort_gate_runs_after_recovery_probe_before_dispatch() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    polls: list[bool] = []
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=adapter, lifecycle_hook=lifecycle).acall(
+            REQUEST,
+            logical_call_id="call-durable-1",
+            should_abort=lambda: polls.append(True) or True,
+            abort_after_recovery_probe=True,
+        )
+
+    with pytest.raises(ModelCallAborted, match="before provider dispatch"):
+        asyncio.run(run())
+
+    assert polls == [True]
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
+def test_terminal_boundary_precedes_durable_resume_abort_gate() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    token = CancellationToken()
+    token.cancel()
+    polls: list[bool] = []
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            lifecycle_hook=lifecycle,
+            current_cancellation_token=lambda: token,
+        ).acall(
+            REQUEST,
+            logical_call_id="call-durable-1",
+            should_abort=lambda: polls.append(True) or True,
+            abort_after_recovery_probe=True,
+        )
+
+    with pytest.raises(RunCancelled):
+        asyncio.run(run())
+
+    assert polls == []
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
 def test_durable_runner_refuses_an_unkeyable_request_before_reservation(
     monkeypatch: Any,
 ) -> None:
