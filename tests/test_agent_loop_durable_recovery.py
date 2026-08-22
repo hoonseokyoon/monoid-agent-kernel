@@ -724,6 +724,101 @@ def test_required_evidence_recovery_does_not_consume_an_extra_step(tmp_path: Pat
     assert len(adapter.requests) == 1
 
 
+def test_required_evidence_recovery_bypasses_budget_exhausted_by_settled_call(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+    adapter = _ScriptedAdapter(
+        ModelTurn(final_text="durable answer", usage=usage, stop_reason="stop")
+    )
+    limits = RunLimits(max_total_tokens=1)
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None and checkpoint.total_usage == usage
+
+    restored, final_checkpoint = _restore(
+        tmp_path,
+        harness,
+        adapter,
+        checkpoint,
+        user_input=None,
+        sink=sink,
+        model_evidence_policy="required",
+        limits=limits,
+    )
+
+    assert restored.reason == "settled"
+    assert restored.turn is not None and restored.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.total_usage == usage
+    assert len(adapter.requests) == 1
+
+
+def test_required_evidence_recovery_completes_before_a_requested_pause(
+    tmp_path: Path,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    sink = _RejectModelEvidence(harness.sink)
+    adapter = _ScriptedAdapter(ModelTurn(final_text="durable answer", stop_reason="stop"))
+    token = harness.claim_writer(RUN_ID, "worker-1")
+    loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=token,
+        model_evidence_policy="required",
+    )
+    loop.open()
+    try:
+        evidence_park = loop.run_until_suspended("hello")
+        checkpoint = loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            loop.discard_uncommitted()
+
+    assert evidence_park.error_code == "evidence_uncommitted"
+    assert checkpoint is not None
+    current = harness.claim_writer(RUN_ID, "worker-2")
+    restored_loop = _loop(
+        tmp_path,
+        adapter,
+        sink=sink,
+        writer_token=current,
+        model_evidence_policy="required",
+    )
+    restored_loop.restore(checkpoint)
+    restored_loop.pause_turn()
+    try:
+        settled = restored_loop.run_until_suspended(None)
+        final_checkpoint = restored_loop.snapshot()
+    finally:
+        with suppress(BaseException):
+            restored_loop.discard_uncommitted()
+
+    assert settled.reason == "settled"
+    assert settled.turn is not None and settled.turn.final_text == "durable answer"
+    assert final_checkpoint is not None and final_checkpoint.last_suspension is not None
+    assert final_checkpoint.last_suspension["reason"] == "settled"
+    assert len(adapter.requests) == 1
+
+
 def test_required_evidence_recovery_preserves_tool_observations_without_replaying_provider(
     tmp_path: Path,
 ) -> None:

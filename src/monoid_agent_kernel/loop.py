@@ -3879,7 +3879,12 @@ class AgentLoop:
             # _check_run_boundary (which also runs mid-step). At this boundary the prior step's
             # tool results sit in state.pending_observations not-yet-sent, so a paused park is
             # clean and a None re-pump resumes the same turn without losing or double-sending them.
-            if self._pause_requested:
+            # Required-evidence recovery completes the model step that already dispatched and
+            # settled. A cooperative pause therefore lands at the next ordinary step boundary,
+            # exactly as it would when requested after an in-flight model call had started.
+            # Preempting here would replace the durable evidence-recovery marker with a generic
+            # paused suspension and strand the stored result.
+            if self._pause_requested and evidence_recovery_step is None:
                 raise TurnPaused("turn paused")
             if evidence_recovery_step is not None:
                 recovering_evidence = True
@@ -4112,7 +4117,12 @@ class AgentLoop:
             # safely (status ``limited``, last-good checkpoint intact) rather than grow the
             # resent-every-turn log without limit. Checked before the call so an over-limit
             # log is never sent or re-persisted.
-            log_limit_code = self._message_log_limit_exceeded(state)
+            # Evidence-only replay invokes no provider and consumes no new run budget. Finish
+            # projecting the already-paid, settled invocation even when that invocation pushed
+            # the run past a limit; the limit applies again at the next ordinary model step.
+            log_limit_code = (
+                None if recovering_evidence else self._message_log_limit_exceeded(state)
+            )
             if log_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the conversation size limit."
@@ -4128,7 +4138,7 @@ class AgentLoop:
             # Token budget: checked before the turn against the accumulated API-reported
             # usage of prior turns, so once a cap is crossed the run settles rather than
             # starting (and paying for) another turn.
-            token_limit_code = self._token_budget_exceeded(state)
+            token_limit_code = None if recovering_evidence else self._token_budget_exceeded(state)
             if token_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the token budget."
@@ -4141,7 +4151,11 @@ class AgentLoop:
                     final_text=state.final_text,
                     error_code=token_limit_code,
                 )
-            delta_limit_code = self._workspace_delta_limit_exceeded(res.workspace)
+            delta_limit_code = (
+                None
+                if recovering_evidence
+                else self._workspace_delta_limit_exceeded(res.workspace)
+            )
             if delta_limit_code is not None:
                 state.status = "limited"
                 state.final_text = "Stopped after reaching the workspace change size limit."
@@ -4195,7 +4209,9 @@ class AgentLoop:
                 # The resolved payload (inline base64) is the real size risk — the durable
                 # by-reference log stays tiny. Guard it separately so an oversized media turn
                 # settles ``limited`` instead of being sent.
-                wire_limit_code = self._wire_bytes_exceeded(wire_messages)
+                wire_limit_code = (
+                    None if recovering_evidence else self._wire_bytes_exceeded(wire_messages)
+                )
                 if wire_limit_code is not None:
                     state.status = "limited"
                     state.final_text = "Stopped after reaching the model request size limit."
