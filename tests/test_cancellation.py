@@ -11,12 +11,16 @@ import pytest
 import monoid_agent_kernel.recorder as recorder_module
 from support.runtime import runtime_config, runtime_provider
 
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore, RunCheckpoint
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.spec import AgentRunSpec
-from monoid_agent_kernel.errors import NativeAgentError, RunCancelled
+from monoid_agent_kernel.errors import RunCancelled
 from monoid_agent_kernel.hosting.contracts import CommitResult, WriterToken
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn, mark_provider_usage
@@ -85,13 +89,15 @@ def test_cancel_callbacks_are_one_shot_and_removable() -> None:
 
 def test_first_interruption_cause_wins_while_lease_authority_is_independent() -> None:
     token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
 
     token.cancel(InterruptionCause.GRACEFUL_DRAIN)
     token.cancel(InterruptionCause.USER_CANCEL)
-    token.cancel(InterruptionCause.LEASE_LOST)
+    authority.revoke()
 
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
-    assert token.lease_lost is True
+    assert authority.revoked is True
 
 
 @pytest.mark.parametrize(
@@ -113,7 +119,6 @@ def test_cancellation_token_rejects_failure_causes_without_mutating_state(
         token.cancel(cause)
 
     assert token.snapshot() == (False, None)
-    assert token.lease_lost is False
     assert callbacks == []
 
 
@@ -155,9 +160,7 @@ def _restorable_loop(tmp_path: Path) -> AgentLoop:
 
 def test_already_lost_lease_stops_before_bootstrap_creates_run_artifacts(tmp_path: Path) -> None:
     loop = _restorable_loop(tmp_path)
-    token = CancellationToken()
-    token.cancel(InterruptionCause.LEASE_LOST)
-    loop.cancellation_token = token
+    loop.lose_writer_authority()
 
     with pytest.raises(RunCancelled) as caught:
         loop.open()
@@ -182,7 +185,7 @@ def test_lease_loss_after_bootstrap_index_write_stops_later_artifacts(
         payload: dict[str, Any],
     ) -> Path:
         path = original(recorder, payload)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         return path
 
     monkeypatch.setattr(recorder_module.AgentRecorder, "write_workspace_index", lose_after_index)
@@ -219,7 +222,7 @@ def test_recorder_constructor_releases_owned_handles_when_lease_is_lost_mid_open
     def lose_after_event_log_open(sink: recorder_module.JsonlEventSink) -> None:
         original_sink_init(sink)
         event_sinks.append(sink)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
 
     monkeypatch.setattr(
         recorder_module.AgentRecorder,
@@ -232,12 +235,40 @@ def test_recorder_constructor_releases_owned_handles_when_lease_is_lost_mid_open
         recorder_module.AgentRecorder(
             loop.spec.run_root,
             loop.spec.run_id,
-            check_authority=loop._check_lease_authority,
+            write_authority=loop.write_authority,
         )
 
     assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
     assert len(event_sinks) == 1 and event_sinks[0]._handle.closed is True
     assert len(transcript_handles) == 1 and transcript_handles[0].closed is True
+
+
+def test_stale_tool_context_refuses_external_side_effect_before_service_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _restorable_loop(tmp_path)
+    token = CancellationToken()
+    loop.cancellation_token = token
+    loop.open()
+    assert loop._session is not None
+    context = loop._session.res.context
+    calls: list[dict[str, Any]] = []
+
+    def capture_execute(args: dict[str, Any], *unused: Any, **ignored: Any) -> dict[str, Any]:
+        calls.append(args)
+        return {"status": "unexpected"}
+
+    monkeypatch.setattr(context._shell_service, "execute", capture_execute)
+    loop.lose_writer_authority()
+
+    try:
+        with pytest.raises(RunCancelled) as caught:
+            context.execute_shell({"command": "must-not-run"})
+        assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+        assert calls == []
+    finally:
+        loop.discard_uncommitted()
 
 
 def test_a_restored_loop_honors_a_durable_cancellation_without_a_token(tmp_path: Path) -> None:
@@ -346,17 +377,17 @@ def test_lease_loss_returns_only_an_in_memory_park_and_refuses_close_writes(
     loop.cancellation_token = token
     loop.open()
     token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-    token.cancel(InterruptionCause.LEASE_LOST)
+    loop.lose_writer_authority()
 
     suspension = loop.run_until_suspended("go")
 
     assert token.cause is InterruptionCause.GRACEFUL_DRAIN
-    assert token.lease_lost is True
+    assert loop.write_authority.revoked is True
     assert suspension.reason == "interrupted"
     assert suspension.error_code == InterruptionCause.LEASE_LOST.value
     assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
     assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
-    with pytest.raises(NativeAgentError, match="lease-lost activation") as exc_info:
+    with pytest.raises(WriteAuthorityRevoked) as exc_info:
         loop.close()
     assert exc_info.value.error_code == "lease_lost"
     assert LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id) is None
@@ -384,7 +415,7 @@ def test_sticky_lease_loss_wins_while_an_older_cancellation_unwinds(
             "run cancelled",
             interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
         )
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         raise stale_exception
 
     loop._apump_turn = raise_after_lease_loss  # type: ignore[method-assign]
@@ -431,7 +462,7 @@ def test_sticky_lease_loss_drops_stale_billing_before_nested_accounting(
             stale_exception,
             {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12},
         )
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         raise stale_exception
 
     loop._session.res.model_runner.acall = stale_model_call  # type: ignore[method-assign]
@@ -456,7 +487,7 @@ def test_tool_await_rechecks_sticky_lease_before_returning_a_result(tmp_path: Pa
 
     async def result_after_lease_loss() -> ToolResult:
         token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         return ToolResult(ok=True, content={"stale": True})
 
     with pytest.raises(RunCancelled) as caught:
@@ -519,7 +550,7 @@ def test_every_checkpoint_surface_rechecks_lease_after_blocking_persistence(
     thread.start()
     assert entered.wait(5)
     token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-    token.cancel(InterruptionCause.LEASE_LOST)
+    loop.lose_writer_authority()
     release.set()
     thread.join(5)
 
@@ -552,7 +583,7 @@ def test_public_pump_converts_lease_loss_during_checkpoint_into_activation_park(
     thread.start()
     assert entered.wait(5)
     token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-    token.cancel(InterruptionCause.LEASE_LOST)
+    loop.lose_writer_authority()
     release.set()
     thread.join(5)
 
@@ -593,11 +624,11 @@ def test_lease_loss_after_a_terminal_verdict_blocks_finalization(tmp_path: Path)
     loop.open()
     token.cancel(InterruptionCause.USER_CANCEL)
     terminal = loop.run_until_suspended("go")
-    token.cancel(InterruptionCause.LEASE_LOST)
+    loop.lose_writer_authority()
 
     assert terminal.reason == "terminal"
     assert terminal.interruption_cause is InterruptionCause.USER_CANCEL
-    with pytest.raises(NativeAgentError, match="lease-lost activation") as exc_info:
+    with pytest.raises(WriteAuthorityRevoked) as exc_info:
         loop.close()
     assert exc_info.value.error_code == "lease_lost"
     events_path = next(loop.spec.run_root.rglob("events.jsonl"))
@@ -626,7 +657,7 @@ def test_lease_loss_after_first_finalization_write_blocks_every_later_projection
 
     def lose_after_proposal(workspace: Any) -> Any:
         result = original(workspace)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         return result
 
     monkeypatch.setattr(recorder, "write_proposal_revision", lose_after_proposal)
@@ -663,7 +694,7 @@ def test_public_pump_stops_finalization_event_fanout_after_lease_loss(tmp_path: 
         def emit(self, event: Any) -> None:
             first_types.append(event.type)
             if event.type == "workspace.proposal.updated":
-                token.cancel(InterruptionCause.LEASE_LOST)
+                loop.lose_writer_authority()
 
         def close(self) -> None:
             return None
@@ -702,7 +733,7 @@ def test_run_close_stops_event_sink_close_fanout_after_lease_loss(tmp_path: Path
 
         def close(self) -> None:
             close_counts[0] += 1
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
 
     class RecordingCloseSink:
         def emit(self, event: Any) -> None:
@@ -739,7 +770,7 @@ def test_proposal_revision_rechecks_authority_after_diff_write(
 
     def lose_after_diff(diff_text: str) -> Path:
         path = original(diff_text)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         return path
 
     monkeypatch.setattr(recorder, "write_diff", lose_after_diff)
@@ -770,7 +801,7 @@ def test_settled_text_rechecks_authority_before_content_sidecar(
     def lose_after_transcript(handle: Any, payload: dict[str, Any]) -> None:
         original(handle, payload)
         if payload.get("kind") == "settled_text":
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
 
     monkeypatch.setattr(recorder_module, "_write_jsonl", lose_after_transcript)
 
@@ -793,7 +824,7 @@ def test_checkpoint_delete_rechecks_authority_after_store_returns(tmp_path: Path
     class LosingDeleteStore(LocalFsCheckpointStore):
         def delete(self, run_id: str) -> None:
             super().delete(run_id)
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
 
     store = LosingDeleteStore(loop.spec.run_root)
     loop.checkpoint_store = store

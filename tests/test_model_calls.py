@@ -810,7 +810,7 @@ def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other
                 "_lose_model_payloads_locked",
                 "_lose_model_content_locked",
             ),
-            ("close",),
+                ("close", "discard_uncommitted", "_close_owned_handles"),
         ),
         (content_module, "ModelContentStore", ("_disable_locked",), ("close",)),
     ):
@@ -820,11 +820,12 @@ def test_every_terminal_disable_announces_because_it_cannot_be_written_any_other
         for door in doors:
             assert door in owned, f"{class_name} must funnel its disable through {door}"
         for name in teardown:
-            assert name in owned, (
-                f"{class_name}.{name} is the teardown this census allows to latch a flag without "
-                f"announcing (normal termination is the one transition an operator must NOT be "
-                f"warned about). It was renamed or removed -- update the census deliberately."
-            )
+                assert name in owned, (
+                    f"{class_name}.{name} is the teardown this census allows to latch a flag without "
+                    f"announcing (normal close and stale activation-local handle release are the "
+                    f"transitions an operator must NOT be warned about). It was renamed or removed "
+                    f"-- update the census deliberately."
+                )
 
         # A terminal latch is an attribute a gate consults AND that this class sets to True. Both
         # halves are derived: gates say which flags decide whether the artifact still records,

@@ -195,7 +195,7 @@ def test_lease_loss_during_each_stream_writer_open_fences_later_opens_and_dispat
 
         def lose_after_private_open(context: ModelStreamContext):  # noqa: ANN202
             writer = original_open(context)
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
             return writer
 
         monkeypatch.setattr(recorder, "open_model_stream", lose_after_private_open)
@@ -204,7 +204,7 @@ def test_lease_loss_during_each_stream_writer_open_fences_later_opens_and_dispat
 
         def lose_after_observer_open(context: ModelStreamContext):  # noqa: ANN202
             writer = original_open(context)
-            token.cancel(InterruptionCause.LEASE_LOST)
+            loop.lose_writer_authority()
             return writer
 
         monkeypatch.setattr(first, "open", lose_after_observer_open)
@@ -294,7 +294,7 @@ def test_lease_loss_during_first_stream_close_stops_remaining_writers(tmp_path: 
     def lose_authority() -> None:
         assert entered.wait(5)
         token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         release.set()
 
     racer = Thread(target=lose_authority)
@@ -343,7 +343,7 @@ def test_lease_loss_during_first_stream_push_stops_remaining_writers(tmp_path: P
     def lose_authority() -> None:
         assert entered.wait(5)
         token.cancel(InterruptionCause.GRACEFUL_DRAIN)
-        token.cancel(InterruptionCause.LEASE_LOST)
+        loop.lose_writer_authority()
         release.set()
 
     racer = Thread(target=lose_authority)

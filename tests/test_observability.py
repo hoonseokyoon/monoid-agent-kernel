@@ -11,6 +11,10 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.cli import _read_watch_batch, main
 from monoid_agent_kernel.core._event_log import EventLogChanged, inspect_event_log_tail
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.events import AgentEvent, EventBus
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -91,30 +95,25 @@ def test_event_bus_normalizes_python_values_before_any_sink_sees_them() -> None:
 
 
 def test_event_bus_rechecks_authority_between_sink_callbacks() -> None:
-    authority_lost = False
+    authority = ActivationWriteAuthority()
     first_events: list[AgentEvent] = []
     second = MemoryEventSink()
 
     class LosingSink:
         def emit(self, event: AgentEvent) -> None:
-            nonlocal authority_lost
             first_events.append(event)
-            authority_lost = True
+            authority.revoke()
 
         def close(self) -> None:
             return None
 
-    def check_authority() -> None:
-        if authority_lost:
-            raise RuntimeError("writer authority lost")
-
     bus = EventBus(
         "run_fenced",
         (LosingSink(), second),
-        check_authority=check_authority,
+        write_authority=authority,
     )
 
-    with pytest.raises(RuntimeError, match="writer authority lost"):
+    with pytest.raises(WriteAuthorityRevoked):
         bus.emit("run.started", data={"mode": "propose"})
 
     assert len(first_events) == 1
@@ -227,7 +226,7 @@ def test_event_bus_closes_each_sink_once_even_when_one_close_fails() -> None:
 
 
 def test_event_bus_rechecks_authority_between_sink_close_callbacks() -> None:
-    authority_lost = False
+    authority = ActivationWriteAuthority()
 
     class ClosingSink:
         def __init__(self, *, lose_authority: bool = False) -> None:
@@ -238,21 +237,17 @@ def test_event_bus_rechecks_authority_between_sink_close_callbacks() -> None:
             del event
 
         def close(self) -> None:
-            nonlocal authority_lost
             self.close_count += 1
             if self.lose_authority:
-                authority_lost = True
-
-    def check_authority() -> None:
-        if authority_lost:
-            raise RuntimeError("writer authority lost")
+                authority.revoke()
 
     sinks = (ClosingSink(lose_authority=True), ClosingSink())
-    bus = EventBus("run-close-fenced", sinks, check_authority=check_authority)
+    bus = EventBus("run-close-fenced", sinks, write_authority=authority)
 
-    with pytest.raises(RuntimeError, match="writer authority lost"):
+    with pytest.raises(WriteAuthorityRevoked):
         bus.close()
-    bus.close()
+    with pytest.raises(WriteAuthorityRevoked):
+        bus.close()
 
     assert [sink.close_count for sink in sinks] == [1, 0]
 

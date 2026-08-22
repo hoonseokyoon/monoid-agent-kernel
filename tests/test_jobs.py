@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked
 import monoid_agent_kernel.tasks as tasks_module
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.tasks import BackgroundJob, SubagentTaskExecutor, TaskManager
@@ -82,7 +83,6 @@ def _start(
 
 def test_cancel_all_rechecks_authority_between_jobs(tmp_path: Path, monkeypatch: Any) -> None:
     manager, recorder, _sink = _manager(tmp_path)
-    authority_lost = False
     cancelled: list[str] = []
 
     class RunningJob:
@@ -91,23 +91,64 @@ def test_cancel_all_rechecks_authority_between_jobs(tmp_path: Path, monkeypatch:
     manager.jobs = {"job-1": RunningJob(), "job-2": RunningJob()}  # type: ignore[dict-item]
 
     def cancel(job_id: str) -> dict[str, Any]:
-        nonlocal authority_lost
         cancelled.append(job_id)
-        authority_lost = True
+        manager.write_authority.revoke()
         return {"job_id": job_id}
-
-    def check_authority() -> None:
-        if authority_lost:
-            raise RuntimeError("writer authority lost")
 
     monkeypatch.setattr(manager, "cancel", cancel)
     try:
-        with pytest.raises(RuntimeError, match="writer authority lost"):
-            manager.cancel_all(check_authority=check_authority)
+        with pytest.raises(WriteAuthorityRevoked):
+            manager.cancel_all()
     finally:
         recorder.close()
 
     assert cancelled == ["job-1"]
+
+
+def test_task_executor_start_does_not_hold_the_authority_lock(tmp_path: Path) -> None:
+    manager, recorder, _sink = _manager(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    revoke_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    class BlockingExecutor:
+        kind = "blocking"
+        in_process = True
+
+        def start(self, _manager: TaskManager, **_request: Any) -> object:
+            entered.set()
+            assert release.wait(5)
+            return object()
+
+        def cancel(self, _manager: TaskManager, _job: object) -> None:
+            return None
+
+    manager.executors["blocking"] = BlockingExecutor()  # type: ignore[assignment]
+
+    def start_task() -> None:
+        try:
+            manager.start_task("blocking", {})
+        except BaseException as exc:
+            errors.append(exc)
+
+    starter = threading.Thread(target=start_task)
+    starter.start()
+    assert entered.wait(5)
+    revoker = threading.Thread(
+        target=lambda: (manager.write_authority.revoke(), revoke_finished.set())
+    )
+    revoker.start()
+    try:
+        assert revoke_finished.wait(1)
+        release.set()
+        starter.join(5)
+        revoker.join(5)
+        assert not starter.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], WriteAuthorityRevoked)
+    finally:
+        release.set()
+        recorder.discard_uncommitted()
 
 
 _RESULT_OBSERVATION_KEYS = {
