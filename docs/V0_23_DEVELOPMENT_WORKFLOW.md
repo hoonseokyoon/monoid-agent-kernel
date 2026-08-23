@@ -1,8 +1,10 @@
 # v0.23 Production Adapters 개발 workflow
 
-> 상태: v0.22 계승 workflow 승인, v0.23 CI 비용 정책 owner 승인 대기
+> 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
 >
 > 작성일: 2026-08-23
+>
+> 승인일: 2026-08-23
 >
 > 기준 릴리스: `v0.22.0` / `6b4bd9f`
 >

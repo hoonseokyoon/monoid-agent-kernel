@@ -1,8 +1,10 @@
 # v0.23 PostgreSQL·ObjectStore·Temporal 구현 전 조사와 실행 계획
 
-> 상태: 사전조사 완료, owner 승인 대기
+> 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
 >
 > 작성일: 2026-08-23
+>
+> 승인일: 2026-08-23
 >
 > 기준 릴리스: `v0.22.0` / `6b4bd9f`
 >
@@ -783,38 +785,35 @@ PR 2~6은 storage production path, PR 7~10은 orchestration production path, PR 
 
 ## 17. owner 결정 항목
 
-다음 표의 권장안을 승인하면 구현 브랜치와 PR 1을 시작할 수 있다.
+2026-08-23 owner가 A01~A14 권장안 전체를 승인했다. 이 표는 v0.23 구현과 release audit의
+canonical disposition이다.
 
 | ID | 결정 | 선택지 | 권장안 | 이유 | 상태 |
 |---|---|---|---|---|---|
-| A01 | v0.23 exact cut | production path만 / production+stream+bounded ops / ModelCallActivity까지 | production+stream+bounded ops | durable chat reconnect와 운영 종료 조건을 채우며 mid-step replay 위험을 분리한다. | 범위 방향 승인, exact cut 재확인 필요 |
-| A02 | 배포 구조 | 별도 adapter distributions / 한 wheel의 optional modules | 한 wheel의 optional modules | 첫 release에서 contract와 compatibility를 한 캠페인으로 검증한다. | 승인 필요 |
-| A03 | package/extras | 자유 명명 / 제안 namespace와 `postgres`, `object-store-s3`, `temporal`, `durable-host` | 제안안 | base install을 가볍게 유지하고 사용자가 필요한 backend만 설치한다. | 승인 필요 |
-| A04 | PostgreSQL 지원 | 15+ / 16+ / 17+ | 16+, release 16·18 | CSP와 정렬되고 충분한 지원 기간과 최신 major 호환성을 함께 확보한다. | 승인 필요 |
-| A05 | DB API | sync pool / sync+async 동시 / async-only | sync psycopg pool | 기존 sink/loop와 Temporal threaded Activity에 맞고 public API surface를 하나로 유지한다. | 승인 필요 |
-| A06 | migration | auto-migrate / explicit bundled SQL / Alembic | explicit bundled SQL, no auto-migrate | rollout과 rollback을 운영자가 통제하고 SQL linearization을 직접 review한다. | 승인 필요 |
-| A07 | takeover | 다른 owner 즉시 takeover / expiry 또는 current-token release 뒤 takeover | expiry/release gate | crashed writer overlap에서 stale publication을 확실히 차단한다. | 승인 필요 |
-| A08 | blob profile | S3 only / bytea only / bytea+S3 | bytea+S3, multipart 포함 | 작은 설치와 conformance 경로를 유지하면서 대형 private content를 지원한다. | 승인 필요 |
-| A09 | Temporal handoff | direct start / Update-With-Start / PG outbox+Signal-With-Start | PG outbox+Signal-With-Start | response loss와 worker unavailability를 흡수하고 canonical admission을 PG에 둔다. | 승인 필요 |
-| A10 | Activity model | async Activity / sync threaded cooperative Activity / model-call Activity | sync threaded cooperative Activity | 현재 sync kernel 경계와 맞고 cancellation/lease loss를 명시적으로 통제한다. | 승인 필요 |
-| A11 | durable stream | 제외 / event table token rows / separate batched stream v1 | separate batched stream v1 | reconnect correctness를 제공하며 canonical event write amplification을 억제한다. | 승인 필요 |
-| A12 | 운영 기능 | docs only / doctor+metrics / doctor+metrics+GC+migration runbook | 세 번째 안 | v0.23을 배포 가능한 adapter release로 닫는다. | 승인 필요 |
-| A13 | CI 비용 정책 | 모든 push full / manual full / Draft-fast + Ready-full | Draft-fast + Ready-full, Draft cancel sentinel; PR 1에서 Draft 수동 Codex review가 실패하면 Ready+`ci:full` label gate | 수십 review cycle의 비용을 억제하고 Codex 제품 동작과 CI 비용 정책을 분리하며 merge SHA의 실제 서비스 증거를 보존한다. | 승인 필요 |
-| A14 | PR/기간 | 8개 대형 PR / 13개 순차 PR / 16개 이상 소형 PR | 13개 순차 PR, 26~33 개발일 | storage/orchestration/stream 책임을 review 가능한 크기로 분리한다. | 승인 필요 |
+| A01 | v0.23 exact cut | production path만 / production+stream+bounded ops / ModelCallActivity까지 | production+stream+bounded ops | durable chat reconnect와 운영 종료 조건을 채우며 mid-step replay 위험을 분리한다. | 승인 |
+| A02 | 배포 구조 | 별도 adapter distributions / 한 wheel의 optional modules | 한 wheel의 optional modules | 첫 release에서 contract와 compatibility를 한 캠페인으로 검증한다. | 승인 |
+| A03 | package/extras | 자유 명명 / 제안 namespace와 `postgres`, `object-store-s3`, `temporal`, `durable-host` | 제안안 | base install을 가볍게 유지하고 사용자가 필요한 backend만 설치한다. | 승인 |
+| A04 | PostgreSQL 지원 | 15+ / 16+ / 17+ | 16+, release 16·18 | CSP와 정렬되고 충분한 지원 기간과 최신 major 호환성을 함께 확보한다. | 승인 |
+| A05 | DB API | sync pool / sync+async 동시 / async-only | sync psycopg pool | 기존 sink/loop와 Temporal threaded Activity에 맞고 public API surface를 하나로 유지한다. | 승인 |
+| A06 | migration | auto-migrate / explicit bundled SQL / Alembic | explicit bundled SQL, no auto-migrate | rollout과 rollback을 운영자가 통제하고 SQL linearization을 직접 review한다. | 승인 |
+| A07 | takeover | 다른 owner 즉시 takeover / expiry 또는 current-token release 뒤 takeover | expiry/release gate | crashed writer overlap에서 stale publication을 확실히 차단한다. | 승인 |
+| A08 | blob profile | S3 only / bytea only / bytea+S3 | bytea+S3, multipart 포함 | 작은 설치와 conformance 경로를 유지하면서 대형 private content를 지원한다. | 승인 |
+| A09 | Temporal handoff | direct start / Update-With-Start / PG outbox+Signal-With-Start | PG outbox+Signal-With-Start | response loss와 worker unavailability를 흡수하고 canonical admission을 PG에 둔다. | 승인 |
+| A10 | Activity model | async Activity / sync threaded cooperative Activity / model-call Activity | sync threaded cooperative Activity | 현재 sync kernel 경계와 맞고 cancellation/lease loss를 명시적으로 통제한다. | 승인 |
+| A11 | durable stream | 제외 / event table token rows / separate batched stream v1 | separate batched stream v1 | reconnect correctness를 제공하며 canonical event write amplification을 억제한다. | 승인 |
+| A12 | 운영 기능 | docs only / doctor+metrics / doctor+metrics+GC+migration runbook | 세 번째 안 | v0.23을 배포 가능한 adapter release로 닫는다. | 승인 |
+| A13 | CI 비용 정책 | 모든 push full / manual full / Draft-fast + Ready-full | Draft-fast + Ready-full, Draft cancel sentinel; PR 1에서 Draft 수동 Codex review가 실패하면 Ready+`ci:full` label gate | 수십 review cycle의 비용을 억제하고 Codex 제품 동작과 CI 비용 정책을 분리하며 merge SHA의 실제 서비스 증거를 보존한다. | 승인 |
+| A14 | PR/기간 | 8개 대형 PR / 13개 순차 PR / 16개 이상 소형 PR | 13개 순차 PR, 26~33 개발일 | storage/orchestration/stream 책임을 review 가능한 크기로 분리한다. | 승인 |
 
-### 승인 요청 문구
+### 승인 기록
 
-전체 권장안을 채택하려면 다음처럼 승인할 수 있다.
+owner 승인 문구:
 
 ```text
 A01~A14 권장안 승인. v0.23 구현 계획과 workflow를 확정하고 PR 1부터 진행.
 ```
 
-일부만 바꾸려면 ID와 선택지를 지정한다. 예:
-
-```text
-A01~A14 승인, 단 A12는 doctor+metrics까지만.
-```
+변경 disposition은 해당 ID, 대체안, 이유와 새 승인일을 이 표에 기록한다.
 
 ## 18. 승인 뒤 즉시 수행할 일
 

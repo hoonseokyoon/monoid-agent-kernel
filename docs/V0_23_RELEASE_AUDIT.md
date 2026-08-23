@@ -1,8 +1,10 @@
 # v0.23.0 Production Adapters Release Audit
 
-> 상태: pre-implementation scaffold; release evidence 없음
+> 상태: approved cut 구현 진행 중; release evidence 없음
 >
 > 작성일: 2026-08-23
+>
+> 범위 승인일: 2026-08-23
 >
 > 기준 릴리스: `v0.22.0` / `6b4bd9f`
 >
@@ -31,20 +33,21 @@
 
 ## 2. approved release cut
 
-owner 승인 뒤 이 표를 구현 계획 A01~A14 disposition과 일치시킨다.
+이 표는 2026-08-23 승인된 구현 계획 A01~A14 disposition과 일치한다. `approval`은 범위 승인을,
+`release evidence`는 release candidate의 실제 검증 상태를 뜻한다.
 
 | boundary | planned result | approval | release evidence |
 |---|---|---|---|
-| package/import | base install remains adapter-free; optional PostgreSQL/S3/Temporal extras | pending | pending |
-| writer authority | DB-clock lease and monotonic generation | pending | pending |
-| PostgreSQL sink | full `FencedRunSink` production implementation | pending | pending |
-| ObjectStore | immutable checked single/multipart S3-compatible blobs | pending | pending |
-| admission | stable input/control identity and PG dispatch outbox | pending | pending |
-| activation | orchestrator-neutral finite activation and canonical receipt | pending | pending |
-| event/terminal | fenced execution bridge and terminal first-writer convergence | pending | pending |
-| Temporal | Signal-With-Start entity Workflow and finite Activity | pending | pending |
-| stream | separate batched durable stream v1 | pending | pending |
-| operations | migration/doctor/metrics/GC/runbook | pending | pending |
+| package/import | base install remains adapter-free; optional PostgreSQL/S3/Temporal extras | approved | pending |
+| writer authority | DB-clock lease and monotonic generation | approved | pending |
+| PostgreSQL sink | full `FencedRunSink` production implementation | approved | pending |
+| ObjectStore | immutable checked single/multipart S3-compatible blobs | approved | pending |
+| admission | stable input/control identity and PG dispatch outbox | approved | pending |
+| activation | orchestrator-neutral finite activation and canonical receipt | approved | pending |
+| event/terminal | fenced execution bridge and terminal first-writer convergence | approved | pending |
+| Temporal | Signal-With-Start entity Workflow and finite Activity | approved | pending |
+| stream | separate batched durable stream v1 | approved | pending |
+| operations | migration/doctor/metrics/GC/runbook | approved | pending |
 
 ## 3. PostgreSQL gate
 
@@ -270,7 +273,7 @@ Release candidate에서 실제 command와 결과를 채운다.
 
 | 승인 | 담당 | 상태 | 근거 |
 |---|---|---|---|
-| 구현 범위 owner | 미정 | pending | A01~A14 disposition |
+| 구현 범위 owner | project owner | approved | A01~A14 disposition, 2026-08-23 |
 | storage/conformance | 미정 | pending | PostgreSQL/ObjectStore evidence |
 | Temporal/replay | 미정 | pending | Workflow/Activity evidence |
 | security/privacy | 미정 | pending | privacy and credential scan |
