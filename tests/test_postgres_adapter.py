@@ -91,6 +91,13 @@ def test_postgres_config_hides_dsn_and_validates_schema_and_pool() -> None:
     assert PostgresConfig(dsn="postgresql://db/service", schema="public").schema == "public"
     with pytest.raises(ValueError, match="max_pool_size"):
         PostgresConfig(dsn="postgresql://db/service", min_pool_size=2, max_pool_size=1)
+    assert PostgresConfig(dsn="postgresql://db/service").max_bytea_blob_bytes == 8 * 1024 * 1024
+    for invalid_limit in (True, 0, -1, 1 << 30):
+        with pytest.raises(ValueError, match="max_bytea_blob_bytes"):
+            PostgresConfig(
+                dsn="postgresql://db/service",
+                max_bytea_blob_bytes=invalid_limit,
+            )
 
 
 def test_external_pool_is_health_checked_but_never_opened_or_closed() -> None:
@@ -161,11 +168,12 @@ def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
 
 def test_bundled_migration_metadata_hashes_exact_wheel_resource() -> None:
     migrations = bundled_migrations()
-    assert tuple(item.migration_id for item in migrations) == ("0001_authority",)
-    raw = (
-        files("monoid_agent_kernel.adapters.postgres")
-        .joinpath("sql", "0001_authority.sql")
-        .read_bytes()
+    assert tuple(item.migration_id for item in migrations) == (
+        "0001_authority",
+        "0002_checkpoint_invocation",
     )
-    assert migrations[0].checksum_sha256 == hashlib.sha256(raw).hexdigest()
-    assert migrations[0].reader_floor == migrations[0].writer_floor == 1
+    root = files("monoid_agent_kernel.adapters.postgres").joinpath("sql")
+    for migration in migrations:
+        raw = root.joinpath(f"{migration.migration_id}.sql").read_bytes()
+        assert migration.checksum_sha256 == hashlib.sha256(raw).hexdigest()
+        assert migration.reader_floor == migration.writer_floor == 1

@@ -23,6 +23,7 @@ from .pool import (
     PostgresHealth,
     UnsupportedPostgresVersion,
 )
+from .sink import PostgresBlobCorrupt, PostgresFencedRunSink
 
 __all__ = [
     "PostgresConfig",
@@ -44,4 +45,6 @@ __all__ = [
     "bundled_migrations",
     "PostgresMigrations",
     "PostgresWriterAuthorityStore",
+    "PostgresBlobCorrupt",
+    "PostgresFencedRunSink",
 ]
