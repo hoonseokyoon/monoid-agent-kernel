@@ -252,7 +252,6 @@ jobs:
       - name: Run combined service integration
         run: python -m pytest -q tests/service -m service --durations=10
       - name: Record integration evidence
-        if: always()
         run: >
           python tools/v023_ci.py write-evidence
           --head-sha "$GITHUB_SHA"
@@ -260,7 +259,6 @@ jobs:
           --profile combined
           --output .tmp/v023-ci-evidence.json
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: v023-combined-evidence
           path: .tmp/v023-ci-evidence.json

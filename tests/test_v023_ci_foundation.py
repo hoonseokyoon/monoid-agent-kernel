@@ -99,10 +99,28 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert ".[dev,openai,reference-dbos]" in full
     assert '(unit or contract) and serial and not service' in full
     assert "full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
+    assert "      - name: Record qualified merge candidate\n        if: always()" not in full
+    assert (
+        "      - uses: actions/upload-artifact@v4\n"
+        "        if: always()\n"
+        "        with:\n"
+        "          name: v023-${{ needs.profile.outputs.profile }}-evidence"
+        not in full
+    )
+    assert "          name: v023-${{ needs.profile.outputs.profile }}-evidence\n          path:" in full
     assert "converted_to_draft" in cancel
     assert "full-pr-${{ github.event.pull_request.number || github.ref }}" in cancel
     assert "pull_request:" not in integration
     assert "codex/v0.23-production-adapters" in integration
+    assert "      - name: Record integration evidence\n        if: always()" not in integration
+    assert (
+        "      - uses: actions/upload-artifact@v4\n"
+        "        if: always()\n"
+        "        with:\n"
+        "          name: v023-combined-evidence"
+        not in integration
+    )
+    assert "          name: v023-combined-evidence\n          path:" in integration
 
 
 def test_ci_helper_writes_public_safe_evidence(tmp_path: Path) -> None:

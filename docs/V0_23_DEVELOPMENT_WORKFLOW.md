@@ -229,6 +229,8 @@ CI checkpoint는 다음 시점에 만든다.
 - 최종 review는 최신 PR head SHA를 대상으로 한다.
 - L2는 그 head와 current base의 GitHub merge ref를 검증한다.
 - L2 artifact는 `github.event.pull_request.head.sha`와 `GITHUB_SHA`를 함께 기록한다.
+- qualification artifact는 설치, 서비스 기동, 실제 integration이 모두 성공한 실행에서만 생성하고
+  업로드한다. 실패한 실행의 진단은 workflow log와 job conclusion으로 확인한다.
 - head 또는 base가 바뀌면 merge candidate가 바뀌므로 L2 evidence를 다시 만든다.
 
 `[skip ci]`, `[ci skip]`은 비용 제어 수단으로 사용하지 않는다. GitHub는 skip된 required
