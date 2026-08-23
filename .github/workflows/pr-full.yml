@@ -64,10 +64,10 @@ jobs:
       run_objectstore: ${{ steps.resolve.outputs.run_objectstore }}
       run_temporal: ${{ steps.resolve.outputs.run_temporal }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Resolve plan-owned service profile
@@ -92,10 +92,10 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -127,10 +127,10 @@ jobs:
       MONOID_MINIO_SECRET_KEY: monoid-test-secret-only
       MONOID_TEMPORAL_CLI_VERSION: v1.8.2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -155,7 +155,7 @@ jobs:
           --merge-sha "$(git rev-parse HEAD)"
           --profile "$MONOID_SERVICE_PROFILE"
           --output .tmp/v023-ci-evidence.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: v023-${{ needs.profile.outputs.profile }}-evidence
           path: .tmp/v023-ci-evidence.json

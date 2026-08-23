@@ -177,7 +177,7 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
     assert "      - name: Record qualified merge candidate\n        if: always()" not in full
     assert (
-        "      - uses: actions/upload-artifact@v4\n"
+        "      - uses: actions/upload-artifact@v7\n"
         "        if: always()\n"
         "        with:\n"
         "          name: v023-${{ needs.profile.outputs.profile }}-evidence"
@@ -190,13 +190,28 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "codex/v0.23-production-adapters" in integration
     assert "      - name: Record integration evidence\n        if: always()" not in integration
     assert (
-        "      - uses: actions/upload-artifact@v4\n"
+        "      - uses: actions/upload-artifact@v7\n"
         "        if: always()\n"
         "        with:\n"
         "          name: v023-combined-evidence"
         not in integration
     )
     assert "          name: v023-combined-evidence\n          path:" in integration
+
+    workflows = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+    )
+    assert "actions/checkout@v4" not in workflows
+    assert "actions/setup-python@v5" not in workflows
+    assert "actions/setup-node@v4" not in workflows
+    assert "actions/upload-artifact@v4" not in workflows
+    assert "actions/download-artifact@v4" not in workflows
+    assert "actions/checkout@v7" in workflows
+    assert "actions/setup-python@v7" in workflows
+    assert "actions/setup-node@v7" in workflows
+    assert "actions/upload-artifact@v7" in workflows
+    assert "actions/download-artifact@v8" in workflows
 
 
 def test_ci_helper_writes_public_safe_evidence(tmp_path: Path) -> None:

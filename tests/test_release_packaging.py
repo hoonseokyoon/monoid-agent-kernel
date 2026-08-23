@@ -68,7 +68,7 @@ def test_publish_workflow_audits_the_wheel_that_it_uploads() -> None:
 
     build_position = workflow.index("- name: Build distributions")
     audit_position = workflow.index("- name: Audit release wheel")
-    upload_position = workflow.index("- uses: actions/upload-artifact@v4")
+    upload_position = workflow.index("- uses: actions/upload-artifact@v7")
 
     assert build_position < audit_position < upload_position
     assert "run: python tools/release_wheel_audit.py dist" in workflow

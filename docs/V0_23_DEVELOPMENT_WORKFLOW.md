@@ -320,6 +320,11 @@ concurrency:
 artifact publish 단계는 별도 concurrency group과 `cancel-in-progress: false`를 사용한다. dormant
 label event는 `full-dormant-pr-*` key를 사용해 required run을 취소하지 않는다.
 
+GitHub-hosted runner workflow는 2026-08-23 기준 공식 Node 24 계열 action major를 사용한다:
+`actions/checkout@v7`, `actions/setup-python@v7`, `actions/setup-node@v7`,
+`actions/upload-artifact@v7`, `actions/download-artifact@v8`. action runtime deprecation annotation은
+CI foundation 결함으로 처리한다.
+
 ### 7.5 서비스 profile
 
 구현 계획은 각 PR에 필요한 profile을 지정한다. PR을 Ready로 전환하기 전에 다음 label 중 하나를
