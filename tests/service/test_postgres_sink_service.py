@@ -229,6 +229,33 @@ def _rewrite_payload_without_digest(
             )
 
 
+def test_global_blob_rows_are_acquired_in_digest_order(
+    sink_harness: _SinkHarness,
+) -> None:
+    class RecordingCursor:
+        def __init__(self) -> None:
+            self.inserted_digests: list[str] = []
+
+        def execute(self, _query: object, parameters: tuple[object, ...]) -> None:
+            if len(parameters) == 3:
+                self.inserted_digests.append(str(parameters[0]))
+
+        def fetchone(self) -> tuple[str]:
+            return (self.inserted_digests[-1],)
+
+    left_sha, left = _blob(b"left-lock")
+    right_sha, right = _blob(b"right-lock")
+    reversed_input = {
+        right_sha: right[right_sha],
+        left_sha: left[left_sha],
+    }
+    cursor = RecordingCursor()
+
+    sink_harness.sink._persist_blobs(cursor, "run-lock-order", reversed_input)
+
+    assert cursor.inserted_digests == sorted((left_sha, right_sha))
+
+
 def test_checkpoint_identity_blobs_monotonic_head_and_restart(
     sink_harness: _SinkHarness,
 ) -> None:

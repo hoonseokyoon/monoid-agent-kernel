@@ -193,7 +193,8 @@ class PostgresFencedRunSink:
     ) -> bool:
         from psycopg import sql
 
-        for sha256, value in blobs.items():
+        for sha256 in sorted(blobs):
+            value = blobs[sha256]
             cursor.execute(  # type: ignore[attr-defined]
                 sql.SQL("SELECT size_bytes, content FROM {} WHERE sha256 = %s").format(
                     self._table("bytea_blob")
