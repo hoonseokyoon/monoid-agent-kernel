@@ -24,15 +24,14 @@ CREATE TABLE __MONOID_SCHEMA__.checkpoint_record (
     content_digest character(64) NOT NULL CHECK (
         content_digest ~ '^[0-9a-f]{64}$'
     ),
-    payload jsonb NOT NULL CHECK (pg_catalog.jsonb_typeof(payload) = 'object'),
+    -- json preserves canonical numeric identity and escaped NUL text across a round trip.
+    -- The typed columns remain authoritative; checked readers bind them to this payload.
+    payload json NOT NULL CHECK (pg_catalog.json_typeof(payload) = 'object'),
     submitted_blobs jsonb NOT NULL CHECK (
         pg_catalog.jsonb_typeof(submitted_blobs) = 'object'
     ),
     committed_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
-    PRIMARY KEY (run_id, sequence),
-    CHECK (payload ->> 'run_id' = run_id),
-    CHECK ((payload ->> 'seq')::bigint = sequence),
-    CHECK (payload ->> 'schema_version' = schema_version)
+    PRIMARY KEY (run_id, sequence)
 );
 
 CREATE TABLE __MONOID_SCHEMA__.checkpoint_head (
@@ -65,25 +64,13 @@ CREATE TABLE __MONOID_SCHEMA__.invocation_record (
     content_digest character(64) NOT NULL CHECK (
         content_digest ~ '^[0-9a-f]{64}$'
     ),
-    payload jsonb NOT NULL CHECK (pg_catalog.jsonb_typeof(payload) = 'object'),
+    -- Keep the full canonical value representation; jsonb normalizes negative zero.
+    payload json NOT NULL CHECK (pg_catalog.json_typeof(payload) = 'object'),
     submitted_blobs jsonb NOT NULL CHECK (
         pg_catalog.jsonb_typeof(submitted_blobs) = 'object'
     ),
     committed_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
-    PRIMARY KEY (run_id, logical_call_id, revision),
-    CHECK (payload ->> 'run_id' = run_id),
-    CHECK (payload ->> 'logical_call_id' = logical_call_id),
-    CHECK ((payload ->> 'revision')::bigint = revision),
-    CHECK (payload ->> 'schema_version' = schema_version),
-    CHECK (payload ->> 'dispatch_id' = dispatch_id),
-    CHECK ((payload ->> 'dispatch_attempt')::bigint = dispatch_attempt),
-    CHECK (payload ->> 'dispatch_state' = dispatch_state),
-    CHECK (payload ->> 'idempotency_key' = idempotency_key),
-    CHECK (payload ->> 'request_digest' = request_digest),
-    CHECK (payload ->> 'digest_generation' = digest_generation),
-    CHECK (payload ->> 'evidence_policy' = evidence_policy),
-    CHECK (payload ->> 'result_ref' = result_ref),
-    CHECK (payload ->> 'failure_code' = failure_code)
+    PRIMARY KEY (run_id, logical_call_id, revision)
 );
 
 CREATE TABLE __MONOID_SCHEMA__.invocation_head (

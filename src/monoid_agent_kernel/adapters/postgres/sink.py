@@ -50,6 +50,7 @@ _STABLE_INVOCATION_FIELDS = (
     "digest_generation",
     "evidence_policy",
 )
+_POSTGRES_BIGINT_MAX = (1 << 63) - 1
 
 
 class PostgresBlobCorrupt(RuntimeError):
@@ -298,6 +299,8 @@ class PostgresFencedRunSink:
     ) -> tuple[CommitResult, str]:
         if not isinstance(checkpoint, RunCheckpoint):
             return CommitResult(status="conflict"), ""
+        if type(checkpoint.seq) is not int or not 0 <= checkpoint.seq <= _POSTGRES_BIGINT_MAX:
+            return CommitResult(status="conflict", sequence=checkpoint.seq), ""
         submitted = self._validated_blobs(blobs)
         if submitted is None:
             return CommitResult(status="conflict", sequence=checkpoint.seq), ""
@@ -322,7 +325,7 @@ class PostgresFencedRunSink:
 
         self._persist_blobs(cursor, checkpoint.run_id, submitted)
         from psycopg import sql
-        from psycopg.types.json import Jsonb
+        from psycopg.types.json import Json, Jsonb
 
         projection = _blob_projection(submitted)
         cursor.execute(  # type: ignore[attr-defined]
@@ -335,7 +338,7 @@ class PostgresFencedRunSink:
                 checkpoint.seq,
                 payload["schema_version"],
                 content_digest,
-                Jsonb(payload),
+                Json(payload),
                 Jsonb(projection),
             ),
         )
@@ -580,7 +583,7 @@ class PostgresFencedRunSink:
 
         self._persist_blobs(cursor, invocation.run_id, submitted)
         from psycopg import sql
-        from psycopg.types.json import Jsonb
+        from psycopg.types.json import Json, Jsonb
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
@@ -605,7 +608,7 @@ class PostgresFencedRunSink:
                 invocation.result_ref,
                 invocation.failure_code,
                 content_digest,
-                Jsonb(payload),
+                Json(payload),
                 Jsonb(_blob_projection(submitted)),
             ),
         )

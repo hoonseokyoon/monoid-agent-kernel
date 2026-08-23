@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import threading
 import time
@@ -27,7 +28,7 @@ if not _selected():
 import psycopg  # noqa: E402
 from psycopg import sql  # noqa: E402
 from psycopg.rows import dict_row  # noqa: E402
-from psycopg.types.json import Jsonb  # noqa: E402
+from psycopg.types.json import Json  # noqa: E402
 from psycopg_pool import ConnectionPool  # noqa: E402
 
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
@@ -161,12 +162,15 @@ def _invocation(
     retryable: bool = False,
     succeeded_blob: str = "",
     request_digest: str = "a" * 64,
+    duration_ms: float | None = None,
 ) -> DurableModelInvocation:
     receipt = None
     result_ref = ""
     failure_code = ""
     if state == "settled":
         receipt = {"request_digest": request_digest, "retryable": retryable}
+        if duration_ms is not None:
+            receipt["duration_ms"] = duration_ms
         if succeeded_blob:
             result_ref = f"blob:{succeeded_blob}"
         else:
@@ -268,6 +272,54 @@ def test_checkpoint_identity_blobs_monotonic_head_and_restart(
         assert restarted.value.blob(sha256) == b"checkpoint-private"
     finally:
         reopened_database.close()
+
+
+def test_payload_json_preserves_negative_zero_and_checkpoint_nul(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-json-identity"
+    token = sink_harness.claim(run_id)
+    checkpoint = RunCheckpoint(
+        run_id=run_id,
+        seq=1,
+        final_text="before\x00after",
+        remaining_duration_s=-0.0,
+    )
+
+    assert sink_harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token).status == (
+        "committed"
+    )
+    loaded = sink_harness.sink.latest_checked(run_id)
+    assert loaded.status == "loaded"
+    assert loaded.value is not None
+    assert loaded.value.checkpoint.final_text == "before\x00after"
+    remaining = loaded.value.checkpoint.remaining_duration_s
+    assert remaining == 0.0
+    assert math.copysign(1.0, remaining) == -1.0
+
+
+def test_checkpoint_sequence_respects_postgres_bigint_boundaries(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-bigint-bound"
+    token = sink_harness.claim(run_id)
+
+    maximum = sink_harness.sink.commit_checkpoint(
+        RunCheckpoint(run_id=run_id, seq=(1 << 63) - 1),
+        {},
+        writer_token=token,
+    )
+
+    result = sink_harness.sink.commit_checkpoint(
+        RunCheckpoint(run_id=run_id, seq=10**30),
+        {},
+        writer_token=token,
+    )
+
+    assert maximum.status == "committed"
+    assert result.status == "conflict"
+    assert result.sequence == 10**30
+    assert _table_count(sink_harness, "checkpoint_record", run_id) == 1
 
 
 def test_blob_bounds_fencing_and_cross_run_authorization(
@@ -430,7 +482,13 @@ def test_invocation_lifecycle_result_blob_and_retry_rules(
         ).status
         == "committed"
     )
-    settled = _invocation(run_id, 3, "settled", succeeded_blob=result_sha)
+    settled = _invocation(
+        run_id,
+        3,
+        "settled",
+        succeeded_blob=result_sha,
+        duration_ms=-0.0,
+    )
     assert sink_harness.sink.commit_invocation(settled, {}, writer_token=token).status == (
         "conflict"
     )
@@ -447,6 +505,9 @@ def test_invocation_lifecycle_result_blob_and_retry_rules(
     assert loaded.sequence == 3
     assert loaded.value is not None
     assert loaded.value.invocation == settled
+    duration = loaded.value.invocation.receipt["duration_ms"]  # type: ignore[index]
+    assert duration == 0.0
+    assert math.copysign(1.0, duration) == -1.0
     assert loaded.value.blob(result_sha) == b"model-result"
     assert (
         sink_harness.sink.commit_invocation(
@@ -705,7 +766,7 @@ def _rewrite_record(
                     f"UPDATE {{}} SET payload = %s, schema_version = %s, "
                     f"content_digest = %s WHERE {identity_sql}"
                 ).format(sql.Identifier(harness.database.config.schema, table)),
-                (Jsonb(changed), changed["schema_version"], digest, *identity_parameters),
+                (Json(changed), changed["schema_version"], digest, *identity_parameters),
             )
 
 
