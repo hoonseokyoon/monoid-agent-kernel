@@ -150,6 +150,10 @@ class PostgresFencedRunSink:
 
         self._ready = False
         status = PostgresMigrations(self.database).require_writer_compatible()
+        if not status.reader_compatible:
+            raise PostgresSchemaIncompatible(
+                "PostgreSQL fenced run sink requires reader and writer compatibility"
+            )
         self._ready = True
         return status
 

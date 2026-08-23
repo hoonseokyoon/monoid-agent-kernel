@@ -1150,6 +1150,32 @@ def test_checked_readers_classify_future_and_corrupt_payloads(
     assert sink_harness.sink.load_invocation(corrupt_run, "call-1").status == "corrupt"
 
 
+def test_sink_readiness_requires_reader_and_writer_compatibility(
+    sink_harness: _SinkHarness,
+) -> None:
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {} "
+                    "(migration_id, ordinal, checksum_sha256, reader_floor, writer_floor) "
+                    "VALUES (%s, %s, %s, %s, %s)"
+                ).format(
+                    sql.Identifier(
+                        sink_harness.database.config.schema,
+                        "monoid_schema_migrations",
+                    )
+                ),
+                ("0003_reader_incompatible", 3, "f" * 64, 3, 2),
+            )
+
+    sink = PostgresFencedRunSink(sink_harness.database)
+    with pytest.raises(PostgresSchemaIncompatible, match="reader and writer"):
+        sink.check_ready()
+    with pytest.raises(PostgresSchemaIncompatible, match="successful check_ready"):
+        sink.latest_checked("run-reader-incompatible")
+
+
 def test_sink_uses_positional_rows_with_a_caller_dict_pool(
     sink_harness: _SinkHarness,
 ) -> None:
