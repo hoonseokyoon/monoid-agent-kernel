@@ -267,6 +267,10 @@ SHA의 full check가 없으므로 merge가 차단된다. 개발자는 Draft로 �
 head에 label을 다시 붙인다. 긴 review cycle에서 의도하지 않은 서비스 matrix 반복을 두 경로 모두
 막는다.
 
+수동 `workflow_dispatch`는 `L2 diagnostic gate` check를 만든다. Ready 이벤트만 `L2 required gate`
+check를 만들며 branch protection은 이 이름만 요구한다. 수동 진단의 ref/profile 선택이 required
+merge evidence를 대체하지 않는다.
+
 fast workflow는 자체 key를 사용한다.
 
 ```yaml

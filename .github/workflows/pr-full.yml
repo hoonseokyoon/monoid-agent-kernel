@@ -140,7 +140,7 @@ jobs:
         run: docker compose -f tests/service/compose.yml down --volumes
 
   gate:
-    name: L2 required gate
+    name: ${{ github.event_name == 'workflow_dispatch' && 'L2 diagnostic gate' || 'L2 required gate' }}
     needs: [profile, core, service]
     if: always()
     runs-on: ubuntu-latest

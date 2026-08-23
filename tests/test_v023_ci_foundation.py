@@ -95,6 +95,7 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "fast-pr-${{ github.event.pull_request.number || github.ref }}" in fast
     assert "ready_for_review" in full
     assert "workflow_dispatch" in full
+    assert "'L2 diagnostic gate' || 'L2 required gate'" in full
     assert ".[dev,openai,reference-dbos]" in full
     assert '(unit or contract) and serial and not service' in full
     assert "full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
