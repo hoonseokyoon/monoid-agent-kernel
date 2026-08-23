@@ -225,6 +225,8 @@ exact SDK는 psycopg 3.3.4, psycopg-pool 3.3.1, boto3 1.43.78, transitive botoco
 temporalio 1.31.0이다. Temporal local service는 CLI v1.8.2와 embedded Server 1.31.2를 사용한다.
 exact SDK, service image digest,
 Temporal CLI archive checksum은 `tests/service/campaign-lock.json`이 소유한다.
+실제 Temporal service gate는 WorkflowService `GetSystemInfo.server_version`을 조회해 lock의 embedded
+Server 버전과 일치시킨 뒤에만 qualification evidence를 만든다.
 
 별도 distribution 분리는 v0.23 완료 뒤 dependency cadence와 maintainer 부담을 근거로 결정한다.
 첫 release는 한 repository의 optional modules로 API와 compatibility를 함께 검증한다.

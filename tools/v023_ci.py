@@ -100,6 +100,8 @@ def validate_lock() -> dict[str, Any]:
     temporal = services.get("temporal_cli")
     if not isinstance(temporal, dict) or not str(temporal.get("version", "")).startswith("v"):
         raise ValueError("Temporal CLI version must include its v prefix")
+    if not re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", str(temporal.get("embedded_server", ""))):
+        raise ValueError("Temporal embedded server version must be an exact semantic version")
     checksums = temporal.get("archive_sha256")
     required_archives = {
         "darwin_amd64",
@@ -191,6 +193,7 @@ def temporal_archive_spec(lock: dict[str, Any]) -> dict[str, str]:
     return {
         "platform": platform_key,
         "version": version,
+        "embedded_server": str(temporal["embedded_server"]),
         "filename": filename,
         "sha256": str(checksum),
         "url": f"https://github.com/temporalio/cli/releases/download/{version}/{filename}",

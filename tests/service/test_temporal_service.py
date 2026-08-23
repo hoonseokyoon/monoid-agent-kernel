@@ -17,6 +17,7 @@ if os.environ.get("MONOID_SERVICE_PROFILE") not in {"temporal", "combined"}:
     pytest.skip("Temporal service profile is not selected", allow_module_level=True)
 
 from temporalio import workflow  # noqa: E402
+from temporalio.api.workflowservice.v1 import GetSystemInfoRequest  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
@@ -54,24 +55,31 @@ def test_pinned_temporal_local_server_executes_workflow() -> None:
     assert prepared.returncode == 0, prepared.stderr or prepared.stdout
     artifact = json.loads(prepared.stdout)
     assert artifact["version"] == cli_version
+    expected_server_version = artifact["embedded_server"]
     executable = artifact["executable"]
 
-    async def run() -> str:
+    async def run() -> tuple[str, str]:
         async with await WorkflowEnvironment.start_local(
             dev_server_existing_path=executable,
             dev_server_log_level="warn",
         ) as environment:
+            system_info = await environment.client.service_client.workflow_service.get_system_info(
+                GetSystemInfoRequest()
+            )
             task_queue = f"monoid-v023-{uuid.uuid4()}"
             async with Worker(
                 environment.client,
                 task_queue=task_queue,
                 workflows=[_ServiceSmokeWorkflow],
             ):
-                return await environment.client.execute_workflow(
+                result = await environment.client.execute_workflow(
                     _ServiceSmokeWorkflow.run,
                     "service-smoke",
                     id=f"monoid-v023-{uuid.uuid4()}",
                     task_queue=task_queue,
                 )
+                return result, system_info.server_version
 
-    assert asyncio.run(run()) == "service-smoke"
+    result, server_version = asyncio.run(run())
+    assert result == "service-smoke"
+    assert server_version == expected_server_version

@@ -32,6 +32,7 @@ def test_campaign_lock_and_tracked_service_artifacts_are_consistent() -> None:
     assert lock["python_dependencies"]["botocore"]["exact"] == "1.43.78"
     temporal_archive = module.temporal_archive_spec(lock)
     assert temporal_archive["version"] == "v1.8.2"
+    assert temporal_archive["embedded_server"] == "1.31.2"
     assert len(temporal_archive["sha256"]) == 64
     assert temporal_archive["filename"].endswith(".tar.gz")
 
