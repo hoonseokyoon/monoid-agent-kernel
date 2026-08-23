@@ -159,8 +159,10 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
 
     assert "synchronize" in fast
     assert "fast-pr-${{ github.event.pull_request.number || github.ref }}" in fast
+    assert "types: [opened, reopened, ready_for_review]" in full
     assert "ready_for_review" in full
     assert "workflow_dispatch" in full
+    assert full.count("github.event.pull_request.draft == false") == 2
     assert "'L2 diagnostic gate' || 'L2 required gate'" in full
     assert ".[dev,openai,reference-dbos]" in full
     assert '(unit or contract) and serial and not service' in full
