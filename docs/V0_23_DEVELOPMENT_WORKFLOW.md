@@ -159,6 +159,10 @@ PR 지원 여부는 별도로 명시하지 않는다. v0.23은 이 제품 동작
 
 ### 6.2 Draft 수동 리뷰 미지원 시 fallback
 
+PR 1 capability 결과(2026-08-23): Draft PR #123의 `@codex review carefully` 요청을
+`chatgpt-codex-connector[bot]`이 👀 reaction으로 인식했다. v0.23은 Draft-fast + Ready-full 경로를
+사용한다. 아래 fallback은 비활성 상태로 유지하며 Draft 인식 동작이 회귀할 때만 활성화한다.
+
 fallback은 PR을 Ready 상태로 유지하고 expensive CI의 시작 조건을 `ci:full` label로 옮긴다.
 
 - `synchronize`는 L1 fast gate와 진행 중 L2를 취소하는 sentinel만 실행한다.
