@@ -12,6 +12,43 @@
       }
     },
     {
+      "fixture_id": "checkpoint-v021-cancelled-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v1",
+        "run_id": "fixture_cancelled_run",
+        "seq": 3,
+        "cancellation_requested": true
+      }
+    },
+    {
+      "fixture_id": "checkpoint-v022-additive-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v1",
+        "run_id": "fixture_run",
+        "seq": 2,
+        "last_model_invocation": {
+          "schema_version": "monoid.model-invocation.v1",
+          "run_id": "fixture_run",
+          "logical_call_id": "fixture_call",
+          "revision": 3,
+          "dispatch_id": "fixture_dispatch",
+          "dispatch_attempt": 1,
+          "idempotency_key": "fixture_key",
+          "dispatch_state": "unknown",
+          "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "digest_generation": "monoid.model-request-digest.v1",
+          "receipt": null,
+          "result_ref": "",
+          "failure_code": "dispatch_unknown"
+        },
+        "interruption_cause": "lease_lost"
+      }
+    },
+    {
       "fixture_id": "checkpoint-legacy-v1",
       "artifact": "checkpoint",
       "expected_status": "loaded",
@@ -29,6 +66,65 @@
         "schema_version": "monoid.checkpoint.v99",
         "run_id": "fixture_run",
         "seq": 1
+      }
+    },
+    {
+      "fixture_id": "terminal-outcome-current-v1",
+      "artifact": "terminal-outcome",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.terminal-outcome.v1",
+        "run_id": "fixture_run",
+        "kind": "dispatch_unknown",
+        "retry_eligibility": "after_reconciliation",
+        "interruption_cause": null,
+        "checkpoint_seq": 2,
+        "final_output_ref": "",
+        "partial_output_ref": "",
+        "last_evidence_ref": "invocation:fixture_call:3",
+        "error_code": "dispatch_unknown",
+        "provider_error_code": "",
+        "http_status": null
+      }
+    },
+    {
+      "fixture_id": "model-invocation-current-v1",
+      "artifact": "model-invocation",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.model-invocation.v1",
+        "run_id": "fixture_run",
+        "logical_call_id": "fixture_call",
+        "revision": 3,
+        "dispatch_id": "fixture_dispatch",
+        "dispatch_attempt": 1,
+        "idempotency_key": "fixture_key",
+        "dispatch_state": "settled",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "monoid.model-request-digest.v1",
+        "receipt": {
+          "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "attempts": 1
+        },
+        "result_ref": "blob:fixture_turn",
+        "failure_code": ""
+      }
+    },
+    {
+      "fixture_id": "model-invocation-future-v99",
+      "artifact": "model-invocation",
+      "expected_status": "unsupported_version",
+      "payload": {
+        "schema_version": "monoid.model-invocation.v99",
+        "run_id": "fixture_run",
+        "logical_call_id": "fixture_call",
+        "revision": 1,
+        "dispatch_id": "fixture_dispatch",
+        "dispatch_attempt": 1,
+        "idempotency_key": "fixture_key",
+        "dispatch_state": "reserved",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "monoid.model-request-digest.v1"
       }
     },
     {

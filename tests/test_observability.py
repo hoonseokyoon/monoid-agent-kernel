@@ -11,6 +11,10 @@ from support.runtime import runtime_config, runtime_provider
 
 from monoid_agent_kernel.cli import _read_watch_batch, main
 from monoid_agent_kernel.core._event_log import EventLogChanged, inspect_event_log_tail
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.events import AgentEvent, EventBus
 from monoid_agent_kernel.core.projections import project_run_status
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
@@ -88,6 +92,32 @@ def test_event_bus_normalizes_python_values_before_any_sink_sees_them() -> None:
     assert event.run_id == "run_�"
     assert event.data == {"�": [None, None, None]}
     assert memory.events == [event]
+
+
+def test_event_bus_rechecks_authority_between_sink_callbacks() -> None:
+    authority = ActivationWriteAuthority()
+    first_events: list[AgentEvent] = []
+    second = MemoryEventSink()
+
+    class LosingSink:
+        def emit(self, event: AgentEvent) -> None:
+            first_events.append(event)
+            authority.revoke()
+
+        def close(self) -> None:
+            return None
+
+    bus = EventBus(
+        "run_fenced",
+        (LosingSink(), second),
+        write_authority=authority,
+    )
+
+    with pytest.raises(WriteAuthorityRevoked):
+        bus.emit("run.started", data={"mode": "propose"})
+
+    assert len(first_events) == 1
+    assert second.events == []
 
 
 def test_jsonl_sink_rejects_non_finite_values_if_an_ingress_is_bypassed(tmp_path: Path) -> None:
@@ -193,6 +223,33 @@ def test_event_bus_closes_each_sink_once_even_when_one_close_fails() -> None:
     bus.close()
 
     assert [sink.close_count for sink in sinks] == [1, 1, 1]
+
+
+def test_event_bus_rechecks_authority_between_sink_close_callbacks() -> None:
+    authority = ActivationWriteAuthority()
+
+    class ClosingSink:
+        def __init__(self, *, lose_authority: bool = False) -> None:
+            self.lose_authority = lose_authority
+            self.close_count = 0
+
+        def emit(self, event: AgentEvent) -> None:
+            del event
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.lose_authority:
+                authority.revoke()
+
+    sinks = (ClosingSink(lose_authority=True), ClosingSink())
+    bus = EventBus("run-close-fenced", sinks, write_authority=authority)
+
+    with pytest.raises(WriteAuthorityRevoked):
+        bus.close()
+    with pytest.raises(WriteAuthorityRevoked):
+        bus.close()
+
+    assert [sink.close_count for sink in sinks] == [1, 0]
 
 
 def test_loop_events_are_ordered_and_status_file_exists(tmp_path: Path) -> None:
@@ -1023,6 +1080,121 @@ def test_a_model_turn_starting_clears_both_parks_on_both_readers(tmp_path: Path)
         )
         assert sink.state["state"] == "running", state
         assert sink.state["terminal"] is False
+
+
+def test_a_settled_recovery_clears_the_interruption_cause_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    events = (
+        {
+            "type": "turn.interrupted",
+            "data": {"reason": "user_stop", "interruption_cause": "user_cancel"},
+        },
+        {
+            "type": "turn.settled",
+            "data": {"status": "completed", "interruption_cause": ""},
+        },
+    )
+    run_dir = tmp_path / "run_recovered_settle"
+    run_dir.mkdir()
+    _write_events(run_dir, *events)
+
+    assert project_run_status(run_dir)["interruption_cause"] is None
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert "interruption_cause" not in sink.state
+
+
+def test_a_legacy_interruption_clears_an_older_typed_cause_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    legacy_payloads = (
+        {"reason": "user_stop"},
+        {"reason": "user_stop", "interruption_cause": ""},
+        {"reason": "user_stop", "interruption_cause": 1},
+        {"reason": "user_stop", "interruption_cause": "cancel"},
+    )
+    for index, legacy_payload in enumerate(legacy_payloads):
+        events = (
+            {
+                "type": "turn.interrupted",
+                "data": {"reason": "drain", "interruption_cause": "graceful_drain"},
+            },
+            {"type": "turn.interrupted", "data": legacy_payload},
+        )
+        run_dir = tmp_path / f"run_legacy_interrupt_{index}"
+        run_dir.mkdir()
+        _write_events(run_dir, *events)
+
+        assert project_run_status(run_dir)["interruption_cause"] is None
+
+        sink = StatusJsonSink(tmp_path / f"status_{index}.json")
+        for payload in events:
+            sink.emit(_event(payload["type"], dict(payload["data"])))
+        assert "interruption_cause" not in sink.state
+
+
+def test_a_pause_supersedes_an_old_interruption_cause_on_both_readers(
+    tmp_path: Path,
+) -> None:
+    events = (
+        {
+            "type": "turn.interrupted",
+            "data": {"reason": "user_stop", "interruption_cause": "user_cancel"},
+        },
+        {"type": "turn.paused", "data": {"reason": "user_pause"}},
+    )
+    run_dir = tmp_path / "run_reparked_as_pause"
+    run_dir.mkdir()
+    _write_events(run_dir, *events)
+
+    assert project_run_status(run_dir)["interruption_cause"] is None
+
+    sink = StatusJsonSink(tmp_path / "status.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert "interruption_cause" not in sink.state
+
+
+@pytest.mark.parametrize(
+    ("park_type", "park_data", "expected_state"),
+    (
+        ("run.waiting", {"jobs": ["job-1"]}, "awaiting_tasks"),
+        (
+            "run.awaiting_input",
+            {"reason": "task", "task_ids": ["task-1"]},
+            "awaiting_input",
+        ),
+    ),
+)
+def test_a_cause_less_run_park_clears_an_old_interruption_cause_on_both_readers(
+    tmp_path: Path,
+    park_type: str,
+    park_data: dict[str, object],
+    expected_state: str,
+) -> None:
+    events = (
+        {
+            "type": "turn.interrupted",
+            "data": {"reason": "drain", "interruption_cause": "graceful_drain"},
+        },
+        {"type": park_type, "data": park_data},
+    )
+    run_dir = tmp_path / f"run_{expected_state}"
+    run_dir.mkdir()
+    _write_events(run_dir, *events)
+
+    projection = project_run_status(run_dir)
+    assert projection["state"] == expected_state
+    assert projection["interruption_cause"] is None
+
+    sink = StatusJsonSink(tmp_path / f"status_{expected_state}.json")
+    for payload in events:
+        sink.emit(_event(payload["type"], dict(payload["data"])))
+    assert sink.state["state"] == expected_state
+    assert "interruption_cause" not in sink.state
 
 
 def test_the_status_sink_records_the_classification_of_a_recoverable_turn_failure(

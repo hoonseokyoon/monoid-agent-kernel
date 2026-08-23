@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -31,7 +32,7 @@ from monoid_agent_kernel.core.tool_surface import (
     tool_surface_manifest,
     validate_tool_surface_snapshot,
 )
-from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.workspace import AuthorityBoundWorkspace, Workspace
 from monoid_agent_kernel.core.workspace_index import build_workspace_index
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.providers.base import resolved_provider_name
@@ -91,8 +92,14 @@ class LoopBootstrapper:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
+    def _guard_external(self, operation: Callable[[], Any]) -> Any:
+        """Run one bootstrap callback through the activation's shared authority."""
+
+        return self._loop.write_authority.guard_external_call(operation)
+
     def bootstrap(self) -> _RunResources:
         loop = self._loop
+        loop._assert_write_authority()
         # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
         # class-exact, so a deployment's extension subclass with both pattern tuples empty read
         # as "the caller configured this" and the operator's spec policy was silently not
@@ -105,20 +112,24 @@ class LoopBootstrapper:
         if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
-        workspace = workspace_factory(loop.spec)
+        raw_workspace = self._guard_external(lambda: workspace_factory(loop.spec))
+        workspace = AuthorityBoundWorkspace(raw_workspace, loop.write_authority)
         loop._stream_sink = QueueEventSink()
-        recorder = AgentRecorder(
-            loop.spec.run_root,
-            loop.spec.run_id,
-            extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
-            status_file=loop.status_file,
-            model_content_file=loop.model_content_file,
-            model_calls_file=loop.model_calls_file,
-            model_payload_file=loop.model_payload_file,
-            # Resolved once here rather than per record: the recorder owns the whole ledger
-            # envelope, and this is the same proven-lineage root the model-stream context uses.
-            root_run_id=loop._validated_root_run_id(),
-            reopen=loop._restoring,
+        recorder = self._guard_external(
+            lambda: AgentRecorder(
+                loop.spec.run_root,
+                loop.spec.run_id,
+                extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
+                status_file=loop.status_file,
+                model_content_file=loop.model_content_file,
+                model_calls_file=loop.model_calls_file,
+                model_payload_file=loop.model_payload_file,
+                # Resolved once here rather than per record: the recorder owns the whole ledger
+                # envelope, and this is the same proven-lineage root the model-stream context uses.
+                root_run_id=loop._validated_root_run_id(),
+                reopen=loop._restoring,
+                write_authority=loop.write_authority,
+            )
         )
         model_stream_observers = loop._materialize_model_stream_observers()
         job_manager = TaskManager(
@@ -126,6 +137,7 @@ class LoopBootstrapper:
             workspace=workspace,
             recorder=recorder,
             permission_policy=loop.permission_policy,
+            write_authority=loop.write_authority,
         )
         shell_service = ShellService(
             run_id=loop.spec.run_id,
@@ -152,9 +164,10 @@ class LoopBootstrapper:
             shell_service,
             web_service,
             jobs_service,
+            loop.write_authority,
             permission_policy=loop.permission_policy,
-            capability_vault=loop._capability_vault,
-            outbox=loop._outbox,
+            _capability_vault=loop._capability_vault,
+            _outbox=loop._outbox,
             invocation_traceparent=safe_invocation_context.traceparent,
         )
         started = time.time()
@@ -169,10 +182,24 @@ class LoopBootstrapper:
         # token is one nobody cancels. ``model_adapter`` and ``async_model_cancel_grace_s`` are
         # public mutable fields the loop reads live everywhere else, and a snapshot of either made
         # this runner disagree with the code around it rather than merely go stale.
+        lifecycle_hook = None
+        if loop.run_sink is not None and loop.writer_token is not None:
+            # Keep the host package lazy for standalone/core-only imports. A configured host is
+            # the only activation that needs this adapter, and __post_init__ already validated the
+            # pair and its declared capabilities before bootstrap reaches this point.
+            from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
+
+            lifecycle_hook = FencedModelCallLifecycle(
+                loop.run_sink,
+                loop.writer_token,
+                evidence_policy=loop.model_evidence_policy,
+                write_authority=loop.write_authority,
+            )
         model_runner = ModelCallRunner(
             adapter=loop.model_adapter,
             current_adapter=lambda: loop.model_adapter,
             current_cancellation_token=lambda: loop.cancellation_token,
+            current_write_authority=lambda: loop.write_authority,
             cancel_grace_s=loop.async_model_cancel_grace_s,
             current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
@@ -190,6 +217,7 @@ class LoopBootstrapper:
             # The corpus needs the exact bytes the key was hashed over; the ledger alone does
             # not, and must not pay the per-call buffering for them.
             capture_request_preimage=loop.model_payload_file,
+            lifecycle_hook=lifecycle_hook,
         )
         # Publish partial ownership as soon as recorder/task resources exist. If a provider,
         # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
@@ -207,7 +235,11 @@ class LoopBootstrapper:
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:
-            base_registry.register_many(provider.get_tools(context))
+            self._guard_external(
+                lambda: base_registry.register_many(
+                    provider.get_tools(context._extension_context)
+                )
+            )
         if loop.subagent_definitions:
             loop._install_subagent_capability(base_registry, context, job_manager)
 
@@ -222,7 +254,9 @@ class LoopBootstrapper:
             model_runner=model_runner,
             model_stream_observers=model_stream_observers,
         )
-        initial_runtime_config = loop._current_runtime_config(base_registry)
+        initial_runtime_config = self._guard_external(
+            lambda: loop._current_runtime_config(base_registry)
+        )
         initial_bound_catalog = compile_bound_tool_catalog(initial_runtime_config, base_registry)
         initial_turn = TurnContext(
             step=1,
@@ -233,26 +267,35 @@ class LoopBootstrapper:
             pending_observation_count=0,
         )
         initial_surface = validate_tool_surface_snapshot(
-            loop.tool_surface_resolver.resolve(
-                bound_catalog=initial_bound_catalog,
-                turn=initial_turn,
+            self._guard_external(
+                lambda: loop.tool_surface_resolver.resolve(
+                    bound_catalog=initial_bound_catalog,
+                    turn=initial_turn,
+                )
             )
         )
         initial_visible_tool_specs = list(initial_surface.immediate_tools)
-        workspace_index = build_workspace_index(workspace, run_id=loop.spec.run_id)
-        workspace_index_path = recorder.write_workspace_index(workspace_index)
+        workspace_index = self._guard_external(
+            lambda: build_workspace_index(workspace, run_id=loop.spec.run_id)
+        )
+        workspace_index_path = self._guard_external(
+            lambda: recorder.write_workspace_index(workspace_index)
+        )
         static_segments: list[str] = []
         if loop.inject_workspace_index:
             index_segment = render_workspace_index_segment(workspace_index)
             if index_segment:
                 static_segments.append(index_segment)
         for provider in loop.context_providers:
-            segment = provider.static_segment()
+            segment = self._guard_external(provider.static_segment)
             if segment and segment.strip():
                 static_segments.append(segment)
         if not loop._restoring:
-            workspace_base_path = recorder.write_workspace_base(
-                workspace.workspace_base_payload(loop.spec.run_id)
+            workspace_base_payload = self._guard_external(
+                lambda: workspace.workspace_base_payload(loop.spec.run_id)
+            )
+            workspace_base_path = self._guard_external(
+                lambda: recorder.write_workspace_base(workspace_base_payload)
             )
             manifest = build_run_manifest(
                 loop.spec,
@@ -277,43 +320,48 @@ class LoopBootstrapper:
                     workspace_base_path.relative_to(recorder.run_dir).as_posix()
                 ),
             )
-            recorder.write_manifest(manifest)
-            recorder.emit(
-                "run.started",
-                data={
-                    "workspace": str(loop.spec.workspace_root),
-                    "run_dir": str(recorder.run_dir),
-                    "manifest_path": "manifest.json",
-                    "mode": loop.spec.mode,
-                    "workspace_backend": loop.spec.workspace_backend,
-                    "workspace_base_path": "workspace.base.json",
-                    # The provider that will SERVE this run, not the transport it travels over.
-                    # A forwarding adapter (the gateway) declares its upstream, and this event
-                    # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
-                    # so filling it from the raw config made that span disagree with the
-                    # receipt-derived span beside it about the same call. The transport is not
-                    # lost: ``manifest.json`` (written three lines up) records the configured
-                    # ``model_provider`` verbatim, and it is the run's configuration record.
-                    #
-                    # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
-                    # reaches the config itself, on the tolerance path too, and its docstring
-                    # says so. What is left is this event's schema obligation: ``model_provider``
-                    # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
-                    # (outside the declared Literal, but constructible) would resolve to ``None``
-                    # and emit null. Kept as that guarantee, not as a second resolution rule.
-                    "model_provider": resolved_provider_name(
-                        loop.model_adapter, initial_runtime_config.model or ModelConfig()
-                    )
-                    or (initial_runtime_config.model or ModelConfig()).provider,
-                    "model": (initial_runtime_config.model or ModelConfig()).model,
-                    "reasoning_effort": (
-                        initial_runtime_config.model or ModelConfig()
-                    ).reasoning.effort,
-                    "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
-                    "agent_config_hash": initial_runtime_config.config_hash,
-                },
+            self._guard_external(lambda: recorder.write_manifest(manifest))
+            self._guard_external(
+                lambda: recorder.emit(
+                    "run.started",
+                    data={
+                        "workspace": str(loop.spec.workspace_root),
+                        "run_dir": str(recorder.run_dir),
+                        "manifest_path": "manifest.json",
+                        "mode": loop.spec.mode,
+                        "workspace_backend": loop.spec.workspace_backend,
+                        "workspace_base_path": "workspace.base.json",
+                        # The provider that will SERVE this run, not the transport it travels over.
+                        # A forwarding adapter (the gateway) declares its upstream, and this event
+                        # is what the event-driven OTel sink turns into ``gen_ai.provider.name`` --
+                        # so filling it from the raw config made that span disagree with the
+                        # receipt-derived span beside it about the same call. The transport is not
+                        # lost: ``manifest.json`` (written three lines up) records the configured
+                        # ``model_provider`` verbatim, and it is the run's configuration record.
+                        #
+                        # The ``or`` is no longer the neutral case's fallback -- ``resolved_``
+                        # reaches the config itself, on the tolerance path too, and its docstring
+                        # says so. What is left is this event's schema obligation: ``model_provider``
+                        # is a required *string*, and a ``ModelConfig`` whose ``provider`` is empty
+                        # (outside the declared Literal, but constructible) would resolve to ``None``
+                        # and emit null. Kept as that guarantee, not as a second resolution rule.
+                        "model_provider": resolved_provider_name(
+                            loop.model_adapter, initial_runtime_config.model or ModelConfig()
+                        )
+                        or (initial_runtime_config.model or ModelConfig()).provider,
+                        "model": (initial_runtime_config.model or ModelConfig()).model,
+                        "reasoning_effort": (
+                            initial_runtime_config.model or ModelConfig()
+                        ).reasoning.effort,
+                        "visible_bindings": [tool.id for tool in initial_visible_tool_specs],
+                        "agent_config_hash": initial_runtime_config.config_hash,
+                    },
+                )
             )
-        loop._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
+        self._guard_external(
+            lambda: loop._emit_bootstrap_validator_skips(initial_runtime_config, recorder)
+        )
+        loop._assert_write_authority()
         return _RunResources(
             workspace=workspace,
             recorder=recorder,
@@ -541,6 +589,33 @@ class LoopFinalizer:
     def __init__(self, loop: Any) -> None:
         self._loop = loop
 
+    def _guard_external(self, operation: Callable[[], Any]) -> Any:
+        """Run one finalization callback through the activation's shared authority."""
+
+        return self._loop.write_authority.guard_external_call(operation)
+
+    def _write_common_projection(
+        self,
+        state: Any,
+        res: _RunResources,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+        """Write the proposal, metrics, and shared workspace event for one settle boundary."""
+
+        loop = self._loop
+        recorder = res.recorder
+        _diff_text, diff_path, proposal_payload = self._guard_external(
+            lambda: recorder.write_proposal_revision(res.workspace)
+        )
+        metrics = self.build_metrics(state, res)
+        self._guard_external(lambda: recorder.write_metrics(metrics))
+        self._guard_external(
+            lambda: recorder.emit(
+                "workspace.proposal.updated",
+                data=public_proposal_payload(proposal_payload, loop.permission_policy),
+            )
+        )
+        return diff_path, proposal_payload, metrics
+
     def build_metrics(self, state: Any, res: _RunResources) -> dict[str, Any]:
         loop = self._loop
         context = res.context
@@ -570,9 +645,9 @@ class LoopFinalizer:
             "requested_reasoning_effort": model.reasoning.effort,
             "effective_reasoning_effort": model.reasoning.effort,
             "error_code": state.error_code,
-            **context.shell_service.metrics(),
-            **context.jobs_service.background_metrics(),
-            **context.web_service.metrics(),
+            **context._shell_service.metrics(),
+            **context._jobs_service.background_metrics(),
+            **context._web_service.metrics(),
             **state.total_usage,
         }
         if context.subagent_count:
@@ -590,6 +665,8 @@ class LoopFinalizer:
             metrics["provider_error_code"] = state.provider_error_code
         if state.provider_http_status is not None:
             metrics["provider_http_status"] = state.provider_http_status
+        if state.interruption_cause is not None:
+            metrics["interruption_cause"] = state.interruption_cause.value
         if state.status == "failed":
             # The verdict beside the code/status pair above: retryable (waiting may help) and
             # config_recoverable (configuration will) are two facts, and this artifact carried
@@ -618,48 +695,51 @@ class LoopFinalizer:
         loop = self._loop
         context = res.context
         recorder = res.recorder
-        workspace = res.workspace
-        context.job_manager.cancel_all()
-        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
-        metrics = self.build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, loop.permission_policy),
+        self._guard_external(
+            context._job_manager.cancel_all
         )
-        recorder.emit(
-            "proposal.ready",
-            data={
-                "proposal_hash": proposal_payload.get("proposal_hash"),
-                "diff_sha256": proposal_payload.get("diff_sha256"),
-                "changed_paths": [
-                    public_path(str(path), loop.permission_policy)
-                    for path in proposal_payload.get("changed_paths", [])
-                ],
-            },
+        diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
+        self._guard_external(
+            lambda: recorder.emit(
+                "proposal.ready",
+                data={
+                    "proposal_hash": proposal_payload.get("proposal_hash"),
+                    "diff_sha256": proposal_payload.get("diff_sha256"),
+                    "changed_paths": [
+                        public_path(str(path), loop.permission_policy)
+                        for path in proposal_payload.get("changed_paths", [])
+                    ],
+                },
+            )
         )
         # The record is written as a side effect of building these fields, so it lands before the
         # emit rather than by a caller remembering to call it first. A restored run is recorded too:
         # provenance is not checkpointed, so ``_rehydrate`` fails closed and treats any restored
         # non-empty text as model-authored. Over-recording is the safe direction; see the field on
         # ``RunState``.
-        recorder.emit(
-            "run.finished",
-            data={
-                "status": state.status,
-                "error": public_error_message(state.error),
-                "error_code": state.error_code,
-                **_settled_text_fields(recorder, state),
-                "duration_s": metrics["duration_s"],
-                "diff_path": str(diff_path.relative_to(recorder.run_dir)),
-                "proposal_path": "proposal.json",
-                "metrics_path": "metrics.json",
-            },
-            level="error" if state.status == "failed" else "info",
+        settled_text_fields = self._guard_external(lambda: _settled_text_fields(recorder, state))
+        self._guard_external(
+            lambda: recorder.emit(
+                "run.finished",
+                data={
+                    "status": state.status,
+                    "error": public_error_message(state.error),
+                    "error_code": state.error_code,
+                    "interruption_cause": (
+                        "" if state.interruption_cause is None else state.interruption_cause.value
+                    ),
+                    **settled_text_fields,
+                    "duration_s": metrics["duration_s"],
+                    "diff_path": str(diff_path.relative_to(recorder.run_dir)),
+                    "proposal_path": "proposal.json",
+                    "metrics_path": "metrics.json",
+                },
+                level="error" if state.status == "failed" else "info",
+            )
         )
         artifacts = tuple(recorder.artifacts)
         run_dir = recorder.run_dir
-        recorder.close()
+        self._guard_external(recorder.close)
         return AgentRunResult(
             run_id=loop.spec.run_id,
             status=state.status,
@@ -676,6 +756,7 @@ class LoopFinalizer:
             error=state.error,
             error_code=state.error_code,
             final_turn_handle=state.previous_turn_handle,
+            interruption_cause=state.interruption_cause,
         )
 
     def checkpoint_on_settle(self, state: Any, res: _RunResources) -> AgentTurnResult:
@@ -683,13 +764,7 @@ class LoopFinalizer:
         recorder = res.recorder
         workspace = res.workspace
         session = loop._session
-        _diff_text, diff_path, proposal_payload = recorder.write_proposal_revision(workspace)
-        metrics = self.build_metrics(state, res)
-        recorder.write_metrics(metrics)
-        recorder.emit(
-            "workspace.proposal.updated",
-            data=public_proposal_payload(proposal_payload, loop.permission_policy),
-        )
+        _diff_path, proposal_payload, metrics = self._write_common_projection(state, res)
         public_changed = [
             public_path(str(path), loop.permission_policy)
             for path in proposal_payload.get("changed_paths", [])
@@ -698,20 +773,26 @@ class LoopFinalizer:
         # what they publish. Both normally carry the same value, and ``settled_text`` is
         # content-keyed, so the second record is a no-op by construction rather than by a caller
         # remembering not to repeat itself.
-        recorder.emit(
-            "turn.settled",
-            turn_id=session.active_turn_id if session is not None else None,
-            parent_id=session.active_turn_parent_id if session is not None else None,
-            data={
-                "status": state.status,
-                **_settled_text_fields(recorder, state),
-                "error_code": state.error_code,
-                "changed_paths": public_changed,
-                "output_validators": len(
-                    loop._active_output_validators(state.previous_runtime_config)
-                ),
-                "output_retries": state.output_retries,
-            },
+        settled_text_fields = self._guard_external(lambda: _settled_text_fields(recorder, state))
+        self._guard_external(
+            lambda: recorder.emit(
+                "turn.settled",
+                turn_id=session.active_turn_id if session is not None else None,
+                parent_id=session.active_turn_parent_id if session is not None else None,
+                data={
+                    "status": state.status,
+                    **settled_text_fields,
+                    "error_code": state.error_code,
+                    "interruption_cause": (
+                        "" if state.interruption_cause is None else state.interruption_cause.value
+                    ),
+                    "changed_paths": public_changed,
+                    "output_validators": len(
+                        loop._active_output_validators(state.previous_runtime_config)
+                    ),
+                    "output_retries": state.output_retries,
+                },
+            )
         )
         return AgentTurnResult(
             status=state.status,
@@ -725,4 +806,5 @@ class LoopFinalizer:
             final_output=state.final_output,
             outputs=dict(state.output_values),
             metrics=metrics,
+            interruption_cause=state.interruption_cause,
         )

@@ -176,11 +176,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Build and audit release wheel
+        if: matrix.install == 'minimal'
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python tools/release_wheel_audit.py dist
       - name: Install package
         run: python -m pip install "${{ matrix.requirement }}"
       - name: Import public and optional surfaces
         run: >
           python -c "import monoid_agent_kernel;
+          import monoid_agent_kernel.hosting;
+          import monoid_agent_kernel.conformance;
           import monoid_agent_kernel.providers.openai;
           import monoid_agent_kernel.providers.gateway;
           import monoid_agent_kernel.observability.otel;

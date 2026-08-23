@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.inbox import InboxMessage
 from monoid_agent_kernel.core.outbox import OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.trace_context import new_traceparent
@@ -43,7 +43,9 @@ class OutboxRetryPolicy:
 class OutboxDispatchContext:
     retry_policy_provider: Callable[[], OutboxRetryPolicy]
     max_message_queue_depth_provider: Callable[[], int]
-    checkpoint_store_provider: Callable[[], CheckpointStore]
+    commit_checkpoint: Callable[
+        [MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None
+    ]
     rng_provider: Callable[[], random.Random]
     live_outbox_runs: Callable[[], list[tuple[MutableRunRecordPort, OutboxLoopPort]]]
     call_soon: Callable[..., None]
@@ -55,6 +57,10 @@ class OutboxDispatchService:
 
     def __init__(self, context: OutboxDispatchContext) -> None:
         self._context = context
+
+    @staticmethod
+    def _raise_if_lease_lost(record: MutableRunRecordPort) -> None:
+        record.write_authority.assert_active()
 
     def backoff_delay(self, attempts: int) -> float:
         """Capped exponential backoff with full jitter.
@@ -83,6 +89,7 @@ class OutboxDispatchService:
 
     def drain_outbox(self, record: MutableRunRecordPort, loop: OutboxLoopPort) -> None:
         """Dispatch due staged outbox requests and persist the resulting checkpoint state."""
+        self._raise_if_lease_lost(record)
         sender = record.outbox_sender
         now = time.time()
         due = loop.due_outbox(now)
@@ -91,12 +98,17 @@ class OutboxDispatchService:
         changed = False
         policy = self._context.retry_policy_provider()
         for request in due:
+            self._raise_if_lease_lost(record)
             if not request.traceparent:
                 request.traceparent = new_traceparent()
             try:
                 receipt = sender.send(request)
             except Exception as exc:  # a sender raising is a retryable transport failure
                 receipt = OutboxReceipt(ok=False, error=str(exc), retryable=True)
+            # A send that overlaps ownership transfer stays pending/unknown. Its durable
+            # idempotency key lets the replacement reconcile or redrive without a stale status
+            # mutation or duplicate semantic effect.
+            self._raise_if_lease_lost(record)
             next_attempt_at = now + self.backoff_delay(request.attempts + 1)
             status = loop.record_outbox_result(
                 request.id,
@@ -108,16 +120,23 @@ class OutboxDispatchService:
             if request.expect_ack and status in {"dispatched", "failed"}:
                 self.stage_outbox_ack(record, request, status, receipt)
         if changed:
+            self._raise_if_lease_lost(record)
             checkpoint = loop.snapshot()
             if checkpoint is not None:
                 checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
                 checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-                self._context.checkpoint_store_provider().put(checkpoint, loop.collect_checkpoint_blobs())
+                self._raise_if_lease_lost(record)
+                self._context.commit_checkpoint(
+                    record,
+                    checkpoint,
+                    loop.collect_checkpoint_blobs(),
+                )
 
     def stage_outbox_ack(
         self, record: MutableRunRecordPort, request: Any, status: str, receipt: OutboxReceipt
     ) -> None:
         """Deliver an outbox send receipt back into the run inbox as a correlated message."""
+        self._raise_if_lease_lost(record)
         ack_id = f"ack_{request.id}"
         if self._context.record_terminal(record):
             return
@@ -142,6 +161,7 @@ class OutboxDispatchService:
             traceparent=request.traceparent,
             tracestate=request.tracestate,
         )
+        self._raise_if_lease_lost(record)
         record.message_queue.put_nowait(envelope.to_json())
 
     def redrive_outbox(self) -> None:

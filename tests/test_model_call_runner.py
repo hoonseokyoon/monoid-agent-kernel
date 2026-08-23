@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import threading
 import time
@@ -15,6 +16,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -22,11 +24,15 @@ from monoid_agent_kernel.core.model_io import (
     ModelCallCapture,
     ModelIOSubscription,
 )
+from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.model_call import ShouldAbort
 from monoid_agent_kernel.core.streaming import QueueEventSink
 from monoid_agent_kernel.errors import (
+    DurableModelCallError,
     ModelAdapterError,
+    ModelDispatchRefused,
     ModelCallAborted,
     RunCancelled,
     RunTimeout,
@@ -35,11 +41,19 @@ from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
     SettledModelCall,
+    _DigestResult,
     _digest,
     _encoded_digest,
     _prompt_payload,
     _request_payload,
 )
+from monoid_agent_kernel.model_lifecycle import (
+    ModelDispatchReservation,
+    ModelDispatchSettlement,
+    UnknownModelDispatch,
+    dispatch_evidence,
+)
+from support.fenced_hosting import DeterministicFencedRunHarness
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelTurn,
@@ -988,6 +1002,37 @@ def test_cancellation_releases_a_slow_adapter() -> None:
     with pytest.raises(RunCancelled):
         asyncio.run(run())
     assert time.monotonic() - started < 2.0
+
+
+def test_lease_loss_supersedes_an_earlier_stop_before_standalone_publication() -> None:
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    token.cancel(InterruptionCause.USER_CANCEL)
+    authority.revoke()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert observer.captures == []
+    assert sidecar == []
 
 
 def test_the_token_is_read_per_call_not_captured_at_construction() -> None:
@@ -4020,6 +4065,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
     )
     assert callers == [
         "monoid_agent_kernel/model_call.py",
+        "monoid_agent_kernel/model_lifecycle.py",
         "monoid_agent_kernel/reference/llm_gateway/service.py",
     ], {"callers": callers}
 
@@ -5023,3 +5069,740 @@ def test_the_two_layers_do_not_multiply(monkeypatch: Any) -> None:
     receipt = observer.captures[0].receipt
     assert receipt.attempts == 3
     assert receipt.provider_retried is False
+
+
+# --- durable dispatch lifecycle ----------------------------------------------------------------
+
+
+class _HardLifecycleCrash(BaseException):
+    """A process-stop failpoint the runner must not turn into a compensation write."""
+
+
+class _JournalLifecycle:
+    """The PR3 standalone hook backed by the PR2 deterministic fenced journal."""
+
+    def __init__(
+        self,
+        harness: DeterministicFencedRunHarness,
+        *,
+        run_id: str = "run-durable-call",
+        failpoint: str = "",
+    ) -> None:
+        self.harness = harness
+        self.run_id = run_id
+        self.token = harness._writers.get(run_id) or harness.claim_writer(run_id, "worker-1")
+        self.failpoint = failpoint
+        self.states: list[str] = []
+
+    def _loaded(self, logical_call_id: str):  # noqa: ANN202 - test fixture seam
+        return self.harness.sink.load_invocation(self.run_id, logical_call_id)
+
+    def _head(self, logical_call_id: str) -> DurableModelInvocation | None:
+        loaded = self._loaded(logical_call_id)
+        return loaded.value.invocation if loaded.value is not None else None
+
+    def _commit(
+        self,
+        invocation: DurableModelInvocation,
+        blobs: dict[str, bytes] | None = None,
+    ) -> None:
+        result = self.harness.sink.commit_invocation(
+            invocation,
+            blobs or {},
+            writer_token=self.token,
+        )
+        if result.status not in {"committed", "already_committed"}:
+            raise RuntimeError(f"invocation commit failed: {result.status}")
+        if result.status == "committed":
+            self.states.append(invocation.dispatch_state)
+
+    def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
+        if self.failpoint == "before_reserve":
+            raise _HardLifecycleCrash()
+        head = self._head(proposed.logical_call_id)
+        if head is not None and head.dispatch_state == "reserved":
+            effective = replace(proposed, idempotency_key=head.idempotency_key)
+            if (
+                head.dispatch_attempt != effective.dispatch_attempt
+                or head.dispatch_id != effective.dispatch_id
+                or head.request_digest != effective.request_digest
+            ):
+                raise DurableModelCallError(
+                    "restored reservation conflicts with the current request",
+                    error_code="durable_invocation_request_conflict",
+                )
+            return effective
+        if head is not None and head.dispatch_state == "dispatch_started":
+            self._commit(
+                replace(
+                    head,
+                    revision=head.revision + 1,
+                    dispatch_state="unknown",
+                    failure_code="dispatch_unknown",
+                )
+            )
+            raise DurableModelCallError(
+                "restored started dispatch is unknown",
+                error_code="dispatch_unknown",
+            )
+        if head is not None and head.dispatch_state == "unknown":
+            raise DurableModelCallError(
+                "restored dispatch remains unknown",
+                error_code="dispatch_unknown",
+            )
+        if head is not None and not (
+            head.dispatch_state == "settled"
+            and head.failure_code
+            and head.receipt is not None
+            and head.receipt.get("retryable") is True
+        ):
+            raise DurableModelCallError(
+                "settled model dispatch cannot be reserved again",
+                error_code="durable_invocation_already_settled",
+            )
+        revision = 1 if head is None else head.revision + 1
+        idempotency_key = proposed.idempotency_key if head is None else head.idempotency_key
+        effective = replace(proposed, idempotency_key=idempotency_key)
+        self._commit(
+            DurableModelInvocation(
+                run_id=self.run_id,
+                logical_call_id=effective.logical_call_id,
+                revision=revision,
+                dispatch_id=effective.dispatch_id,
+                dispatch_attempt=effective.dispatch_attempt,
+                idempotency_key=effective.idempotency_key,
+                dispatch_state="reserved",
+                request_digest=effective.request_digest,
+                digest_generation=effective.digest_generation,
+            )
+        )
+        if self.failpoint == "after_reserve":
+            raise _HardLifecycleCrash()
+        return effective
+
+    def dispatch_started(self, reservation: ModelDispatchReservation) -> None:
+        head = self._head(reservation.logical_call_id)
+        assert head is not None
+        self._commit(
+            replace(
+                head,
+                revision=head.revision + 1,
+                dispatch_state="dispatch_started",
+            )
+        )
+        if self.failpoint == "after_start":
+            raise _HardLifecycleCrash()
+
+    def settled(self, settlement: ModelDispatchSettlement) -> None:
+        if self.failpoint == "before_settle":
+            raise _HardLifecycleCrash()
+        if self.failpoint == "settle_error":
+            raise RuntimeError("injected settlement failure")
+        head = self._head(settlement.reservation.logical_call_id)
+        assert head is not None
+        blobs: dict[str, bytes] = {}
+        result_ref = ""
+        if settlement.result_blob is not None:
+            sha256 = hashlib.sha256(settlement.result_blob).hexdigest()
+            blobs[sha256] = settlement.result_blob
+            result_ref = f"blob:{sha256}"
+        self._commit(
+            replace(
+                head,
+                revision=head.revision + 1,
+                dispatch_state="settled",
+                receipt=settlement.receipt,
+                result_ref=result_ref,
+                failure_code=settlement.failure_code,
+            ),
+            blobs,
+        )
+
+    def unknown(self, unknown: UnknownModelDispatch) -> None:
+        if self.failpoint == "unknown_error":
+            raise RuntimeError("injected unknown transition failure")
+        head = self._head(unknown.reservation.logical_call_id)
+        assert head is not None
+        self._commit(
+            replace(
+                head,
+                revision=head.revision + 1,
+                dispatch_state="unknown",
+                failure_code=unknown.failure_code,
+            )
+        )
+
+
+class _CountingDurableAdapter:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.keys: list[str] = []
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        self.calls += 1
+        self.keys.append(request.idempotency_key)
+        return ModelTurn(
+            response_id="response-1",
+            final_text="durable answer",
+            usage={"input_tokens": 3, "output_tokens": 4},
+            raw={"private": "provider body"},
+            reasoning=({"type": "encrypted_reasoning", "id": "reasoning-1"},),
+            stop_reason="stop",
+        )
+
+
+def _durable_call(
+    adapter: Any,
+    lifecycle: _JournalLifecycle,
+    *,
+    request: ModelRequest = REQUEST,
+) -> tuple[ModelTurn, Any]:
+    return asyncio.run(
+        ModelCallRunner(adapter=adapter, lifecycle_hook=lifecycle).acall(
+            request,
+            logical_call_id="call-durable-1",
+        )
+    )
+
+
+def test_durable_runner_requires_an_explicit_logical_call_id_before_dispatch() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        asyncio.run(ModelCallRunner(adapter=adapter, lifecycle_hook=lifecycle).acall(REQUEST))
+
+    assert caught.value.error_code == "durable_invocation_identity_required"
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
+@pytest.mark.parametrize(
+    ("lose_after", "expected_states"),
+    (
+        ("reserve", ["reserved"]),
+        ("dispatch_started", ["reserved", "dispatch_started"]),
+    ),
+)
+def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
+    lose_after: str,
+    expected_states: list[str],
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def _lose_authority(self, transition: str) -> None:
+            if transition == lose_after:
+                token.cancel(InterruptionCause.USER_CANCEL)
+                authority.revoke()
+
+        def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
+            effective = super().reserve(proposed)
+            self._lose_authority("reserve")
+            return effective
+
+        def dispatch_started(self, reservation: ModelDispatchReservation) -> None:
+            super().dispatch_started(reservation)
+            self._lose_authority("dispatch_started")
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.USER_CANCEL
+    assert lifecycle.states == expected_states
+    assert adapter.calls == 0
+    assert observer.captures == []
+    assert sidecar == []
+
+
+def test_durable_resume_abort_gate_runs_after_recovery_probe_before_dispatch() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    polls: list[bool] = []
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=adapter, lifecycle_hook=lifecycle).acall(
+            REQUEST,
+            logical_call_id="call-durable-1",
+            should_abort=lambda: polls.append(True) or True,
+            abort_after_recovery_probe=True,
+        )
+
+    with pytest.raises(ModelCallAborted, match="before provider dispatch"):
+        asyncio.run(run())
+
+    assert polls == [True]
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
+def test_terminal_boundary_precedes_durable_resume_abort_gate() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    token = CancellationToken()
+    token.cancel()
+    polls: list[bool] = []
+
+    async def run() -> None:
+        await ModelCallRunner(
+            adapter=adapter,
+            lifecycle_hook=lifecycle,
+            current_cancellation_token=lambda: token,
+        ).acall(
+            REQUEST,
+            logical_call_id="call-durable-1",
+            should_abort=lambda: polls.append(True) or True,
+            abort_after_recovery_probe=True,
+        )
+
+    with pytest.raises(RunCancelled):
+        asyncio.run(run())
+
+    assert polls == []
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
+def test_durable_runner_refuses_an_unkeyable_request_before_reservation(
+    monkeypatch: Any,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    monkeypatch.setattr(
+        "monoid_agent_kernel.model_call._encoded_digest",
+        lambda **_kwargs: _DigestResult(status="too_large"),
+    )
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle)
+
+    assert caught.value.error_code == "durable_invocation_unkeyable"
+    assert adapter.calls == 0
+    assert lifecycle._loaded("call-durable-1").status == "missing"
+
+
+def test_durable_runner_rejects_reservation_identity_drift_before_dispatch() -> None:
+    class DriftingLifecycle(_JournalLifecycle):
+        def reserve(self, proposed: ModelDispatchReservation) -> ModelDispatchReservation:
+            effective = super().reserve(proposed)
+            return replace(effective, dispatch_id="different-dispatch")
+
+    harness = DeterministicFencedRunHarness()
+    lifecycle = DriftingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle)
+
+    assert caught.value.error_code == "durable_invocation_reservation_conflict"
+    assert adapter.calls == 0
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "reserved"
+
+
+def test_only_the_typed_refusal_marks_definite_dispatch_evidence() -> None:
+    class LookalikeError(ModelAdapterError):
+        dispatch_evidence = "refused"
+
+    assert dispatch_evidence(ModelAdapterError("ambiguous")) == "unknown"
+    assert dispatch_evidence(LookalikeError("lookalike")) == "unknown"
+    assert dispatch_evidence(ModelDispatchRefused("refused")) == "refused"
+
+
+def test_durable_success_commits_the_canonical_private_result_before_passive_delivery() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    delivered_states: list[str] = []
+
+    def passive_sink(_call: SettledModelCall) -> None:
+        head = lifecycle._head("call-durable-1")
+        delivered_states.append(head.dispatch_state if head is not None else "missing")
+
+    turn, receipt = asyncio.run(
+        ModelCallRunner(
+            adapter=adapter,
+            lifecycle_hook=lifecycle,
+            settled_sink=passive_sink,
+        ).acall(REQUEST, logical_call_id="call-durable-1")
+    )
+
+    loaded = lifecycle._loaded("call-durable-1")
+    assert loaded.value is not None
+    invocation = loaded.value.invocation
+    assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
+    assert invocation.dispatch_state == "settled"
+    assert invocation.failure_code == ""
+    assert invocation.receipt is not None
+    assert invocation.receipt["request_digest"] == receipt.request_digest
+    assert delivered_states == ["settled"]
+    sha256 = invocation.result_ref.removeprefix("blob:")
+    body = json.loads(loaded.value.blob(sha256))
+    assert body["final_text"] == turn.final_text == "durable answer"
+    assert body["reasoning"] == [{"type": "encrypted_reasoning", "id": "reasoning-1"}]
+    assert "raw" not in body
+    assert adapter.keys == [invocation.idempotency_key]
+
+
+def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+
+    class LeaseLosingLifecycle(_JournalLifecycle):
+        def settled(self, settlement: ModelDispatchSettlement) -> None:
+            super().settled(settlement)
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+            authority.revoke()
+
+    lifecycle = LeaseLosingLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=adapter,
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert authority.revoked is True
+    assert lifecycle.states == ["reserved", "dispatch_started", "settled"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "settled"
+    assert observer.captures == []
+    assert sidecar == []
+
+
+def test_lease_loss_during_receipt_subscriber_stops_fanout_and_sidecar() -> None:
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    entered, release = threading.Event(), threading.Event()
+    first_captures: list[ModelCallCapture] = []
+
+    class BlockingObserver:
+        def on_model_call(self, capture: ModelCallCapture) -> None:
+            first_captures.append(capture)
+            entered.set()
+            assert release.wait(5)
+
+    second = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    def lose_authority() -> None:
+        assert entered.wait(5)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        authority.revoke()
+        release.set()
+
+    racer = threading.Thread(target=lose_authority)
+    racer.start()
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=SyncAdapter(),
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=BlockingObserver(),
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                    ModelIOSubscription(
+                        observer=second,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST)
+        )
+    racer.join(5)
+
+    assert not racer.is_alive()
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(first_captures) == 1
+    assert second.captures == []
+    assert sidecar == []
+
+
+def test_sticky_lease_loss_supersedes_an_older_cancel_before_dispatch_compensation() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    authority.add_revoke_callback(token._cancel_for_authority_loss)
+    lifecycle = _JournalLifecycle(harness)
+
+    class RacingAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+            stale_exception = RunCancelled(
+                "run cancelled",
+                interruption_cause=InterruptionCause.GRACEFUL_DRAIN,
+            )
+            authority.revoke()
+            raise stale_exception
+
+    observer = RecordingObserver()
+    sidecar: list[SettledModelCall] = []
+
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(
+            ModelCallRunner(
+                adapter=RacingAdapter(),
+                lifecycle_hook=lifecycle,
+                current_cancellation_token=lambda: token,
+                current_write_authority=lambda: authority,
+                subscriptions=(
+                    ModelIOSubscription(
+                        observer=observer,
+                        policy=CapturePolicy(mode="digest"),
+                    ),
+                ),
+                settled_sink=sidecar.append,
+            ).acall(REQUEST, logical_call_id="call-durable-1")
+        )
+
+    assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+    assert token.cause is InterruptionCause.GRACEFUL_DRAIN
+    assert authority.revoked is True
+    assert lifecycle.states == ["reserved", "dispatch_started"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "dispatch_started"
+    assert observer.captures == []
+    assert sidecar == []
+
+
+@pytest.mark.parametrize(
+    ("failpoint", "expected_state", "calls"),
+    (
+        ("before_reserve", "missing", 0),
+        ("after_reserve", "reserved", 0),
+        ("after_start", "dispatch_started", 0),
+        ("before_settle", "dispatch_started", 1),
+    ),
+)
+def test_hard_crash_failpoints_leave_the_last_committed_head_without_compensation(
+    failpoint: str,
+    expected_state: str,
+    calls: int,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness, failpoint=failpoint)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(_HardLifecycleCrash):
+        _durable_call(adapter, lifecycle)
+
+    head = lifecycle._head("call-durable-1")
+    assert (head.dispatch_state if head is not None else "missing") == expected_state
+    assert adapter.calls == calls
+
+
+def test_reserved_crash_reuses_the_committed_key_and_dispatches_once_after_restore() -> None:
+    harness = DeterministicFencedRunHarness()
+    crashed = _JournalLifecycle(harness, failpoint="after_reserve")
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(_HardLifecycleCrash):
+        _durable_call(adapter, crashed)
+    reserved = crashed._head("call-durable-1")
+    assert reserved is not None
+
+    restored = _JournalLifecycle(harness)
+    _durable_call(adapter, restored)
+
+    settled = restored._head("call-durable-1")
+    assert settled is not None
+    assert settled.dispatch_state == "settled"
+    assert settled.idempotency_key == reserved.idempotency_key
+    assert adapter.keys == [reserved.idempotency_key]
+    assert adapter.calls == 1
+
+
+@pytest.mark.parametrize("failpoint", ("after_start", "before_settle"))
+def test_started_crash_restores_as_unknown_without_another_provider_call(
+    failpoint: str,
+) -> None:
+    harness = DeterministicFencedRunHarness()
+    crashed = _JournalLifecycle(harness, failpoint=failpoint)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(_HardLifecycleCrash):
+        _durable_call(adapter, crashed)
+    calls_at_crash = adapter.calls
+
+    restored = _JournalLifecycle(harness)
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, restored)
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == calls_at_crash
+    head = restored._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "unknown"
+
+
+def test_ambiguous_transport_failure_becomes_unknown_and_disables_kernel_retry() -> None:
+    class AmbiguousAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            raise ModelAdapterError("connection dropped", retryable=True)
+
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = AmbiguousAdapter()
+    request = replace(REQUEST, model=_kernel_model())
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle, request=request)
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == 1
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "unknown"
+
+
+def test_malformed_provider_terminal_becomes_unknown() -> None:
+    class MalformedTerminalAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            return ModelTurn(final_text="answer", provider_retried="yes")  # type: ignore[arg-type]
+
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = MalformedTerminalAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle)
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == 1
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "unknown"
+
+
+def test_unknown_transition_failure_still_forbids_paid_call_retry() -> None:
+    class AmbiguousAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            raise ModelAdapterError("connection dropped", retryable=True)
+
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness, failpoint="unknown_error")
+    adapter = AmbiguousAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle, request=replace(REQUEST, model=_kernel_model()))
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == 1
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "dispatch_started"
+
+
+def test_explicit_retryable_refusal_settles_then_reuses_the_key_on_the_next_dispatch() -> None:
+    class RefusesThenAnswers:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.keys: list[str] = []
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            self.keys.append(request.idempotency_key)
+            if self.calls == 1:
+                raise ModelDispatchRefused(
+                    "provider refused",
+                    provider_error_code="rate_limited",
+                    retryable=True,
+                    http_status=429,
+                )
+            return ModelTurn(final_text="answer", usage={"output_tokens": 2})
+
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = RefusesThenAnswers()
+
+    _durable_call(adapter, lifecycle, request=replace(REQUEST, model=_kernel_model()))
+
+    assert lifecycle.states == [
+        "reserved",
+        "dispatch_started",
+        "settled",
+        "reserved",
+        "dispatch_started",
+        "settled",
+    ]
+    assert adapter.calls == 2
+    assert len(set(adapter.keys)) == 1
+    head = lifecycle._head("call-durable-1")
+    assert head is not None
+    assert head.dispatch_state == "settled"
+    assert head.dispatch_attempt == 2
+
+
+def test_settlement_write_failure_closes_the_started_dispatch_as_unknown() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness, failpoint="settle_error")
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(adapter, lifecycle)
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == 1
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "unknown"

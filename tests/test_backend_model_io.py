@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,13 +11,17 @@ import pytest
 from support.backend_factory import ManagedBackendFactory
 from support.runtime import runtime_config
 
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
     ModelIOSubscription,
 )
-from monoid_agent_kernel.core.result import Suspension
+from monoid_agent_kernel.core.result import AgentRunResult, Suspension
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.reference.backend.recovery import RecoveryService
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest
@@ -284,9 +289,11 @@ def test_recovered_execution_failure_discards_activation_before_recording_failur
 
     context = replace(
         backend._recovery._context,
-        record=lambda _run_id: object(),
+        record=lambda _run_id: SimpleNamespace(
+            write_authority=ActivationWriteAuthority(),
+        ),
         drive_open_session=fail_drive,
-        record_run_failure=lambda _run_id, exc: failures.append(exc),
+        record_run_failure=lambda _record, exc: failures.append(exc),
         acquire_run_slot=acquire_slot,
         release_run_slot=release_slot,
     )
@@ -348,7 +355,7 @@ def test_recovered_activation_cancelled_while_waiting_for_slot_is_discarded(
             backend._recovery._context,
             acquire_run_slot=block_acquire,
             release_run_slot=release_slot,
-            record_run_failure=lambda _run_id, exc: failures.append(exc),
+            record_run_failure=lambda _record, exc: failures.append(exc),
         )
         service = RecoveryService(context)
         request = BackendRunRequest(
@@ -392,9 +399,10 @@ def test_recovered_record_registration_is_an_atomic_first_writer_claim(
         runtime_config=runtime_config(),
     )
     prepared: Any = backend._run_preparation.prepare(request)
-    first = prepared.record
-    contender = replace(first)
-    backend._unregister_recovered_record(first)
+    seed = prepared.record
+    backend._unregister_recovered_record(seed)
+    first = replace(seed, write_authority=ActivationWriteAuthority())
+    contender = replace(seed, write_authority=ActivationWriteAuthority())
 
     try:
         assert backend._register_recovered_record(first) is True
@@ -402,6 +410,71 @@ def test_recovered_record_registration_is_an_atomic_first_writer_claim(
         assert backend._record(first.run_id) is first
     finally:
         backend._unregister_recovered_record(first)
+
+
+def test_stale_record_unregistration_preserves_a_replacement_owner(
+    tmp_path: Path,
+    backend_factory: ManagedBackendFactory,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    request = BackendRunRequest(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        workspace_root=workspace,
+        instruction="replace owner",
+        runtime_config=runtime_config(),
+    )
+    prepared: Any = backend._run_preparation.prepare(request)
+    stale = prepared.record
+    replacement = replace(stale, write_authority=ActivationWriteAuthority())
+    backend._unregister_recovered_record(stale)
+    assert backend._register_recovered_record(replacement) is True
+
+    try:
+        backend._unregister_recovered_record(stale)
+        assert backend._record(stale.run_id) is replacement
+    finally:
+        backend._unregister_recovered_record(replacement)
+
+
+def test_activation_settlement_cannot_mutate_the_replacement_record(
+    tmp_path: Path,
+    backend_factory: ManagedBackendFactory,
+) -> None:
+    workspace = backend_factory.workspace()
+    backend = backend_factory.create(workspace=workspace)
+    request = BackendRunRequest(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        workspace_root=workspace,
+        instruction="replace before stale settlement",
+        runtime_config=runtime_config(),
+    )
+    prepared: Any = backend._run_preparation.prepare(request)
+    stale = prepared.record
+    replacement = replace(stale, write_authority=ActivationWriteAuthority())
+    backend._unregister_recovered_record(stale)
+    assert backend._register_recovered_record(replacement) is True
+
+    try:
+        with pytest.raises(WriteAuthorityRevoked):
+            backend._record_activation_result(
+                stale,
+                AgentRunResult(
+                    run_id=stale.run_id,
+                    status="completed",
+                    final_text="stale",
+                    run_dir=stale.run_dir,
+                    diff_path=stale.run_dir / "diff.patch",
+                    proposal_path=stale.run_dir / "proposal.json",
+                ),
+            )
+        assert backend._record(stale.run_id) is replacement
+        assert replacement.terminal is False
+        assert replacement.result is None
+    finally:
+        backend._unregister_recovered_record(replacement)
 
 
 def test_watchdog_cas_loser_keeps_lease_for_locally_tracked_winner(

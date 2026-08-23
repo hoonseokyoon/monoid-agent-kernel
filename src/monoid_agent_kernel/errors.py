@@ -56,6 +56,30 @@ class ModelAdapterError(NativeAgentError):
         self.provider_retried = provider_retried
 
 
+class ModelDispatchRefused(ModelAdapterError):
+    """A provider/adapter path proved a definite terminal refusal for this dispatch."""
+
+
+class DurableModelCallError(NativeAgentError):
+    """A durable runner boundary stopped before it could return a reusable model outcome."""
+
+    error_code = "durable_model_call_error"
+
+
+class ModelEvidenceUncommitted(ModelAdapterError):
+    """A model dispatch settled authoritatively while required evidence did not.
+
+    The session may retry evidence delivery, but it must reuse the stored invocation instead of
+    paying for another provider call. The durable invocation retains the original success or
+    provider-refusal classification until delivery succeeds.
+    """
+
+    error_code = "evidence_uncommitted"
+
+    def __init__(self, message: str = "required model evidence was not committed") -> None:
+        super().__init__(message, error_code=self.error_code, retryable=True)
+
+
 class TurnNotSettled(NativeAgentError):
     """A blocking submit facade parked without a settled turn to return.
 
@@ -64,8 +88,10 @@ class TurnNotSettled(NativeAgentError):
     ``"paused"`` — outcomes that produce no ``AgentTurnResult`` because nothing settled. The
     session stays alive; the non-blocking pump (``run_until_suspended``) hands the same park
     back as a :class:`~monoid_agent_kernel.core.result.Suspension` instead of raising, and
-    the one-shot ``run_once`` absorbs it — its closing ``finally`` promotes an unrecovered
-    park to the terminal failure record and returns that failed result. ``suspension``
+    the one-shot ``run_once`` absorbs ordinary recoverable provider/config failures — its closing
+    ``finally`` promotes that unrecovered park to the terminal failure record and returns the
+    failed result. An `evidence_uncommitted` park escapes one-shot after the activation releases
+    its durable recovery boundary, preserving sink-only recovery. ``suspension``
     carries the full evidence (reason, error, ``retryable``, ``http_status``,
     ``config_recoverable``, ``provider_error_code``, ``provider_retried``) so a driver can
     decide between re-attempt, config fix, and giving up — the same decision the
@@ -91,6 +117,7 @@ class TurnNotSettled(NativeAgentError):
         self.config_recoverable = suspension.config_recoverable
         self.provider_error_code = suspension.provider_error_code
         self.provider_retried = suspension.provider_retried
+        self.interruption_cause = suspension.interruption_cause
 
 
 class PermissionDenied(NativeAgentError):
@@ -132,6 +159,10 @@ class RunCancelled(NativeAgentError):
     """Raised when a run is cancelled by an external caller."""
 
     error_code = "cancelled"
+
+    def __init__(self, message: str, *, interruption_cause: object = None) -> None:
+        super().__init__(message)
+        self.interruption_cause = interruption_cause
 
 
 class TurnInterrupted(NativeAgentError):

@@ -16,6 +16,10 @@ from typing import Any, Literal, Protocol
 
 from monoid_agent_kernel._proc import file_size, proc_group_kwargs, terminate_process
 from monoid_agent_kernel.core._util import read_text_resilient, write_json_atomic
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.json_ingress import (
     UnportableValueError,
     loads_json_ingress,
@@ -48,7 +52,7 @@ from monoid_agent_kernel.shell import (
     ShellExecutionOptions,
     ResolvedShellExecutionWorkspace,
 )
-from monoid_agent_kernel.core.workspace import Workspace
+from monoid_agent_kernel.core.workspace import Workspace, _workspace_root_path
 from monoid_agent_kernel.workspace.paths import is_within, normalize_workspace_path
 
 import monoid_agent_kernel.shell as shell_runtime
@@ -294,7 +298,9 @@ class ShellTaskExecutor:
 
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         job_dir = manager.recorder.artifacts_dir / "jobs" / job_id
-        job_dir.mkdir(parents=True, exist_ok=False)
+        manager.write_authority.guard_local_mutation(
+            lambda: job_dir.mkdir(parents=True, exist_ok=False)
+        )
         stdout_path = job_dir / "stdout.log"
         stderr_path = job_dir / "stderr.log"
         job = BackgroundJob(
@@ -335,7 +341,13 @@ class ShellTaskExecutor:
             self._cleanup_tmp(job)
             raise ToolExecutionError(str(exc), error_code="shell_exec_error") from exc
 
-        manager._register(job)
+        try:
+            manager._register(job)
+        except WriteAuthorityRevoked:
+            if job.process is not None:
+                terminate_process(job.process)
+            self._cleanup_tmp(job)
+            raise
         manager.recorder.emit("job.started", data=manager._public_job_payload(job))
         # Monitor the subprocess on the same always-on loop — no per-job thread, no poll.
         manager.schedule_job_coroutine(self._amonitor(manager, job_id))
@@ -356,8 +368,9 @@ class ShellTaskExecutor:
         execution_workspace: ResolvedShellExecutionWorkspace,
     ) -> tuple[Path, Path | None, Any]:
         if execution_workspace == "direct":
-            cwd_abs = (manager.workspace.root / cwd_rel).resolve()
-            if not is_within(manager.workspace.root, cwd_abs):
+            workspace_root = _workspace_root_path(manager.workspace)
+            cwd_abs = (workspace_root / cwd_rel).resolve()
+            if not is_within(workspace_root, cwd_abs):
                 raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
             if not cwd_abs.exists() or not cwd_abs.is_dir():
                 raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
@@ -713,7 +726,9 @@ class HostedTaskExecutor:
             raise ValueError("hosted task resume_on_exit must be a boolean")
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
-        task_dir.mkdir(parents=True, exist_ok=False)
+        manager.write_authority.guard_local_mutation(
+            lambda: task_dir.mkdir(parents=True, exist_ok=False)
+        )
         task = HostedTask(
             job_id=task_id,
             kind=self.kind,
@@ -851,7 +866,9 @@ class SubagentTaskExecutor:
         resume = background if resume_on_exit is None else resume_on_exit
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         task_dir = manager.recorder.artifacts_dir / "tasks" / task_id
-        task_dir.mkdir(parents=True, exist_ok=False)
+        manager.write_authority.guard_local_mutation(
+            lambda: task_dir.mkdir(parents=True, exist_ok=False)
+        )
         task = HostedTask(
             job_id=task_id,
             kind=self.kind,
@@ -884,6 +901,8 @@ class SubagentTaskExecutor:
                 task.status = "answered"
         except asyncio.CancelledError:
             self._set_cancelled_result(task)
+            raise
+        except WriteAuthorityRevoked:
             raise
         except Exception as exc:  # noqa: BLE001 - surface as a failed subagent result
             task.status = "failed"
@@ -932,6 +951,10 @@ class TaskManager:
     workspace: Workspace
     recorder: AgentRecorder
     permission_policy: PermissionPolicy
+    write_authority: ActivationWriteAuthority = field(
+        default_factory=ActivationWriteAuthority,
+        kw_only=True,
+    )
     jobs: dict[str, Task] = field(default_factory=dict)
     executors: dict[str, TaskExecutor] = field(default_factory=dict, init=False, repr=False)
     injectors: dict[str, ResultInjector] = field(default_factory=dict, init=False, repr=False)
@@ -982,15 +1005,18 @@ class TaskManager:
         }
 
     def _register(self, job: Task) -> None:
-        with self._condition:
-            self.jobs[job.job_id] = job
-            self._write_job(job)
+        def register() -> None:
+            with self._condition:
+                self.jobs[job.job_id] = job
+                self._write_job(job)
+
+        self.write_authority.guard_local_mutation(register)
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Bind the run's event loop (called by AgentLoop._apump_turn while running on it).
         Background shell jobs schedule their subprocess monitors onto this loop so they
         progress on the same always-on loop that drives the run."""
-        self._run_loop = loop
+        self.write_authority.guard_local_mutation(lambda: setattr(self, "_run_loop", loop))
 
     def _job_loop(self) -> asyncio.AbstractEventLoop:
         """The loop to run subprocess monitors on: the bound run loop in production, else a
@@ -1047,6 +1073,7 @@ class TaskManager:
         ones) so an answered-but-undelivered task's result is not lost on restore.
         Shell ``BackgroundJob``s are intentionally omitted — they are never restored
         live (a subprocess can't cross a process boundary)."""
+        self.write_authority.assert_active()
         with self._lock:
             return {
                 "hosted_tasks": [
@@ -1070,11 +1097,14 @@ class TaskManager:
         disk, so this only re-registers the in-memory objects — it does not re-write
         them. Shell jobs are never restored live; see AgentLoop._rehydrate for the
         crashed-shell -> failed-observation path."""
-        with self._condition:
-            for task in hosted_tasks:
-                self.jobs[task.job_id] = task
-            self._reentry_queue = list(reentry_queue)
-            self._delivered_reentry_jobs = set(delivered_reentry_jobs)
+        def restore() -> None:
+            with self._condition:
+                for task in hosted_tasks:
+                    self.jobs[task.job_id] = task
+                self._reentry_queue = list(reentry_queue)
+                self._delivered_reentry_jobs = set(delivered_reentry_jobs)
+
+        self.write_authority.guard_local_mutation(restore)
 
     def start_task(self, kind: str, request: dict[str, Any]) -> Task:
         """Generic task creation, callable from a tool handler or the backend.
@@ -1101,7 +1131,9 @@ class TaskManager:
             raise ToolExecutionError(
                 f"no executor for task kind: {kind}", error_code="task_kind_unknown"
             )
-        return executor.start(self, **request)  # type: ignore[attr-defined]
+        return self.write_authority.guard_external_call(
+            lambda: executor.start(self, **request)  # type: ignore[attr-defined]
+        )
 
     def create_task(self, kind: str, request: dict[str, Any]) -> str:
         """TaskReporter entry: create a task and return its id (backend-initiated)."""
@@ -1154,9 +1186,12 @@ class TaskManager:
                 f"task result is not portable JSON: {exc}",
                 error_code="task_result_unportable",
             ) from exc
-        task.status = status  # type: ignore[assignment]
-        task.finished_at = time.time()
-        task.result = result  # type: ignore[attr-defined]
+        def apply_result() -> None:
+            task.status = status  # type: ignore[assignment]
+            task.finished_at = time.time()
+            task.result = result  # type: ignore[attr-defined]
+
+        self.write_authority.guard_local_mutation(apply_result)
         self.mark_ready(task)
         return {"task_id": task_id, "status": status, "delivered": True, "duplicate": False}
 
@@ -1165,15 +1200,24 @@ class TaskManager:
 
         Called by the in-process shell monitor and (for hosted kinds) by an
         external reporter that has already set ``status``/``result``/``finished_at``."""
-        with self._condition:
-            if job.ready_for_reentry:
-                return
-            job.ready_for_reentry = True
-            self._write_job(job)
+        def publish_completion() -> bool:
+            with self._condition:
+                if job.ready_for_reentry:
+                    return False
+                job.ready_for_reentry = True
+                self._write_job(job)
+                if job.resume_on_exit:
+                    self._reentry_queue.append(job.job_id)
+                return True
+
+        if self.write_authority.guard_local_mutation(publish_completion):
             self._emit_terminal_event(job)
-            if job.resume_on_exit:
-                self._reentry_queue.append(job.job_id)
-            self._condition.notify_all()
+
+            def notify_completion() -> None:
+                with self._condition:
+                    self._condition.notify_all()
+
+            self.write_authority.guard_local_mutation(notify_completion)
 
     def start_shell_job(
         self,
@@ -1209,10 +1253,12 @@ class TaskManager:
         )
 
     def list_jobs(self) -> list[dict[str, Any]]:
+        self.write_authority.assert_active()
         with self._lock:
             return [self._public_job_payload(job) for job in self.jobs.values()]
 
     def get_job(self, job_id: str) -> BackgroundJob:
+        self.write_authority.assert_active()
         with self._lock:
             try:
                 return self.jobs[job_id]
@@ -1241,19 +1287,28 @@ class TaskManager:
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         job = self.get_job(job_id)
-        job.cancel_path.write_text("cancel requested\n", encoding="utf-8")
+        self.write_authority.guard_local_mutation(
+            lambda: job.cancel_path.write_text("cancel requested\n", encoding="utf-8")
+        )
         with self._condition:
             executor = self.executors.get(job.kind)
-            if executor is not None:
-                executor.cancel(self, job)
-            if (
-                (executor is None or not executor.in_process)
-                and job.status != "running"
-                and job.finished_at is not None
-                and not job.ready_for_reentry
-            ):
-                self.mark_ready(job)
-            self._condition.notify_all()
+        if executor is not None:
+            self.write_authority.guard_external_call(lambda: executor.cancel(self, job))
+
+        def publish_cancel() -> bool:
+            with self._condition:
+                should_mark_ready = (
+                    (executor is None or not executor.in_process)
+                    and job.status != "running"
+                    and job.finished_at is not None
+                    and not job.ready_for_reentry
+                )
+                self._condition.notify_all()
+                return should_mark_ready
+
+        if self.write_authority.guard_local_mutation(publish_cancel):
+            self.mark_ready(job)
+        self.write_authority.assert_active()
         return {"job_id": job_id, "cancel_requested": True, "status": job.status}
 
     def wait(self, job_id: str, timeout_s: int | None = None) -> dict[str, Any]:
@@ -1270,6 +1325,7 @@ class TaskManager:
         return job.result_observation(self.recorder.run_dir)
 
     def has_resume_jobs(self) -> bool:
+        self.write_authority.assert_active()
         with self._lock:
             return bool(self._reentry_queue) or any(
                 job.resume_on_exit and job.job_id not in self._delivered_reentry_jobs
@@ -1279,6 +1335,7 @@ class TaskManager:
     def external_pending_task_ids(self) -> list[str]:
         """Undelivered resume-tasks whose executor is NOT in-process — i.e. hosted
         (hitl/automation) tasks the run is parked on awaiting an external report."""
+        self.write_authority.assert_active()
         with self._lock:
             out: list[str] = []
             for job in self.jobs.values():
@@ -1297,6 +1354,7 @@ class TaskManager:
         of executor kind. The difference against ``external_pending_task_ids`` is the
         set of live in-process (shell) tasks — AgentLoop.snapshot() uses it to refuse a
         snapshot while a shell job is still alive (a live subprocess can't be restored)."""
+        self.write_authority.assert_active()
         with self._lock:
             return {
                 job.job_id
@@ -1310,6 +1368,7 @@ class TaskManager:
         """Drain finished resume-tasks and render them through their per-kind
         ResultInjector. The injector decides the injection shape (tool observation
         vs user message via ``is_background``)."""
+        self.write_authority.assert_active()
         with self._condition:
             for job in self.jobs.values():
                 if (
@@ -1341,9 +1400,11 @@ class TaskManager:
             return bool(self._reentry_queue)
 
     def cancel_all(self) -> None:
+        self.write_authority.assert_active()
         with self._condition:
             job_ids = list(self.jobs)
         for job_id in job_ids:
+            self.write_authority.assert_active()
             job = self.get_job(job_id)
             if job.status == "running":
                 self.cancel(job_id)
@@ -1370,14 +1431,24 @@ class TaskManager:
             self._shutdown_task_loop()
 
     def discard_uncommitted(self, *, preserve_hosted_task_ids: set[str]) -> None:
-        """Cancel process-local work and newly-created hosted tasks during recovery cleanup.
+        """Discard work while preserving the latest committed hosted-task ownership.
 
-        Hosted tasks already present in the last durable checkpoint remain live: another process
-        will restore them and accept their external result. Hosted tasks created after that
-        checkpoint are cancelled so an externally visible orphan cannot survive the discarded
-        activation.
+        An active activation cancels newly-created hosted tasks through the ordinary task API, so
+        its external worker observes the cancel marker. A revoked activation takes the local-only
+        path and leaves hosted cleanup to its fenced/idempotent host adapter.
         """
 
+        if not self.write_authority.revoked:
+            try:
+                self._cancel_active_uncommitted(preserve_hosted_task_ids)
+                return
+            except WriteAuthorityRevoked:
+                # Authority may move between selecting work and cancelling it. From that point on
+                # this activation may release process-owned resources only.
+                pass
+        self._discard_revoked_handles()
+
+    def _cancel_active_uncommitted(self, preserve_hosted_task_ids: set[str]) -> None:
         with self._condition:
             job_ids: list[str] = []
             for job_id, job in self.jobs.items():
@@ -1392,6 +1463,8 @@ class TaskManager:
             for job_id in job_ids:
                 try:
                     self.cancel(job_id)
+                except WriteAuthorityRevoked:
+                    raise
                 except BaseException as exc:
                     cleanup_errors.append(exc)
             deadline = time.time() + 5
@@ -1399,6 +1472,47 @@ class TaskManager:
                 with self._condition:
                     if all(self.jobs[job_id].status != "running" for job_id in job_ids):
                         break
+                time.sleep(0.05)
+        finally:
+            try:
+                self._shutdown_task_loop()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    def _discard_revoked_handles(self) -> None:
+        """Release only in-process handles and publish no stale cleanup state."""
+
+        with self._condition:
+            jobs = [
+                job
+                for job in self.jobs.values()
+                if job.status == "running"
+                and (executor := self.executors.get(job.kind)) is not None
+                and executor.in_process
+            ]
+        cleanup_errors: list[BaseException] = []
+        try:
+            for job in jobs:
+                try:
+                    if isinstance(job, BackgroundJob) and job.process is not None:
+                        terminate_process(job.process)
+                    elif isinstance(job, HostedTask):
+                        future = job.runtime_future
+                        if future is not None and not future.done():
+                            future.cancel()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if all(
+                    not isinstance(job, BackgroundJob)
+                    or job.process is None
+                    or job.process.returncode is not None
+                    for job in jobs
+                ):
+                    break
                 time.sleep(0.05)
         finally:
             try:
@@ -1427,7 +1541,9 @@ class TaskManager:
         return job.public_payload(self.recorder.run_dir, self.permission_policy)
 
     def _write_job(self, job: BackgroundJob) -> None:
-        write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
+        self.write_authority.guard_local_mutation(
+            lambda: write_json_atomic(job.job_path, job.to_json(self.recorder.run_dir))
+        )
 
 
 def _changed_entry_fingerprints(workspace: Workspace) -> dict[str, tuple[object, ...]]:

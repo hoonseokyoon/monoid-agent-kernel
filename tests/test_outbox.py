@@ -7,6 +7,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,7 +17,12 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from support.waiting import eventually
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core.capability import AutoGrantBroker
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.outbox import Outbox, OutboxReceipt, OutboxRequest
 from monoid_agent_kernel.core.external_agent_envelope import (
     external_agent_envelope_to_inbox_message,
@@ -129,12 +135,15 @@ def test_outbox_receipt_direct_construction_normalizes_and_validates() -> None:
 
 def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
+    authority = ActivationWriteAuthority()
     context = SimpleNamespace(
-        outbox=Outbox(),
+        _outbox=Outbox(),
+        _write_authority=authority,
+        _check_writer_authority=authority.assert_active,
         _current_call=CallContext("call-1", "turn-1", "event-1"),
         capability_token=lambda capability: f"token:{capability}",
         run_id="run-1",
-        recorder=SimpleNamespace(
+        _recorder=SimpleNamespace(
             emit=lambda event_type, **kwargs: events.append((event_type, kwargs))
         ),
     )
@@ -149,7 +158,7 @@ def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() 
         reply_to="reply\ud800",
     )
 
-    [request] = context.outbox.pending()
+    [request] = context._outbox.pending()
     assert request.destination == "peer\ufffd"
     assert request.capability == "send\ufffd"
     assert request.token_ref == "token:send\ufffd"
@@ -165,13 +174,14 @@ def test_emit_outbox_normalizes_before_staging_and_rejects_coercible_controls() 
             {},
             expect_ack=1,  # type: ignore[arg-type]
         )
-    assert len(context.outbox.pending()) == 1
+    assert len(context._outbox.pending()) == 1
 
 
 def test_record_outbox_result_normalizes_forged_receipt_before_state_change() -> None:
     loop = object.__new__(AgentLoop)
     loop._outbox = Outbox()
     loop._session = None
+    loop.write_authority = ActivationWriteAuthority()
     request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
     receipt = object.__new__(OutboxReceipt)
     object.__setattr__(receipt, "ok", True)
@@ -187,6 +197,7 @@ def test_record_outbox_result_rejects_malformed_forged_receipt_without_mutation(
     loop = object.__new__(AgentLoop)
     loop._outbox = Outbox()
     loop._session = None
+    loop.write_authority = ActivationWriteAuthority()
     request = loop._outbox.append(OutboxRequest(destination="peer", id="o1"))
     receipt = object.__new__(OutboxReceipt)
     object.__setattr__(receipt, "ok", "false")
@@ -683,14 +694,20 @@ def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -
                 max_attempts=5, base_s=1.0, factor=2.0, cap_s=float("inf")
             ),
             max_message_queue_depth_provider=lambda: 100,
-            checkpoint_store_provider=lambda: None,
+            commit_checkpoint=lambda *_args: None,
             rng_provider=lambda: random.Random(7),
             live_outbox_runs=lambda: [],
             call_soon=lambda *_a, **_k: None,
             record_terminal=lambda _record: False,
         )
     )
-    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+    service.drain_outbox(
+        SimpleNamespace(
+            outbox_sender=_Sender(),
+            write_authority=ActivationWriteAuthority(),
+        ),
+        _Loop(),
+    )
 
     assert sent == ["o1"]
     [(request_id, ok, next_attempt_at)] = recorded
@@ -699,6 +716,159 @@ def test_an_unlimited_cap_stamps_a_next_attempt_the_durable_record_can_carry() -
     # the writer the drain hands it to.
     carried = OutboxRequest(destination="email", id="o1", next_attempt_at=next_attempt_at)
     assert OutboxRequest.from_json(carried.to_json()).next_attempt_at == next_attempt_at
+
+
+def test_outbox_send_overlap_with_lease_loss_keeps_request_unprojected() -> None:
+    authority = ActivationWriteAuthority()
+    request = OutboxRequest(destination="email", id="o-lease", idempotency_key="idem-lease")
+    recorded: list[str] = []
+
+    class _Sender:
+        def send(self, req: OutboxRequest) -> OutboxReceipt:
+            assert req.idempotency_key == "idem-lease"
+            authority.revoke()
+            return OutboxReceipt(ok=True, reference="possibly-delivered")
+
+    class _Loop:
+        def due_outbox(self, now: float) -> list[OutboxRequest]:
+            del now
+            return [request]
+
+        def record_outbox_result(self, request_id: str, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            recorded.append(request_id)
+            return "dispatched"
+
+        def snapshot(self) -> None:
+            return None
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    service = OutboxDispatchService(
+        OutboxDispatchContext(
+            retry_policy_provider=lambda: OutboxRetryPolicy(
+                max_attempts=5,
+                base_s=1.0,
+                factor=2.0,
+                cap_s=10.0,
+            ),
+            max_message_queue_depth_provider=lambda: 100,
+            commit_checkpoint=lambda *_args: None,
+            rng_provider=lambda: random.Random(7),
+            live_outbox_runs=lambda: [],
+            call_soon=lambda *_a, **_k: None,
+            record_terminal=lambda _record: False,
+        )
+    )
+    record = SimpleNamespace(outbox_sender=_Sender(), write_authority=authority)
+
+    with pytest.raises(WriteAuthorityRevoked):
+        service.drain_outbox(record, _Loop())
+
+    assert recorded == []
+    assert request.status == "pending"
+
+
+def test_outbox_checkpoint_commit_linearizes_with_authority_revocation() -> None:
+    authority = ActivationWriteAuthority()
+    entered, release, revoke_returned = Event(), Event(), Event()
+    committed: list[int] = []
+    caught: list[BaseException] = []
+    request = OutboxRequest(destination="email", id="o-checkpoint")
+
+    class _Sender:
+        def send(self, req: OutboxRequest) -> OutboxReceipt:
+            assert req is request
+            return OutboxReceipt(ok=True, reference="delivered")
+
+    class _Loop:
+        def due_outbox(self, now: float) -> list[OutboxRequest]:
+            del now
+            return [request]
+
+        def record_outbox_result(self, request_id: str, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            assert request_id == request.id
+            return "dispatched"
+
+        def snapshot(self) -> RunCheckpoint:
+            return RunCheckpoint(run_id="run_outbox_checkpoint", seq=1)
+
+        def collect_checkpoint_blobs(self) -> dict[str, bytes]:
+            return {}
+
+    record = SimpleNamespace(
+        run_id="run_outbox_checkpoint",
+        outbox_sender=_Sender(),
+        write_authority=authority,
+        message_queue=SimpleNamespace(_queue=[]),
+        seen_inbox_ids=set(),
+    )
+
+    def commit_checkpoint(
+        active_record: Any,
+        checkpoint: RunCheckpoint,
+        blobs: dict[str, bytes],
+    ) -> None:
+        assert active_record is record
+
+        def commit() -> None:
+            assert blobs == {}
+            entered.set()
+            assert release.wait(5)
+            committed.append(checkpoint.seq)
+
+        active_record.write_authority.guard_local_mutation(commit)
+
+    service = OutboxDispatchService(
+        OutboxDispatchContext(
+            retry_policy_provider=lambda: OutboxRetryPolicy(
+                max_attempts=5,
+                base_s=1.0,
+                factor=2.0,
+                cap_s=10.0,
+            ),
+            max_message_queue_depth_provider=lambda: 100,
+            commit_checkpoint=commit_checkpoint,
+            rng_provider=lambda: random.Random(7),
+            live_outbox_runs=lambda: [],
+            call_soon=lambda *_a, **_k: None,
+            record_terminal=lambda _record: False,
+        )
+    )
+
+    def drain() -> None:
+        try:
+            service.drain_outbox(record, _Loop())
+        except BaseException as exc:
+            caught.append(exc)
+
+    drain_thread = Thread(target=drain)
+    drain_thread.start()
+    assert entered.wait(5)
+
+    def revoke() -> None:
+        authority.revoke()
+        revoke_returned.set()
+
+    revoke_thread = Thread(target=revoke)
+    revoke_thread.start()
+    assert not revoke_returned.wait(0.05)
+    release.set()
+    drain_thread.join(5)
+    revoke_thread.join(5)
+
+    assert not drain_thread.is_alive()
+    assert not revoke_thread.is_alive()
+    assert revoke_returned.is_set()
+    assert committed == [1]
+    assert len(caught) == 1
+    assert isinstance(caught[0], WriteAuthorityRevoked)
+
+    with pytest.raises(WriteAuthorityRevoked):
+        service.drain_outbox(record, _Loop())
+    assert committed == [1]
 
 
 def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_happened() -> None:
@@ -745,7 +915,7 @@ def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_ha
                 max_attempts=5, base_s=1.0, factor=float("nan"), cap_s=10.0
             ),
             max_message_queue_depth_provider=lambda: 100,
-            checkpoint_store_provider=lambda: None,
+            commit_checkpoint=lambda *_args: None,
             rng_provider=lambda: random.Random(7),
             live_outbox_runs=lambda: [],
             call_soon=lambda *_a, **_k: None,
@@ -753,7 +923,13 @@ def test_a_nan_retry_factor_does_not_lose_the_receipt_for_a_send_that_already_ha
         )
     )
     before = time.time()
-    service.drain_outbox(SimpleNamespace(outbox_sender=_Sender()), _Loop())
+    service.drain_outbox(
+        SimpleNamespace(
+            outbox_sender=_Sender(),
+            write_authority=ActivationWriteAuthority(),
+        ),
+        _Loop(),
+    )
 
     assert sent == ["o1"]
     [(request_id, ok, next_attempt_at)] = recorded

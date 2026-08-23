@@ -7,6 +7,190 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-23
+
+### Added — portable production-boundary records
+
+- Added the content-free `TerminalOutcome` contract with typed retry eligibility and interruption
+  causes, plus the checked `DurableModelInvocation` record for reserved, dispatch-started, settled,
+  and unknown model-call revisions. Invocation receipts use a closed, canonical, typed
+  safe-evidence vocabulary with digest equality checks. Both artifacts use versioned canonical
+  writers, retained namespace readers, compatibility-ledger rows, and packaged fixtures.
+- Added optional latest-invocation and interruption-cause carriage to `monoid.checkpoint.v1` while
+  preserving v0.21 readers and positional construction. `RunCheckpoint.to_json()` now uses an
+  explicit field projection and the iterative portable JSON copier, removing the recursive
+  `dataclasses.asdict` boundary and its redundant deep copy.
+
+### Added — fenced hosting contracts
+
+- Added the explicit `monoid_agent_kernel.hosting` namespace with writer tokens, fail-closed
+  storage capabilities, fenced commit results, private invocation records, and composite
+  checkpoint/run-sink protocols. Loaded invocation records provide lazy result-blob access without
+  exposing an unfenced standalone blob mutation. These host-facing names stay outside the stable
+  package root and carry no database, queue, lease, Redis, or Temporal dependency.
+- Added a reusable fenced-run-sink conformance contract covering fence-first precedence,
+  blob-inclusive content identity, monotonic checkpoint publication, terminal first-writer-wins,
+  field- and edge-complete durable invocation transitions, fresh-facade durability, and
+  backend-hook-coordinated CAS and writer-handoff races for every authoritative mutation.
+  Concurrent writers use separate facades over shared backing. Per-execution namespaces make the
+  suite repeatable on one persistent test service. Reopened records use complete canonical-payload
+  comparisons. Same-key checkpoint, event, terminal, and invocation retries vary every mutable
+  canonical non-key field independently. Initial and retry invocation coordinates have exhaustive
+  invalid-combination matrices. Accepted legacy invocation schema and digest-generation aliases
+  normalize in both same-revision retry and lifecycle-transition directions. Exact retries of every older invocation
+  revision cannot republish an obsolete journal head. Every successful invocation fixture commits
+  the result blob referenced by its durable metadata. The harness lifecycle closes every factory
+  instance and reopened sink facade after each complete contract execution. All four resource-key
+  families prove independent same-coordinate commits and retries across two authorized runs.
+  Checkpoint schema aliases and nested invocation aliases normalize in both retry directions.
+  Fresh malformed checkpoint and invocation blob maps are rejected before metadata or head
+  publication, and every blob key is verified against its submitted bytes. A corrected retry then
+  commits and round-trips the intended bytes. Same-run records that share the digest retain their
+  original bytes before repair, and stale or cross-run malformed requests remain fenced before
+  validation.
+  Reopened event and terminal-winner inspection compare complete canonical payloads instead of
+  trusting retry digests. Retry reservations reject dispatch IDs used by any earlier attempt in
+  the logical call history, while a complete third attempt with a fresh ID remains legal. Accepted
+  terminal schema aliases normalize in both same-winner retry directions.
+  Checkpoint and settled-invocation CAS/writer-handoff races carry referenced blobs and verify their
+  post-race bytes. Populated commit-result sequence, submitted digest, and winner digest evidence is
+  checked for every mutation family across committed, idempotent, and conflict statuses. Writer
+  authority probes vary owner and generation independently across existing and fresh resources,
+  and handoff races cover same-owner lease renewal plus owner reassignment. Every CAS race reloads
+  the complete winning payload. Fresh checkpoint and invocation records with unresolved blob
+  references are rejected without head publication and recover with the referenced bytes.
+  `LocalFsCheckpointStore` now declares its actual single-writer checkpoint capability while
+  retaining the legacy unfenced store API.
+
+### Added — durable model-call lifecycle
+
+- Added the opt-in `ModelCallRunner` lifecycle boundary for durable paid calls. A durable call now
+  reserves its logical dispatch and commits `dispatch_started` before adapter entry, then commits a
+  proven success/refusal or closes ambiguous transport and settlement failures as `unknown`.
+  Restore and kernel retry reuse the first committed idempotency key. Logical-call and dispatch IDs
+  are deterministic content-free addresses derived from execution coordinates.
+- Durable failure evidence is fail-closed. An ordinary `ModelAdapterError` is ambiguous;
+  `ModelDispatchRefused` is the typed proof that permits a settled failure and the existing kernel
+  retry policy. Retryability alone never proves that a paid dispatch finished. Successful durable
+  settlements store the existing canonical replay-turn projection as a private content-addressed
+  result blob, excluding `ModelTurn.raw`.
+- Added standalone fenced-journal crash tests for every PR3 boundary: before/after reserve,
+  after start and before adapter entry, after adapter return and before settle, ambiguous transport,
+  explicit retryable refusal, result settlement, and settlement-write failure. Hard-crash
+  failpoints retain the last committed head without running in-process compensation.
+
+### Added — AgentLoop fenced recovery
+
+- Added opt-in `AgentLoop` wiring for a `FencedRunSink` and run-bound `WriterToken`. Durable mode
+  requires lease fencing, durable checkpoints, and durable invocations, rejects mixed callback
+  persistence, and sends every checkpoint through the fenced sink without a local fallback. The
+  default in-process path and lazy root import remain unchanged.
+- Added the host-side `FencedModelCallLifecycle` adapter. AgentLoop now derives stable logical-call
+  IDs from durable run/turn coordinates independently of caller provenance, reuses a committed
+  reservation key, turns a restored
+  `dispatch_started` head into `dispatch_unknown`, and refuses every automatic paid-call retry from
+  an unknown head. Request-digest mismatch, corrupt records, unsupported records, missing result
+  bytes, and digest mismatches fail before provider entry.
+- Added canonical replay of settled success and failure. Successful recovery verifies and decodes
+  the private recorded-turn blob with `ModelTurn.raw` removed. Failed recovery reconstructs the
+  typed refusal from safe receipt evidence, including configuration recoverability and billed
+  usage, without restoring provider exception text. Public receipt accounting preserves the full
+  logical-call usage across kernel retries, including cache-creation and audio tokens, while the
+  private result retains final-turn evidence. Passive model-I/O consumers receive the recovered
+  settlement once.
+- Settled recovery now proves current writer ownership through an exact fenced invocation retry
+  before exposing either terminal arm. Result-integrity failures retain authoritative billed usage,
+  so missing, tampered, malformed, and receipt-conflicting replay data remain visible to run
+  accounting without another provider call.
+- Recovered retryable refusals now restore their committed attempt count and aggregate usage before
+  entering the remaining kernel retry budget. Durable receipts carry explicit stream-delivery
+  evidence; continuation requires `stream_committed=false`, while missing evidence fails closed.
+- Added AgentLoop crash-injection coverage for reserved, dispatch-started, successful settled, and
+  failed settled heads, plus request drift, unreadable heads, tampered result bytes, fenced
+  checkpoint commits, and invalid durable-host configuration. The matrix asserts provider call
+  counts at every recovery boundary.
+
+### Added — model evidence delivery policy
+
+- Added opt-in `passive`, `required`, and `outbox` model-evidence policies. Passive delivery keeps
+  the existing failure-contained `settled_sink`. Required delivery commits public-safe evidence
+  after the authoritative invocation settlement. Outbox delivery stages evidence with settlement
+  through `commit_invocation(..., stage_evidence=True)` and requires the sink's
+  `transactional_outbox` capability.
+- Required evidence failure now surfaces as the recoverable `evidence_uncommitted` classification.
+  The first durable reservation records its stable `passive | required | outbox` evidence policy in
+  every invocation revision. Settlement recovery honors that journal field independently of a
+  replacement host's passive default, closing the crash windows before either an evidence-failure
+  checkpoint or an outbox-staged settlement is published. The checked reader maps the earlier
+  prerelease `requires_evidence` boolean to `passive` or `required`; canonical writers emit the enum.
+  Journal-required recovery completes the fenced evidence mutation before checking a request digest
+  rebuilt from replacement config or dynamic context.
+  An activation cannot upgrade an existing passive invocation to required delivery; it fails before
+  provider or evidence mutation and applies the stronger policy to a new logical call.
+  An outbox reservation remains outbox-owned across worker replacement, validates transactional
+  outbox capability before redispatch, and stages evidence atomically at settlement even when the
+  replacement activation uses the passive default.
+  Recovery commits evidence from the stored logical-call ID and request digest before rebuilding
+  any runtime-dependent provider request. It applies the stored success or final refusal to loop
+  state before consulting current runtime config, context providers, tool surfaces, or media;
+  recovered tool calls enter the transcript before current tool execution setup. Stored outcomes
+  therefore survive config drift. Stored refusals are surfaced without an automatic paid retry.
+  Passive observers and requested model-call sidecars receive the original settled call once even
+  when required evidence parks the run; recovery does not republish it. Successful provider
+  streams close live observers and the private model-content sidecar as completed with settled
+  final text and usage while the run independently parks for evidence recovery. Settled provider
+  refusals retain their failed stream classification. Repeated evidence parks,
+  transcript rows, and public events carry only newly billable usage, preventing provider replay
+  and usage duplication. The durable recovery marker forces required delivery even when a new
+  activation is configured as passive. `run_once()` releases this park and raises
+  `TurnNotSettled` instead of promoting it to an unrecoverable terminal checkpoint. Model step
+  limits and cooperative pause cannot preempt this commit
+  barrier. Cancellation and deadline apply after the fenced evidence mutation; an interrupt before
+  result application retains the same logical call and its tool-follow-up observations for a
+  `None` resume. If the recovered assistant tool-call turn was already projected when an interrupt
+  lands, the interruption checkpoint marks that turn as pending and carries each completed tool
+  observation. A later `None` resume reloads the same settled result, skips completed stable call
+  IDs, executes the remaining calls, and appends no duplicate assistant turn. New user input is
+  rejected until this already-projected tool exchange completes. Checkpoints also carry the
+  context-owned plan, pending `run.finish` result, and pending `tool.search` loads, so skipping a
+  completed call after process restore preserves its kernel-owned effects.
+- Model-call usage now has one accounting owner for successful receipts and exception-carried
+  bills. A settled receipt updates cumulative usage and metrics before stop or deadline can persist
+  an unapplied result. Resume projects that stored result with a zero delta, preserving billing and
+  token-limit enforcement without a duplicate provider call.
+- A durable internal safety checkpoint now restores its already-allocated model-step coordinate
+  once before the pump advances. Recovery probes that same invocation journal head, completes any
+  required evidence obligation, and prevents a settled call from being hidden under the next
+  logical-call ID. Streamed cooperative Stop is polled after the recovery probe and before any new
+  provider dispatch; ordinary one-shot Stop semantics remain unchanged.
+- Added the content-free suspension-to-terminal-outcome projection. Evidence delivery failure maps
+  to safe retry, while an unknown paid dispatch requires reconciliation. Crash coverage includes
+  repeated required failure, settled provider refusal without paid continuation, multimodal stored
+  result replay, transactional outbox staging, atomic-stage rejection, and capability gates.
+  Run-limit exhaustion projects to the terminal `limited` kind with retry forbidden, preserving
+  its meaning separately from cooperative pause and task-wait boundaries.
+
+### Changed — activation authority and typed interruption
+
+- Split operational cancellation from writer authority. `CancellationToken` now carries
+  `user_cancel`, `graceful_drain`, `deadline`, or `host_shutdown`; lease loss revokes the shared
+  `ActivationWriteAuthority` and wakes execution without storing lease loss on the token.
+  Cancellation cause now survives suspension, checkpoint, result, Reference projection, and
+  recovery. Reference drain closes admission before signaling live runs.
+- Workspace, recorder, tool context, model stream, observer, task, outbox, checkpoint, result, and
+  cleanup paths share activation-scoped mutation guards. A revoked activation publishes no later
+  checkpoint, event, projection, usage, or terminal result. Tool extensions receive a slotted,
+  method-only context rather than raw recorder, task, outbox, or workspace handles.
+- Reference checkpoint commits and outbox redrive use one record-bound authority seam. LocalFS and
+  SQLite stores declare single-writer capability; overlapping canonical writers use a
+  `FencedRunSink` whose adapter checks `WriterToken` owner and generation atomically with storage.
+- Added deterministic abandoned-activation races covering retained synchronous handlers, workspace
+  writes, artifact allocation, callback fan-out, model streams, task cleanup, checkpoint commits,
+  outbox commits, recovery, and terminal settlement.
+- Kept the pre-v0.22 positional constructor ABI for `ModelCallRunner` and `TaskManager`. New writer
+  authority and durable lifecycle injection fields are keyword-only and pinned by structural and
+  behavioral public-surface tests.
+
 ## [0.21.0] - 2026-08-12
 
 ### Fixed — the container stops answering questions about itself: cycles, depth, and the `allow` path

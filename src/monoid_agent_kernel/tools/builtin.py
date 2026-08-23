@@ -253,7 +253,7 @@ def _fs_stat(workspace: Workspace) -> ToolSpec:
         stat_path = getattr(workspace, "stat_path", None)
         if callable(stat_path):
             return ToolResult(ok=True, content=stat_path(path))
-        rel, _abs_path = workspace.resolve_existing_or_parent(path)
+        rel = workspace.normalize(path)
         kind = workspace.path_kind(path)
         if kind is None:
             return ToolResult(ok=True, content={"path": rel, "exists": False})

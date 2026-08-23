@@ -454,7 +454,7 @@ def _seed_approved_replays(
     suspended = loop.run_until_suspended("approve the calls")
     assert suspended.reason == "awaiting_tasks"
     assert len(suspended.awaiting_task_ids) == len(values)
-    manager = loop._require_open().res.context.job_manager
+    manager = loop._require_open().res.context._job_manager
     task_by_call_id = {
         str(getattr(task, "request").get("call_id") or ""): task_id
         for task_id, task in manager.jobs.items()
@@ -600,7 +600,7 @@ def test_ask_authorization_reported_result_survives_restore_before_replay(tmp_pa
         tool_providers=(provider,),
     )
     restored.restore(latest.checkpoint, blobs=latest.blob)
-    manager = restored._require_open().res.context.job_manager
+    manager = restored._require_open().res.context._job_manager
     task = manager.jobs[suspended.awaiting_task_ids[0]]
 
     assert getattr(task, "result")["approved"] is True
@@ -894,7 +894,7 @@ def test_ask_authorization_replay_rejects_approval_key_mismatch(tmp_path: Path) 
 
     suspended = loop.run_until_suspended("use the approval tool")
     loop.report_task_result(suspended.awaiting_task_ids[0], {"approved": True})
-    manager = loop._require_open().res.context.job_manager
+    manager = loop._require_open().res.context._job_manager
     manager.jobs[suspended.awaiting_task_ids[0]].request["approval_key"] = "tampered"
     loop.run_until_suspended(None)
     result = loop.close()

@@ -4,6 +4,23 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from monoid_agent_kernel.core.interruption import InterruptionCause
+
+_OPERATIONAL_CANCELLATION_CAUSES = frozenset(
+    {
+        InterruptionCause.USER_CANCEL,
+        InterruptionCause.GRACEFUL_DRAIN,
+        InterruptionCause.DEADLINE,
+        InterruptionCause.HOST_SHUTDOWN,
+    }
+)
+
+
+def is_operational_cancellation_cause(cause: InterruptionCause) -> bool:
+    """Whether ``cause`` belongs to the public execution-cancellation capability."""
+
+    return cause in _OPERATIONAL_CANCELLATION_CAUSES
+
 
 @dataclass
 class CancellationToken:
@@ -11,9 +28,31 @@ class CancellationToken:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _callbacks: dict[int, Callable[[], None]] = field(default_factory=dict, init=False, repr=False)
     _next_callback_id: int = field(default=0, init=False, repr=False)
+    _cause: InterruptionCause | None = field(default=None, init=False, repr=False)
 
-    def cancel(self) -> None:
+    def cancel(
+        self,
+        cause: InterruptionCause = InterruptionCause.USER_CANCEL,
+    ) -> None:
+        try:
+            cause = InterruptionCause(cause)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cancellation cause is outside the portable vocabulary") from exc
+        if not is_operational_cancellation_cause(cause):
+            allowed = ", ".join(sorted(item.value for item in _OPERATIONAL_CANCELLATION_CAUSES))
+            raise ValueError(f"cancellation cause must be operational: {allowed}")
+        self._request(cause)
+
+    def _cancel_for_authority_loss(self) -> None:
+        """Wake execution after a separate ``ActivationWriteAuthority`` was revoked."""
+
+        self._request(InterruptionCause.LEASE_LOST)
+
+    def _request(self, cause: InterruptionCause) -> None:
         with self._lock:
+            if self._event.is_set():
+                return
+            self._cause = cause
             self._event.set()
             callbacks = tuple(self._callbacks.values())
             self._callbacks.clear()
@@ -44,3 +83,14 @@ class CancellationToken:
     @property
     def requested(self) -> bool:
         return self._event.is_set()
+
+    def snapshot(self) -> tuple[bool, InterruptionCause | None]:
+        """Return the request flag and its first-writer cause under one lock."""
+
+        with self._lock:
+            return self._event.is_set(), self._cause
+
+    @property
+    def cause(self) -> InterruptionCause | None:
+        with self._lock:
+            return self._cause

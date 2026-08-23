@@ -138,6 +138,12 @@ mount and filesystem semantics that support atomic replace and locking. Read che
 `unsupported_version` outcomes. The executable example asserts a checked `loaded` outcome.
 It also returns `runtime_profile="embedded-local"` so test output names the selected topology.
 
+The bundled LocalFS and SQLite checkpoint stores are single-writer adapters. Their atomic commit
+protects checkpoint integrity, and the Reference host serializes each in-process commit with its
+activation write authority. A topology where an old writer can resume after another writer takes
+over uses a `FencedRunSink` and passes a `WriterToken` into every canonical mutation. The storage
+adapter validates owner and generation in the same transaction as the write.
+
 Reconstruct the loop with the same run ID, compatible runtime definition, workspace mapping, and
 blob store. Restore the checked checkpoint before accepting a new input. Stop recovery and surface
 an actionable failure for corrupt or unsupported state.
@@ -192,6 +198,102 @@ The Reference inbox assembly realizes the activation and input rows with leases,
 command store, a recovery service, and a watchdog. A product-owned scheduler can realize the same
 obligations through different storage and recovery mechanisms.
 
+### Choose the model evidence delivery policy
+
+Hosted products that configure `AgentLoop(run_sink=..., writer_token=...)` also choose
+`model_evidence_policy`:
+
+- `passive` preserves the existing observer and sidecar behavior. Export failure does not alter the
+  model result.
+- `required` makes the public-safe evidence projection a checked post-settlement mutation. An
+  evidence failure parks as `evidence_uncommitted`; resume the same checkpoint without a new user
+  input. The loop reloads the settled invocation and retries the sink without calling the provider.
+- `outbox` asks the sink to stage evidence in the invocation-settlement transaction. Enable it only
+  on a sink that declares `transactional_outbox=True`. The host runs the sender and its retry or
+  dead-letter policy.
+
+Keep invocation settlement and evidence delivery in separate tables or record families for
+`required`. Make `commit_model_evidence()` fence-first, idempotent on
+`(run_id, logical_call_id, revision)`, and valid only for the current authoritative settled
+revision. Persist the invocation's `evidence_policy` enum in the same transaction as every
+invocation revision and preserve it across retries. A replacement worker must honor the journal
+policy even when its configured policy is `passive`; this covers a crash before an
+`evidence_uncommitted` checkpoint exists. Reject a `passive` to `required` policy change for an
+existing logical call before provider or evidence mutation. Apply the stronger policy to a new
+logical call. On recovery, deliver a journal-required settlement before validating a request digest
+rebuilt from replacement config or dynamic context. For `outbox`, reject the complete transaction
+when either
+the invocation revision or the outbox entry cannot commit. A partial invocation-only commit
+violates the declared capability. A recovered outbox reservation remains outbox-owned, checks
+`transactional_outbox` before provider entry, and stages evidence at settlement even when the
+replacement activation uses the passive default.
+
+Treat a durable checkpoint whose `last_suspension` is null and whose model-step counter is positive
+as an in-progress internal checkpoint. Resume that allocated step once before advancing counters.
+The lifecycle then probes the same logical-call journal address, delivers any required evidence,
+and only enters a new provider dispatch when the head is missing. This rule covers a crash after an
+approval-replay safety checkpoint and after provider settlement but before an evidence-failure park.
+
+On `evidence_uncommitted`, persist the returned checkpoint before releasing the worker. Redrive it
+with the same run ID and a current writer token. The loop commits evidence from the stored logical
+call ID and request digest, then applies the stored success or final refusal before consulting the
+current request-building configuration. A recovered final settles immediately. A recovered
+tool-call turn enters the message log before the current tool surface is resolved for execution.
+Stored outcomes therefore survive runtime-config changes. Passive observers and enabled
+model-call sidecars receive the authoritative call at the original settlement even when required
+evidence parks afterward; recovery does not duplicate that passive publication. Live model-stream
+observers and the private content sidecar close a settled provider success as `completed` with its
+final text and usage while the run separately parks for evidence recovery. The checkpoint
+marker and the authoritative invocation flag each force required delivery on the replacement
+activation even when its configured policy is `passive`. One-shot `run_once()` releases this
+committed park and raises `TurnNotSettled`; restore
+the checkpoint and resume with `None`. Treat
+`dispatch_unknown` separately: reconcile the journal or provider before any new paid call.
+The kernel accounts an authoritative settled receipt before a stop or deadline can park its result
+as unapplied. Persisted interruption checkpoints therefore include the paid usage even when the
+assistant turn remains absent; resume projects the stored result without adding that usage again.
+Lease loss uses the stricter ownership boundary. The runner rechecks authority immediately after
+durable settlement and suppresses stale usage accounting, metrics, passive model-I/O delivery,
+model-call sidecars, and model-stream completion. The replacement owner recovers the stored receipt
+and publishes it without another provider dispatch.
+Treat `CancellationToken.cause` as first-cause execution-control history. Inject one
+`ActivationWriteAuthority` into AgentLoop and every activation-owned adapter. Revoke that authority
+when lease ownership moves. Revocation wakes the loop while preserving an earlier Stop or drain
+cause, and the stale activation returns an ephemeral `lease_lost` disposition. Required-evidence
+recovery checks the authority before and after its lifecycle hook. Token-based deadlines use the
+same `run_timeout` terminal projection as elapsed wall-clock deadlines.
+
+Keep the host's `WriterToken(run_id, owner_id, generation)` beside the process-local authority.
+Checkpoint, invocation, canonical event, and terminal adapters validate that token atomically with
+each durable mutation. When any adapter reports `fenced`, revoke the shared authority immediately.
+Host adapters also fence or deduplicate external shell, MCP, memory, and custom effects that can
+continue after an activation loses authority.
+Revocation synchronously disables the recorder's private model-content store. Stale activation
+cleanup cancels pending flush timers, drops buffered deltas, and closes its handle without appending
+segments or a stream terminal record.
+Ordinary cleanup while authority remains active cancels hosted tasks created after the last
+committed checkpoint and writes their normal cancel marker. It preserves hosted tasks already
+owned by that checkpoint. Revoked cleanup releases in-process handles only and delegates hosted
+task cancellation to the fenced/idempotent host adapter.
+Evidence recovery surfaces stored retryable refusals without consuming a remaining kernel attempt.
+Let the driver decide whether to start a later model step.
+Evidence recovery is a commit barrier for a model step that already settled. The runner completes
+the fenced settlement/evidence mutation before applying a pending cancellation or expired deadline.
+An internal safety checkpoint taken after allocating step `N` and before a park restores step `N`
+once. Recovery queries that journal coordinate before incrementing either the run step or the
+submit-local step, so a crash before evidence delivery cannot strand the settled invocation behind
+step `N+1` or start a second paid call.
+An interrupt can still park before the recovered result is applied; a `None` resume reloads that
+same logical call with its checkpointed tool observations, while a new user input intentionally
+abandons the interrupted result. An interrupt after a recovered assistant tool-call turn is added
+to the message log persists `model_tool_calls_pending=true` and every completed observation. Resume
+with `None`: the loop reloads the settled result, skips completed call IDs, and executes the rest
+without adding a second assistant turn. The loop rejects new user input with
+`evidence_recovery_requires_resume` until this tool exchange completes. Give effectful tool handlers
+stable idempotency keys because a process can still disappear after an external effect and before
+its observation is returned. The interruption checkpoint restores the kernel-owned plan, pending
+`run.finish` value, and pending `tool.search` loads before completed call IDs are skipped.
+
 ## Model and tool wiring
 
 The offline examples inject a fake adapter, so no gateway is contacted. A hosted deployment places
@@ -231,8 +333,9 @@ Every hosted assembly follows these portable rules:
 
 For the Reference inbox assembly, every instance shares durable checkpoint and lease stores plus
 one transactional command store. A fresh backend can call `recover_runs()` and start its watchdog
-after an atomic stale-owner claim. Queue limits and claim TTLs bound durable command admission and
-recovery. The bundled SQLite composition remains a single-host Reference fixture.
+after an atomic stale-owner claim once the previous writer has stopped. Queue limits and claim TTLs
+bound durable command admission and recovery. The bundled SQLite composition remains a
+single-host, single-writer Reference fixture.
 
 For the experimental DBOS profile, the private host is the sole DBOS lifecycle authority in one
 process. A supervisor fences the previous process and restarts the same stable executor slot with
@@ -327,6 +430,8 @@ Apply these boundaries:
 - validate token kind, audience, run ID, tenant, user, task metadata, and expiry;
 - keep provider keys and capability secrets in a gateway, broker, or secret manager;
 - persist hashes or opaque handles in checkpoints, events, commands, receipts, and logs;
+- give Python tool extensions only the method-only `ToolContext` façade; keep workspace roots,
+  native paths, recorder/task handles, lifecycle state, and counters behind the trusted kernel edge;
 - restrict workspace roots and resolve paths through the `Workspace` contract;
 - isolate run artifacts, projections, quotas, and retention by tenant;
 - run the production checklist and relevant conformance profiles before external traffic.
@@ -372,6 +477,8 @@ state as operational diagnostics.
 | Lost task-secret response | Keep the secret absent from durable state and require explicit replacement. | Hosted golden path scans durable files for callback bearers. |
 | Gateway credential expiry | Mint a new scoped gateway token and keep provider keys at the gateway. | Gateway contract and token tests cover expiry and scope. |
 | Telemetry exporter failure | Drop, buffer, or retry telemetry without changing run semantics. | Event sink boundaries isolate exporter failure. |
+| Required model-evidence delivery failure | Commit the settled invocation, publish passive call records once, park as `evidence_uncommitted`, and redrive the same checkpoint. | Fenced recovery retries only `commit_model_evidence`; it applies the stored outcome before current request-building state and keeps provider and passive-record counts fixed. |
+| Transactional evidence outbox failure | Publish neither the settlement nor the outbox entry; close paid-call ambiguity through `dispatch_unknown`. | `transactional_outbox` capability gate and atomic-stage recovery tests cover the boundary. |
 
 ## Conformance and release gate
 
@@ -382,12 +489,14 @@ Before production traffic:
 3. run the external `minimal-agent` profile against each product implementation, then call
    `run_checkpoint_store_contract(factory, root)` and `run_capability_broker_contract(factory)`
    directly for each replacement store or broker;
-4. execute the durability fault matrix for the selected checkpoint, activation, input, and effect
+4. run `run_fenced_run_sink_contract(factory)` against the canonical storage transaction and lease
+   boundary used by every host with overlapping or replaceable workers;
+5. execute the durability fault matrix for the selected checkpoint, activation, input, and effect
    paths;
-5. verify the compatibility ledger and package contents from the built wheel;
-6. rehearse fenced recovery, gateway outage, cursor reconnect, drain, rollback, and credential
+6. verify the compatibility ledger and package contents from the built wheel;
+7. rehearse fenced recovery, gateway outage, cursor reconnect, drain, rollback, and credential
    rotation for the selected runtime;
-7. complete [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md).
+8. complete [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md).
 
 For the Reference inbox fixture, run `tests/test_backend_command_inbox.py` and its shared-store
 recovery tests. For DBOS evaluation, install `reference-dbos`, run the owned-runtime, shared-host,
