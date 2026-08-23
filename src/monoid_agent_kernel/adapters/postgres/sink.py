@@ -556,6 +556,10 @@ class PostgresFencedRunSink:
     ) -> tuple[CommitResult, str]:
         if not isinstance(invocation, DurableModelInvocation):
             return CommitResult(status="conflict"), ""
+        if not 1 <= invocation.revision <= _POSTGRES_BIGINT_MAX:
+            return CommitResult(status="conflict", sequence=invocation.revision), ""
+        if not 1 <= invocation.dispatch_attempt <= _POSTGRES_BIGINT_MAX:
+            return CommitResult(status="conflict", sequence=invocation.revision), ""
         if (
             type(stage_evidence) is not bool
             or stage_evidence

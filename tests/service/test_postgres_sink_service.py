@@ -324,6 +324,64 @@ def test_checkpoint_sequence_respects_postgres_bigint_boundaries(
     assert _table_count(sink_harness, "checkpoint_record", run_id) == 1
 
 
+def test_invocation_revision_outside_postgres_bigint_is_conflict(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-invocation-bigint-bound"
+    token = sink_harness.claim(run_id)
+
+    result = sink_harness.sink.commit_invocation(
+        _invocation(run_id, 10**30, "reserved"),
+        {},
+        writer_token=token,
+    )
+
+    assert result.status == "conflict"
+    assert result.sequence == 10**30
+    assert _table_count(sink_harness, "invocation_record", run_id) == 0
+
+
+def test_deleting_run_authority_cascades_records_and_heads(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-authority-cascade"
+    token = sink_harness.claim(run_id)
+    assert (
+        sink_harness.sink.commit_checkpoint(
+            RunCheckpoint(run_id=run_id, seq=1),
+            {},
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+    assert (
+        sink_harness.sink.commit_invocation(
+            _invocation(run_id, 1, "reserved"),
+            {},
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("DELETE FROM {} WHERE run_id = %s").format(
+                    sql.Identifier(sink_harness.database.config.schema, "run_authority")
+                ),
+                (run_id,),
+            )
+
+    for table in (
+        "run_authority",
+        "checkpoint_record",
+        "checkpoint_head",
+        "invocation_record",
+        "invocation_head",
+    ):
+        assert _table_count(sink_harness, table, run_id) == 0
+
+
 def test_blob_bounds_fencing_and_cross_run_authorization(
     sink_harness: _SinkHarness,
 ) -> None:

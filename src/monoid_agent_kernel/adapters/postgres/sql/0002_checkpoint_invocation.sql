@@ -40,6 +40,7 @@ CREATE TABLE __MONOID_SCHEMA__.checkpoint_head (
     updated_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     FOREIGN KEY (run_id, sequence)
         REFERENCES __MONOID_SCHEMA__.checkpoint_record (run_id, sequence)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE __MONOID_SCHEMA__.invocation_record (
@@ -81,6 +82,7 @@ CREATE TABLE __MONOID_SCHEMA__.invocation_head (
     PRIMARY KEY (run_id, logical_call_id),
     FOREIGN KEY (run_id, logical_call_id, revision)
         REFERENCES __MONOID_SCHEMA__.invocation_record (run_id, logical_call_id, revision)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX invocation_record_dispatch_idx
