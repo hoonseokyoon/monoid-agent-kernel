@@ -62,6 +62,13 @@ def test_v023_durable_adapters_are_explicit_optional_extras() -> None:
         assert tuple(extras[name]) == expected
 
 
+def test_postgres_migration_resources_have_platform_stable_bytes() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    attributes = project_root.joinpath(".gitattributes").read_text(encoding="utf-8")
+
+    assert "src/monoid_agent_kernel/adapters/postgres/sql/*.sql text eol=lf" in attributes
+
+
 def test_publish_workflow_audits_the_wheel_that_it_uploads() -> None:
     project_root = Path(__file__).resolve().parents[1]
     workflow = project_root.joinpath(".github/workflows/publish.yml").read_text(encoding="utf-8")

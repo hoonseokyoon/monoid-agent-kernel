@@ -1,4 +1,5 @@
 *.py text eol=lf
+src/monoid_agent_kernel/adapters/postgres/sql/*.sql text eol=lf
 .nvmrc text eol=lf
 # `vite build` copies studio-ui/index.html verbatim and injects the hashed asset tags with LF.
 # With core.autocrlf=true the template checks out CRLF on Windows, so the generated file comes out
