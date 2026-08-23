@@ -125,6 +125,7 @@ import pytest
 
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.lifecycle import REASON_TO_STATE
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.manifest import _tool_spec_payload as _manifest_tool_spec_payload
 from monoid_agent_kernel.core.result import (
     AgentTurnResult,
@@ -640,6 +641,8 @@ def _maximal_suspension() -> Suspension:
         config_recoverable=True,
         provider_error_code="insufficient_quota",
         provider_retried=True,
+        model_tool_calls_pending=True,
+        interruption_cause=InterruptionCause.PROVIDER_FAILURE,
     )
 
 
@@ -2033,6 +2036,7 @@ TURN_NOT_SETTLED_RESTAMPED = frozenset(
         # ``rate_limit_exceeded`` is the same retryable/http_status pair with opposite answers.
         "provider_error_code",
         "provider_retried",
+        "interruption_cause",
     }
 )
 
@@ -4261,6 +4265,9 @@ CHECKPOINT_INLINE_VALIDATED = frozenset(
         "pending_user_input",
         "previous_runtime_config",
         "workspace_base",
+        "last_model_invocation",
+        "interruption_cause",
+        "pending_finish",
         # No longer "an object or null": the park payload has a schema of its own now
         # (``_validate_suspension_payload``), shared with the receipt copy below.
         "last_suspension",
@@ -4315,6 +4322,8 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "outbox_requests",
             # The evidence behind ``output_retries``, which rode this snapshot without it.
             "output_failure_history",
+            # AgentToolContext state that must survive a post-tool interruption.
+            "plan",
         }
     ),
     "_CHECKPOINT_LIST_OF_STRING_FIELDS": frozenset(
@@ -4327,6 +4336,7 @@ CHECKPOINT_VALIDATION_BUCKETS: dict[str, frozenset[str]] = {
             "inbox_seen_ids",
             "applied_input_ids",
             "skills_activated",
+            "pending_tool_loads",
         }
     ),
 }
@@ -5735,6 +5745,8 @@ EVENT_CONSUMER_CORE = frozenset(
         "run.awaiting_input",
         "run.resumed",
         "turn.failed",
+        "turn.interrupted",
+        "turn.settled",
         "model.turn.started",
     }
 )
@@ -5750,12 +5762,12 @@ EVENT_CONSUMER_PROGRESS = frozenset(
         "workspace.proposal.updated",
     }
 )
-# The pause park's session-lane projection, handled by the two status-file readers. NOT part of
-# ``EVENT_CONSUMER_CORE``: the backend record's pause state is owned by session_drive (the
-# driver observes the ``paused`` Suspension directly and a ``record_event`` state write would
-# race it — the same reason its ``turn.failed`` branch never touches state), so the record
-# deliberately has no branch for this event.
-EVENT_CONSUMER_PAUSE = frozenset({"session.state.changed"})
+# The pause park's turn and session projections, handled by the two status-file readers. The turn
+# event clears the prior cause; the session event changes lifecycle state. The backend record's
+# pause state is owned by session_drive: the driver observes the ``paused`` Suspension directly,
+# and a ``record_event`` state write would race it. The record therefore has no branch for either
+# pause event.
+EVENT_CONSUMER_PAUSE = frozenset({"turn.paused", "session.state.changed"})
 EVENT_CONSUMER_HANDLED: dict[str, frozenset[str]] = {
     # The offline projection reads the *committed log*, so it can also fold the durable proposal
     # lifecycle that the two live sinks never see (they fire before the artifacts are written).
@@ -5966,30 +5978,24 @@ def test_each_status_consumer_branch_copies_its_pinned_classification_subset(
     }
 
 
-def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot() -> None:
-    """Registered BY DESIGN: one key name, two vocabularies, on two sibling events.
+def test_by_design_the_turn_lane_reason_and_park_reason_are_distinct_vocabularies() -> None:
+    """Registered BY DESIGN: one key name has distinct event-cause and park vocabularies.
 
     ``data.reason`` on ``turn.interrupted``/``turn.paused`` names the CAUSE (``user_stop`` /
     ``user_pause``); ``Suspension.reason`` names the PARK (``interrupted`` / ``paused``). The
-    assertions are unchanged from when this was a burn-down entry — they pin the emit's literals
-    and the proof that neither value is a member of the park vocabulary it shares a field name
-    with — but what they pin is now a declared fact rather than a defect: merging the two would
-    make one field answer two questions.
-
-    The genuine half of the old entry is closed below: the pause park emits a turn-lane event of
-    its own now, so the two sibling parks ARE observable the same way.
+    ``turn.interrupted`` additionally carries the typed interruption cause used by durable hosts.
     """
 
-    for event_type, cause in (("turn.interrupted", "user_stop"), ("turn.paused", "user_pause")):
-        emitted = _emit_data_keys("loop.py", event_type)
-        assert emitted == {"reason"}, {"event": event_type, "emitted": sorted(emitted)}
-        values = _literal_dict_keys_where("loop.py", "reason", cause)
-        assert len(values) == 1, {"event": event_type, "reason_literals": len(values)}
-        assert values[0] == {"reason"}
+    for cause in ("user_stop", "user_pause"):
         assert cause not in _SUSPENSION_REASONS, {
-            "event": event_type,
+            "cause": cause,
             "hint": "the cause and park vocabularies merged — this entry says they must not",
         }
+    assert _emit_data_keys("loop.py", "turn.interrupted") == {
+        "reason",
+        "interruption_cause",
+    }
+    assert _emit_data_keys("loop.py", "turn.paused") == {"reason"}
     assert {"interrupted", "paused"} <= _SUSPENSION_REASONS
     # The asymmetry that WAS a defect: the pause park emitted only a session-lane event.
     paused_emits = [
@@ -6006,15 +6012,16 @@ def test_by_design_the_turn_lane_speaks_a_cause_vocabulary_the_park_type_cannot(
         "turn_paused_emit_sites": len(paused_emits),
         "hint": "the pause park's turn-lane event is the interrupt's twin: exactly one site",
     }
-    # Both are declared event types with a data schema, and the schemas are the same shape.
+    # Both are declared event types and strictly schema-bound.
     from monoid_agent_kernel.core.events import AgentEventType
     from monoid_agent_kernel.core.schemas import EVENT_DATA_SCHEMAS
 
     assert {"turn.interrupted", "turn.paused"} <= set(get_args(AgentEventType))
-    assert (
-        EVENT_DATA_SCHEMAS["turn.paused"]["properties"]
-        == EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]
-    )
+    assert set(EVENT_DATA_SCHEMAS["turn.interrupted"]["properties"]) == {
+        "reason",
+        "interruption_cause",
+    }
+    assert set(EVENT_DATA_SCHEMAS["turn.paused"]["properties"]) == {"reason"}
     assert EVENT_DATA_SCHEMAS["turn.paused"]["additionalProperties"] is False
 
 
@@ -6170,9 +6177,9 @@ def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_writ
         if key is None
     }
     assert {
-        "context.shell_service.metrics()",
-        "context.jobs_service.background_metrics()",
-        "context.web_service.metrics()",
+        "context._shell_service.metrics()",
+        "context._jobs_service.background_metrics()",
+        "context._web_service.metrics()",
     } <= splatted, {
         "metrics_blocks_splatted": sorted(splatted),
         "hint": "the narrowed entry names these three service blocks",
@@ -6182,10 +6189,11 @@ def test_the_snapshot_and_the_restore_carry_the_siblings_of_the_fields_they_writ
 def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
     """Was registered (round 2): a restore without a token un-cancelled a durable cancel.
 
-    The flag is the request; the token is only the channel a boundary check reads it through. So
-    the restore mints one when the loop has none, exactly as ``astream`` and ``LoopSession.cancel``
-    do — pinned as "the guard is the flag alone, and a token is minted", because re-introducing a
-    token precondition anywhere in that branch restores the defect.
+    The flag is the request. Operational causes use the shared token-creation seam; legacy lease
+    loss revokes writer authority before bootstrap and uses that token only as its private wake
+    channel. Pinned as "the guard is the flag alone, and both cause families have an explicit
+    disposition", because a token precondition, late revocation, or public ``cancel`` restores one
+    of the defects.
     """
 
     assert "cancellation_requested" in _snapshot_written_keys()
@@ -6199,16 +6207,16 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
         "restore_guards": guards,
         "hint": "a second condition on this branch is the asymmetry that was closed",
     }
-    minting = [
+    token_ensures = [
         ast.unparse(node)
         for node in ast.walk(restore)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "CancellationToken"
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_ensure_cancellation_token"
     ]
-    assert minting == ["CancellationToken()"], {
-        "tokens_minted_during_restore": minting,
-        "hint": "without minting, a loop rebuilt with no token silently un-cancels the run",
+    assert token_ensures == ["self._ensure_cancellation_token()"], {
+        "token_ensure_calls": token_ensures,
+        "hint": "without the shared ensure seam, a fresh loop silently un-cancels the run",
     }
     cancels = [
         ast.unparse(node)
@@ -6217,7 +6225,30 @@ def test_the_cancellation_flag_is_written_always_and_applied_always() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "cancel"
     ]
-    assert cancels == ["self.cancellation_token.cancel()"], {"cancel_calls": cancels}
+    assert cancels == ["self._ensure_cancellation_token().cancel(cause)"], {
+        "cancel_calls": cancels
+    }
+    public_restore = _function_node("loop.py", "restore")
+    authority_losses = [
+        node
+        for node in ast.walk(public_restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "lose_writer_authority"
+    ]
+    bootstraps = [
+        node
+        for node in ast.walk(public_restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_bootstrap"
+    ]
+    assert len(authority_losses) == 1 and len(bootstraps) == 1
+    assert authority_losses[0].lineno < bootstraps[0].lineno, {
+        "authority_loss_line": authority_losses[0].lineno,
+        "bootstrap_line": bootstraps[0].lineno,
+        "hint": "legacy lease loss must be classified before bootstrap side effects",
+    }
 
 
 def test_the_two_tenant_meters_sum_the_same_seven_counts() -> None:
@@ -6516,6 +6547,7 @@ STATUS_SCHEMA_KEYS = frozenset(
         "retryable",
         "config_recoverable",
         "provider_retried",
+        "interruption_cause",
     }
 )
 
@@ -6571,12 +6603,21 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # vocabulary.
             # Joined in the burn-down's durable batch: the park payload has a schema now, and
             # this is one of the fields it type-checks.
+            # v0.22's fenced sink conformance matrix treats every canonical receipt field as
+            # durable CAS identity and exercises both legal settlement and conflicting evidence.
+            "conformance/contracts.py",
             "core/checkpoint.py",
             # Joined in W6-1: the durable model-call ledger records the whole failure
             # classification, so a keyless or failed call can be triaged from the artifact alone.
             "core/model_calls.py",
             "core/model_content.py",
             "core/model_io.py",
+            # v0.22's durable invocation receipt preserves this failure classification through
+            # crash recovery without carrying provider exception text.
+            "core/model_invocation.py",
+            # v0.22 PR5's content-free terminal projection distinguishes a configuration repair
+            # from a safe same-call retry when it maps a durable Suspension.
+            "core/outcome.py",
             "core/model_stream.py",
             # Joined in the burn-down's carriage sweep: the offline run-status projection
             # carries the full classification a parked turn.failed emits.
@@ -6626,12 +6667,18 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     "provider_retried": frozenset(
         {
             "contracts.py",
+            # v0.22's fenced sink conformance matrix treats every canonical receipt field as
+            # durable CAS identity and exercises both legal settlement and conflicting evidence.
+            "conformance/contracts.py",
             # Joined in the burn-down's durable batch: see config_recoverable above.
             "core/checkpoint.py",
             # Joined in W6-1: see config_recoverable above. `attempts` and this are not the same
             # fact, so a ledger carrying only the first would show a gateway's three internal
             # retries as one clean call.
             "core/model_calls.py",
+            # v0.22's durable invocation receipt preserves this per-call evidence through crash
+            # recovery without carrying the provider response itself.
+            "core/model_invocation.py",
             "core/model_io.py",
             # Joined in W6-2: the replay corpus's response body carries the flag because a
             # replayed turn must answer with what the original turn declared -- a corpus that
@@ -6647,6 +6694,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             "errors.py",
             "loop.py",
             "model_call.py",
+            # v0.22's private durable-result decoder restores the recorded turn's retry fact
+            # before the runner verifies it against the public invocation receipt.
+            "model_lifecycle.py",
             "observability/otel.py",
             "providers/base.py",
             "providers/gateway.py",
@@ -6688,6 +6738,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # is restamped (`mark_provider_usage`) with the merged total, so the loop's
             # failure accounting sees the whole call, not the last attempt.
             "model_call.py",
+            # Joined in v0.22 PR3: durable settlement and unknown-write failures preserve
+            # already-reported paid usage on the escaping durable boundary error.
+            "model_lifecycle.py",
             "providers/base.py",
             "providers/gateway.py",
             # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in
@@ -6701,6 +6754,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     ),
     "reasoning_tokens": frozenset(
         {
+            # v0.22's safe receipt usage vocabulary can preserve the billed sub-count while the
+            # private reasoning payload stays in the result blob.
+            "core/model_invocation.py",
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",

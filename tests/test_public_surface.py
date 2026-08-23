@@ -22,6 +22,11 @@ EXPECTED_CONTRACTS_ALL = [
     "AgentRunResult",
     "AgentTurnResult",
     "Suspension",
+    "TerminalOutcome",
+    "InterruptionCause",
+    "RetryEligibility",
+    "DurableModelInvocation",
+    "ModelEvidencePolicy",
     "RunCheckpoint",
     "CheckpointStore",
     "CheckedCheckpointStore",
@@ -175,6 +180,12 @@ EXPECTED_CONTRACTS_ALL = [
 ]
 
 REMOVED_PUBLIC_SURFACE_NAMES = [
+    "WriterToken",
+    "CommitResult",
+    "ModelInvocationRecord",
+    "StorageCapabilities",
+    "FencedCheckpointStore",
+    "FencedRunSink",
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
@@ -387,6 +398,32 @@ def test_package_root_mirrors_contracts_surface() -> None:
     assert root.__all__ == contracts.__all__
 
 
+def test_hosting_surface_is_narrow_and_explicit() -> None:
+    import monoid_agent_kernel.hosting as hosting
+
+    assert hosting.__all__ == [
+        "WriterToken",
+        "CommitResult",
+        "ModelInvocationRecord",
+        "StorageCapabilities",
+        "FencedCheckpointStore",
+        "FencedRunSink",
+    ]
+
+
+def test_public_conformance_surface_exposes_fenced_sink_contract() -> None:
+    import monoid_agent_kernel.conformance as conformance
+
+    expected = {
+        "FencedRunSinkHarness",
+        "FencedRunSinkHarnessFactory",
+        "run_fenced_run_sink_contract",
+    }
+
+    assert expected <= set(conformance.__all__)
+    assert all(hasattr(conformance, name) for name in expected)
+
+
 def test_helpers_and_conveniences_are_not_root_or_contract_exports() -> None:
     import monoid_agent_kernel as root
     import monoid_agent_kernel.contracts as contracts
@@ -590,15 +627,54 @@ def test_root_import_keeps_reference_and_optional_providers_lazy() -> None:
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     code = """
 import sys
+import typing
 import monoid_agent_kernel
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+typing.get_type_hints(LocalFsCheckpointStore.capabilities.fget)
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
+    or name.startswith('monoid_agent_kernel.hosting')
     or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
     or name.startswith('dbos.')
+]
+if blocked:
+    raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_hosting_import_keeps_platform_implementations_out() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code = """
+import sys
+import monoid_agent_kernel.hosting
+blocked = [
+    name for name in sys.modules
+    if name.startswith('monoid_agent_kernel.reference')
+    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'temporalio'}
+    or name.startswith('dbos.')
+    or name.startswith('psycopg.')
+    or name.startswith('psycopg2.')
+    or name.startswith('redis.')
+    or name.startswith('temporalio.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
@@ -649,6 +725,22 @@ def test_the_relayed_provider_fields_are_keyword_only() -> None:
         assert fld.kw_only, f"{cls.__name__}.{name} must be keyword-only to preserve positional order"
 
 
+def test_v022_injected_constructor_dependencies_are_keyword_only() -> None:
+    """New authority and lifecycle seams preserve every pre-v0.22 positional binding."""
+    import dataclasses
+
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.tasks import TaskManager
+
+    for cls, name in (
+        (ModelCallRunner, "current_write_authority"),
+        (ModelCallRunner, "lifecycle_hook"),
+        (TaskManager, "write_authority"),
+    ):
+        (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"
+
+
 def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
     """The behavioral half: the old positional shapes still mean what they meant.
 
@@ -677,6 +769,25 @@ def test_positional_construction_keeps_its_pre_v021_meaning() -> None:
     assert studio.llm_gateway_provider is None
 
 
+def test_v022_positional_construction_keeps_its_pre_v022_meaning() -> None:
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.tasks import TaskManager
+
+    adapter = object()
+    runner = ModelCallRunner(adapter, None, None, 0.05)
+
+    assert runner.adapter is adapter
+    assert runner.cancel_grace_s == 0.05
+    assert runner.current_write_authority is None
+    assert runner.lifecycle_hook is None
+
+    restored_jobs = {}
+    manager = TaskManager("run", object(), object(), object(), restored_jobs)
+
+    assert manager.jobs is restored_jobs
+    assert manager.write_authority.revoked is False
+
+
 def test_stable_constructor_positional_order_is_append_only() -> None:
     """The positional signature of the shipped constructors is a compatibility surface.
 
@@ -688,9 +799,11 @@ def test_stable_constructor_positional_order_is_append_only() -> None:
     import dataclasses
 
     from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
+    from monoid_agent_kernel.model_call import ModelCallRunner
     from monoid_agent_kernel.reference.backend.loop_factory import BackendLoopFactoryContext
     from monoid_agent_kernel.reference.backend.service import RunnerBackend
     from monoid_agent_kernel.reference.studio.server import StudioConfig
+    from monoid_agent_kernel.tasks import TaskManager
 
     def positional(cls: type) -> tuple[str, ...]:
         return tuple(f.name for f in dataclasses.fields(cls) if f.init and not f.kw_only)
@@ -698,6 +811,14 @@ def test_stable_constructor_positional_order_is_append_only() -> None:
     assert positional(GatewayModelAdapter) == (
         "config", "gateway_url", "token", "token_env", "token_file", "token_provider",
         "provider_name",
+    )
+    assert positional(ModelCallRunner) == (
+        "adapter", "current_adapter", "current_cancellation_token", "cancel_grace_s",
+        "current_cancel_grace_s", "thread_name", "subscriptions", "settled_sink",
+        "capture_request_preimage",
+    )
+    assert positional(TaskManager) == (
+        "run_id", "workspace", "recorder", "permission_policy", "jobs",
     )
     assert positional(StudioConfig) == (
         "workspace", "host", "port", "provider", "run_root", "skills_directory", "mcp",

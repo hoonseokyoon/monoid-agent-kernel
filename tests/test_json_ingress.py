@@ -31,6 +31,7 @@ from monoid_agent_kernel.core.json_ingress import (
     UnportableContainerError,
     UnportableScalarError,
     is_finite_json_number,
+    is_portable_json_integer,
     loads_json_ingress,
     loads_model_envelope_json_ingress,
     loads_model_json_ingress,
@@ -72,6 +73,18 @@ def test_finite_json_number_check_is_total_for_arbitrarily_large_integers() -> N
     assert not is_finite_json_number(float("inf"))
     assert not is_finite_json_number(True)
     assert not is_finite_json_number(IntegerSubclass(1))
+
+
+def test_portable_json_integer_uses_the_writer_and_reader_digit_bound() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    assert is_portable_json_integer(0)
+    assert is_portable_json_integer(-1)
+    assert not is_portable_json_integer(10**5000)
+    assert not is_portable_json_integer(True)
+    assert not is_portable_json_integer(1.0)
+    assert not is_portable_json_integer(IntegerSubclass(1))
 
 
 def test_json_ingress_normalizes_nested_keys_values_and_nonfinite_numbers() -> None:
@@ -961,10 +974,10 @@ def test_the_refusing_ingress_boundaries_are_exactly_the_python_object_routes() 
 
     Every other caller keeps the default. For scalars the reason is that they hand the normalizer
     values that came off a bounded JSON parse, so the decoders already refused what these
-    boundaries refuse. That reason does **not** extend to shape: the model-JSON decoders admit 512
-    levels of nesting and ``dataclasses.asdict`` dies at 492, so the depth bound had to be carried
-    by these boundaries rather than inherited from the parsers — which is why the route a model's
-    own tool-call arguments take is now one of them.
+    boundaries refuse. The shape cap also remains an ingress contract after the v0.22 checkpoint
+    writer became iterative: widening it would change what model/tool routes accept, and recursive
+    JSON writers around those routes still need the margin. The route a model's own tool-call
+    arguments take is therefore one of these boundaries.
 
     The ``==`` fails in both directions. A new ``True`` site means a new Python-object ingress was
     opened, and it belongs here only together with the conversion the others carry. A missing

@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
     ModelStreamOutcome,
+    ModelStreamStatus,
 )
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
@@ -165,6 +169,61 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
     assert settled.parent_id == started.event_id
 
 
+@pytest.mark.parametrize("losing_open", ("private", "observer"))
+def test_lease_loss_during_each_stream_writer_open_fences_later_opens_and_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    losing_open: str,
+) -> None:
+    token = CancellationToken()
+    first = _RecordingObserver()
+    second = _RecordingObserver()
+    adapter = _ScriptedStreamAdapter([TextDelta("unreachable"), TurnComplete(response_id="r1")])
+    loop = _loop(
+        tmp_path,
+        adapter,
+        observer_factories=(lambda: first, lambda: second),
+        model_content_file=losing_open == "private",
+    )
+    loop.cancellation_token = token
+    loop.open()
+    assert loop._session is not None
+
+    if losing_open == "private":
+        recorder = loop._session.res.recorder
+        original_open = recorder.open_model_stream
+
+        def lose_after_private_open(context: ModelStreamContext):  # noqa: ANN202
+            writer = original_open(context)
+            loop.lose_writer_authority()
+            return writer
+
+        monkeypatch.setattr(recorder, "open_model_stream", lose_after_private_open)
+    else:
+        original_open = first.open
+
+        def lose_after_observer_open(context: ModelStreamContext):  # noqa: ANN202
+            writer = original_open(context)
+            loop.lose_writer_authority()
+            return writer
+
+        monkeypatch.setattr(first, "open", lose_after_observer_open)
+
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.discard_uncommitted()
+
+    assert suspension.reason == "interrupted"
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert adapter.stream_calls == 0
+    assert second.contexts == []
+    if losing_open == "private":
+        assert first.contexts == []
+    else:
+        assert len(first.contexts) == 1
+
+
 def test_one_shot_adapter_still_closes_observer_with_settled_output(tmp_path: Path) -> None:
     class OneShotAdapter:
         supports_multimodal = False
@@ -198,6 +257,109 @@ def test_one_shot_adapter_still_closes_observer_with_settled_output(tmp_path: Pa
             usage={"input_tokens": 0, "output_tokens": 2, "total_tokens": 0},
         )
     ]
+
+
+def test_lease_loss_during_first_stream_close_stops_remaining_writers(tmp_path: Path) -> None:
+    token = CancellationToken()
+    entered, release = Event(), Event()
+
+    class BlockingCloseWriter(_RecordingWriter):
+        def close(self, outcome: ModelStreamOutcome) -> None:
+            entered.set()
+            assert release.wait(5)
+            super().close(outcome)
+
+    class FixedObserver:
+        def __init__(self, writer: _RecordingWriter) -> None:
+            self.writer = writer
+
+        def open(self, context: ModelStreamContext) -> _RecordingWriter:
+            del context
+            return self.writer
+
+    class OneShotAdapter:
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            return ModelTurn(response_id="r-close", final_text="done")
+
+    first, second = BlockingCloseWriter(), _RecordingWriter()
+    loop = _loop(
+        tmp_path,
+        OneShotAdapter(),
+        observer_factories=(lambda: FixedObserver(first), lambda: FixedObserver(second)),
+    )
+    loop.cancellation_token = token
+    loop.open()
+
+    def lose_authority() -> None:
+        assert entered.wait(5)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        loop.lose_writer_authority()
+        release.set()
+
+    racer = Thread(target=lose_authority)
+    racer.start()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        racer.join(5)
+        loop.discard_uncommitted()
+
+    assert not racer.is_alive()
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(first.outcomes) == 1
+    assert second.outcomes == []
+
+
+def test_lease_loss_during_first_stream_push_stops_remaining_writers(tmp_path: Path) -> None:
+    token = CancellationToken()
+    entered, release = Event(), Event()
+
+    class BlockingPushWriter(_RecordingWriter):
+        def push(self, delta: ModelStreamDelta) -> None:
+            entered.set()
+            assert release.wait(5)
+            super().push(delta)
+
+    class FixedObserver:
+        def __init__(self, writer: _RecordingWriter) -> None:
+            self.writer = writer
+
+        def open(self, context: ModelStreamContext) -> _RecordingWriter:
+            del context
+            return self.writer
+
+    first, second = BlockingPushWriter(), _RecordingWriter()
+    loop = _loop(
+        tmp_path,
+        _ScriptedStreamAdapter(
+            [TextDelta("partial"), TurnComplete(response_id="unreachable")]
+        ),
+        observer_factories=(lambda: FixedObserver(first), lambda: FixedObserver(second)),
+    )
+    loop.cancellation_token = token
+    loop.open()
+
+    def lose_authority() -> None:
+        assert entered.wait(5)
+        token.cancel(InterruptionCause.GRACEFUL_DRAIN)
+        loop.lose_writer_authority()
+        release.set()
+
+    racer = Thread(target=lose_authority)
+    racer.start()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        racer.join(5)
+        loop.discard_uncommitted()
+
+    assert not racer.is_alive()
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert first.deltas == [ModelStreamDelta(channel="output", text="partial")]
+    assert second.deltas == []
+    assert first.outcomes == []
+    assert second.outcomes == []
 
 
 def test_root_stream_context_ignores_forged_request_metadata(tmp_path: Path) -> None:
@@ -248,6 +410,65 @@ def test_stream_model_calls_forces_streaming_and_token_boundary_interrupt(tmp_pa
         assert interrupted.parent_id == started.event_id
     finally:
         loop.close()
+
+
+@pytest.mark.parametrize(
+    ("cause", "suspension_reason", "stream_status", "stream_error_code"),
+    (
+        (InterruptionCause.DEADLINE, "terminal", "timed_out", "run_timeout"),
+        (
+            InterruptionCause.GRACEFUL_DRAIN,
+            "interrupted",
+            "interrupted",
+            "graceful_drain",
+        ),
+        (
+            InterruptionCause.HOST_SHUTDOWN,
+            "interrupted",
+            "interrupted",
+            "host_shutdown",
+        ),
+    ),
+)
+def test_typed_run_cancellation_closes_the_model_stream_with_the_same_classification(
+    tmp_path: Path,
+    cause: InterruptionCause,
+    suspension_reason: str,
+    stream_status: ModelStreamStatus,
+    stream_error_code: str,
+) -> None:
+    token = CancellationToken()
+    observer = _RecordingObserver()
+
+    class CancellingAdapter(_ScriptedStreamAdapter):
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            yield TextDelta("partial")
+            token.cancel(cause)
+            await asyncio.Event().wait()
+
+    loop = _loop(
+        tmp_path,
+        CancellingAdapter([]),
+        observer_factories=(lambda: observer,),
+    )
+    loop.cancellation_token = token
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.discard_uncommitted()
+
+    assert suspension.reason == suspension_reason
+    assert suspension.interruption_cause is cause
+    assert observer.writers[0].outcomes == [
+        ModelStreamOutcome(
+            status=stream_status,
+            final_text="partial",
+            error_code=stream_error_code,
+        )
+    ]
 
 
 def test_partial_output_closes_observer_as_failed(tmp_path: Path) -> None:

@@ -43,7 +43,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from monoid_agent_kernel.core._sync_bridge import (
@@ -54,6 +54,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     is_async_callable,
     start_abandonable_sync_call,
 )
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
@@ -68,12 +69,32 @@ from monoid_agent_kernel.core.model_io import (
     destination_digest,
     dispatch_model_call,
 )
-from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
+from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import (
+    DurableModelCallError,
     ModelAdapterError,
     ModelCallAborted,
+    ModelDispatchRefused,
+    ModelEvidenceUncommitted,
     RunCancelled,
     RunTimeout,
+)
+from monoid_agent_kernel.model_lifecycle import (
+    ModelCallLifecycleHook,
+    ModelDispatchReservation,
+    RecoveredModelDispatch,
+    dispatch_evidence,
+    durable_model_result_blob,
+    durable_model_turn,
+    mark_recovered_model_usage,
+    raise_model_dispatch_unknown,
+    recover_model_dispatch,
+    reserve_model_dispatch,
+    safe_failure_code,
+    settle_model_dispatch,
 )
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
@@ -143,6 +164,41 @@ class SettledModelCall:
     receipt: ModelCallReceipt
     request_preimage: bytes | None = None
     turn: Any | None = None
+
+
+_SETTLED_MODEL_STREAM_OUTCOME = "_monoid_settled_model_stream_outcome"
+
+
+def _carry_settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+    turn: ModelTurn,
+) -> None:
+    """Carry a successful provider stream across a required-evidence projection failure.
+
+    The exception still parks durable evidence recovery. This private in-process fact lets the
+    owning loop close live observers and the private content writer with the provider outcome
+    that already settled, instead of relabelling a paid success as a failed stream. The normalized
+    turn is the same source used by the ordinary successful return path.
+    """
+
+    setattr(
+        error,
+        _SETTLED_MODEL_STREAM_OUTCOME,
+        ModelStreamOutcome(
+            status="completed",
+            final_text=turn.final_text,
+            usage=turn.usage,
+        ),
+    )
+
+
+def _settled_model_stream_outcome(
+    error: ModelEvidenceUncommitted,
+) -> ModelStreamOutcome | None:
+    """Read only the private, typed success marker produced by this runner."""
+
+    outcome = getattr(error, _SETTLED_MODEL_STREAM_OUTCOME, None)
+    return outcome if isinstance(outcome, ModelStreamOutcome) else None
 
 
 def _recordable_usage(usage: Mapping[str, Any]) -> dict[str, int]:
@@ -221,6 +277,72 @@ def _merged_usage(spent: Mapping[str, int], usage: Mapping[str, int]) -> dict[st
     for key, value in spent.items():
         merged[key] = merged.get(key, 0) + value
     return merged
+
+
+def _recovered_receipt(
+    base: ModelCallReceipt,
+    recovered: RecoveredModelDispatch,
+) -> ModelCallReceipt:
+    """Combine current private routing context with authoritative public settlement evidence."""
+
+    try:
+        evidence = recovered.receipt
+        reservation = recovered.reservation
+        return replace(
+            base,
+            request_digest=reservation.request_digest,
+            digest_generation=reservation.digest_generation,
+            digest_status="ok",
+            idempotency_key=reservation.idempotency_key,
+            stop_reason=evidence.get("stop_reason", ""),
+            usage=dict(evidence.get("usage", {})),
+            latency_ms=evidence.get("latency_ms", 0),
+            attempts=evidence["attempts"],
+            provider_retried=evidence.get("provider_retried", False),
+            error_code=recovered.failure_code,
+            provider_error_code=evidence.get("provider_error_code", ""),
+            retryable=evidence.get("retryable", False),
+            config_recoverable=evidence.get("config_recoverable", False),
+            http_status=evidence.get("http_status"),
+            attempt_log=(),
+        )
+    except Exception as exc:
+        raise DurableModelCallError(
+            "durable model invocation receipt is corrupt",
+            error_code="durable_invocation_receipt_corrupt",
+        ) from exc
+
+
+def _recovered_result_matches_evidence(
+    turn: ModelTurn,
+    evidence: Mapping[str, Any],
+) -> bool:
+    """Compare only facts preserved by both durable projections.
+
+    The public receipt describes the whole logical call, including usage absorbed by kernel
+    retries and provider-retry evidence folded across attempts. The private result describes the
+    final provider turn. Their usage and retry fields intentionally have different meanings. A
+    public-safe stop reason, when present, is the one shared result fact that can be compared.
+    Blob-address verification and ``durable_model_turn`` validate the private result itself.
+    """
+
+    return "stop_reason" not in evidence or (turn.stop_reason or "") == evidence["stop_reason"]
+
+
+def _recovered_failure_can_retry(
+    receipt: ModelCallReceipt,
+    evidence: Mapping[str, Any],
+    retry_plan: ModelRetryConfig | None,
+) -> bool:
+    """Whether a proven refusal can safely resume the current kernel retry loop."""
+
+    return (
+        retry_plan is not None
+        and receipt.retryable
+        and not receipt.config_recoverable
+        and receipt.attempts < retry_plan.max_attempts
+        and evidence.get("stream_committed") is False
+    )
 
 
 def _safe_repr(value: Any) -> str:
@@ -397,6 +519,12 @@ class ModelCallRunner:
     runner holding a snapshot would watch a token nobody cancels and silently lose cancellation on
     the streaming path."""
 
+    current_write_authority: Callable[[], ActivationWriteAuthority | None] | None = field(
+        default=None,
+        kw_only=True,
+    )
+    """Returns the activation's independent process-local mutation capability, when present."""
+
     cancel_grace_s: float = 1.0
     """How long an abandoned call's worker is given to settle before it is reported as leaked.
 
@@ -456,6 +584,15 @@ class ModelCallRunner:
     held in memory per in-flight call -- and a sink that only files receipts (the ledger without
     the payload corpus) should not pay for bytes it never reads. The wiring that enables the
     payload recorder sets this; the digests themselves are computed either way."""
+
+    lifecycle_hook: ModelCallLifecycleHook | None = field(default=None, kw_only=True)
+    """Optional authoritative lifecycle writer for durable paid-call execution.
+
+    The hook is synchronous because the hosting contracts it adapts are synchronous fenced
+    mutations. It is opt-in and independent of ``settled_sink``: lifecycle writes control whether
+    adapter work may begin or be retried, while the existing sink remains passive evidence
+    delivery. Durable mode requires an explicit ``logical_call_id`` on :meth:`acall`.
+    """
 
     def _effective_model(
         self,
@@ -532,11 +669,29 @@ class ModelCallRunner:
         and has no meaning for a one-shot call, which cannot be stopped part-way.
         """
 
+        self._assert_write_authority()
         token = self._token()
         if token is not None and token.requested:
-            raise RunCancelled("run cancelled")
+            raise RunCancelled(
+                "run cancelled",
+                interruption_cause=token.cause or InterruptionCause.USER_CANCEL,
+            )
         if deadline is not None and time.time() >= deadline:
             raise RunTimeout("run exceeded max duration")
+
+    def _assert_write_authority(self) -> None:
+        """Fence publication immediately after a durable host mutation returns.
+
+        A lifecycle commit can be the operation that discovers or concurrently observes lease
+        loss. Its durable settlement remains authoritative, while every receipt observer and
+        sidecar after that commit belongs to the stale activation and must stay untouched.
+        """
+
+        authority = (
+            None if self.current_write_authority is None else self.current_write_authority()
+        )
+        if authority is not None:
+            authority.assert_active()
 
     async def acall(
         self,
@@ -546,6 +701,8 @@ class ModelCallRunner:
         deadline: float | None = None,
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
+        logical_call_id: str = "",
+        abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one call and return the turn with the receipt that describes it.
 
@@ -561,9 +718,19 @@ class ModelCallRunner:
         A receipt is produced whether the call succeeded or failed -- a failed call is exactly the
         one an audit trail needs -- and is delivered to every subscription before the exception is
         re-raised.
+
+        ``logical_call_id`` is required only when ``lifecycle_hook`` is configured. It is the
+        caller-owned durable address of this call; standalone anonymous calls cannot invent a
+        stable address across process restore.
+
+        ``abort_after_recovery_probe`` is the durable-resume seam for an already-started streamed
+        step. It polls ``should_abort`` once after authoritative recovery proves there is no
+        reusable outcome and before a new dispatch. The default preserves the ordinary contract:
+        one-shot calls never poll the streamed-call abort predicate before provider entry.
         """
 
         started = time.monotonic()
+        lifecycle_hook = self.lifecycle_hook
         adapter = self._current_adapter()
         # Same tolerance as the other two adapter probes, and for the same reason. Undefended, a
         # `provider_name` property that raised -- or whose `str()` did -- lost the call before the
@@ -611,26 +778,35 @@ class ModelCallRunner:
             # settles the call. Initialized beside `spent_usage` because the failure exit
             # reads both for calls refused before the loop was ever entered.
             attempt_log: list[ModelCallAttempt] = []
+            # A recovered public receipt carries aggregate usage but intentionally omits the
+            # private per-attempt log. Once recovery resumes a kernel retry, the final receipt
+            # keeps that log empty rather than fabricating the missing historical entries.
+            attempt_log_complete = True
             last_attempt_entry: ModelCallAttempt | None = None
             # The measured wait that preceded the NEXT dispatch: 0 until a backoff actually
             # runs, then re-measured after each one. Threaded into every entry-construction
             # site so the wait lands on the entry it delayed, not the one that caused it.
             pending_backoff_ms = 0
+            recovered_failure_receipt: ModelCallReceipt | None = None
+            durable_outcome_receipt: ModelCallReceipt | None = None
+            elapsed_before_recovery_ms = 0
             try:
-                # Before dispatch, not only inside the race. `_aawait` reports a boundary that had
-                # already been crossed, but by then the adapter has been invoked and the provider has
-                # been paid for work the run had already decided not to do. Checking here also covers
-                # the interval the caller cannot: building the receipt digests above happens between
-                # the caller's own boundary check and this line, so a deadline can expire in between.
-                #
-                # Nothing awaits between here and the dispatch, so the check cannot go stale within
-                # this task. A boundary crossed *after* dispatch is the race's business, which is why
-                # this is an addition to it rather than a replacement.
-                #
-                # Lifted out of `_adrive` so that refusing the call and dispatching it are
-                # distinguishable here; `_adrive` is called from nowhere else, so the check still
-                # exists once.
-                self._check_cancel_or_deadline(deadline)
+                if lifecycle_hook is not None and not is_safe_opaque_id(logical_call_id):
+                    raise DurableModelCallError(
+                        "durable model calls require an explicit bounded logical_call_id",
+                        error_code="durable_invocation_identity_required",
+                    )
+                # An ordinary call keeps the historical boundary precedence: cancellation or an
+                # expired deadline refuses it before ingress normalization, keying, or adapter
+                # entry. Durable calls defer this check only long enough to probe and complete an
+                # existing authoritative settlement/evidence barrier below.
+                if lifecycle_hook is None:
+                    self._check_cancel_or_deadline(deadline)
+                else:
+                    # Lease loss is an authority boundary, not a recoverable cancellation.
+                    # Other terminal requests intentionally wait for an already-settled required
+                    # evidence barrier below; a stale owner may not attempt that mutation.
+                    self._assert_write_authority()
                 request = normalize_model_request(request)
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
@@ -714,6 +890,118 @@ class ModelCallRunner:
                     destination_digest=destination_digest(where),
                     idempotency_key=request.idempotency_key,
                 )
+                if lifecycle_hook is not None and digest_result.status != "ok":
+                    raise DurableModelCallError(
+                        "durable model call request could not be keyed",
+                        error_code="durable_invocation_unkeyable",
+                    )
+                if lifecycle_hook is not None:
+                    recovered = recover_model_dispatch(
+                        lifecycle_hook,
+                        logical_call_id=logical_call_id,
+                        request_digest=receipt.request_digest,
+                    )
+                    if recovered is not None:
+                        # The recovery hook performs the fenced, idempotent settlement/evidence
+                        # commit and invokes no provider. Let that commit barrier finish before a
+                        # terminal boundary wins; otherwise cancel or expiry can permanently strand
+                        # required evidence for a provider call that already settled.
+                        self._check_cancel_or_deadline(deadline)
+                        object.__setattr__(
+                            request,
+                            "idempotency_key",
+                            recovered.reservation.idempotency_key,
+                        )
+                        try:
+                            receipt = _recovered_receipt(receipt, recovered)
+                        except DurableModelCallError as recovery_error:
+                            mark_recovered_model_usage(recovery_error, recovered.receipt)
+                            raise
+                        if recovered.failure_code:
+                            recovered_failure_receipt = receipt
+                            recovered_error = ModelDispatchRefused(
+                                "durable model dispatch restored a settled refusal",
+                                error_code=recovered.failure_code,
+                                provider_error_code=receipt.provider_error_code,
+                                retryable=receipt.retryable,
+                                config_recoverable=receipt.config_recoverable,
+                                http_status=receipt.http_status,
+                                provider_retried=receipt.provider_retried,
+                            )
+                            if not _recovered_failure_can_retry(
+                                receipt,
+                                recovered.receipt,
+                                retry_plan,
+                            ):
+                                raise recovered_error
+                            delay = retry_delay_s(
+                                receipt.attempts,
+                                retry_plan.initial_delay_s,
+                                retry_plan.max_delay_s,
+                                retry_plan.backoff_multiplier,
+                                retry_plan.jitter_s,
+                            )
+                            if deadline is not None and time.time() + delay >= deadline:
+                                raise recovered_error
+                            attempts_made = receipt.attempts
+                            spent_usage = dict(receipt.usage)
+                            elapsed_before_recovery_ms = receipt.latency_ms
+                            attempt_log_complete = False
+                            receipt = replace(
+                                receipt,
+                                stop_reason="",
+                                usage={},
+                                latency_ms=0,
+                                error_code="",
+                                provider_error_code="",
+                                retryable=False,
+                                config_recoverable=False,
+                                http_status=None,
+                                attempt_log=(),
+                            )
+                            recovered_failure_receipt = None
+                            backoff_started = time.monotonic()
+                            await self._abackoff(delay, deadline)
+                            pending_backoff_ms = (
+                                self._ms_since(backoff_started) if delay > 0 else 0
+                            )
+                        else:
+                            try:
+                                turn = durable_model_turn(recovered.result_blob)
+                            except DurableModelCallError as recovery_error:
+                                mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                raise
+                            if not _recovered_result_matches_evidence(turn, recovered.receipt):
+                                recovery_error = DurableModelCallError(
+                                    "durable model result conflicts with its receipt",
+                                    error_code="durable_invocation_result_corrupt",
+                                )
+                                mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                raise recovery_error
+                            settled = self._publish(
+                                request,
+                                turn,
+                                receipt,
+                                elapsed_ms=receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
+                            return turn, settled
+                # Check immediately before any path can reserve or enter the adapter. Digesting and
+                # probing durable recovery above are local/idempotent work; every new provider
+                # dispatch remains barred once cancellation or the deadline has won.
+                self._check_cancel_or_deadline(deadline)
+                # Durable recovery above must run first so an already-settled required-evidence
+                # obligation cannot be stranded by a stop. Once that probe and every terminal
+                # boundary prove there is no reusable outcome, a cooperative turn stop bars
+                # reservation/provider entry too. The ordinary AgentLoop path checks this at its
+                # step boundary; this second gate covers a restored internal safety checkpoint
+                # that must reuse and probe its in-progress coordinate before honoring that signal.
+                if (
+                    abort_after_recovery_probe
+                    and should_abort is not None
+                    and should_abort()
+                ):
+                    raise ModelCallAborted("model call aborted before provider dispatch")
                 consumer = delta_consumer
                 delivered = False
                 # Installed for any consumer, not only under the kernel's loop. The flag is
@@ -735,14 +1023,44 @@ class ModelCallRunner:
                         inner_consumer(chunk)
 
                     consumer = _marking_consumer
+                reservation: ModelDispatchReservation | None = None
                 while True:
-                    attempts_made += 1
+                    next_attempt = attempts_made + 1
+                    if lifecycle_hook is not None:
+                        reservation = reserve_model_dispatch(
+                            lifecycle_hook,
+                            logical_call_id=logical_call_id,
+                            dispatch_attempt=next_attempt,
+                            request_digest=receipt.request_digest,
+                            idempotency_key=request.idempotency_key,
+                        )
+                        self._assert_write_authority()
+                        # A restored reservation owns the key. The request digest excludes this
+                        # carriage field, so replacing it does not invalidate the identity already
+                        # checked above.
+                        object.__setattr__(
+                            request, "idempotency_key", reservation.idempotency_key
+                        )
+                        receipt = replace(
+                            receipt,
+                            idempotency_key=reservation.idempotency_key,
+                        )
+                        # The commit sits immediately before adapter entry. A hook failure leaves
+                        # attempts_made unchanged, so the receipt does not claim provider work.
+                        lifecycle_hook.dispatch_started(reservation)
+                        self._assert_write_authority()
+                    attempts_made = next_attempt
                     reports_before = progress.count
                     attempt_started = time.monotonic()
                     try:
                         turn = await self._adrive(
                             request, deadline, should_abort, consumer, adapter
                         )
+                        if lifecycle_hook is not None:
+                            # Durable mode classifies a malformed terminal inside the started
+                            # dispatch. The default path keeps its historical settle accounting
+                            # below unchanged.
+                            turn = normalize_model_turn(turn)
                         break
                     except BaseException as exc:
                         # Every fact the entry needs, read through `with_error` on a throwaway
@@ -765,6 +1083,64 @@ class ModelCallRunner:
                             stream_committed=delivered,
                             backoff_ms=pending_backoff_ms,
                         )
+                        # The provider exception records the interruption cause that existed when
+                        # it was raised. Lease loss can become sticky while that exception unwinds;
+                        # re-read authority before any dispatch-unknown or failure transition.
+                        self._assert_write_authority()
+                        if (
+                            lifecycle_hook is not None
+                            and reservation is not None
+                            and isinstance(exc, Exception)
+                            and not (
+                                isinstance(exc, RunCancelled)
+                                and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                            )
+                        ):
+                            if dispatch_evidence(exc) != "refused":
+                                raise_model_dispatch_unknown(
+                                    lifecycle_hook,
+                                    reservation,
+                                    exc,
+                                    failure_code=safe_failure_code(
+                                        probe.error_code,
+                                        default="dispatch_unknown",
+                                    ),
+                                    usage=(
+                                        _merged_usage(spent_usage, probe.usage)
+                                        if spent_usage
+                                        else probe.usage
+                                    ),
+                                )
+                            current_failure = receipt.with_error(exc)
+                            durable_failure = replace(
+                                current_failure,
+                                attempts=attempts_made,
+                                latency_ms=(
+                                    elapsed_before_recovery_ms + self._ms_since(started)
+                                ),
+                                provider_retried=(
+                                    current_failure.provider_retried or progress.retried
+                                ),
+                                attempt_log=(
+                                    (*attempt_log, last_attempt_entry)
+                                    if attempt_log_complete
+                                    else ()
+                                ),
+                                usage=(
+                                    _merged_usage(spent_usage, current_failure.usage)
+                                    if spent_usage
+                                    else current_failure.usage
+                                ),
+                            )
+                            durable_outcome_receipt = durable_failure
+                            settle_model_dispatch(
+                                lifecycle_hook,
+                                reservation,
+                                durable_failure,
+                                failure_code=durable_failure.error_code,
+                                stream_committed=delivered,
+                            )
+                            self._assert_write_authority()
                         if (
                             retry_plan is None
                             or attempts_made >= retry_plan.max_attempts
@@ -798,7 +1174,8 @@ class ModelCallRunner:
                         # the wait below reports itself, not the provider failure it
                         # interrupted.
                         spent_usage = _merged_usage(spent_usage, probe.usage)
-                        attempt_log.append(last_attempt_entry)
+                        if attempt_log_complete:
+                            attempt_log.append(last_attempt_entry)
                         # Measured, not copied from the schedule -- a capped sleep must record
                         # what happened. Only when a wait was actually requested: for a zero
                         # schedule the boundary check is not a backoff, and timing it would
@@ -808,8 +1185,78 @@ class ModelCallRunner:
                         pending_backoff_ms = (
                             self._ms_since(backoff_started) if delay > 0 else 0
                         )
-                turn = normalize_model_turn(turn)
+                if lifecycle_hook is None:
+                    turn = normalize_model_turn(turn)
             except BaseException as exc:
+                # Any lifecycle mutation above may be the operation that observes concurrent lease
+                # loss. Authority supersedes the exception taxonomy before passive publication.
+                self._assert_write_authority()
+                if (
+                    isinstance(exc, RunCancelled)
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                ):
+                    # A durable settlement may have won immediately before lease loss. Preserve
+                    # that journal fact and skip every stale observer/sidecar publication below.
+                    raise
+                # Process-control exceptions preserve already-observed accounting but never become
+                # model outcomes or lifecycle compensation. Prefer a complete receipt prepared
+                # immediately before durable settle. If the stop arrived earlier, carry the usage
+                # of completed attempts without constructing an attempt log whose terminal entry
+                # would falsely describe the stop as a provider result. Every diagnostic action is
+                # contained so the original KeyboardInterrupt/SystemExit-shaped signal survives.
+                if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                    crash_receipt = durable_outcome_receipt
+                    if crash_receipt is None:
+                        crash_usage = dict(spent_usage)
+                        if (
+                            last_attempt_entry is not None
+                            and last_attempt_entry.index == attempts_made
+                        ):
+                            crash_usage = _merged_usage(crash_usage, last_attempt_entry.usage)
+                        with contextlib.suppress(Exception):
+                            crash_receipt = replace(
+                                receipt.with_error(exc),
+                                attempts=attempts_made,
+                                attempt_log=(),
+                                usage=crash_usage,
+                            )
+                    if crash_receipt is not None:
+                        self._publish_best_effort(
+                            request,
+                            None,
+                            crash_receipt,
+                            elapsed_ms=(elapsed_before_recovery_ms + self._ms_since(started)),
+                            request_preimage=request_preimage,
+                        )
+                        if crash_receipt.usage:
+                            mark_provider_usage(exc, crash_receipt.usage)
+                    raise
+                if isinstance(exc, ModelEvidenceUncommitted):
+                    # The paid dispatch and its canonical result/refusal are already settled.
+                    # Required evidence is a separate recovery lane. Passive subscribers and
+                    # sidecars still receive the authoritative provider outcome now, while the
+                    # original request/preimage is in hand; the projection failure itself never
+                    # becomes a fabricated model-call failure and never enters the retry loop.
+                    if durable_outcome_receipt is not None:
+                        self._publish_best_effort(
+                            request,
+                            None,
+                            durable_outcome_receipt,
+                            elapsed_ms=durable_outcome_receipt.latency_ms,
+                            request_preimage=request_preimage,
+                        )
+                    raise
+                if recovered_failure_receipt is not None:
+                    self._publish_best_effort(
+                        request,
+                        None,
+                        recovered_failure_receipt,
+                        elapsed_ms=recovered_failure_receipt.latency_ms,
+                        request_preimage=request_preimage,
+                    )
+                    if recovered_failure_receipt.usage:
+                        mark_provider_usage(exc, recovered_failure_receipt.usage)
+                    raise
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
                 # abandoned worker's eventual exception is never read, so for a call the run gave
@@ -828,7 +1275,7 @@ class ModelCallRunner:
                 # every dispatched attempt is already logged and the receipt alone carries the
                 # boundary's taxonomy. A refused call never dispatched, so its log stays empty
                 # beside `attempts == 0`.
-                if attempts_made > len(attempt_log):
+                if attempt_log_complete and attempts_made > len(attempt_log):
                     if (
                         last_attempt_entry is not None
                         and last_attempt_entry.index == attempts_made
@@ -870,14 +1317,13 @@ class ModelCallRunner:
                     attempt_log=tuple(attempt_log),
                     usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
                 )
-                with contextlib.suppress(Exception):
-                    self._publish(
-                        request,
-                        None,
-                        failed,
-                        elapsed_ms=self._ms_since(started),
-                        request_preimage=request_preimage,
-                    )
+                self._publish_best_effort(
+                    request,
+                    None,
+                    failed,
+                    elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
+                    request_preimage=request_preimage,
+                )
                 # The terminal error leaves carrying what the whole logical call cost: the
                 # loop's failure accounting reads this stamp (`_billed_usage`), and a stamp
                 # naming only the last attempt under-counts every absorbed one. Stamped AFTER
@@ -917,16 +1363,59 @@ class ModelCallRunner:
             # is what makes "briefly" indistinguishable from "at all".
             completed = replace(
                 completed,
-                attempt_log=(*attempt_log, answering_entry),
+                attempt_log=(
+                    (*attempt_log, answering_entry) if attempt_log_complete else ()
+                ),
                 usage=(
                     _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
                 ),
             )
+            if lifecycle_hook is not None:
+                if reservation is None:  # pragma: no cover - a started durable call reserves first
+                    raise AssertionError("durable model call completed without a reservation")
+                durable_completed = replace(
+                    completed,
+                    latency_ms=elapsed_before_recovery_ms + self._ms_since(started),
+                )
+                durable_outcome_receipt = durable_completed
+                try:
+                    result_blob = durable_model_result_blob(turn)
+                except DurableModelCallError as result_error:
+                    raise_model_dispatch_unknown(
+                        lifecycle_hook,
+                        reservation,
+                        result_error,
+                        failure_code=result_error.error_code,
+                        usage=durable_completed.usage,
+                    )
+                try:
+                    settle_model_dispatch(
+                        lifecycle_hook,
+                        reservation,
+                        durable_completed,
+                        result_blob=result_blob,
+                        stream_committed=delivered,
+                    )
+                    self._assert_write_authority()
+                except ModelEvidenceUncommitted as evidence_error:
+                    # The success settlement is finalized after the provider try/except above.
+                    # Publish it here so passive observers and sidecars see the paid call even
+                    # though required evidence parks the loop before the ordinary publish below.
+                    self._assert_write_authority()
+                    _carry_settled_model_stream_outcome(evidence_error, turn)
+                    self._publish_best_effort(
+                        request,
+                        turn,
+                        durable_completed,
+                        elapsed_ms=durable_completed.latency_ms,
+                        request_preimage=request_preimage,
+                    )
+                    raise
             settled = self._publish(
                 request,
                 turn,
                 completed,
-                elapsed_ms=self._ms_since(started),
+                elapsed_ms=elapsed_before_recovery_ms + self._ms_since(started),
                 request_preimage=request_preimage,
             )
         return turn, settled
@@ -967,7 +1456,7 @@ class ModelCallRunner:
             # adapter with no retry loop. Combined with what the adapter reported through the
             # channel, since either alone is a partial view and neither can contradict the other:
             # both only ever say that a retry happened.
-            provider_retried=retried or turn_retried,
+            provider_retried=receipt.provider_retried or retried or turn_retried,
         )
 
     def _publish(
@@ -997,15 +1486,45 @@ class ModelCallRunner:
         timed = replace(receipt, latency_ms=elapsed_ms)
         settled = timed
         try:
+            self._assert_write_authority()
             if self.subscriptions:
+                content = _call_content(request, turn)
+                self._assert_write_authority()
                 settled = dispatch_model_call(
                     receipt=timed,
-                    content=_call_content(request, turn),
+                    content=content,
                     subscriptions=self.subscriptions,
+                    check_authority=self._assert_write_authority,
                 )
         finally:
+            self._assert_write_authority()
             self._record(settled, request_preimage, turn)
+            self._assert_write_authority()
         return settled
+
+    def _publish_best_effort(
+        self,
+        request: ModelRequest,
+        turn: ModelTurn | None,
+        receipt: ModelCallReceipt,
+        *,
+        elapsed_ms: int,
+        request_preimage: bytes | None = None,
+    ) -> ModelCallReceipt | None:
+        """Contain diagnostic publication failures while preserving writer-authority loss."""
+
+        try:
+            return self._publish(
+                request,
+                turn,
+                receipt,
+                elapsed_ms=elapsed_ms,
+                request_preimage=request_preimage,
+            )
+        except RunCancelled:
+            raise
+        except Exception:
+            return None
 
     def _record(
         self, receipt: ModelCallReceipt, request_preimage: bytes | None, turn: Any | None
@@ -1025,14 +1544,18 @@ class ModelCallRunner:
         sink = self.settled_sink
         if sink is None:
             return
+        self._assert_write_authority()
         try:
             sink(
                 SettledModelCall(
                     receipt=receipt, request_preimage=request_preimage, turn=turn
                 )
             )
+        except RunCancelled:
+            raise
         except Exception:  # noqa: BLE001 - recording must not alter the model-call outcome
             _LOGGER.debug("model call settled sink failed", exc_info=True)
+        self._assert_write_authority()
 
     async def _adrive(
         self,
@@ -1042,10 +1565,10 @@ class ModelCallRunner:
         delta_consumer: DeltaConsumer | None,
         adapter: Any,
     ) -> ModelTurn:
-        # The pre-dispatch boundary check that used to open this method now sits in `acall`, one
-        # statement above the call to this one, so that a call refused before the adapter is reached
-        # can be told apart from one that failed after -- `attempts=0` versus 1. Nothing awaits
-        # between there and here.
+        # The pre-dispatch boundary check that used to open this method now sits in `acall`, before
+        # the optional synchronous lifecycle reserve/start commits. This method is called only after
+        # those commits, so reaching it is the runner's adapter-entry boundary and increments the
+        # receipt's attempt count exactly once.
         astream_turn = getattr(adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(

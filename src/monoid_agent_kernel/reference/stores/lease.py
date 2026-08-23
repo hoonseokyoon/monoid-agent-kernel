@@ -5,8 +5,8 @@ The watchdog answers "is this run's worker still alive, and may I take it over?"
 the claim's atomicity* live behind this seam. The default ``LocalFsLeaseStore`` keeps a
 ``lease.json`` per run dir with an ``O_EXCL`` file-lock CAS — correct for one host / one
 shared filesystem. A ``SqliteLeaseStore`` (transactional CAS) puts the lease in a shared db
-instead, so a worker on another process/host can see it and reclaim across that boundary —
-the "shared board" that local files cannot be.
+instead, so another worker can observe and claim it. The lease CAS chooses one claimant. A
+canonical store separately needs owner/generation fencing to tolerate an old writer resuming.
 """
 
 from __future__ import annotations

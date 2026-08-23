@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from monoid_agent_kernel.core.checkpoint import CheckpointStore, RunCheckpoint
+from monoid_agent_kernel.core.checkpoint import RunCheckpoint
 from monoid_agent_kernel.core.content import ContentPart, content_part_from_json
 from monoid_agent_kernel.core.inbox import InboxMessage, is_inbox_envelope
 from monoid_agent_kernel.core.lifecycle import SessionState, state_from_suspension
@@ -35,7 +35,9 @@ class SessionDriveLimits:
 @dataclass(frozen=True)
 class SessionDriveContext:
     limits_provider: Callable[[], SessionDriveLimits]
-    checkpoint_store_provider: Callable[[], CheckpointStore]
+    commit_checkpoint: Callable[
+        [MutableRunRecordPort, RunCheckpoint, Mapping[str, bytes]], None
+    ]
     drain_outbox: Callable[[MutableRunRecordPort, LoopPort], None]
     close_signal: object
     resume_signal: object
@@ -117,6 +119,9 @@ class SessionDriveService:
         """Drive an already-open run until close, idle, cancellation, or terminal suspension."""
         consecutive_turn_failures = 0
         while True:
+            # Lease loss is an activation disposition. It cannot become run state because a
+            # replacement owner may already be projecting the same run.
+            record.write_authority.assert_active()
             limits = self._context.limits_provider()
             _set_record_state(
                 record,
@@ -141,6 +146,7 @@ class SessionDriveService:
             record.provider_retried = bool(suspension.provider_retried)
             record.error = str(suspension.error or "")
             record.error_code = str(suspension.error_code or "")
+            record.interruption_cause = suspension.interruption_cause
             if suspension.turn is not None:
                 record.last_final_output = suspension.turn.final_output
             if suspension.reason in {"terminal", "limited"}:
@@ -270,13 +276,16 @@ class SessionDriveService:
 
     def persist_run_checkpoint(self, record: MutableRunRecordPort) -> None:
         """Augment the loop checkpoint with backend-owned queue and inbox state."""
+        record.write_authority.assert_active()
         loop = record.loop
         if loop is None:
             return
         checkpoint = loop.snapshot()
         if checkpoint is None:
             return
-        self.persist_run_checkpoint_payload(record, checkpoint, loop.collect_checkpoint_blobs())
+        blobs = loop.collect_checkpoint_blobs()
+        record.write_authority.assert_active()
+        self.persist_run_checkpoint_payload(record, checkpoint, blobs)
 
     def persist_run_checkpoint_payload(
         self,
@@ -285,13 +294,18 @@ class SessionDriveService:
         blobs: Mapping[str, bytes],
     ) -> None:
         """Commit a loop checkpoint after adding backend-owned queue and inbox state."""
+        record.write_authority.assert_active()
         loop = record.loop
         if loop is None:
             return
         checkpoint.queued_messages = queued_message_snapshot(record.message_queue)
         checkpoint.inbox_seen_ids = sorted(record.seen_inbox_ids)
-        self._context.checkpoint_store_provider().put(checkpoint, blobs)
+        self._context.commit_checkpoint(record, checkpoint, blobs)
+        # The host commit seam linearizes the Reference store write with process-local revocation.
+        # Outbox dispatch is the next external boundary, so stale authority must stop here too.
+        record.write_authority.assert_active()
         self._context.drain_outbox(record, loop)
+        record.write_authority.assert_active()
 
     async def persist_run_checkpoint_async(self, record: MutableRunRecordPort) -> None:
         self.persist_run_checkpoint(record)

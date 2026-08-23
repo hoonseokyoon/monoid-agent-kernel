@@ -5,12 +5,11 @@ seam's invariants for free — ``put`` commits atomically (a crash mid-put rolls
 ``latest`` never sees a torn checkpoint), the latest pointer advances monotonically via a
 conditional UPSERT, and content-addressed blobs are write-once. The same db also hosts the
 ``SqliteLeaseStore`` (a transactional CAS lease), so one shared db is the "shared board"
-that lets a worker on another process/host reclaim a crashed peer's run.
+that lets a worker reclaim a run after its previous writer has stopped.
 
-SQLite itself is single-host; a real cross-host deployment swaps this for a networked DB or
-object store behind the same seams (documented follow-up). What it proves here, with zero
-dependencies, is that the seams are sufficient and the transactional commit/CAS pattern is
-correct.
+SQLite itself is a single-host Reference fixture. Its checkpoint ``put`` carries no writer
+identity and declares the single-writer capability. A topology with overlapping writers uses a
+``FencedRunSink`` that atomically validates ``WriterToken`` owner/generation with every mutation.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
+from monoid_agent_kernel.core._storage_capabilities import StorageCapabilities
 from monoid_agent_kernel.core._util import sha256_bytes
 from monoid_agent_kernel.core.checkpoint import (
     CHECKPOINT_CODEC,
@@ -88,7 +88,10 @@ def _ensure_schema(db_path: str) -> None:
 
 class SqliteCheckpointStore:
     """A durable ``CheckpointStore`` backed by one SQLite db. Honors the same contract as
-    ``LocalFsCheckpointStore`` (atomic last-good, monotonic ``latest``, write-once blobs)."""
+    ``LocalFsCheckpointStore`` (atomic last-good, monotonic ``latest``, write-once blobs).
+
+    The compatibility contract is single-writer. Use ``FencedRunSink`` for overlapping writers.
+    """
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
@@ -96,6 +99,12 @@ class SqliteCheckpointStore:
             threading.Lock()
         )  # serialize this instance's writers; cross-process is BEGIN IMMEDIATE
         _ensure_schema(self._db_path)
+
+    @property
+    def capabilities(self) -> StorageCapabilities:
+        """Declare the guarantees exposed by this legacy single-writer store."""
+
+        return StorageCapabilities(single_writer=True, durable_checkpoints=True)
 
     def put(self, checkpoint: RunCheckpoint, blobs: Mapping[str, bytes] = {}) -> None:
         manifest = json.dumps(

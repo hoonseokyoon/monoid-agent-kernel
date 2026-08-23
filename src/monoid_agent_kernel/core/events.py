@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
 
 from monoid_agent_kernel.core._util import utc_timestamp
@@ -141,6 +142,7 @@ class EventBus:
     run_id: str
     sinks: tuple[EventSink, ...]
     _seq: int = 0
+    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
     _closed: bool = field(default=False, init=False, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
@@ -153,17 +155,21 @@ class EventBus:
         turn_id: str | None = None,
         parent_id: str | None = None,
     ) -> AgentEvent:
+        self.write_authority.assert_active()
         with self._lock:
-            self._seq += 1
-            event = make_agent_event(
-                run_id=self.run_id,
-                seq=self._seq,
-                event_type=event_type,
-                data=data,
-                level=level,
-                turn_id=turn_id,
-                parent_id=parent_id,
-            )
+            def build_event() -> AgentEvent:
+                self._seq += 1
+                return make_agent_event(
+                    run_id=self.run_id,
+                    seq=self._seq,
+                    event_type=event_type,
+                    data=data,
+                    level=level,
+                    turn_id=turn_id,
+                    parent_id=parent_id,
+                )
+
+            event = self.write_authority.guard_local_mutation(build_event)
             # A background job (e.g. a shell monitor thread) can deliver its terminal event
             # after the run has closed the recorder. That late emit is a benign race, not an
             # error: drop it to the closed sinks rather than writing to a closed file handle.
@@ -171,10 +177,11 @@ class EventBus:
             if self._closed:
                 return event
             for sink in self.sinks:
-                sink.emit(event)
+                self.write_authority.guard_external_call(lambda sink=sink: sink.emit(event))
             return event
 
     def close(self) -> None:
+        self.write_authority.assert_active()
         with self._lock:
             if self._closed:
                 return
@@ -184,9 +191,11 @@ class EventBus:
             errors: list[BaseException] = []
             for sink in self.sinks:
                 try:
-                    sink.close()
+                    self.write_authority.guard_external_call(sink.close)
                 except BaseException as exc:
                     errors.append(exc)
+                    if self.write_authority.revoked:
+                        break
             if errors:
                 raise errors[0]
 

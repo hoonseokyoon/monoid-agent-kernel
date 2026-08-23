@@ -19,13 +19,22 @@ from __future__ import annotations
 import shutil
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
+from monoid_agent_kernel.core.cancellation import is_operational_cancellation_cause
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
-from monoid_agent_kernel.core.json_ingress import is_finite_json_number, loads_json_ingress
+from monoid_agent_kernel.core.json_ingress import (
+    is_finite_json_number,
+    loads_json_ingress,
+    normalize_json_ingress,
+)
+from monoid_agent_kernel.core.media import BLOB_SCHEME, blob_shas_in_messages
+from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core._storage_capabilities import StorageCapabilities
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 SCHEMA_VERSION = namespaced_id("checkpoint.v1")
@@ -159,13 +168,124 @@ class RunCheckpoint:
     skill_activation_count: int = 0
     skills_activated: list[str] = field(default_factory=list)
 
+    # --- additive v0.22 (kept at the tail for positional compatibility) ---
+    # A compact copy of the latest durable model-call journal revision at the next safe checkpoint.
+    # The fenced run sink remains crash-window authority; this is recovery context and inspection.
+    last_model_invocation: dict[str, Any] | None = None
+    # Empty until a typed interruption is observed. PR 6 connects the cancellation token and host
+    # lifecycle to this already-versioned checkpoint carriage.
+    interruption_cause: str = ""
+    # AgentToolContext state whose mutation can precede an observable interruption boundary.
+    # These fields make a completed tool observation sufficient to skip that call after restore.
+    plan: list[dict[str, Any]] = field(default_factory=list)
+    pending_finish: dict[str, Any] | None = None
+    pending_tool_loads: list[str] = field(default_factory=list)
+
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        # Explicit rather than dataclasses.asdict: the latter recursively descends and deep-copies,
+        # failing before the portable JSON depth accepted by this package. The existing iterative
+        # normalizer makes one detached JSON graph and keeps legitimate sharing. Field validators
+        # and the JSON writer retain their existing refusal rules; applying the tool-argument
+        # 64-container cap to this whole outer record would narrow that accepted input by charging
+        # checkpoint/message wrappers a second time.
+        payload = {
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "seq": self.seq,
+            "status": self.status,
+            "error": self.error,
+            "error_code": self.error_code,
+            "provider_error_code": self.provider_error_code,
+            "provider_http_status": self.provider_http_status,
+            "final_text": self.final_text,
+            "previous_turn_handle": self.previous_turn_handle,
+            "pending_user_input": self.pending_user_input,
+            "pending_observations": self.pending_observations,
+            "pending_binding_loads": self.pending_binding_loads,
+            "tool_call_counts": self.tool_call_counts,
+            "previous_runtime_config": self.previous_runtime_config,
+            "total_tool_calls": self.total_tool_calls,
+            "output_retries": self.output_retries,
+            "total_usage": self.total_usage,
+            "messages": self.messages,
+            "session_step": self.session_step,
+            "submit_local_step": self.submit_local_step,
+            "terminal": self.terminal,
+            "hosted_tasks": self.hosted_tasks,
+            "reentry_queue": self.reentry_queue,
+            "delivered_reentry_jobs": self.delivered_reentry_jobs,
+            "workspace_delta": self.workspace_delta,
+            "workspace_base": self.workspace_base,
+            "capability_leases": self.capability_leases,
+            "pending_capability_replays": self.pending_capability_replays,
+            "pending_tool_approval_replays": self.pending_tool_approval_replays,
+            "revoked_lease_ids": self.revoked_lease_ids,
+            "revoked_capabilities": self.revoked_capabilities,
+            "revoked_before": self.revoked_before,
+            "revoked_all": self.revoked_all,
+            "remaining_duration_s": self.remaining_duration_s,
+            "cancellation_requested": self.cancellation_requested,
+            "queued_messages": self.queued_messages,
+            "inbox_seen_ids": self.inbox_seen_ids,
+            "outbox_requests": self.outbox_requests,
+            "last_suspension": self.last_suspension,
+            "applied_input_ids": self.applied_input_ids,
+            "active_input": self.active_input,
+            "applied_input_receipts": self.applied_input_receipts,
+            "output_failure_history": self.output_failure_history,
+            "subagent_count": self.subagent_count,
+            "subagent_usage": self.subagent_usage,
+            "skill_activation_count": self.skill_activation_count,
+            "skills_activated": self.skills_activated,
+            "last_model_invocation": self.last_model_invocation,
+            "interruption_cause": self.interruption_cause,
+            "plan": self.plan,
+            "pending_finish": self.pending_finish,
+            "pending_tool_loads": self.pending_tool_loads,
+        }
+        normalized = normalize_json_ingress(
+            payload,
+            substitute_nonfinite=False,
+        )
+        if not isinstance(normalized, dict):  # pragma: no cover - literal root is always a dict
+            raise ValueError("checkpoint projection must be an object")
+        return normalized
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> RunCheckpoint | None:
         """Compatibility wrapper over :func:`decode_checkpoint`."""
         return decode_checkpoint(payload).value
+
+
+def checkpoint_blob_references(checkpoint: RunCheckpoint) -> set[str]:
+    """Return every blob digest suffix that must resolve before checkpoint publication.
+
+    Malformed ``blob:`` suffixes remain in the result so a fenced adapter's content-addressed
+    lookup rejects them. External invocation result addresses use another scheme and require no
+    blob lookup.
+    """
+
+    references = {
+        item["content_sha256"]
+        for item in checkpoint.workspace_delta
+        if isinstance(item.get("content_sha256"), str) and item["content_sha256"]
+    }
+    queued_message_carriers: list[dict[str, Any]] = []
+    for message in checkpoint.queued_messages:
+        if isinstance(message, list):
+            queued_message_carriers.append({"content": message})
+        elif isinstance(message, dict):
+            queued_message_carriers.append(message)
+    references.update(blob_shas_in_messages(tuple(checkpoint.messages)))
+    references.update(blob_shas_in_messages(tuple(queued_message_carriers)))
+    if checkpoint.last_model_invocation is not None:
+        invocation = decode_model_invocation(checkpoint.last_model_invocation)
+        if not invocation.ok or invocation.value is None:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        result_ref = invocation.value.result_ref
+        if result_ref.startswith(BLOB_SCHEME):
+            references.add(result_ref[len(BLOB_SCHEME) :])
+    return references
 
 
 _CHECKPOINT_STRING_FIELDS = frozenset(
@@ -202,6 +322,7 @@ _CHECKPOINT_LIST_OF_DICT_FIELDS = frozenset(
         "pending_tool_approval_replays",
         "outbox_requests",
         "output_failure_history",
+        "plan",
     }
 )
 _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
@@ -214,6 +335,7 @@ _CHECKPOINT_LIST_OF_STRING_FIELDS = frozenset(
         "inbox_seen_ids",
         "applied_input_ids",
         "skills_activated",
+        "pending_tool_loads",
     }
 )
 
@@ -250,8 +372,20 @@ def _validate_counter_mapping(value: object, field_name: str) -> None:
 # The park payload's own field families, mirroring what
 # ``core/result.py:suspension_from_checkpoint_payload`` expects to read back. Named here so the
 # validator and the reader cannot drift into disagreeing about one payload.
-_SUSPENSION_STRING_FIELDS = ("final_text", "error", "error_code", "provider_error_code")
-_SUSPENSION_BOOL_FIELDS = ("has_external", "retryable", "config_recoverable", "provider_retried")
+_SUSPENSION_STRING_FIELDS = (
+    "final_text",
+    "error",
+    "error_code",
+    "provider_error_code",
+    "interruption_cause",
+)
+_SUSPENSION_BOOL_FIELDS = (
+    "has_external",
+    "retryable",
+    "config_recoverable",
+    "provider_retried",
+    "model_tool_calls_pending",
+)
 
 
 def _validate_suspension_payload(value: object, field_name: str) -> None:
@@ -283,6 +417,14 @@ def _validate_suspension_payload(value: object, field_name: str) -> None:
     for name in _SUSPENSION_STRING_FIELDS:
         if name in value and not isinstance(value[name], str):
             raise ValueError(f"checkpoint {field_name}.{name} must be a string")
+    interruption_cause = value.get("interruption_cause", "")
+    if interruption_cause:
+        try:
+            InterruptionCause(interruption_cause)
+        except ValueError as exc:
+            raise ValueError(
+                f"checkpoint {field_name}.interruption_cause is outside the portable vocabulary"
+            ) from exc
     for name in _SUSPENSION_BOOL_FIELDS:
         if name in value and not isinstance(value[name], bool):
             raise ValueError(f"checkpoint {field_name}.{name} must be boolean")
@@ -301,6 +443,20 @@ def _validate_active_input(value: object) -> None:
     if value.get("phase") not in {"running", "completed"}:
         raise ValueError("checkpoint active_input.phase must be running or completed")
     _require_nonnegative_int(value.get("source_seq"), "active_input.source_seq")
+
+
+def _validate_pending_finish(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint pending_finish must be an object or null")
+    if set(value) != {"summary", "outputs", "notes"}:
+        raise ValueError("checkpoint pending_finish has an invalid object shape")
+    if not isinstance(value.get("summary"), str):
+        raise ValueError("checkpoint pending_finish.summary must be a string")
+    _require_list_of(value.get("outputs"), str, "pending_finish.outputs")
+    if value.get("notes") is not None and not isinstance(value.get("notes"), str):
+        raise ValueError("checkpoint pending_finish.notes must be a string or null")
 
 
 def _validate_receipts(value: object) -> None:
@@ -360,7 +516,7 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             _require_list_of(payload[field_name], str, field_name)
     if "pending_user_input" in payload and payload["pending_user_input"] is not None:
         _require_list_of(payload["pending_user_input"], dict, "pending_user_input")
-    for field_name in ("previous_runtime_config", "workspace_base"):
+    for field_name in ("previous_runtime_config", "workspace_base", "last_model_invocation"):
         if (
             field_name in payload
             and payload[field_name] is not None
@@ -369,6 +525,35 @@ def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:
             raise ValueError(f"checkpoint {field_name} must be an object or null")
     if "last_suspension" in payload:
         _validate_suspension_payload(payload["last_suspension"], "last_suspension")
+    if "pending_finish" in payload:
+        _validate_pending_finish(payload["pending_finish"])
+    if payload.get("last_model_invocation") is not None:
+        invocation = decode_model_invocation(payload["last_model_invocation"])
+        if not invocation.ok:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        if invocation.value is None or invocation.value.run_id != payload.get("run_id"):
+            raise ValueError("checkpoint last_model_invocation run_id must match checkpoint run_id")
+    parsed_interruption_cause: InterruptionCause | None = None
+    if "interruption_cause" in payload:
+        interruption_cause = payload["interruption_cause"]
+        if not isinstance(interruption_cause, str):
+            raise ValueError("checkpoint interruption_cause is outside the portable vocabulary")
+        if interruption_cause:
+            try:
+                parsed_interruption_cause = InterruptionCause(interruption_cause)
+            except ValueError as exc:
+                raise ValueError(
+                    "checkpoint interruption_cause is outside the portable vocabulary"
+                ) from exc
+    if (
+        payload.get("cancellation_requested") is True
+        and parsed_interruption_cause is not None
+        and parsed_interruption_cause is not InterruptionCause.LEASE_LOST
+        and not is_operational_cancellation_cause(parsed_interruption_cause)
+    ):
+        raise ValueError(
+            "checkpoint cancellation_requested requires an operational interruption cause"
+        )
     for field_name in ("tool_call_counts", "total_usage", "subagent_usage"):
         if field_name in payload:
             _validate_counter_mapping(payload[field_name], field_name)
@@ -413,6 +598,11 @@ def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
     """Return the canonical current writer shape regardless of a restored alias."""
     payload = checkpoint.to_json()
     payload["schema_version"] = SCHEMA_VERSION
+    if payload.get("last_model_invocation") is not None:
+        invocation = decode_model_invocation(payload["last_model_invocation"])
+        if not invocation.ok or invocation.value is None:
+            raise ValueError("checkpoint last_model_invocation is invalid")
+        payload["last_model_invocation"] = invocation.value.to_json()
     _validate_checkpoint_payload(payload)
     return payload
 
@@ -592,6 +782,16 @@ class LocalFsCheckpointStore:
     # live peer before stealing anyway (so a stuck holder can never deadlock a put).
     lock_timeout_s: float = 10.0
     lock_stale_s: float = 30.0
+
+    @property
+    def capabilities(self) -> StorageCapabilities:
+        """Declare only guarantees this legacy local store can actually provide.
+
+        The import stays lazy so importing the stable kernel root does not load the host-only
+        namespace. LocalFS remains a legacy ``CheckpointStore`` and exposes no fenced mutation.
+        """
+
+        return StorageCapabilities(single_writer=True, durable_checkpoints=True)
 
     def _dir(self, run_id: str) -> Path:
         return self.run_root / run_id / "checkpoints"

@@ -11,6 +11,7 @@ from monoid_agent_kernel.core.lifecycle import (
     session_state_from_run_status,
     session_state_value,
 )
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import public_path
 from monoid_agent_kernel.tasks import public_job_artifacts, run_permission_policy
@@ -106,6 +107,11 @@ def _event_http_status(data: dict[str, Any]) -> int | None:
     return value if type(value) is int else None
 
 
+def _event_interruption_cause(data: dict[str, Any]) -> str | None:
+    cause = parse_interruption_cause(data.get("interruption_cause"))
+    return cause.value if cause is not None else None
+
+
 def _assign_failure_classification(projection: dict[str, Any], data: dict[str, Any]) -> None:
     projection["provider_error_code"] = _event_text(data, "provider_error_code")
     projection["http_status"] = _event_http_status(data)
@@ -160,6 +166,10 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         "retryable": _event_flag(status_payload, "retryable"),
         "config_recoverable": _event_flag(status_payload, "config_recoverable"),
         "provider_retried": _event_flag(status_payload, "provider_retried"),
+        "interruption_cause": (
+            _event_interruption_cause(status_payload)
+            or _event_interruption_cause(metrics)
+        ),
         "workspace_backend": (
             status_payload.get("workspace_backend")
             or metrics.get("workspace_backend")
@@ -217,6 +227,7 @@ def project_run_status(run_dir: Path) -> dict[str, Any]:
         projection["retryable"] = _event_flag(status_payload, "retryable")
         projection["config_recoverable"] = _event_flag(status_payload, "config_recoverable")
         projection["provider_retried"] = _event_flag(status_payload, "provider_retried")
+        projection["interruption_cause"] = None
     return projection
 
 
@@ -260,6 +271,7 @@ def _apply_event_projection(
             projection["terminal"] = True
             projection["error"] = _event_text(data, "error")
             projection["error_code"] = _event_text(data, "error_code")
+            projection["interruption_cause"] = _event_interruption_cause(data)
             # ...and the classification heals with it, except on a failed terminal, where the
             # ``run.failed`` one event earlier owns it and a clear here would undo that record.
             if projection["state"] != session_state_value(SessionState.FAILED):
@@ -273,10 +285,14 @@ def _apply_event_projection(
             # ``provider_retried`` — a per-call fact the terminal vocabulary deliberately
             # drops, so it is cleared rather than carried over from the park.
             _assign_failure_classification(projection, data)
+            projection["interruption_cause"] = None
         elif event_type == "run.waiting":
             projection["state"] = session_state_value(SessionState.AWAITING_TASKS)
             projection["terminal"] = False
             projection["waiting_for_background_jobs"] = True
+            # A run park is the current suspension. These events carry no interruption cause,
+            # so a cause seeded from status.json/metrics or an older interrupted turn is stale.
+            projection["interruption_cause"] = None
         elif event_type == "run.awaiting_input":
             # The other park on this same stream. Handling only ``run.waiting`` here left a run
             # parked for a hosted task or for user input reading as *running* to `monoid status`,
@@ -284,6 +300,7 @@ def _apply_event_projection(
             # handled both. Both parks now, on both readers.
             projection["state"] = session_state_value(SessionState.AWAITING_INPUT)
             projection["terminal"] = False
+            projection["interruption_cause"] = None
         elif event_type == "run.resumed":
             projection["state"] = session_state_value(SessionState.RUNNING)
             projection["terminal"] = False
@@ -298,6 +315,14 @@ def _apply_event_projection(
             projection["error"] = _event_text(data, "error")
             projection["error_code"] = _event_text(data, "error_code")
             _assign_failure_classification(projection, data)
+        elif event_type == "turn.paused":
+            # The newest turn park is authoritative. A pause has no interruption cause, so it
+            # clears the cause projected from an older interrupted park.
+            projection["interruption_cause"] = None
+        elif event_type == "turn.settled":
+            projection["interruption_cause"] = _event_interruption_cause(data)
+        elif event_type == "turn.interrupted":
+            projection["interruption_cause"] = _event_interruption_cause(data)
         elif event_type == "session.state.changed":
             # The pause park's session-lane projection — the sink twin binds the same event.
             # Only the state this reader can prove: the pause is today's sole emitter.
@@ -327,6 +352,7 @@ def _apply_event_projection(
             projection["error"] = ""
             projection["error_code"] = ""
             _clear_failure_classification(projection)
+            projection["interruption_cause"] = None
         elif event_type == "tool.call.started":
             projection["current_tool"] = data.get("tool")
         elif event_type in {"tool.call.finished", "tool.call.failed"}:

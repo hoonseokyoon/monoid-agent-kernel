@@ -191,6 +191,7 @@ class BackendLoopFactory:
                 model_io_subscriptions=tuple(model_io_subscriptions),
                 permission_policy=request.permission_policy,
                 cancellation_token=record.cancellation_token,
+                write_authority=record.write_authority,
                 shell_approval_provider=None,
                 web_gateway_client=web_gateway_client,
                 runtime_config_provider=runtime_config_provider,

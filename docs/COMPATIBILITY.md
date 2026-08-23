@@ -44,6 +44,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `external-agent-envelope` | wire | `monoid.external-agent-envelope.v1` | strict | `monoid.external-agent-envelope.v1`<br>`native-agent-runner.external-agent-envelope.v1` |
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
+| `terminal-outcome` | wire | `monoid.terminal-outcome.v1` | strict | `monoid.terminal-outcome.v1`<br>`native-agent-runner.terminal-outcome.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
@@ -52,6 +53,7 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `web-context` | wire | `monoid.web-context.v1` | permissive; missing id accepted | `monoid.web-context.v1`<br>`native-agent-runner.web-context.v1` |
 | `web-context-result` | wire | `monoid.web-context-result.v1` | permissive; missing id accepted | `monoid.web-context-result.v1`<br>`native-agent-runner.web-context-result.v1` |
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
+| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
@@ -80,6 +82,37 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `studio-trace-export-compact` | reference | `studio.trace-export.compact.v1` | writer-only | None (writer-only) |
 | `studio-model-content` | reference | `studio.model-content.v1` | strict | `studio.model-content.v1` |
 <!-- compatibility-registry:end -->
+
+`monoid.terminal-outcome.v1` is a content-free final-state envelope. It carries portable outcome,
+retry, and interruption vocabularies plus opaque output/evidence addresses in bounded
+`scheme:locator` form. It never carries a prompt, model response, reasoning item, replay payload,
+or raw provider exception. Its strict reader rejects fields outside the versioned top-level schema.
+A `dispatch_unknown` outcome permits only `after_reconciliation` or `forbidden` retry eligibility,
+so an ambiguous paid call cannot be classified for automatic retry.
+The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
+limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
+contract window, so deploy the current strict reader before a writer that can emit it.
+
+`monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
+call. Current and retained namespace readers distinguish malformed data from future versions. The
+receipt is normalized metadata; model content, request bodies, endpoints, and raw exceptions are
+refused. The top-level record, receipt, and usage object each accept a closed versioned vocabulary;
+unknown fields are private by default. Receipt key spellings are canonicalized. Digest, identifier,
+taxonomy, timestamp, numeric, boolean, and usage values each have bounded typed validation; a
+receipt request digest must equal the invocation request digest. Settled success points to a private
+result blob through a bounded `scheme:locator` address, and ambiguous dispatch has no automatic
+retry evidence. The `evidence_policy` enum records `passive`, `required`, or `outbox` delivery from
+the first reservation through every later revision and retry. The checked reader accepts the earlier
+v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `true` to `required`;
+the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
+writer because the earlier prerelease reader used a closed top-level vocabulary.
+
+`monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
+`pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
+`interruption_cause`. A v0.21 checkpoint omits these fields and restores them with empty/default
+values. Current readers accept the absent suspension cause; current writers emit the normalized
+typed value when an interruption has one. The writer keeps the checkpoint version and emits an
+explicit field projection copied through the iterative portable JSON normalizer.
 
 The v0.19.2 conformance rollout keeps the default external report writer on v1 and adds an opt-in
 v2 evidence path after deploying its checked reader. Retained v1 reports migrate into the v2 typed
@@ -580,3 +613,15 @@ identity or receipt ledger can redrive an applied input or return the wrong boun
 experimental DBOS adapter, keep `application_version` stable while same-slot recovery of pending
 workflow history is required. That operational version never replaces checkpoint schema/version
 compatibility or the checkpoint receipt as semantic authority.
+
+Checkpoints produced before v0.22 may encode `lease_lost` as a cancellation request. A v0.22
+reader detects that value before bootstrap and revokes the activation's
+`ActivationWriteAuthority`, leaving recorder, workspace replay, task restore, and extension
+callbacks unopened. The public `CancellationToken.cancel()` API receives only operational causes.
+Checkpoint validation rejects `cancellation_requested=true` when its cause is
+`provider_failure`, `validation_failure`, or `unknown`; those values describe outcomes and cannot
+drive execution cancellation. Direct `AgentLoop.restore()` applies the same check before
+bootstrap.
+The Reference recovery service also resolves the registered activation record before its first
+authority-sensitive loop call, so a concurrent revocation still unregisters and discards the
+stale activation.

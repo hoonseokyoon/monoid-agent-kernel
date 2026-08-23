@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority
 from monoid_agent_kernel.core.model_content import (
     MODEL_CONTENT_FILENAME,
     MODEL_CONTENT_SCHEMA_VERSION,
@@ -180,6 +181,21 @@ def test_explicit_live_hydration_flush_commits_the_current_batch(tmp_path: Path)
     store.close()
     assert active_model_content_stream_ids(path) == frozenset()
     assert flush_active_model_content(path) == 0
+
+
+def test_discard_drops_the_buffered_stream_prefix_without_publication(tmp_path: Path) -> None:
+    path = tmp_path / "model-content.jsonl"
+    store = ModelContentStore(path, run_id="run-1", batch_interval_s=60.0)
+    writer = store.open(_context())
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " stale buffered tail"))
+
+    store.discard()
+
+    records = _records(path)
+    assert [record.get("text") for record in records if "text" in record] == ["persisted"]
+    assert all(record["kind"] != "stream_closed" for record in records)
+    assert active_model_content_stream_ids(path) == frozenset()
 
 
 def test_open_publishes_an_active_writer_only_after_its_descriptor_exists(
@@ -852,3 +868,30 @@ def test_recorder_sidecar_is_opt_in_and_dual_writes_settled_text(tmp_path: Path)
     assert [record["kind"] for record in transcript] == ["settled_text"]
     assert [record["kind"] for record in sidecar] == ["settled_text"]
     assert read_model_content(enabled.run_dir).settled_texts == {digest: "private"}
+
+
+def test_recorder_revocation_discards_buffered_model_content_before_return(
+    tmp_path: Path,
+) -> None:
+    authority = ActivationWriteAuthority()
+    recorder = AgentRecorder(
+        tmp_path,
+        "revoked",
+        status_file=False,
+        model_content_file=True,
+        write_authority=authority,
+    )
+    writer = recorder.open_model_stream(_context(run_id="revoked"))
+    assert recorder._model_content_store is not None
+    recorder._model_content_store.batch_interval_s = 60.0
+    writer.push(ModelStreamDelta("output", "persisted"))
+    writer.push(ModelStreamDelta("output", " stale buffered tail"))
+
+    assert authority.revoke() is True
+
+    path = recorder.run_dir / MODEL_CONTENT_FILENAME
+    records = _records(path)
+    assert [record.get("text") for record in records if "text" in record] == ["persisted"]
+    assert all(record["kind"] != "stream_closed" for record in records)
+    assert active_model_content_stream_ids(path) == frozenset()
+    recorder.discard_uncommitted()

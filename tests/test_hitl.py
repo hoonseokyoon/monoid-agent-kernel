@@ -52,7 +52,7 @@ def test_hitl_request_parks_and_resumes_with_user_message(tmp_path: Path) -> Non
     )
     loop = _build_loop(tmp_path, adapter)
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
 
     captured: dict = {}
     responder = threading.Thread(target=_answer_when_parked, args=(loop, manager, "Ada", captured))
@@ -84,7 +84,7 @@ def test_report_result_is_idempotent_first_report_wins(tmp_path: Path) -> None:
     # observe the result twice). Mirrors the inbox's dedup-by-id.
     loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     task = manager.start_task("hitl", {"prompt": "Pick a name"})
 
     first = manager.report_result(task.job_id, {"answer": "Ada"})
@@ -114,7 +114,7 @@ def test_an_unportable_task_request_or_result_is_refused_at_ingress(tmp_path: Pa
     """
     loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
 
     with pytest.raises(ToolExecutionError) as refused_request:
         manager.start_task("hitl", {"prompt": b"\x00"})
@@ -141,7 +141,7 @@ def test_a_cyclic_task_payload_is_refused_at_the_same_two_boundaries(tmp_path: P
         tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")])
     )
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
 
     cyclic_request: dict = {}
     cyclic_request["self"] = cyclic_request
@@ -174,7 +174,7 @@ def test_a_duplicate_report_is_a_no_op_even_when_its_body_is_unportable(tmp_path
     """
     loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     task = manager.start_task("hitl", {"prompt": "Pick a name"})
     assert manager.report_result(task.job_id, {"answer": "Ada"})["delivered"] is True
 
@@ -199,7 +199,7 @@ def test_a_cancelled_task_answers_a_late_report_rather_than_judging_its_body(tmp
     """
     loop = _build_loop(tmp_path, FakeModelAdapter(turns=[ModelTurn(response_id="r1", final_text="x")]))
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     task = manager.start_task("hitl", {"prompt": "Pick a name"})
     manager.cancel(task.job_id)
     cancelled_result = task.result
@@ -224,7 +224,7 @@ def test_hitl_answer_can_be_delivered_as_tool_result(tmp_path: Path) -> None:
     )
     loop = _build_loop(tmp_path, adapter)
     loop.open()
-    manager = loop._session.res.context.job_manager  # type: ignore[union-attr]
+    manager = loop._session.res.context._job_manager  # type: ignore[union-attr]
     manager.injectors["hitl"].as_user_message = False
 
     captured: dict = {}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +13,14 @@ import pytest
 from support.runtime import runtime_provider, tool_binding
 
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, OutputValidatorBinding
-from monoid_agent_kernel.core.checkpoint import RunCheckpoint, read_checkpoint, write_checkpoint
+from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.core.checkpoint import (
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+    read_checkpoint,
+    write_checkpoint,
+)
+from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.output_validator import (
     FinalOutputView,
     OutputRetry,
@@ -545,6 +554,56 @@ def test_slow_validator_still_settles(tmp_path: Path) -> None:
 
     assert result.status == "completed"
     assert result.final_output == "slow-ok"
+
+
+def test_lease_loss_during_output_validation_precedes_settle_projection(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingValidator:
+        id = "lease.blocking"
+        schema = None
+
+        def validate(self, view: FinalOutputView) -> ValidationOutcome:
+            entered.set()
+            assert release.wait(timeout=5)
+            return ValidationOutcome(ok=True, value=view.final_text)
+
+    sink = MemoryEventSink()
+    token = CancellationToken()
+    loop = AgentLoop(
+        spec=_spec(tmp_path),
+        model_adapter=FakeModelAdapter(turns=[_text_turn("validated")]),
+        runtime_config_provider=_provider("lease.blocking"),
+        output_validators=(BlockingValidator(),),
+        event_sinks=(sink,),
+        cancellation_token=token,
+    )
+    loop.open()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(loop.run_until_suspended, "go")
+        try:
+            assert entered.wait(timeout=5)
+            events_before_loss = len(sink.events)
+            stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+            checkpoint_before_loss = (
+                None if stored is None else stored.checkpoint.to_json()
+            )
+            loop.lose_writer_authority()
+        finally:
+            release.set()
+        suspension = pending.result(timeout=5)
+
+    stored = LocalFsCheckpointStore(loop.spec.run_root).latest(loop.spec.run_id)
+    assert suspension.interruption_cause is InterruptionCause.LEASE_LOST
+    assert len(sink.events) == events_before_loss
+    assert (
+        None if stored is None else stored.checkpoint.to_json()
+    ) == checkpoint_before_loss
+    loop.discard_uncommitted()
 
 
 # --- E2: contradictory validators exhaust with a diagnosable roll-up -----------------------

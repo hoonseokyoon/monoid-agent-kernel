@@ -6,7 +6,8 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from functools import wraps
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,10 @@ from monoid_agent_kernel.core._util import (
     utc_timestamp,
     write_json_atomic,
 )
+from monoid_agent_kernel.core.authority import (
+    ActivationWriteAuthority,
+    WriteAuthorityRevoked,
+)
 from monoid_agent_kernel.core._verified_file import (
     open_verified_append_text,
     verified_directory_is_safe,
@@ -36,6 +41,7 @@ from monoid_agent_kernel.core.json_ingress import (
     loads_json_ingress,
     normalize_json_ingress,
 )
+from monoid_agent_kernel.core.interruption import parse_interruption_cause
 from monoid_agent_kernel.core.lifecycle import (
     SessionState,
     session_state_from_run_status,
@@ -62,6 +68,8 @@ from monoid_agent_kernel.core.model_io import content_digest, content_length
 from monoid_agent_kernel.core.model_stream import (
     NOOP_MODEL_STREAM_WRITER,
     ModelStreamContext,
+    ModelStreamDelta,
+    ModelStreamOutcome,
     ModelStreamWriter,
     safe_open_model_stream,
 )
@@ -72,6 +80,30 @@ if TYPE_CHECKING:
     from monoid_agent_kernel.core.workspace import ChangedEntry, Workspace
 
 _LOGGER = logging.getLogger("monoid_agent_kernel.recorder")
+
+
+def _authority_local_mutation(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Linearize a recorder mutation entrypoint with activation revocation."""
+
+    @wraps(method)
+    def guarded(self: AgentRecorder, *args: Any, **kwargs: Any) -> Any:
+        return self.write_authority.guard_local_mutation(
+            lambda: method(self, *args, **kwargs)
+        )
+
+    return guarded
+
+
+@dataclass
+class _AuthorityBoundModelStreamWriter:
+    writer: ModelStreamWriter
+    write_authority: ActivationWriteAuthority
+
+    def push(self, delta: ModelStreamDelta) -> None:
+        self.write_authority.guard_external_call(lambda: self.writer.push(delta))
+
+    def close(self, outcome: ModelStreamOutcome) -> None:
+        self.write_authority.guard_external_call(lambda: self.writer.close(outcome))
 
 
 @dataclass(frozen=True)
@@ -222,6 +254,11 @@ class StatusJsonSink:
                     "error_code": data.get("error_code", ""),
                 }
             )
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
+            else:
+                self.state.pop("interruption_cause", None)
             # The terminal heal: ASSIGNED error/error_code above, and a non-failed terminal
             # clears the parked classification — a completed run must not keep a dead turn's
             # ``retryable``. A failed terminal keeps it: ``run.finished{status:"failed"}``
@@ -249,11 +286,32 @@ class StatusJsonSink:
                 }
             )
             self.state.pop("provider_retried", None)
+            self.state.pop("interruption_cause", None)
+        elif event.type == "turn.paused":
+            # The current turn park owns this projection. A cause-less pause supersedes any
+            # interruption cause carried by the preceding park.
+            self.state.pop("interruption_cause", None)
+        elif event.type == "turn.settled":
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
+            else:
+                self.state.pop("interruption_cause", None)
+        elif event.type == "turn.interrupted":
+            cause = parse_interruption_cause(data.get("interruption_cause"))
+            if cause is not None:
+                self.state["interruption_cause"] = cause.value
+            else:
+                # Legacy producers emit only the reason. The newest park is still authoritative,
+                # so absence or malformed input clears an older typed cause instead of inheriting it.
+                self.state.pop("interruption_cause", None)
         elif event.type == "run.waiting":
             self.state["state"] = session_state_value(SessionState.AWAITING_TASKS)
             self.state["terminal"] = False
             self.state["waiting_for_background_jobs"] = True
             self.state["waiting_jobs"] = data.get("jobs", [])
+            # The current cause-less park supersedes a cause left by an interrupted turn.
+            self.state.pop("interruption_cause", None)
         elif event.type == "run.resumed":
             self.state["state"] = session_state_value(SessionState.RUNNING)
             self.state["terminal"] = False
@@ -267,6 +325,7 @@ class StatusJsonSink:
                 "task_ids": data.get("task_ids", []),
                 "prompt": data.get("prompt"),
             }
+            self.state.pop("interruption_cause", None)
         elif event.type == "agent.config.updated":
             self.state["agent_config"] = {
                 "definition_id": data.get("definition_id"),
@@ -286,6 +345,7 @@ class StatusJsonSink:
                 self.state["terminal"] = False
                 self.state["waiting_for_background_jobs"] = False
                 self.state.pop("awaiting_input", None)
+            self.state.pop("interruption_cause", None)
             # The unpark clear, unconditional on purpose: a retried turn never passes through
             # a parked state (the driver re-pumps straight from ``turn_failed``), so guarding
             # this behind the parked-state check kept a dead turn's error beside
@@ -391,6 +451,11 @@ class AgentRecorder:
     _transcript_file: TextIO = field(init=False, repr=False)
     started_at: float = field(default_factory=time.time)
     artifacts: list[AgentArtifact] = field(default_factory=list)
+    _artifacts_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
     # Private authored-content sidecar. Opt-in keeps the v0.20 run-dir shape and embedders'
     # retention assumptions unchanged unless the caller explicitly enables the new channel.
     model_content_file: bool = False
@@ -404,6 +469,9 @@ class AgentRecorder:
     # Private replay corpus (request preimages + settled response bodies), opt-in like its two
     # sidecar siblings and appended after them so no positional caller is rebound.
     model_payload_file: bool = False
+    # Shared process-local mutation capability. Standalone recorders receive an always-active
+    # default; hosted loops inject the activation's authority.
+    write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
@@ -412,6 +480,11 @@ class AgentRecorder:
     _model_content_store_failed: bool = field(default=False, init=False, repr=False)
     _model_content_store_lock: threading.Lock = field(
         default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _remove_model_content_revoke_callback: Callable[[], None] | None = field(
+        default=None,
         init=False,
         repr=False,
     )
@@ -436,24 +509,64 @@ class AgentRecorder:
     _payload_chunk_shas: set[str] = field(default_factory=set, init=False, repr=False)
     _payload_request_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
+    @_authority_local_mutation
     def __post_init__(self) -> None:
-        self.run_dir = self.run_root / self.run_id
-        self.artifacts_dir = self.run_dir / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
-        events_path = self.run_dir / "events.jsonl"
-        advertised_last_seq = _read_status_last_event_seq(self.run_dir)
-        tail = repair_event_log_tail_for_append(
-            events_path,
-            advertised_last_seq=advertised_last_seq,
-        )
-        initial_seq = _verified_event_sequence_seed(events_path, tail)
-        self._transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
-        self._terminate_torn_transcript_tail()
-        sinks: list[EventSink] = [JsonlEventSink(events_path)]
-        if self.status_file:
-            sinks.append(StatusJsonSink(self.run_dir / "status.json"))
-        sinks.extend(self.extra_event_sinks)
-        self.event_bus = EventBus(self.run_id, tuple(sinks), _seq=initial_seq)
+        transcript_file: TextIO | None = None
+        event_file_sink: JsonlEventSink | None = None
+        self._check_writer_authority()
+        try:
+            self.run_dir = self.run_root / self.run_id
+            self.artifacts_dir = self.run_dir / "artifacts"
+            self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
+            self._check_writer_authority()
+            events_path = self.run_dir / "events.jsonl"
+            advertised_last_seq = _read_status_last_event_seq(self.run_dir)
+            self._check_writer_authority()
+            tail = repair_event_log_tail_for_append(
+                events_path,
+                advertised_last_seq=advertised_last_seq,
+            )
+            self._check_writer_authority()
+            initial_seq = _verified_event_sequence_seed(events_path, tail)
+            self._check_writer_authority()
+            transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
+            self._transcript_file = transcript_file
+            self._check_writer_authority()
+            self._terminate_torn_transcript_tail()
+            self._check_writer_authority()
+            event_file_sink = JsonlEventSink(events_path)
+            self._check_writer_authority()
+            sinks: list[EventSink] = [event_file_sink]
+            if self.status_file:
+                sinks.append(StatusJsonSink(self.run_dir / "status.json"))
+            sinks.extend(self.extra_event_sinks)
+            self.event_bus = EventBus(
+                self.run_id,
+                tuple(sinks),
+                _seq=initial_seq,
+                write_authority=self.write_authority,
+            )
+            self._check_writer_authority()
+        except BaseException:
+            # Construction can lose authority after opening local files but before bootstrap can
+            # publish this recorder for ordinary cleanup. Release only recorder-owned handles:
+            # extension sinks may flush durable projections and therefore cannot be called by the
+            # stale activation.
+            if event_file_sink is not None:
+                try:
+                    event_file_sink.close()
+                except Exception:  # pragma: no cover - best-effort constructor cleanup
+                    _LOGGER.debug(
+                        "event log close after recorder bootstrap failure failed", exc_info=True
+                    )
+            if transcript_file is not None:
+                try:
+                    transcript_file.close()
+                except Exception:  # pragma: no cover - best-effort constructor cleanup
+                    _LOGGER.debug(
+                        "transcript close after recorder bootstrap failure failed", exc_info=True
+                    )
+            raise
 
     def emit(
         self,
@@ -471,6 +584,9 @@ class AgentRecorder:
             turn_id=turn_id,
             parent_id=parent_id,
         )
+
+    def _check_writer_authority(self) -> None:
+        self.write_authority.assert_active()
 
     def _terminate_torn_transcript_tail(self) -> None:
         """Close off ``transcript.jsonl``'s torn last line. See :meth:`_terminate_torn_tail`."""
@@ -514,9 +630,13 @@ class AgentRecorder:
         except OSError:
             return
 
+    @_authority_local_mutation
     def transcript(self, item: dict[str, Any]) -> None:
+        self._check_writer_authority()
         _write_jsonl(self._transcript_file, item)
+        self._check_writer_authority()
 
+    @_authority_local_mutation
     def record_settled_call(self, call: SettledModelCall) -> None:
         """Record one settled call into the private sidecars, shielding the run from every failure.
 
@@ -536,10 +656,10 @@ class AgentRecorder:
         costs its own line rather than the run — and does not consume an index, since the counter
         advances only for a line that reached the file. A write error disables the handle rather
         than retrying: a partial write may have torn the current line, and appending after it would
-        glue the next record onto the remnant and lose both. And nothing here raises, whoever calls
-        it: an answer the provider has already been paid for is not discarded because a disk filled
-        up, and this method's guarantee must not depend on ``ModelCallRunner._record`` also having
-        one.
+        glue the next record onto the remnant and lose both. Diagnostic persistence failures never
+        raise: an answer the provider has already been paid for survives a full disk, independently
+        of ``ModelCallRunner._record`` containment. Writer-authority loss is execution control; it
+        escapes this boundary and stops later sidecar writes.
 
         Reserving the index and writing the line happen under **one** acquisition. Split across
         two, concurrent callers read the same counter and write two records claiming one index,
@@ -549,6 +669,7 @@ class AgentRecorder:
         caller; the recorder holds a lock because it is shared with tool and job threads.
         """
 
+        self._check_writer_authority()
         ledger_wanted = (
             self.model_calls_file and not self._model_calls_failed and not self._model_calls_closed
         )
@@ -587,6 +708,7 @@ class AgentRecorder:
             except Exception:  # noqa: BLE001 - one unrecordable corpus entry costs only the corpus
                 _LOGGER.debug("model payload split failed", exc_info=True)
                 split = None
+            self._check_writer_authority()
             # The response body joins the split out here for the same reason, and it was not
             # always so: the offloaded-depth gate arrived inside the lock, where its per-character
             # scan measured 382.9 ms on a 7.9 MB body against 4.0 ms of sha256 -- a 12x critical
@@ -600,7 +722,9 @@ class AgentRecorder:
                 except Exception:  # noqa: BLE001 - as above: the corpus entry, never the ledger
                     _LOGGER.debug("model payload response encode failed", exc_info=True)
                     body = None
+            self._check_writer_authority()
             with self._model_calls_lock:
+                self._check_writer_authority()
                 index = self._model_calls_index
                 # One clock read for however many files record this call. ``call_index`` restarts
                 # at zero when a durable run reopens its directory, so it cannot join the ledger to
@@ -615,6 +739,7 @@ class AgentRecorder:
                     and not self._model_calls_closed
                 ):
                     advanced = self._record_ledger_locked(call, index, recorded_at) or advanced
+                    self._check_writer_authority()
                 if (
                     self.model_payload_file
                     and not self._model_payloads_failed
@@ -624,6 +749,7 @@ class AgentRecorder:
                         self._record_payloads_locked(call, index, recorded_at, split, body)
                         or advanced
                     )
+                    self._check_writer_authority()
                 # One counter for however many files recorded this call, advanced when any of
                 # them did: the index identifies the CALL, so per-file write failures surface as
                 # holes in that file rather than as two files disagreeing about which call is
@@ -632,7 +758,11 @@ class AgentRecorder:
                 if advanced:
                     self._model_calls_index += 1
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
+            # Diagnostic failures remain contained. Sticky lease loss is execution control and
+            # must escape this best-effort boundary before another sidecar mutation can begin.
+            self._check_writer_authority()
             _LOGGER.debug("model call record could not be written", exc_info=True)
+        self._check_writer_authority()
 
     def _record_ledger_locked(self, call: SettledModelCall, index: int, recorded_at: str) -> bool:
         """Build and append one ledger line. Caller holds ``_model_calls_lock``."""
@@ -687,6 +817,7 @@ class AgentRecorder:
         computed because it is expensive and pure; see the caller.
         """
 
+        self._check_writer_authority()
         receipt = call.receipt
         # The join key as the corpus may state it. A digest that is not a digest joins nothing, and
         # the schema says so (``^(|[0-9a-f]{64})$``); writing one through would put a line in this
@@ -712,11 +843,13 @@ class AgentRecorder:
             if split is not None and receipt.request_digest not in self._payload_request_digests:
                 landed = True
                 for sha, chunk in split.chunks.items():
+                    self._check_writer_authority()
                     if sha in self._payload_chunk_shas:
                         continue
                     if not self._store_payload_chunk_locked(sha, chunk, envelope):
                         landed = False
                         break
+                    self._check_writer_authority()
                     self._payload_chunk_shas.add(sha)
                 if landed:
                     request_line = self._encoded_payload_line(
@@ -729,7 +862,9 @@ class AgentRecorder:
                         )
                     )
                     if request_line is not None and self._append_model_payload(request_line):
+                        self._check_writer_authority()
                         self._payload_request_digests.add(receipt.request_digest)
+            self._check_writer_authority()
             # Re-checked, because the request side can have gone terminal since the gate above:
             # a response record written now would carry a ``request_digest`` naming a request
             # record that can never exist, and would append to a handle the opener just refused.
@@ -756,6 +891,7 @@ class AgentRecorder:
                         else:
                             sha = sha256_bytes(recorded.encoded)
                             if self._store_payload_chunk_locked(sha, recorded.encoded, envelope):
+                                self._check_writer_authority()
                                 self._payload_chunk_shas.add(sha)
                                 response = chunk_marker(sha)
                             else:
@@ -787,9 +923,12 @@ class AgentRecorder:
                     # body's brackets are still visible.
                     response_line = line_for(None, "unencodable")
                 if response_line is not None and self._append_model_payload(response_line):
+                    self._check_writer_authority()
                     wrote_response = True
         except Exception:  # noqa: BLE001 - one unrecordable call must not cost the others
+            self._check_writer_authority()
             _LOGGER.debug("model payload records could not be written", exc_info=True)
+        self._check_writer_authority()
         return wrote_response or call.turn is None
 
     def _encoded_payload_line(self, record: dict[str, Any]) -> str | None:
@@ -835,9 +974,12 @@ class AgentRecorder:
         than accumulating records whose references dangle.
         """
 
+        self._check_writer_authority()
         if len(chunk) > PAYLOAD_OFFLOAD_THRESHOLD_BYTES:
             target = self.run_dir / MODEL_PAYLOADS_DIRNAME / sha
-            if write_verified_bytes_once(target, chunk):
+            stored = write_verified_bytes_once(target, chunk)
+            self._check_writer_authority()
+            if stored:
                 return True
             # A chunk lands before the record that references it, so this is the one disable that
             # can leave the corpus file never created at all -- nothing on disk to notice, which is
@@ -904,12 +1046,15 @@ class AgentRecorder:
     def _append_model_call(self, line: str) -> bool:
         """Write one encoded line. Caller holds ``_model_calls_lock``; returns whether it landed."""
 
+        self._check_writer_authority()
         handle = self._ensure_model_calls_handle_locked()
+        self._check_writer_authority()
         if handle is None:
             return False
         try:
             handle.write(line + "\n")
             handle.flush()
+            self._check_writer_authority()
         except (OSError, UnicodeError):
             # The traceback stays, at ``debug``, beside the announcement: the door says *that* the
             # ledger stopped, and only errno says whether this was a full disk, a dead handle or a
@@ -923,12 +1068,15 @@ class AgentRecorder:
     def _append_model_payload(self, line: str) -> bool:
         """Write one encoded corpus line. Caller holds ``_model_calls_lock``."""
 
+        self._check_writer_authority()
         handle = self._ensure_model_payloads_handle_locked()
+        self._check_writer_authority()
         if handle is None:
             return False
         try:
             handle.write(line + "\n")
             handle.flush()
+            self._check_writer_authority()
         except (OSError, UnicodeError):
             _LOGGER.debug("model payload append failed", exc_info=True)
             self._lose_model_payloads_locked("an append failed and may have torn its line")
@@ -951,6 +1099,7 @@ class AgentRecorder:
         live -- because identity cannot tell a dead writer from a live one, and guessing wrong in
         the other direction is the failure above."""
 
+        self._check_writer_authority()
         if self._model_payloads_failed:
             # Terminal, not per-line. Two appends can reach this within one call, and a refusal is
             # a property of the path: re-running the verified open is a second chance to be handed
@@ -959,12 +1108,23 @@ class AgentRecorder:
         if self._model_payloads_handle is not None:
             return self._model_payloads_handle
         handle = open_verified_append_text(self.run_dir / MODEL_PAYLOADS_FILENAME)
+        try:
+            self._check_writer_authority()
+        except BaseException:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    _LOGGER.debug("model payload handle close after authority loss failed", exc_info=True)
+            raise
         if handle is None:
             self._lose_model_payloads_locked("it could not be safely opened")
             return None
         self._model_payloads_handle = handle
         chunk_dir = self.run_dir / MODEL_PAYLOADS_DIRNAME
-        if not verified_directory_is_safe(chunk_dir):
+        directory_is_safe = verified_directory_is_safe(chunk_dir)
+        self._check_writer_authority()
+        if not directory_is_safe:
             # The sweep unlinks, and it runs before the first write -- so it reaches the chunk
             # directory ahead of the only other gate on it. ``Path.glob`` follows a redirection
             # planted there, which would make this a delete primitive in a directory of somebody
@@ -972,10 +1132,12 @@ class AgentRecorder:
             return handle
         try:
             for orphan in chunk_dir.glob(f"*.{os.getpid()}.*.tmp"):
+                self._check_writer_authority()
                 try:
                     orphan.unlink()
                 except OSError:
                     continue
+                self._check_writer_authority()
         except OSError:
             pass
         return handle
@@ -1001,6 +1163,7 @@ class AgentRecorder:
         receipt would only re-run the identical refusal.
         """
 
+        self._check_writer_authority()
         if self._model_calls_failed:
             # The corpus twin has always self-guarded, and the "once per activation" property was
             # resting on the two callers above happening to check the flag first. It is the door's
@@ -1009,6 +1172,15 @@ class AgentRecorder:
         if self._model_calls_handle is not None:
             return self._model_calls_handle
         handle = open_verified_append_text(self.run_dir / MODEL_CALLS_FILENAME)
+        try:
+            self._check_writer_authority()
+        except BaseException:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    _LOGGER.debug("model call handle close after authority loss failed", exc_info=True)
+            raise
         if handle is None:
             self._lose_model_calls_locked("it could not be safely opened")
             return None
@@ -1018,10 +1190,15 @@ class AgentRecorder:
     def open_model_stream(self, context: ModelStreamContext) -> ModelStreamWriter:
         """Open the opt-in private content writer without exposing failures to the run."""
 
+        self._check_writer_authority()
         store = self._get_model_content_store()
+        self._check_writer_authority()
         if store is None:
             return NOOP_MODEL_STREAM_WRITER
-        return safe_open_model_stream(store, context)
+        writer = self.write_authority.guard_external_call(
+            lambda: safe_open_model_stream(store, context)
+        )
+        return _AuthorityBoundModelStreamWriter(writer, self.write_authority)
 
     def _get_model_content_store(self) -> ModelContentStore | None:
         if not self.model_content_file or self._model_content_store_failed:
@@ -1034,10 +1211,18 @@ class AgentRecorder:
             if self._model_content_store_failed:
                 return None
             try:
-                self._model_content_store = ModelContentStore(
+                store = ModelContentStore(
                     self.run_dir / MODEL_CONTENT_FILENAME,
                     run_id=self.run_id,
                 )
+                # Revocation waits for callbacks to finish. Discarding here disables timer and
+                # close-driven appends before ``revoke()`` returns, while a normal close keeps its
+                # buffered-prefix behavior.
+                remove_callback = self.write_authority.add_revoke_callback(store.discard)
+                self._model_content_store = store
+                self._remove_model_content_revoke_callback = remove_callback
+            except WriteAuthorityRevoked:
+                raise
             except Exception:  # noqa: BLE001 - private content persistence is best-effort
                 # The detail stays at ``debug``. Promoting the level carried this ``exc_info`` up
                 # with it, and a rendered traceback names the absolute run directory -- run id and
@@ -1048,6 +1233,7 @@ class AgentRecorder:
                 return None
         return self._model_content_store
 
+    @_authority_local_mutation
     def settled_text(self, text: str) -> str:
         """Record model-authored settled text and return its content digest.
 
@@ -1073,6 +1259,7 @@ class AgentRecorder:
         **content-missing is a tolerated read outcome** — hydration fills absent fields and never
         fails a read.
         """
+        self._check_writer_authority()
         # ``content_digest``, never a bare sha256 of the text: it hashes canonical JSON under a
         # shape key so a text field cannot collide with a structured value's serialization. Once a
         # record persists one it is frozen (see the function's own docstring).
@@ -1087,20 +1274,26 @@ class AgentRecorder:
                     "final_text_len": content_length(text),
                 },
             )
+            self._check_writer_authority()
             # Marked written only once it is. Adding before the write meant a raising write (a
             # full disk mid-flush) recorded the digest as present with nothing on disk, so a later
             # call for the same text short-circuited and returned a digest resolving to nothing.
             self._settled_text_digests.add(digest)
         store = self._get_model_content_store()
+        self._check_writer_authority()
         if store is not None:
             try:
                 text_len = content_length(text)
                 if text_len is not None:
                     store.settled_text(text, digest, text_len)
+            except WriteAuthorityRevoked:
+                raise
             except Exception:  # noqa: BLE001 - private sidecar failure must not change this method
                 _LOGGER.debug("settled text sidecar write failed", exc_info=True)
+            self._check_writer_authority()
         return digest
 
+    @_authority_local_mutation
     def emit_artifact_bytes(
         self,
         *,
@@ -1110,57 +1303,99 @@ class AgentRecorder:
         label: str | None,
         metadata: dict[str, Any] | None = None,
     ) -> AgentArtifact:
-        artifact_id = f"artifact_{len(self.artifacts) + 1:04d}"
-        target = self.artifacts_dir / artifact_id / Path(workspace_path).name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        artifact = AgentArtifact(
-            artifact_id=artifact_id,
-            path=str(target.relative_to(self.run_dir).as_posix()),
-            kind=kind,
-            label=label,
-            metadata=dict(metadata or {}),
-        )
-        self.artifacts.append(artifact)
+        self._check_writer_authority()
+        with self._artifacts_lock:
+            self._check_writer_authority()
+            # Claim the artifact directory atomically. A recovered/replacement activation starts
+            # with a fresh process-local list, and a stale in-flight writer may have claimed an id
+            # immediately before observing lease loss. mkdir(exist_ok=False) prevents either case
+            # from overwriting that artifact path and naturally advances across prior run history.
+            artifact_index = len(self.artifacts) + 1
+            while True:
+                artifact_id = f"artifact_{artifact_index:04d}"
+                artifact_dir = self.artifacts_dir / artifact_id
+                self._check_writer_authority()
+                try:
+                    artifact_dir.mkdir()
+                except FileExistsError:
+                    artifact_index += 1
+                    continue
+                self._check_writer_authority()
+                break
+            target = artifact_dir / Path(workspace_path).name
+            target.write_bytes(content)
+            self._check_writer_authority()
+            artifact = AgentArtifact(
+                artifact_id=artifact_id,
+                path=str(target.relative_to(self.run_dir).as_posix()),
+                kind=kind,
+                label=label,
+                metadata=dict(metadata or {}),
+            )
+            self.artifacts.append(artifact)
+            self._check_writer_authority()
         return artifact
 
+    @_authority_local_mutation
     def write_diff(self, diff_text: str) -> Path:
+        self._check_writer_authority()
         diff_path = self.run_dir / "diff.patch"
         diff_path.write_text(diff_text, encoding="utf-8")
+        self._check_writer_authority()
         return diff_path
 
+    @_authority_local_mutation
     def write_proposal_revision(self, workspace: Workspace) -> tuple[str, Path, dict[str, Any]]:
         """Persist one internally consistent diff and proposal snapshot revision."""
+        self._check_writer_authority()
         with proposal_snapshot_lock(self.run_dir):
             diff_text = workspace.diff_patch()
+            self._check_writer_authority()
             diff_path = self.write_diff(diff_text)
+            self._check_writer_authority()
             proposal_payload = self.write_proposal_snapshot(workspace, diff_path)
+            self._check_writer_authority()
         return diff_text, diff_path, proposal_payload
 
+    @_authority_local_mutation
     def write_manifest(self, manifest: RunManifest) -> Path:
+        self._check_writer_authority()
         manifest_path = self.run_dir / "manifest.json"
         write_json_atomic(manifest_path, manifest.to_json())
+        self._check_writer_authority()
         return manifest_path
 
+    @_authority_local_mutation
     def write_workspace_index(self, payload: dict[str, Any]) -> Path:
+        self._check_writer_authority()
         path = self.run_dir / "workspace.index.json"
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
+    @_authority_local_mutation
     def write_workspace_base(self, payload: dict[str, Any]) -> Path:
+        self._check_writer_authority()
         path = self.run_dir / "workspace.base.json"
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
+    @_authority_local_mutation
     def write_proposal_snapshot(self, workspace: Workspace, diff_path: Path) -> dict[str, Any]:
+        self._check_writer_authority()
         proposal_path = self.run_dir / "proposal.json"
         files_dir = self.run_dir / "proposal" / "files"
         files_dir.mkdir(parents=True, exist_ok=True)
+        self._check_writer_authority()
         files: list[dict[str, Any]] = []
         for entry in workspace.changed_entries():
+            self._check_writer_authority()
             files.append(self._write_proposal_entry(entry, files_dir))
+            self._check_writer_authority()
         diff_data = diff_path.read_bytes() if diff_path.exists() else b""
         diff_bytes = diff_path.stat().st_size if diff_path.exists() else 0
+        self._check_writer_authority()
         payload: dict[str, Any] = {
             "schema_version": namespaced_id("proposal.v2"),
             "run_id": self.run_id,
@@ -1176,10 +1411,14 @@ class AgentRecorder:
         # proposal_hash a stable content identifier so repeated settle checkpoints
         # with no workspace change produce the same hash.
         payload["proposal_hash"] = canonical_sha256(payload, drop=("proposal_hash", "updated_at"))
+        self._check_writer_authority()
         write_json_atomic(proposal_path, payload)
+        self._check_writer_authority()
         return payload
 
+    @_authority_local_mutation
     def write_metrics(self, metrics: dict[str, Any]) -> Path:
+        self._check_writer_authority()
         path = self.run_dir / "metrics.json"
         payload = {
             "run_id": self.run_id,
@@ -1188,62 +1427,92 @@ class AgentRecorder:
             **metrics,
         }
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
+    @_authority_local_mutation
     def write_failure(self, payload: dict[str, Any]) -> Path:
         """Write ``run_dir/failure.json`` — the operator-facing failure bundle: what
         broke plus which checkpoint to restore from. The core surfaces this; recovery
         (if any) is the integrator's call (no auto-recovery in the core)."""
+        self._check_writer_authority()
         path = self.run_dir / "failure.json"
         write_json_atomic(path, payload)
+        self._check_writer_authority()
         return path
 
     def close(self) -> None:
         try:
             self.event_bus.close()
         finally:
-            try:
-                # Event-sink failure must not retain the private transcript handle. TextIO close is
-                # idempotent, while EventBus separately guarantees each configured sink is called
-                # once.
-                self._transcript_file.close()
-            finally:
+            self._close_owned_handles()
+
+    def discard_uncommitted(self) -> None:
+        """Release recorder-owned handles without publishing through observer or event sinks."""
+
+        for sink in getattr(self.event_bus, "sinks", ()):
+            if isinstance(sink, JsonlEventSink):
                 try:
-                    store = self._model_content_store
-                    if store is not None:
-                        try:
-                            store.close()
-                        except Exception:  # noqa: BLE001 - private persistence is best-effort
-                            _LOGGER.debug("model content store close failed", exc_info=True)
-                finally:
-                    # Nested rather than sequential: one private artifact failing to close must
-                    # not retain the other's descriptor, the same rule the transcript already has
-                    # against the event bus above.
+                    sink.close()
+                except OSError:
+                    _LOGGER.debug("event log discard close failed", exc_info=True)
+                break
+        self._close_owned_handles(flush_model_content=False)
+
+    def _close_owned_handles(self, *, flush_model_content: bool = True) -> None:
+        """Close local handles, optionally flushing the normal model-content prefix."""
+
+        try:
+            # Event-sink failure must not retain the private transcript handle. TextIO close is
+            # idempotent, while EventBus separately owns close idempotence and stops its
+            # callback fan-out when writer authority moves.
+            self._transcript_file.close()
+        finally:
+            try:
+                store = self._model_content_store
+                if store is not None:
                     try:
-                        with self._model_calls_lock:
-                            # Marked closed under the same acquisition that takes the handle, so a
-                            # concurrent record cannot slip between the two and reopen the file.
-                            self._model_calls_closed = True
-                            handle, self._model_calls_handle = self._model_calls_handle, None
-                        if handle is not None:
-                            try:
-                                handle.close()
-                            except OSError:
-                                _LOGGER.debug("model call ledger close failed", exc_info=True)
+                        if flush_model_content and not self.write_authority.revoked:
+                            store.close()
+                        else:
+                            store.discard()
+                    except Exception:  # noqa: BLE001 - private persistence is best-effort
+                        _LOGGER.debug("model content store close failed", exc_info=True)
                     finally:
-                        # Fourth arm, nested for the same reason as the third: the corpus handle
-                        # must be released even when the ledger's close raised.
-                        with self._model_calls_lock:
-                            self._model_payloads_closed = True
-                            payloads_handle = self._model_payloads_handle
-                            self._model_payloads_handle = None
-                        if payloads_handle is not None:
-                            try:
-                                payloads_handle.close()
-                            except OSError:
-                                _LOGGER.debug("model payload corpus close failed", exc_info=True)
+                        remove_callback = self._remove_model_content_revoke_callback
+                        self._remove_model_content_revoke_callback = None
+                        if remove_callback is not None:
+                            remove_callback()
+            finally:
+                # Nested rather than sequential: one private artifact failing to close must
+                # not retain the other's descriptor, the same rule the transcript already has
+                # against the event bus above.
+                try:
+                    with self._model_calls_lock:
+                        # Marked closed under the same acquisition that takes the handle, so a
+                        # concurrent record cannot slip between the two and reopen the file.
+                        self._model_calls_closed = True
+                        handle, self._model_calls_handle = self._model_calls_handle, None
+                    if handle is not None:
+                        try:
+                            handle.close()
+                        except OSError:
+                            _LOGGER.debug("model call ledger close failed", exc_info=True)
+                finally:
+                    # Fourth arm, nested for the same reason as the third: the corpus handle
+                    # must be released even when the ledger's close raised.
+                    with self._model_calls_lock:
+                        self._model_payloads_closed = True
+                        payloads_handle = self._model_payloads_handle
+                        self._model_payloads_handle = None
+                    if payloads_handle is not None:
+                        try:
+                            payloads_handle.close()
+                        except OSError:
+                            _LOGGER.debug("model payload corpus close failed", exc_info=True)
 
     def _write_proposal_entry(self, entry: ChangedEntry, files_dir: Path) -> dict[str, Any]:
+        self._check_writer_authority()
         payload: dict[str, Any] = {
             "path": entry.path,
             "kind": entry.kind,
@@ -1257,7 +1526,9 @@ class AgentRecorder:
             return payload
         target = files_dir.joinpath(*entry.path.split("/"))
         target.parent.mkdir(parents=True, exist_ok=True)
+        self._check_writer_authority()
         target.write_bytes(entry.content)
+        self._check_writer_authority()
         payload["snapshot_path"] = str(target.relative_to(self.run_dir).as_posix())
         payload["snapshot_sha256"] = sha256_bytes(entry.content)
         return payload

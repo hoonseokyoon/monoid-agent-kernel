@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from monoid_agent_kernel._policy_util import dedupe, str_tuple
 from monoid_agent_kernel._proc import file_size, spawn_process, terminate_process
 from monoid_agent_kernel.core.json_ingress import exact_text, normalize_unicode_scalars
+from monoid_agent_kernel.core.workspace import _workspace_root_path
 from monoid_agent_kernel.errors import PermissionDenied, ToolExecutionError, WorkspaceError
 from monoid_agent_kernel.permissions import PermissionPolicy
 from monoid_agent_kernel.public_view import (
@@ -602,8 +603,9 @@ def execute_shell(
     )
 
     if resolved_execution_workspace == "direct":
-        cwd_abs = (workspace.root / cwd_rel).resolve()
-        if not is_within(workspace.root, cwd_abs):
+        workspace_root = _workspace_root_path(workspace)
+        cwd_abs = (workspace_root / cwd_rel).resolve()
+        if not is_within(workspace_root, cwd_abs):
             raise WorkspaceError(f"shell cwd escapes workspace: {cwd_rel}")
         if not cwd_abs.exists() or not cwd_abs.is_dir():
             raise WorkspaceError(f"shell cwd is not a directory: {cwd_rel}")
@@ -710,7 +712,7 @@ def validate_cwd(
 ) -> str:
     rel = normalize_workspace_path(cwd or ".")
     _check_shell_path_allowed(rel, permission_policy)
-    resolved_rel, _abs_path = workspace.resolve_existing_or_parent(rel)
+    resolved_rel = workspace.normalize(rel)
     kind = workspace.path_kind(rel)
     if kind != "dir":
         raise WorkspaceError(f"shell cwd is not a directory: {resolved_rel}")

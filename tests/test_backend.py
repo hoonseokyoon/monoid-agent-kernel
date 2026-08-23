@@ -33,6 +33,8 @@ from support.backend_harness import (
     tool_binding,
 )
 from monoid_agent_kernel.core.lifecycle import SessionState
+from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference.backend.run_types import normalize_backend_run_request
 from monoid_agent_kernel.tools.base import ToolContext, ToolResult, ToolSpec
 
@@ -350,7 +352,7 @@ def test_backend_tool_approval_replay_checkpoint_preserves_queued_messages(tmp_p
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 
@@ -449,7 +451,7 @@ def test_backend_recovered_tool_approval_replay_checkpoint_preserves_queued_mess
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 
@@ -674,7 +676,58 @@ def test_backend_drain_ends_parked_multi_turn_sessions(tmp_path: Path) -> None:
     assert eventually(lambda: backend._record(run_id).state is SessionState.AWAITING_INPUT)
     pending = backend.drain(timeout_s=20)
     assert pending == []
-    assert backend._record(run_id).terminal is True
+    record = backend._record(run_id)
+    assert record.terminal is True
+    assert record.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
+    assert record.result is not None
+    assert record.result.interruption_cause is InterruptionCause.GRACEFUL_DRAIN
+    assert backend.status(run_id, submission.run_token)["interruption_cause"] == "graceful_drain"
+    assert backend.result(run_id, submission.run_token)["interruption_cause"] == "graceful_drain"
+
+    existing_run_dirs = set(backend.run_root.iterdir())
+    with pytest.raises(NativeAgentError) as exc_info:
+        backend.submit_run(
+            BackendRunRequest(
+                tenant_id="tenant_a",
+                user_id="user_a",
+                workspace_root=workspace,
+                instruction="must be rejected after drain",
+                runtime_config=_default_config(),
+            )
+        )
+    assert exc_info.value.error_code == "backend_draining"
+    assert set(backend.run_root.iterdir()) == existing_run_dirs
+
+
+def test_backend_drain_does_not_stamp_a_run_that_terminalizes_during_cancel(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    backend = _backend(tmp_path, workspace, [])
+    prepared = backend._prepare_run_record(
+        BackendRunRequest(
+            tenant_id="tenant_a",
+            user_id="user_a",
+            workspace_root=workspace,
+            instruction="complete while drain takes ownership",
+            runtime_config=_default_config(),
+        )
+    )
+    record = backend._record(prepared.run_id)
+
+    def complete_during_cancel() -> None:
+        record.state = SessionState.COMPLETED
+        record.terminal = True
+
+    record.cancellation_token.add_cancel_callback(complete_during_cancel)
+
+    pending = backend.drain(timeout_s=0)
+
+    assert pending == []
+    assert record.state is SessionState.COMPLETED
+    assert record.error == ""
+    assert record.error_code == ""
+    assert record.interruption_cause is None
 
 
 def test_token_manager_binds_kind_audience_run_and_expiry() -> None:
@@ -1162,7 +1215,7 @@ def test_backend_recovery_rebuilds_a_recording_activation(tmp_path: Path) -> Non
             return []
         return [
             task
-            for task in record.loop._session.res.context.job_manager.list_jobs()
+            for task in record.loop._session.res.context._job_manager.list_jobs()
             if task.get("kind") == "tool_approval" and task.get("status") == "running"
         ]
 
