@@ -76,13 +76,22 @@ class PostgresWriterAuthorityStore:
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "SELECT run_id, owner_id, generation, leased_until, revoked, "
-                "clock_timestamp() FROM {} WHERE run_id = %s FOR UPDATE"
+                "SELECT run_id, owner_id, generation, leased_until, revoked "
+                "FROM {} WHERE run_id = %s FOR UPDATE"
             ).format(self._qualified_table()),
             (run_id,),
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
-        return None if row is None else _authority_from_row(row)
+        if row is None:
+            return None
+        # PostgreSQL may evaluate SELECT target-list expressions before FOR UPDATE finishes
+        # waiting. Sample in a second statement so expiry is judged strictly after this
+        # transaction owns the row lock.
+        cursor.execute("SELECT clock_timestamp()")  # type: ignore[attr-defined]
+        clock_row = cursor.fetchone()  # type: ignore[attr-defined]
+        if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
+            raise RuntimeError("PostgreSQL writer authority clock query returned no row")
+        return _authority_from_row((*row, clock_row[0]))
 
     def _insert_first(
         self,

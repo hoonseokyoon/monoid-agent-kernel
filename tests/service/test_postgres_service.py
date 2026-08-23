@@ -393,3 +393,71 @@ def test_concurrent_expiry_handoff_has_one_generation_winner_across_pools(
     assert losers[0].authority.writer_token == winners[0].writer_token
     current = first_store.read("run-race")
     assert current is not None and current.writer_token == winners[0].writer_token
+
+
+def test_lock_wait_samples_database_clock_after_the_row_lock(
+    postgres_database: PostgresDatabase,
+) -> None:
+    PostgresMigrations(postgres_database).apply()
+    first_store = PostgresWriterAuthorityStore(postgres_database)
+    first_store.check_ready()
+    first = first_store.claim("run-lock-clock", "worker-a", timedelta(milliseconds=700))
+
+    waiter_database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=2,
+            application_name="monoid-pr02-clock-waiter",
+        )
+    )
+    waiter_database.open()
+    waiter_store = PostgresWriterAuthorityStore(waiter_database)
+    waiter_store.check_ready()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with postgres_database.connection() as blocking_connection:
+                with blocking_connection.transaction():
+                    with blocking_connection.cursor() as cursor:
+                        cursor.execute(
+                            sql.SQL("SELECT run_id FROM {}.{} WHERE run_id = %s FOR UPDATE").format(
+                                sql.Identifier(postgres_database.config.schema),
+                                sql.Identifier("run_authority"),
+                            ),
+                            (first.writer_token.run_id,),
+                        )
+                        assert cursor.fetchone() == (first.writer_token.run_id,)
+                    future = executor.submit(
+                        waiter_store.claim,
+                        first.writer_token.run_id,
+                        "worker-b",
+                        timedelta(seconds=2),
+                    )
+                    deadline = time.monotonic() + 5
+                    while True:
+                        with postgres_database.connection() as observer_connection:
+                            with observer_connection.transaction():
+                                with observer_connection.cursor() as cursor:
+                                    cursor.execute(
+                                        "SELECT EXISTS ("
+                                        "SELECT 1 FROM pg_stat_activity "
+                                        "WHERE application_name = %s AND wait_event_type = 'Lock'"
+                                        ")",
+                                        (waiter_database.config.application_name,),
+                                    )
+                                    blocked = bool(cursor.fetchone()[0])
+                        if blocked:
+                            break
+                        if time.monotonic() >= deadline:
+                            pytest.fail("claimant did not block on the authority row lock")
+                        time.sleep(0.01)
+                    time.sleep(0.85)
+            replacement = future.result(timeout=5)
+    finally:
+        waiter_database.close()
+
+    assert replacement.writer_token.generation == 2
+    assert replacement.writer_token.owner_id == "worker-b"
+    assert replacement.observed_at > first.leased_until
