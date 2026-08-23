@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from datetime import timedelta
-from typing import Any, Iterator
+from typing import Any
 
 from monoid_agent_kernel.adapters.postgres.migrations import (
     MigrationStatus,
@@ -71,18 +70,6 @@ class PostgresWriterAuthorityStore:
             raise PostgresSchemaIncompatible(
                 "PostgreSQL writer authority store requires a successful check_ready()"
             )
-
-    @staticmethod
-    @contextmanager
-    def _transaction(connection: Any) -> Iterator[None]:
-        """Run one authority operation with the statement snapshots its protocol requires."""
-
-        with connection.transaction():
-            with connection.cursor() as cursor:
-                # This must be the transaction's first statement. In particular, an absent-row
-                # conflict needs a new snapshot after ON CONFLICT waits for a committed winner.
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            yield
 
     def _read_locked(self, cursor: object, run_id: str) -> WriterAuthority | None:
         from psycopg import sql
@@ -195,28 +182,27 @@ class PostgresWriterAuthorityStore:
             raise ValueError("writer claim owner_id must be a bounded opaque id")
         _validate_ttl(ttl)
 
-        with self.database.connection() as connection:
-            with self._transaction(connection):
-                with connection.cursor() as cursor:
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                current = self._read_locked(cursor, run_id)
+                if current is None:
+                    inserted = self._insert_first(cursor, run_id, owner_id, ttl)
+                    if inserted is not None:
+                        return inserted
+                    # A concurrent absent-row insert committed while ON CONFLICT waited. This
+                    # new statement observes and locks that winner under READ COMMITTED.
                     current = self._read_locked(cursor, run_id)
-                    if current is None:
-                        inserted = self._insert_first(cursor, run_id, owner_id, ttl)
-                        if inserted is not None:
-                            return inserted
-                        # A concurrent absent-row insert committed while ON CONFLICT waited. This
-                        # new statement observes and locks that winner under READ COMMITTED.
-                        current = self._read_locked(cursor, run_id)
-                        if current is None:  # pragma: no cover - conflicting row must now exist
-                            raise RuntimeError("PostgreSQL writer claim conflict lost its winner")
-                    if current.active:
-                        if current.writer_token.owner_id == owner_id:
-                            return WriterLease(
-                                writer_token=current.writer_token,
-                                leased_until=current.leased_until,
-                                observed_at=current.observed_at,
-                            )
-                        raise WriterLeaseUnavailable(current)
-                    return self._take_over(cursor, run_id, owner_id, ttl)
+                    if current is None:  # pragma: no cover - conflicting row must now exist
+                        raise RuntimeError("PostgreSQL writer claim conflict lost its winner")
+                if current.active:
+                    if current.writer_token.owner_id == owner_id:
+                        return WriterLease(
+                            writer_token=current.writer_token,
+                            leased_until=current.leased_until,
+                            observed_at=current.observed_at,
+                        )
+                    raise WriterLeaseUnavailable(current)
+                return self._take_over(cursor, run_id, owner_id, ttl)
 
     def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
         self._require_ready()
@@ -225,49 +211,44 @@ class PostgresWriterAuthorityStore:
         _validate_ttl(ttl)
         from psycopg import sql
 
-        with self.database.connection() as connection:
-            with self._transaction(connection):
-                with connection.cursor() as cursor:
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                current = self._read_locked(cursor, writer_token.run_id)
+                if current is None or current.writer_token != writer_token or not current.active:
+                    return RenewResult(status="fenced", authority=current)
+                cursor.execute(
+                    sql.SQL(
+                        "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                        "UPDATE {} AS authority SET "
+                        "leased_until = sampled.db_now + %s, updated_at = sampled.db_now "
+                        "FROM sampled WHERE authority.run_id = %s "
+                        "AND authority.owner_id = %s AND authority.generation = %s "
+                        "AND NOT authority.revoked AND authority.leased_until > sampled.db_now "
+                        "RETURNING authority.run_id, authority.owner_id, "
+                        "authority.generation, authority.leased_until, authority.revoked, "
+                        "sampled.db_now"
+                    ).format(self._qualified_table()),
+                    (
+                        ttl,
+                        writer_token.run_id,
+                        writer_token.owner_id,
+                        writer_token.generation,
+                    ),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    # The database clock crossed expiry between observation and UPDATE.
                     current = self._read_locked(cursor, writer_token.run_id)
-                    if (
-                        current is None
-                        or current.writer_token != writer_token
-                        or not current.active
-                    ):
-                        return RenewResult(status="fenced", authority=current)
-                    cursor.execute(
-                        sql.SQL(
-                            "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
-                            "UPDATE {} AS authority SET "
-                            "leased_until = sampled.db_now + %s, updated_at = sampled.db_now "
-                            "FROM sampled WHERE authority.run_id = %s "
-                            "AND authority.owner_id = %s AND authority.generation = %s "
-                            "AND NOT authority.revoked AND authority.leased_until > sampled.db_now "
-                            "RETURNING authority.run_id, authority.owner_id, "
-                            "authority.generation, authority.leased_until, authority.revoked, "
-                            "sampled.db_now"
-                        ).format(self._qualified_table()),
-                        (
-                            ttl,
-                            writer_token.run_id,
-                            writer_token.owner_id,
-                            writer_token.generation,
-                        ),
-                    )
-                    row = cursor.fetchone()
-                    if row is None:
-                        # The database clock crossed expiry between observation and UPDATE.
-                        current = self._read_locked(cursor, writer_token.run_id)
-                        return RenewResult(status="fenced", authority=current)
-                    authority = _authority_from_row(row)
-                    return RenewResult(
-                        status="renewed",
-                        lease=WriterLease(
-                            writer_token=authority.writer_token,
-                            leased_until=authority.leased_until,
-                            observed_at=authority.observed_at,
-                        ),
-                    )
+                    return RenewResult(status="fenced", authority=current)
+                authority = _authority_from_row(row)
+                return RenewResult(
+                    status="renewed",
+                    lease=WriterLease(
+                        writer_token=authority.writer_token,
+                        leased_until=authority.leased_until,
+                        observed_at=authority.observed_at,
+                    ),
+                )
 
     def release(self, writer_token: WriterToken) -> ReleaseResult:
         self._require_ready()
@@ -275,40 +256,39 @@ class PostgresWriterAuthorityStore:
             raise TypeError("writer release requires WriterToken")
         from psycopg import sql
 
-        with self.database.connection() as connection:
-            with self._transaction(connection):
-                with connection.cursor() as cursor:
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                current = self._read_locked(cursor, writer_token.run_id)
+                if current is None or current.writer_token != writer_token:
+                    return ReleaseResult(status="fenced", authority=current)
+                if current.revoked:
+                    return ReleaseResult(status="already_released", authority=current)
+                if not current.active:
+                    return ReleaseResult(status="fenced", authority=current)
+                cursor.execute(
+                    sql.SQL(
+                        "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                        "UPDATE {} AS authority SET "
+                        "leased_until = sampled.db_now, revoked = true, "
+                        "updated_at = sampled.db_now "
+                        "FROM sampled WHERE authority.run_id = %s "
+                        "AND authority.owner_id = %s AND authority.generation = %s "
+                        "AND NOT authority.revoked AND authority.leased_until > sampled.db_now "
+                        "RETURNING authority.run_id, authority.owner_id, "
+                        "authority.generation, authority.leased_until, authority.revoked, "
+                        "sampled.db_now"
+                    ).format(self._qualified_table()),
+                    (
+                        writer_token.run_id,
+                        writer_token.owner_id,
+                        writer_token.generation,
+                    ),
+                )
+                row = cursor.fetchone()
+                if row is None:
                     current = self._read_locked(cursor, writer_token.run_id)
-                    if current is None or current.writer_token != writer_token:
-                        return ReleaseResult(status="fenced", authority=current)
-                    if current.revoked:
-                        return ReleaseResult(status="already_released", authority=current)
-                    if not current.active:
-                        return ReleaseResult(status="fenced", authority=current)
-                    cursor.execute(
-                        sql.SQL(
-                            "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
-                            "UPDATE {} AS authority SET "
-                            "leased_until = sampled.db_now, revoked = true, "
-                            "updated_at = sampled.db_now "
-                            "FROM sampled WHERE authority.run_id = %s "
-                            "AND authority.owner_id = %s AND authority.generation = %s "
-                            "AND NOT authority.revoked AND authority.leased_until > sampled.db_now "
-                            "RETURNING authority.run_id, authority.owner_id, "
-                            "authority.generation, authority.leased_until, authority.revoked, "
-                            "sampled.db_now"
-                        ).format(self._qualified_table()),
-                        (
-                            writer_token.run_id,
-                            writer_token.owner_id,
-                            writer_token.generation,
-                        ),
-                    )
-                    row = cursor.fetchone()
-                    if row is None:
-                        current = self._read_locked(cursor, writer_token.run_id)
-                        return ReleaseResult(status="fenced", authority=current)
-                    return ReleaseResult(status="released", authority=_authority_from_row(row))
+                    return ReleaseResult(status="fenced", authority=current)
+                return ReleaseResult(status="released", authority=_authority_from_row(row))
 
     def read(self, run_id: str) -> WriterAuthority | None:
         self._require_ready()
@@ -316,17 +296,16 @@ class PostgresWriterAuthorityStore:
             raise ValueError("writer authority run_id must be a bounded opaque id")
         from psycopg import sql
 
-        with self.database.connection() as connection:
-            with self._transaction(connection):
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        sql.SQL(
-                            "SELECT run_id, owner_id, generation, leased_until, revoked, "
-                            "clock_timestamp() FROM {} WHERE run_id = %s"
-                        ).format(self._qualified_table()),
-                        (run_id,),
-                    )
-                    row = cursor.fetchone()
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT run_id, owner_id, generation, leased_until, revoked, "
+                        "clock_timestamp() FROM {} WHERE run_id = %s"
+                    ).format(self._qualified_table()),
+                    (run_id,),
+                )
+                row = cursor.fetchone()
         return None if row is None else _authority_from_row(row)
 
 

@@ -191,9 +191,7 @@ def test_migration_checksum_drift_fails_closed(postgres_database: PostgresDataba
         with connection.transaction():
             with connection.cursor() as cursor:
                 cursor.execute(
-                    sql.SQL(
-                        "UPDATE {}.{} SET checksum_sha256 = %s WHERE migration_id = %s"
-                    ).format(
+                    sql.SQL("UPDATE {}.{} SET checksum_sha256 = %s WHERE migration_id = %s").format(
                         sql.Identifier(postgres_database.config.schema),
                         sql.Identifier("monoid_schema_migrations"),
                     ),
@@ -287,6 +285,78 @@ def test_migration_advisory_lock_serializes_independent_runners(
     finally:
         for database in peer_databases:
             database.close()
+
+    assert sorted(applied, key=len) == [(), ("0001_authority",)]
+    assert PostgresMigrations(postgres_database).status().current is True
+
+
+@pytest.mark.parametrize(
+    "isolation_level",
+    [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE],
+)
+def test_migration_lock_wait_enforces_read_committed_on_caller_pools(
+    postgres_database: PostgresDatabase,
+    isolation_level: IsolationLevel,
+) -> None:
+    caller_pools: list[ConnectionPool[psycopg.Connection[tuple[object, ...]]]] = []
+    peer_databases: list[PostgresDatabase] = []
+
+    def configure(connection: psycopg.Connection[tuple[object, ...]]) -> None:
+        connection.isolation_level = isolation_level
+
+    for index in range(2):
+        application_name = f"monoid-pr02-migration-{isolation_level.name.lower()}-{index}"
+        caller_pool = ConnectionPool(
+            postgres_database.config.dsn,
+            kwargs={"application_name": application_name},
+            min_size=1,
+            max_size=1,
+            open=False,
+            configure=configure,
+        )
+        caller_pool.open(wait=True, timeout=10)
+        database = PostgresDatabase(
+            PostgresConfig(
+                dsn=postgres_database.config.dsn,
+                schema=postgres_database.config.schema,
+                min_pool_size=1,
+                max_pool_size=1,
+                application_name=application_name,
+            ),
+            pool=caller_pool,
+        )
+        database.open()
+        caller_pools.append(caller_pool)
+        peer_databases.append(database)
+
+    barrier = threading.Barrier(2)
+
+    def migrate(index: int) -> tuple[str, ...]:
+        barrier.wait(timeout=5)
+        result = PostgresMigrations(peer_databases[index]).apply()
+        return tuple(item.migration_id for item in result.applied)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with postgres_database.connection() as blocking_connection:
+                with blocking_connection.transaction():
+                    with blocking_connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                            (f"monoid-agent-kernel:migrations:{postgres_database.config.schema}",),
+                        )
+                    futures = tuple(executor.submit(migrate, index) for index in range(2))
+                    for database in peer_databases:
+                        _wait_until_application_blocks_on_lock(
+                            postgres_database,
+                            database.config.application_name,
+                        )
+            applied = tuple(future.result(timeout=10) for future in futures)
+    finally:
+        for database in peer_databases:
+            database.close()
+        for caller_pool in caller_pools:
+            caller_pool.close()
 
     assert sorted(applied, key=len) == [(), ("0001_authority",)]
     assert PostgresMigrations(postgres_database).status().current is True

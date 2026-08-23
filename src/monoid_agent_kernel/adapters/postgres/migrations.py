@@ -253,9 +253,8 @@ class PostgresMigrations:
         )
 
     def status(self) -> MigrationStatus:
-        with self.database.connection() as connection:
-            with connection.transaction():
-                return self._inspect(connection)
+        with self.database.transaction() as connection:
+            return self._inspect(connection)
 
     def plan(self) -> MigrationPlan:
         status = self.status()
@@ -285,44 +284,41 @@ class PostgresMigrations:
         from psycopg import sql
 
         schema = self.database.config.schema
-        with self.database.connection() as connection:
-            with connection.transaction():
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{_MIGRATION_LOCK_NAMESPACE}:{schema}",),
+                )
+            before = self._inspect(connection)
+            pending_ids = {item.migration_id for item in before.pending}
+            pending_sources = tuple(
+                source for source in _sources() if source.info.migration_id in pending_ids
+            )
+            if pending_sources:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                        (f"{_MIGRATION_LOCK_NAMESPACE}:{schema}",),
+                        sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
                     )
-                before = self._inspect(connection)
-                pending_ids = {item.migration_id for item in before.pending}
-                pending_sources = tuple(
-                    source for source in _sources() if source.info.migration_id in pending_ids
-                )
-                if pending_sources:
-                    with connection.cursor() as cursor:
+                    self._set_search_path(cursor, schema)
+                    for source in pending_sources:
+                        cursor.execute(source.sql_text)
                         cursor.execute(
-                            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
-                                sql.Identifier(schema)
-                            )
+                            sql.SQL(
+                                "INSERT INTO {} "
+                                "(migration_id, ordinal, checksum_sha256, reader_floor, "
+                                "writer_floor, applied_at) "
+                                "VALUES (%s, %s, %s, %s, %s, clock_timestamp())"
+                            ).format(sql.Identifier(_METADATA_TABLE)),
+                            (
+                                source.info.migration_id,
+                                source.info.ordinal,
+                                source.info.checksum_sha256,
+                                source.info.reader_floor,
+                                source.info.writer_floor,
+                            ),
                         )
-                        self._set_search_path(cursor, schema)
-                        for source in pending_sources:
-                            cursor.execute(source.sql_text)
-                            cursor.execute(
-                                sql.SQL(
-                                    "INSERT INTO {} "
-                                    "(migration_id, ordinal, checksum_sha256, reader_floor, "
-                                    "writer_floor, applied_at) "
-                                    "VALUES (%s, %s, %s, %s, %s, clock_timestamp())"
-                                ).format(sql.Identifier(_METADATA_TABLE)),
-                                (
-                                    source.info.migration_id,
-                                    source.info.ordinal,
-                                    source.info.checksum_sha256,
-                                    source.info.reader_floor,
-                                    source.info.writer_floor,
-                                ),
-                            )
-                after = self._inspect(connection)
+            after = self._inspect(connection)
         if not after.current:
             raise PostgresSchemaIncompatible(
                 "PostgreSQL migrations completed without a current compatible schema"

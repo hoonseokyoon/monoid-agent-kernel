@@ -142,16 +142,27 @@ class PostgresDatabase:
         with pool.connection(timeout=float(self.config.pool_timeout_s)) as connection:  # type: ignore[attr-defined]
             yield connection
 
-    def health(self) -> PostgresHealth:
-        """Verify connectivity, supported major version, and database-clock availability."""
+    @contextmanager
+    def transaction(self) -> Iterator[Any]:
+        """Borrow a connection and start the adapter's READ COMMITTED transaction primitive."""
 
         with self.connection() as connection:
             with connection.transaction():
                 with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT current_setting('server_version_num')::integer, clock_timestamp()"
-                    )
-                    row = cursor.fetchone()
+                    # This is deliberately the first statement. Adapter linearization may wait on
+                    # row, unique-index, or advisory locks and then needs a new statement snapshot.
+                    cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                yield connection
+
+    def health(self) -> PostgresHealth:
+        """Verify connectivity, supported major version, and database-clock availability."""
+
+        with self.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT current_setting('server_version_num')::integer, clock_timestamp()"
+                )
+                row = cursor.fetchone()
         if row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
             raise RuntimeError("PostgreSQL health query returned no row")
         health = PostgresHealth(server_version_num=int(row[0]), database_time=row[1])
