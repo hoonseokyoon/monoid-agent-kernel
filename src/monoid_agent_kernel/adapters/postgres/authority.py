@@ -23,7 +23,9 @@ from monoid_agent_kernel.hosting import (
 
 
 _AUTHORITY_TABLE = "run_authority"
-_ELAPSED_TTL_INTERVAL = "(%s::text || ' microseconds')::interval"
+_ELAPSED_TTL_INTERVAL = (
+    "(%s::pg_catalog.text || ' microseconds')::pg_catalog.interval"
+)
 
 
 def _ttl_microseconds(ttl: object) -> int:
@@ -92,7 +94,7 @@ class PostgresWriterAuthorityStore:
         # PostgreSQL may evaluate SELECT target-list expressions before FOR UPDATE finishes
         # waiting. Sample in a second statement so expiry is judged strictly after this
         # transaction owns the row lock.
-        cursor.execute("SELECT clock_timestamp()")  # type: ignore[attr-defined]
+        cursor.execute("SELECT pg_catalog.clock_timestamp()")  # type: ignore[attr-defined]
         clock_row = cursor.fetchone()  # type: ignore[attr-defined]
         if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
             raise RuntimeError("PostgreSQL writer authority clock query returned no row")
@@ -109,7 +111,7 @@ class PostgresWriterAuthorityStore:
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
                 "INSERT INTO {} "
                 "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
                 "SELECT %s, %s, 1, db_now, true, db_now FROM sampled "
@@ -126,7 +128,7 @@ class PostgresWriterAuthorityStore:
         # placeholder; start the active TTL from a fresh clock sampled after the wait completed.
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
                 "UPDATE {} AS authority SET "
                 "leased_until = sampled.db_now + "
                 + _ELAPSED_TTL_INTERVAL
@@ -160,7 +162,7 @@ class PostgresWriterAuthorityStore:
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
                 "UPDATE {} AS authority SET "
                 "owner_id = %s, generation = authority.generation + 1, "
                 "leased_until = sampled.db_now + "
@@ -227,7 +229,7 @@ class PostgresWriterAuthorityStore:
                     return RenewResult(status="fenced", authority=current)
                 cursor.execute(
                     sql.SQL(
-                        "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                        "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
                         "UPDATE {} AS authority SET "
                         "leased_until = sampled.db_now + "
                         + _ELAPSED_TTL_INTERVAL
@@ -278,7 +280,7 @@ class PostgresWriterAuthorityStore:
                     return ReleaseResult(status="fenced", authority=current)
                 cursor.execute(
                     sql.SQL(
-                        "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                        "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
                         "UPDATE {} AS authority SET "
                         "leased_until = sampled.db_now, revoked = true, "
                         "updated_at = sampled.db_now "

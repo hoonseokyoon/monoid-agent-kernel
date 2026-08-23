@@ -126,6 +126,22 @@ def test_adapter_construction_has_no_connection_or_migration_side_effect() -> No
     assert pool.borrow_timeouts == []
 
 
+def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
+    pool = _FakePool()
+    database = PostgresDatabase(PostgresConfig(dsn="postgresql://unused/service"), pool=pool)
+    database.open()
+    pool.connection_value.cursor_value.executed.clear()
+
+    with database.transaction():
+        pass
+
+    assert pool.connection_value.cursor_value.executed == [
+        ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", None),
+        ("SET LOCAL search_path TO pg_catalog, pg_temp", None),
+    ]
+    database.close()
+
+
 def test_bundled_migration_metadata_hashes_exact_wheel_resource() -> None:
     migrations = bundled_migrations()
     assert tuple(item.migration_id for item in migrations) == ("0001_authority",)

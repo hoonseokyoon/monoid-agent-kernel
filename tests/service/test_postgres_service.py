@@ -407,6 +407,67 @@ def test_migration_path_resists_pooled_temp_table_shadowing(
         caller_pool.close()
 
 
+def test_migration_schema_cannot_shadow_pg_catalog_builtins(
+    postgres_database: PostgresDatabase,
+) -> None:
+    schema = postgres_database.config.schema
+    with postgres_database.connection() as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "CREATE FUNCTION {}.{}() RETURNS pg_catalog.timestamptz "
+                        "LANGUAGE SQL IMMUTABLE "
+                        "AS 'SELECT ''-infinity''::pg_catalog.timestamptz'"
+                    ).format(
+                        sql.Identifier(schema),
+                        sql.Identifier("clock_timestamp"),
+                    )
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "CREATE FUNCTION {}.{}(pg_catalog.text) RETURNS pg_catalog.int4 "
+                        "LANGUAGE SQL IMMUTABLE AS 'SELECT 0::pg_catalog.int4'"
+                    ).format(
+                        sql.Identifier(schema),
+                        sql.Identifier("octet_length"),
+                    )
+                )
+
+    result = PostgresMigrations(postgres_database).apply()
+    assert result.status.current is True
+    store = PostgresWriterAuthorityStore(postgres_database)
+    store.check_ready()
+    lease = store.claim("run-shadow-builtins", "worker-a", timedelta(seconds=10))
+    assert lease.observed_at.year >= 2020
+
+    class RollBackDefaultProbe(Exception):
+        pass
+
+    try:
+        with postgres_database.connection() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.{} "
+                            "(migration_id, ordinal, checksum_sha256, reader_floor, writer_floor) "
+                            "VALUES (%s, %s, %s, %s, %s) RETURNING applied_at"
+                        ).format(
+                            sql.Identifier(schema),
+                            sql.Identifier("monoid_schema_migrations"),
+                        ),
+                        ("9999_default_probe", 2, "f" * 64, 1, 1),
+                    )
+                    assert cursor.fetchone()[0].year >= 2020
+                raise RollBackDefaultProbe
+    except RollBackDefaultProbe:
+        pass
+
+
 @pytest.mark.parametrize(
     "isolation_level",
     [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE],

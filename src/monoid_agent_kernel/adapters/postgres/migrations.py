@@ -18,6 +18,7 @@ from monoid_agent_kernel.core.json_ingress import portable_type_name
 SCHEMA_VERSION = 1
 _METADATA_TABLE = "monoid_schema_migrations"
 _MIGRATION_LOCK_NAMESPACE = "monoid-agent-kernel:migrations"
+_SCHEMA_TOKEN = "__MONOID_SCHEMA__"
 
 
 class PostgresMigrationError(RuntimeError):
@@ -124,6 +125,20 @@ def bundled_migrations() -> tuple[MigrationInfo, ...]:
     return tuple(source.info for source in _sources())
 
 
+def _render_migration(sql_text: str, schema: str) -> object:
+    """Render only the reserved schema token as a quoted PostgreSQL identifier."""
+
+    from psycopg import sql
+
+    parts = sql_text.split(_SCHEMA_TOKEN)
+    if len(parts) == 1:
+        raise PostgresMigrationError("PostgreSQL migration resource is missing its schema token")
+    rendered: list[object] = [sql.SQL(parts[0])]
+    for part in parts[1:]:
+        rendered.extend((sql.Identifier(schema), sql.SQL(part)))
+    return sql.Composed(rendered)
+
+
 class PostgresMigrations:
     """Read-only schema inspection plus explicitly invoked migration application."""
 
@@ -135,7 +150,7 @@ class PostgresMigrations:
     @staticmethod
     def _schema_exists(cursor: object, schema: str) -> bool:
         cursor.execute(  # type: ignore[attr-defined]
-            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s)",
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s)",
             (schema,),
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
@@ -147,8 +162,9 @@ class PostgresMigrations:
             """
             SELECT EXISTS (
                 SELECT 1
-                FROM pg_class AS relation
-                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                FROM pg_catalog.pg_class AS relation
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname = %s
                   AND relation.relname = %s
                   AND relation.relkind IN ('r', 'p')
@@ -158,19 +174,6 @@ class PostgresMigrations:
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
         return bool(row[0])
-
-    @staticmethod
-    def _set_search_path(cursor: object, schema: str) -> None:
-        from psycopg import sql
-
-        cursor.execute(  # type: ignore[attr-defined]
-            # PostgreSQL searches the temporary schema first when pg_temp is omitted, even from
-            # an explicit path. Put it last so pooled-session temp objects cannot shadow trusted
-            # migration relations; keep pg_catalog ahead of it for built-in function resolution.
-            sql.SQL("SET LOCAL search_path TO {}, pg_catalog, pg_temp").format(
-                sql.Identifier(schema)
-            )
-        )
 
     def _inspect(self, connection: object) -> MigrationStatus:
         from psycopg import sql
@@ -292,7 +295,8 @@ class PostgresMigrations:
         with self.database.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    "SELECT pg_catalog.pg_advisory_xact_lock("
+                    "pg_catalog.hashtextextended(%s, 0))",
                     (f"{_MIGRATION_LOCK_NAMESPACE}:{schema}",),
                 )
             before = self._inspect(connection)
@@ -305,16 +309,19 @@ class PostgresMigrations:
                     cursor.execute(
                         sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
                     )
-                    self._set_search_path(cursor, schema)
                     for source in pending_sources:
-                        cursor.execute(source.sql_text)
+                        cursor.execute(_render_migration(source.sql_text, schema))
                         cursor.execute(
                             sql.SQL(
-                                "INSERT INTO {} "
+                                "INSERT INTO {}.{} "
                                 "(migration_id, ordinal, checksum_sha256, reader_floor, "
                                 "writer_floor, applied_at) "
-                                "VALUES (%s, %s, %s, %s, %s, clock_timestamp())"
-                            ).format(sql.Identifier(_METADATA_TABLE)),
+                                "VALUES (%s, %s, %s, %s, %s, "
+                                "pg_catalog.clock_timestamp())"
+                            ).format(
+                                sql.Identifier(schema),
+                                sql.Identifier(_METADATA_TABLE),
+                            ),
                             (
                                 source.info.migration_id,
                                 source.info.ordinal,

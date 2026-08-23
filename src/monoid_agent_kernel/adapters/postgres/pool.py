@@ -144,7 +144,7 @@ class PostgresDatabase:
 
     @contextmanager
     def transaction(self) -> Iterator[Any]:
-        """Borrow a connection and start the adapter's READ COMMITTED transaction primitive."""
+        """Start the adapter's READ COMMITTED transaction with a trusted local search path."""
 
         with self.connection() as connection:
             with connection.transaction():
@@ -152,6 +152,10 @@ class PostgresDatabase:
                     # This is deliberately the first statement. Adapter linearization may wait on
                     # row, unique-index, or advisory locks and then needs a new statement snapshot.
                     cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    # Caller-provided pooled sessions may carry an untrusted search_path. Adapter
+                    # relations are schema-qualified; built-ins resolve from pg_catalog, and temp
+                    # objects remain reachable only after it. SET LOCAL restores caller state.
+                    cursor.execute("SET LOCAL search_path TO pg_catalog, pg_temp")
                 yield connection
 
     def health(self) -> PostgresHealth:
@@ -160,7 +164,8 @@ class PostgresDatabase:
         with self.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT current_setting('server_version_num')::integer, clock_timestamp()"
+                    "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, "
+                    "pg_catalog.clock_timestamp()"
                 )
                 row = cursor.fetchone()
         if row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
