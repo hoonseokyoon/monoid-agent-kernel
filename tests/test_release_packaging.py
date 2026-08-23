@@ -13,6 +13,21 @@ EXPECTED_BASE_DEPENDENCIES = (
     "pydantic>=2.6",
 )
 
+EXPECTED_DURABLE_EXTRAS = {
+    "postgres": (
+        "psycopg[binary]>=3.2,<4",
+        "psycopg-pool>=3.2,<4",
+    ),
+    "object-store-s3": ("boto3>=1.37.32,<2",),
+    "temporal": ("temporalio>=1.17,<2",),
+    "durable-host": (
+        "psycopg[binary]>=3.2,<4",
+        "psycopg-pool>=3.2,<4",
+        "boto3>=1.37.32,<2",
+        "temporalio>=1.17,<2",
+    ),
+}
+
 
 def test_release_version_metadata_is_consistent() -> None:
     project_root = Path(__file__).resolve().parents[1]
@@ -36,6 +51,15 @@ def test_v022_base_dependency_set_is_frozen_and_platform_neutral() -> None:
         platform_dependency not in lowered
         for platform_dependency in ("dbos", "psycopg", "redis", "temporal")
     )
+
+
+def test_v023_durable_adapters_are_explicit_optional_extras() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads(project_root.joinpath("pyproject.toml").read_text(encoding="utf-8"))
+    extras = pyproject["project"]["optional-dependencies"]
+
+    for name, expected in EXPECTED_DURABLE_EXTRAS.items():
+        assert tuple(extras[name]) == expected
 
 
 def test_publish_workflow_audits_the_wheel_that_it_uploads() -> None:

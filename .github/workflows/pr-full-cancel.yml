@@ -1,0 +1,18 @@
+name: V0.23 PR full cancel sentinel
+
+on:
+  pull_request:
+    types: [converted_to_draft]
+
+permissions: {}
+
+concurrency:
+  group: full-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cancel:
+    name: Cancel stale L2 run
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Draft transition invalidated the previous L2 merge candidate."

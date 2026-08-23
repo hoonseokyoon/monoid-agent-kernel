@@ -1,0 +1,155 @@
+name: V0.23 PR full
+
+on:
+  pull_request:
+    types: [ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number used by the cross-workflow concurrency key
+        required: true
+        type: string
+      ref:
+        description: Exact merge ref or commit to qualify
+        required: true
+        type: string
+      profile:
+        description: Explicit diagnostic service profile
+        required: true
+        type: choice
+        options: [core, postgres, objectstore, temporal, combined]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  profile:
+    name: Validate L2 profile
+    runs-on: ubuntu-latest
+    outputs:
+      profile: ${{ steps.resolve.outputs.profile }}
+      lock_sha256: ${{ steps.resolve.outputs.lock_sha256 }}
+      run_postgres: ${{ steps.resolve.outputs.run_postgres }}
+      run_postgres18: ${{ steps.resolve.outputs.run_postgres18 }}
+      run_objectstore: ${{ steps.resolve.outputs.run_objectstore }}
+      run_temporal: ${{ steps.resolve.outputs.run_temporal }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve plan-owned service profile
+        id: resolve
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref || inputs.ref }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          REQUESTED_PROFILE: ${{ inputs.profile }}
+        run: >
+          python tools/v023_ci.py resolve-profile
+          --head-ref "$HEAD_REF"
+          --labels-json "$LABELS_JSON"
+          ${REQUESTED_PROFILE:+--requested-profile "$REQUESTED_PROFILE"}
+          --github-output "$GITHUB_OUTPUT"
+
+  core:
+    name: L2 core (Python ${{ matrix.python-version }})
+    needs: profile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev,openai]"
+      - name: Run complete unit and contract gate
+        run: >
+          python -m pytest -q -n 4
+          -m "(unit or contract) and not serial and not service"
+          --durations=25
+      - name: Run serial contract gate
+        run: >
+          python -m pytest -q
+          -m "contract and serial and not service"
+          --durations=25
+
+  service:
+    name: L2 ${{ needs.profile.outputs.profile }} services
+    needs: [profile, core]
+    if: needs.profile.outputs.profile != 'core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MONOID_SERVICE_PROFILE: ${{ needs.profile.outputs.profile }}
+      MONOID_POSTGRES16_DSN: postgresql://monoid:monoid-local-only@127.0.0.1:55416/monoid_kernel_test
+      MONOID_POSTGRES18_DSN: postgresql://monoid:monoid-local-only@127.0.0.1:55418/monoid_kernel_test
+      MONOID_MINIO_ENDPOINT: http://127.0.0.1:59000
+      MONOID_MINIO_ACCESS_KEY: monoid-test-access
+      MONOID_MINIO_SECRET_KEY: monoid-test-secret-only
+      MONOID_TEMPORAL_CLI_VERSION: v1.8.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact campaign SDKs
+        run: |
+          python -m pip install -e ".[dev,durable-host]"
+          python tools/v023_ci.py exact-requirements | xargs python -m pip install
+      - name: Start selected repository services
+        if: needs.profile.outputs.run_postgres == 'true'
+        env:
+          COMPOSE_PROFILES: ${{ needs.profile.outputs.profile }}
+        run: docker compose -f tests/service/compose.yml up -d --wait
+      - name: Run actual service integration
+        run: python -m pytest -q tests/service -m service --durations=10
+      - name: Record qualified merge candidate
+        if: always()
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >
+          python tools/v023_ci.py write-evidence
+          --head-sha "${PR_HEAD_SHA:-$(git rev-parse HEAD)}"
+          --merge-sha "$(git rev-parse HEAD)"
+          --profile "$MONOID_SERVICE_PROFILE"
+          --output .tmp/v023-ci-evidence.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v023-${{ needs.profile.outputs.profile }}-evidence
+          path: .tmp/v023-ci-evidence.json
+      - name: Stop repository services
+        if: always() && needs.profile.outputs.run_postgres == 'true'
+        run: docker compose -f tests/service/compose.yml down --volumes
+
+  gate:
+    name: L2 required gate
+    needs: [profile, core, service]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require profile, core, and selected service success
+        env:
+          PROFILE_RESULT: ${{ needs.profile.result }}
+          CORE_RESULT: ${{ needs.core.result }}
+          SERVICE_RESULT: ${{ needs.service.result }}
+        run: |
+          test "$PROFILE_RESULT" = success
+          test "$CORE_RESULT" = success
+          test "$SERVICE_RESULT" = success -o "$SERVICE_RESULT" = skipped

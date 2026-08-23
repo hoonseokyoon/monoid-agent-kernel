@@ -90,6 +90,27 @@ mcp = [
 reference-dbos = [
     "dbos>=2.26,<2.27",
 ]
+# PostgreSQL production adapter.  Imports stay lazy so the base package remains platform-neutral.
+postgres = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+]
+# S3-compatible object-store adapter, qualified against MinIO and AWS S3 semantics.
+object-store-s3 = [
+    "boto3>=1.37.32,<2",
+]
+# Temporal orchestration adapter and local service qualification harness.
+temporal = [
+    "temporalio>=1.17,<2",
+]
+# Complete v0.23 production-host dependency set.  Keep this explicit so wheel metadata remains
+# reviewable and dependency resolution does not rely on self-referential extras.
+durable-host = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+    "boto3>=1.37.32,<2",
+    "temporalio>=1.17,<2",
+]
 
 [project.scripts]
 monoid = "monoid_agent_kernel.cli:main"
@@ -124,6 +145,7 @@ markers = [
     "slow: tests that intentionally wait for subprocess, timeout, or multi-service behavior",
     "live: tests that require external credentials or network-backed providers",
     "serial: tests that must not run concurrently under pytest-xdist",
+    "service: tests that require repository-managed local service processes",
 ]
 timeout = 240
 timeout_method = "thread"

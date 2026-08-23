@@ -636,11 +636,16 @@ blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
     or name.startswith('monoid_agent_kernel.hosting')
-    or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
+    or name.startswith('monoid_agent_kernel.adapters')
+    or name in {'openai', 'httpx', 'opentelemetry', 'dbos', 'psycopg', 'boto3', 'botocore', 'temporalio'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
     or name.startswith('dbos.')
+    or name.startswith('psycopg.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
+    or name.startswith('temporalio.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
@@ -669,11 +674,55 @@ import monoid_agent_kernel.hosting
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference')
-    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'temporalio'}
+    or name.startswith('monoid_agent_kernel.adapters')
+    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'boto3', 'botocore', 'temporalio'}
     or name.startswith('dbos.')
     or name.startswith('psycopg.')
     or name.startswith('psycopg2.')
     or name.startswith('redis.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
+    or name.startswith('temporalio.')
+]
+if blocked:
+    raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_adapter_namespace_imports_are_explicit_and_dependency_lazy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code = """
+import sys
+import monoid_agent_kernel.adapters as adapters
+import monoid_agent_kernel.adapters.postgres as postgres
+import monoid_agent_kernel.adapters.object_store as object_store
+import monoid_agent_kernel.adapters.temporal as temporal
+
+assert adapters.__all__ == []
+assert postgres.__all__ == []
+assert object_store.__all__ == []
+assert temporal.__all__ == []
+blocked = [
+    name for name in sys.modules
+    if name in {'psycopg', 'psycopg2', 'boto3', 'botocore', 'temporalio'}
+    or name.startswith('psycopg.')
+    or name.startswith('psycopg2.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
     or name.startswith('temporalio.')
 ]
 if blocked:
