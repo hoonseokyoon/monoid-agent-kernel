@@ -72,9 +72,21 @@ def test_postgres_config_hides_dsn_and_validates_schema_and_pool() -> None:
     assert "secret" not in repr(config)
     assert config.schema == "monoid_kernel"
 
-    for schema in ("", "quoted.schema", "schema-name", "1schema", "x" * 64):
+    for schema in (
+        "",
+        "quoted.schema",
+        "schema-name",
+        "1schema",
+        "x" * 64,
+        "pg_temp",
+        "PG_CATALOG",
+        "pg_toast_42",
+        "information_schema",
+        "INFORMATION_SCHEMA",
+    ):
         with pytest.raises(ValueError, match="schema"):
             PostgresConfig(dsn="postgresql://db/service", schema=schema)
+    assert PostgresConfig(dsn="postgresql://db/service", schema="public").schema == "public"
     with pytest.raises(ValueError, match="max_pool_size"):
         PostgresConfig(dsn="postgresql://db/service", min_pool_size=2, max_pool_size=1)
 

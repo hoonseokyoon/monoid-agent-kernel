@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z", re.ASCII)
+_RESERVED_SCHEMA_NAMES = frozenset({"information_schema"})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -30,6 +31,9 @@ class PostgresConfig:
             raise ValueError(
                 "PostgreSQL schema must be an ASCII identifier of at most 63 characters"
             )
+        normalized_schema = self.schema.casefold()
+        if normalized_schema.startswith("pg_") or normalized_schema in _RESERVED_SCHEMA_NAMES:
+            raise ValueError("PostgreSQL schema cannot use a reserved system namespace")
         if type(self.min_pool_size) is not int or self.min_pool_size < 0:
             raise ValueError("PostgreSQL min_pool_size must be a non-negative integer")
         if (
