@@ -96,6 +96,30 @@ def postgres_database(postgres_target: tuple[str, int]) -> Iterator[PostgresData
             database.close()
 
 
+def _wait_until_application_blocks_on_lock(
+    database: PostgresDatabase,
+    application_name: str,
+) -> None:
+    deadline = time.monotonic() + 5
+    while True:
+        with database.connection() as observer_connection:
+            with observer_connection.transaction():
+                with observer_connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT EXISTS ("
+                        "SELECT 1 FROM pg_stat_activity "
+                        "WHERE application_name = %s AND wait_event_type = 'Lock'"
+                        ")",
+                        (application_name,),
+                    )
+                    blocked = bool(cursor.fetchone()[0])
+        if blocked:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail("PostgreSQL application did not block on the expected lock")
+        time.sleep(0.01)
+
+
 @pytest.mark.parametrize(
     ("dsn_variable", "expected_major", "profiles"),
     _POSTGRES_TARGETS,
@@ -435,24 +459,10 @@ def test_lock_wait_samples_database_clock_after_the_row_lock(
                         "worker-b",
                         timedelta(seconds=2),
                     )
-                    deadline = time.monotonic() + 5
-                    while True:
-                        with postgres_database.connection() as observer_connection:
-                            with observer_connection.transaction():
-                                with observer_connection.cursor() as cursor:
-                                    cursor.execute(
-                                        "SELECT EXISTS ("
-                                        "SELECT 1 FROM pg_stat_activity "
-                                        "WHERE application_name = %s AND wait_event_type = 'Lock'"
-                                        ")",
-                                        (waiter_database.config.application_name,),
-                                    )
-                                    blocked = bool(cursor.fetchone()[0])
-                        if blocked:
-                            break
-                        if time.monotonic() >= deadline:
-                            pytest.fail("claimant did not block on the authority row lock")
-                        time.sleep(0.01)
+                    _wait_until_application_blocks_on_lock(
+                        postgres_database,
+                        waiter_database.config.application_name,
+                    )
                     time.sleep(0.85)
             replacement = future.result(timeout=5)
     finally:
@@ -461,3 +471,67 @@ def test_lock_wait_samples_database_clock_after_the_row_lock(
     assert replacement.writer_token.generation == 2
     assert replacement.writer_token.owner_id == "worker-b"
     assert replacement.observed_at > first.leased_until
+
+
+def test_fresh_claim_samples_database_clock_after_unique_conflict_rollback(
+    postgres_database: PostgresDatabase,
+) -> None:
+    PostgresMigrations(postgres_database).apply()
+    waiter_database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=2,
+            application_name="monoid-pr02-insert-waiter",
+        )
+    )
+    waiter_database.open()
+    waiter_store = PostgresWriterAuthorityStore(waiter_database)
+    waiter_store.check_ready()
+
+    class RollBackConflict(Exception):
+        pass
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                with postgres_database.connection() as blocking_connection:
+                    with blocking_connection.transaction():
+                        with blocking_connection.cursor() as cursor:
+                            cursor.execute(
+                                sql.SQL(
+                                    "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                                    "INSERT INTO {}.{} "
+                                    "(run_id, owner_id, generation, leased_until, revoked, "
+                                    "updated_at) "
+                                    "SELECT %s, %s, 1, db_now + interval '10 seconds', false, "
+                                    "db_now FROM sampled RETURNING updated_at"
+                                ).format(
+                                    sql.Identifier(postgres_database.config.schema),
+                                    sql.Identifier("run_authority"),
+                                ),
+                                ("run-insert-wait", "rolled-back-owner"),
+                            )
+                            blocker_time = cursor.fetchone()[0]
+                        future = executor.submit(
+                            waiter_store.claim,
+                            "run-insert-wait",
+                            "worker-b",
+                            timedelta(seconds=2),
+                        )
+                        _wait_until_application_blocks_on_lock(
+                            postgres_database,
+                            waiter_database.config.application_name,
+                        )
+                        time.sleep(0.85)
+                        raise RollBackConflict
+            except RollBackConflict:
+                pass
+            lease = future.result(timeout=5)
+    finally:
+        waiter_database.close()
+
+    assert lease.writer_token.generation == 1
+    assert lease.writer_token.owner_id == "worker-b"
+    assert lease.observed_at >= blocker_time + timedelta(milliseconds=700)

@@ -107,16 +107,35 @@ class PostgresWriterAuthorityStore:
                 "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
                 "INSERT INTO {} "
                 "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
-                "SELECT %s, %s, 1, db_now + %s, false, db_now FROM sampled "
+                "SELECT %s, %s, 1, db_now, true, db_now FROM sampled "
                 "ON CONFLICT (run_id) DO NOTHING "
-                "RETURNING run_id, owner_id, generation, leased_until, revoked, updated_at"
+                "RETURNING run_id"
             ).format(self._qualified_table()),
-            (run_id, owner_id, ttl),
+            (run_id, owner_id),
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
         if row is None:
             return None
-        authority = _authority_from_row(row)
+        # A unique-index conflict can wait for another uncommitted insertion and then succeed if
+        # that transaction rolls back. The first statement writes only an invisible revoked
+        # placeholder; start the active TTL from a fresh clock sampled after the wait completed.
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                "UPDATE {} AS authority SET "
+                "leased_until = sampled.db_now + %s, revoked = false, "
+                "updated_at = sampled.db_now FROM sampled "
+                "WHERE authority.run_id = %s AND authority.owner_id = %s "
+                "AND authority.generation = 1 AND authority.revoked "
+                "RETURNING authority.run_id, authority.owner_id, authority.generation, "
+                "authority.leased_until, authority.revoked, sampled.db_now"
+            ).format(self._qualified_table()),
+            (ttl, run_id, owner_id),
+        )
+        activated_row = cursor.fetchone()  # type: ignore[attr-defined]
+        if activated_row is None:  # pragma: no cover - this transaction owns its inserted row
+            raise RuntimeError("PostgreSQL writer claim could not activate its inserted row")
+        authority = _authority_from_row(activated_row)
         return WriterLease(
             writer_token=authority.writer_token,
             leased_until=authority.leased_until,
