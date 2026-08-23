@@ -19,9 +19,27 @@ REQUIRED_MEMBERS = {
     "monoid_agent_kernel/hosting/__init__.py",
     "monoid_agent_kernel/hosting/commit_results.py",
     "monoid_agent_kernel/hosting/contracts.py",
+    "monoid_agent_kernel/adapters/__init__.py",
+    "monoid_agent_kernel/adapters/postgres/__init__.py",
+    "monoid_agent_kernel/adapters/object_store/__init__.py",
+    "monoid_agent_kernel/adapters/temporal/__init__.py",
     "monoid_agent_kernel/conformance/fixtures/compatibility-v1.json",
 }
-FORBIDDEN_VENDORED_PACKAGES = {"dbos", "psycopg", "psycopg2", "redis", "temporalio"}
+FORBIDDEN_VENDORED_PACKAGES = {
+    "boto3",
+    "botocore",
+    "dbos",
+    "psycopg",
+    "psycopg2",
+    "redis",
+    "temporalio",
+}
+EXPECTED_DURABLE_EXTRA_DEPENDENCIES = {
+    "postgres": {"psycopg", "psycopg-pool"},
+    "object-store-s3": {"boto3"},
+    "temporal": {"temporalio"},
+    "durable-host": {"psycopg", "psycopg-pool", "boto3", "temporalio"},
+}
 
 
 def _requirement_name(requirement: str) -> str:
@@ -65,6 +83,23 @@ def audit_wheel(wheel_path: Path) -> None:
         forbidden_base = sorted(FORBIDDEN_VENDORED_PACKAGES & base_names)
         if forbidden_base:
             raise ValueError(f"platform packages became base dependencies: {forbidden_base}")
+
+        provided_extras = set(metadata.get_all("Provides-Extra", []))
+        missing_extras = sorted(EXPECTED_DURABLE_EXTRA_DEPENDENCIES.keys() - provided_extras)
+        if missing_extras:
+            raise ValueError(f"release wheel is missing durable extras: {missing_extras}")
+        durable_requirements: dict[str, set[str]] = {
+            extra: set() for extra in EXPECTED_DURABLE_EXTRA_DEPENDENCIES
+        }
+        for requirement in requirements:
+            matched_extra = re.search(r"extra\s*==\s*['\"]([^'\"]+)['\"]", requirement)
+            if matched_extra and matched_extra.group(1) in durable_requirements:
+                durable_requirements[matched_extra.group(1)].add(_requirement_name(requirement))
+        if durable_requirements != EXPECTED_DURABLE_EXTRA_DEPENDENCIES:
+            raise ValueError(
+                "release wheel durable extra dependencies differ from the v0.23 boundary: "
+                f"{durable_requirements}"
+            )
 
         fixture = json.loads(
             archive.read(

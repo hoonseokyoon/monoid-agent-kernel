@@ -2,16 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
-  pull_request:
+    branches: [main, develop, codex/v0.23-production-adapters]
+
+permissions:
+  contents: read
 
 jobs:
   studio-ui:
     name: Studio UI build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version-file: ".nvmrc"
           cache: npm
@@ -31,8 +33,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install lint tooling
@@ -42,7 +44,7 @@ jobs:
         # that also fixes the new findings, so the migration is reviewable on its own.
         run: python -m pip install ruff==0.15.6
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests tools/v023_ci.py
 
   fast-contract:
     name: Fast + contract (Python ${{ matrix.python-version }})
@@ -52,8 +54,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
@@ -69,21 +71,24 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
         run: python -m pip install -e ".[dev,openai]"
       - name: Run bounded serial shard
-        run: python -m pytest -q -m "(integration or serial) and not live" --durations=25
+        run: >
+          python -m pytest -q
+          -m "(integration or serial) and not live and not service"
+          --durations=25
 
   coverage:
     name: Coverage floor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install
@@ -96,14 +101,14 @@ jobs:
           --cov-report=
       - name: Append serial integration coverage and enforce floor
         run: >
-          python -m pytest -q -m "(integration or serial) and not live"
+          python -m pytest -q -m "(integration or serial) and not live and not service"
           --cov=monoid_agent_kernel
           --cov=native_agent_runner
           --cov-append
           --cov-report=term-missing:skip-covered
           --cov-report=xml
           --cov-fail-under=80
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-xml
           path: coverage.xml
@@ -116,8 +121,8 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install
@@ -140,8 +145,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install experimental DBOS profile
@@ -170,10 +175,10 @@ jobs:
           - install: minimal
             requirement: "."
           - install: all-extras
-            requirement: ".[openai,http-async,otel-export,mcp,reference-dbos]"
+            requirement: ".[openai,http-async,otel-export,mcp,reference-dbos,durable-host]"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Build and audit release wheel
@@ -192,10 +197,13 @@ jobs:
           import monoid_agent_kernel.providers.gateway;
           import monoid_agent_kernel.observability.otel;
           import monoid_agent_kernel.mcp;
-          import monoid_agent_kernel.reference.dbos"
+          import monoid_agent_kernel.reference.dbos;
+          import monoid_agent_kernel.adapters.postgres;
+          import monoid_agent_kernel.adapters.object_store;
+          import monoid_agent_kernel.adapters.temporal"
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
-        run: python -c "import dbos, openai, httpx, opentelemetry.sdk"
+        run: python -c "import boto3, dbos, openai, httpx, opentelemetry.sdk, psycopg, psycopg_pool, temporalio"
       - name: Run installed conformance evidence smoke
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}
@@ -214,3 +222,46 @@ jobs:
           monoid studio accept \
             --workspace "${{ runner.temp }}/studio-workspace" \
             --run-root "${{ runner.temp }}/studio-runs"
+
+  combined-services:
+    name: V0.23 combined actual services
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MONOID_SERVICE_PROFILE: combined
+      MONOID_POSTGRES16_DSN: postgresql://monoid:monoid-local-only@127.0.0.1:55416/monoid_kernel_test
+      MONOID_POSTGRES18_DSN: postgresql://monoid:monoid-local-only@127.0.0.1:55418/monoid_kernel_test
+      MONOID_MINIO_ENDPOINT: http://127.0.0.1:59000
+      MONOID_MINIO_ACCESS_KEY: monoid-test-access
+      MONOID_MINIO_SECRET_KEY: monoid-test-secret-only
+      MONOID_TEMPORAL_CLI_VERSION: v1.8.2
+      COMPOSE_PROFILES: combined
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact campaign SDKs
+        run: |
+          python -m pip install -e ".[dev,durable-host]"
+          python tools/v023_ci.py exact-requirements | xargs python -m pip install
+          python tools/v023_ci.py verify-installed
+      - name: Start PostgreSQL and MinIO
+        run: docker compose -f tests/service/compose.yml up -d --wait
+      - name: Run combined service integration
+        run: python -m pytest -q tests/service -m service --durations=10
+      - name: Record integration evidence
+        run: >
+          python tools/v023_ci.py write-evidence
+          --head-sha "$GITHUB_SHA"
+          --merge-sha "$GITHUB_SHA"
+          --profile combined
+          --output .tmp/v023-ci-evidence.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: v023-combined-evidence
+          path: .tmp/v023-ci-evidence.json
+      - name: Stop PostgreSQL and MinIO
+        if: always()
+        run: docker compose -f tests/service/compose.yml down --volumes

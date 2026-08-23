@@ -1,0 +1,48 @@
+name: monoid-v023-services
+
+services:
+  postgres16:
+    image: postgres:16.15-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537
+    environment:
+      POSTGRES_DB: monoid_kernel_test
+      POSTGRES_USER: monoid
+      POSTGRES_PASSWORD: monoid-local-only
+    ports:
+      - "${MONOID_POSTGRES16_PORT:-55416}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monoid -d monoid_kernel_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    profiles: ["postgres", "objectstore", "combined", "release"]
+
+  postgres18:
+    image: postgres:18.6-bookworm@sha256:7d2695c3aa88e792e8b3b233e7e4adb296a20412c6c0ca361e3edaaacfada108
+    environment:
+      POSTGRES_DB: monoid_kernel_test
+      POSTGRES_USER: monoid
+      POSTGRES_PASSWORD: monoid-local-only
+    ports:
+      - "${MONOID_POSTGRES18_PORT:-55418}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monoid -d monoid_kernel_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    profiles: ["combined", "release"]
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: monoid-test-access
+      MINIO_ROOT_PASSWORD: monoid-test-secret-only
+    ports:
+      - "${MONOID_MINIO_PORT:-59000}:9000"
+      - "${MONOID_MINIO_CONSOLE_PORT:-59001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    profiles: ["objectstore", "combined", "release"]

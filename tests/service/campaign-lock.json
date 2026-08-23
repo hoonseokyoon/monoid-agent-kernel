@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "campaign": "v0.23",
+  "python_dependencies": {
+    "psycopg": {
+      "requirement": "psycopg[binary]>=3.2,<4",
+      "exact": "3.3.4"
+    },
+    "psycopg-pool": {
+      "requirement": "psycopg-pool>=3.2,<4",
+      "exact": "3.3.1"
+    },
+    "boto3": {
+      "requirement": "boto3>=1.37.32,<2",
+      "exact": "1.43.78"
+    },
+    "botocore": {
+      "requirement": "botocore>=1.43.78,<1.44",
+      "exact": "1.43.78",
+      "role": "boto3 transitive implementation lock"
+    },
+    "temporalio": {
+      "requirement": "temporalio>=1.17,<2",
+      "exact": "1.31.0"
+    }
+  },
+  "services": {
+    "postgres16": {
+      "image": "postgres:16.15-bookworm@sha256:60f4761b9035e0b8d5218f701a8c3382f641bf12b1604822574cf5be3baeb537",
+      "major": 16
+    },
+    "postgres18": {
+      "image": "postgres:18.6-bookworm@sha256:7d2695c3aa88e792e8b3b233e7e4adb296a20412c6c0ca361e3edaaacfada108",
+      "major": 18
+    },
+    "minio": {
+      "image": "quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0"
+    },
+    "temporal_cli": {
+      "version": "v1.8.2",
+      "embedded_server": "1.31.2",
+      "archive_sha256": {
+        "darwin_amd64": "489d7f5420cae02b559774ac23df035141954c33a51dba96f5759a0ddccdf1b6",
+        "darwin_arm64": "dacdc3587682c04cf27e67c8878ca2d755230b6ad63c0c6ebddd7348ae90ed94",
+        "linux_amd64": "d8421bda989e6514b4bdb4d63a9012a8a05a806892e881a5aad8510496349a94",
+        "linux_arm64": "83600a8fac6e3da54093e5da6918d399f501532b9f1172235603f9606f4ac6e4",
+        "windows_amd64": "c845948aa4ab3b1a3643f9fea6d1cd691188bc31513de5f2dc5f7eceea25f22a",
+        "windows_arm64": "da78339510b1f91a8212ff247940d3b1dd3022ccfa00add400359311f941697e"
+      }
+    }
+  },
+  "pull_request_profiles": {
+    "01": "combined",
+    "02": "postgres",
+    "03": "postgres",
+    "04": "postgres",
+    "05": "objectstore",
+    "06": "objectstore",
+    "07": "postgres",
+    "08": "postgres",
+    "09": "temporal",
+    "10": "combined",
+    "11": "combined",
+    "12": "combined",
+    "13": "combined"
+  }
+}

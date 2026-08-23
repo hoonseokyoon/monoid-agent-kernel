@@ -215,13 +215,18 @@ lazy import한다. package root는 adapter를 re-export하지 않는다.
 | extra | dependency policy |
 |---|---|
 | `postgres` | `psycopg[binary]>=3.2,<4`, `psycopg-pool>=3.2,<4` |
-| `object-store-s3` | `boto3>=X,<2` |
-| `temporal` | `temporalio>=Y,<2` |
+| `object-store-s3` | `boto3>=1.37.32,<2` |
+| `temporal` | `temporalio>=1.17,<2` |
 | `durable-host` | 앞 세 extra dependency의 합집합 |
 
-`X`와 `Y`는 PR 1 compatibility spike에서 필요한 API가 들어간 가장 낮은
-minor로 고정한다. source main의 version을 추정해 pin하지 않는다. campaign lock은 CI에서 검증한
-exact versions와 service binary/image digest를 기록한다.
+PR 1 compatibility spike는 boto3 1.37.32에서 conditional PUT/checksum/multipart API를,
+temporalio 1.17.0에서 local environment, Signal-With-Start, Replayer API를 확인했다. campaign
+exact SDK는 psycopg 3.3.4, psycopg-pool 3.3.1, boto3 1.43.78, transitive botocore 1.43.78,
+temporalio 1.31.0이다. Temporal local service는 CLI v1.8.2와 embedded Server 1.31.2를 사용한다.
+exact SDK, service image digest,
+Temporal CLI archive checksum은 `tests/service/campaign-lock.json`이 소유한다.
+실제 Temporal service gate는 WorkflowService `GetSystemInfo.server_version`을 조회해 lock의 embedded
+Server 버전과 일치시킨 뒤에만 qualification evidence를 만든다.
 
 별도 distribution 분리는 v0.23 완료 뒤 dependency cadence와 maintainer 부담을 근거로 결정한다.
 첫 release는 한 repository의 optional modules로 API와 compatibility를 함께 검증한다.

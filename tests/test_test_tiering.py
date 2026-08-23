@@ -24,6 +24,7 @@ pytestmark = pytest.mark.unit
         ("tests/test_outbox.py", "integration"),
         ("tests/test_memory.py", "integration"),
         ("tests/test_proposal_package.py", "integration"),
+        ("tests/service/test_postgres_service.py", "integration"),
     ],
 )
 def test_primary_tier_policy(path: str, expected: str) -> None:
@@ -38,6 +39,7 @@ def test_primary_tier_policy(path: str, expected: str) -> None:
         "tests/test_checkpoint_store_contract.py",
         "tests/test_command_store_contract.py",
         "tests/conformance/test_reference_full_profile.py",
+        "tests/service/test_temporal_service.py",
     ],
 )
 def test_threaded_and_service_backed_modules_are_serial(path: str) -> None:
