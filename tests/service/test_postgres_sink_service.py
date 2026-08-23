@@ -205,6 +205,30 @@ def _table_count(harness: _SinkHarness, table: str, run_id: str) -> int:
             return int(cursor.fetchone()[0])
 
 
+def _rewrite_payload_without_digest(
+    harness: _SinkHarness,
+    table: str,
+    identity_sql: str,
+    identity_parameters: tuple[object, ...],
+    mutate: Callable[[dict[str, object]], dict[str, object]],
+) -> None:
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(f"SELECT payload FROM {{}} WHERE {identity_sql}").format(
+                    sql.Identifier(harness.database.config.schema, table)
+                ),
+                identity_parameters,
+            )
+            changed = mutate(dict(cursor.fetchone()[0]))
+            cursor.execute(
+                sql.SQL(f"UPDATE {{}} SET payload = %s WHERE {identity_sql}").format(
+                    sql.Identifier(harness.database.config.schema, table)
+                ),
+                (Json(changed), *identity_parameters),
+            )
+
+
 def test_checkpoint_identity_blobs_monotonic_head_and_restart(
     sink_harness: _SinkHarness,
 ) -> None:
@@ -380,6 +404,49 @@ def test_deleting_run_authority_cascades_records_and_heads(
         "invocation_head",
     ):
         assert _table_count(sink_harness, table, run_id) == 0
+
+
+def test_corrupt_records_cannot_acknowledge_idempotent_retries(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-corrupt-idempotence"
+    token = sink_harness.claim(run_id)
+    checkpoint = RunCheckpoint(run_id=run_id, seq=1, final_text="original")
+    invocation = _invocation(run_id, 1, "reserved")
+    assert (
+        sink_harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token).status
+        == "committed"
+    )
+    assert (
+        sink_harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        == "committed"
+    )
+
+    _rewrite_payload_without_digest(
+        sink_harness,
+        "checkpoint_record",
+        "run_id = %s AND sequence = %s",
+        (run_id, 1),
+        lambda payload: {**payload, "final_text": "corrupt"},
+    )
+    _rewrite_payload_without_digest(
+        sink_harness,
+        "invocation_record",
+        "run_id = %s AND logical_call_id = %s AND revision = %s",
+        (run_id, "call-1", 1),
+        lambda payload: {**payload, "dispatch_state": "dispatch_started"},
+    )
+
+    assert (
+        sink_harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token).status
+        == "conflict"
+    )
+    assert (
+        sink_harness.sink.commit_invocation(invocation, {}, writer_token=token).status
+        == "conflict"
+    )
+    assert sink_harness.sink.latest_checked(run_id).status == "corrupt"
+    assert sink_harness.sink.load_invocation(run_id, "call-1").status == "corrupt"
 
 
 def test_blob_bounds_fencing_and_cross_run_authorization(
@@ -604,14 +671,63 @@ def test_invocation_lifecycle_result_blob_and_retry_rules(
     assert sink_harness.sink.commit_invocation(retry, {}, writer_token=token).status == (
         "committed"
     )
+    second_attempt_tail = (
+        _invocation(
+            run_id,
+            5,
+            "dispatch_started",
+            logical_call_id=retry_call,
+            attempt=2,
+            dispatch_id="dispatch-2",
+        ),
+        _invocation(
+            run_id,
+            6,
+            "settled",
+            logical_call_id=retry_call,
+            attempt=2,
+            dispatch_id="dispatch-2",
+            retryable=True,
+        ),
+    )
+    assert tuple(
+        sink_harness.sink.commit_invocation(item, {}, writer_token=token).status
+        for item in second_attempt_tail
+    ) == ("committed", "committed")
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "UPDATE {} SET dispatch_id = %s WHERE run_id = %s AND logical_call_id = %s "
+                    "AND revision <= %s"
+                ).format(sql.Identifier(sink_harness.database.config.schema, "invocation_record")),
+                ("corrupt-typed-dispatch", run_id, retry_call, 3),
+            )
     assert (
         sink_harness.sink.commit_invocation(
-            replace(retry, revision=5, dispatch_id="dispatch-1"),
+            _invocation(
+                run_id,
+                7,
+                "reserved",
+                logical_call_id=retry_call,
+                attempt=3,
+                dispatch_id="dispatch-1",
+            ),
             {},
             writer_token=token,
         ).status
         == "conflict"
     )
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "UPDATE {} SET dispatch_id = %s WHERE run_id = %s AND logical_call_id = %s "
+                    "AND revision = %s"
+                ).format(sql.Identifier(sink_harness.database.config.schema, "invocation_record")),
+                ("corrupt-head-dispatch", run_id, retry_call, 6),
+            )
+    assert sink_harness.sink.load_invocation(run_id, retry_call).status == "corrupt"
     assert (
         sink_harness.sink.commit_invocation(
             _invocation(run_id, 1, "reserved", logical_call_id="evidence-call"),

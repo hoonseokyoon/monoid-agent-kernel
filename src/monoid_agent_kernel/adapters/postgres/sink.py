@@ -51,6 +51,22 @@ _STABLE_INVOCATION_FIELDS = (
     "evidence_policy",
 )
 _POSTGRES_BIGINT_MAX = (1 << 63) - 1
+_CHECKPOINT_TYPED_FIELDS = ("run_id", "seq", "schema_version")
+_INVOCATION_TYPED_FIELDS = (
+    "run_id",
+    "logical_call_id",
+    "revision",
+    "schema_version",
+    "dispatch_id",
+    "dispatch_attempt",
+    "dispatch_state",
+    "idempotency_key",
+    "request_digest",
+    "digest_generation",
+    "evidence_policy",
+    "result_ref",
+    "failure_code",
+)
 
 
 class PostgresBlobCorrupt(RuntimeError):
@@ -90,6 +106,16 @@ def _checked_stored_digest(
         return None
     calculated = canonical_sha256({"record": payload, "blobs": submitted_blobs})
     return content_digest if calculated == content_digest else None
+
+
+def _payload_matches_typed_values(
+    payload: object,
+    fields: tuple[str, ...],
+    typed_values: tuple[object, ...],
+) -> bool:
+    return isinstance(payload, dict) and tuple(
+        payload.get(field) for field in fields
+    ) == typed_values
 
 
 def _is_ambiguous_database_error(exc: Exception) -> bool:
@@ -253,10 +279,29 @@ class PostgresFencedRunSink:
         content_digest: str,
         *,
         sequence: int,
+        typed_fields: tuple[str, ...],
+        expected_typed_values: tuple[object, ...],
     ) -> CommitResult | None:
         if row is None:
             return None
         winner_digest = str(row[0])  # type: ignore[index]
+        stored_payload = row[1]  # type: ignore[index]
+        stored_typed_values = tuple(row[3:])  # type: ignore[index]
+        if (
+            _checked_stored_digest(stored_payload, row[2], row[0]) is None  # type: ignore[index]
+            or stored_typed_values != expected_typed_values
+            or not _payload_matches_typed_values(
+                stored_payload,
+                typed_fields,
+                stored_typed_values,
+            )
+        ):
+            return CommitResult(
+                status="conflict",
+                sequence=sequence,
+                content_digest=content_digest,
+                winner_digest=winner_digest,
+            )
         if winner_digest == content_digest:
             return CommitResult(
                 status="already_committed",
@@ -275,20 +320,24 @@ class PostgresFencedRunSink:
         cursor: object,
         run_id: str,
         sequence: int,
+        schema_version: str,
         content_digest: str,
     ) -> CommitResult | None:
         from psycopg import sql
 
         cursor.execute(  # type: ignore[attr-defined]
-            sql.SQL("SELECT content_digest FROM {} WHERE run_id = %s AND sequence = %s").format(
-                self._table("checkpoint_record")
-            ),
+            sql.SQL(
+                "SELECT content_digest, payload, submitted_blobs, run_id, sequence, "
+                "schema_version FROM {} WHERE run_id = %s AND sequence = %s"
+            ).format(self._table("checkpoint_record")),
             (run_id, sequence),
         )
         return self._stored_result(
             cursor.fetchone(),  # type: ignore[attr-defined]
             content_digest,
             sequence=sequence,
+            typed_fields=_CHECKPOINT_TYPED_FIELDS,
+            expected_typed_values=(run_id, sequence, schema_version),
         )
 
     def _commit_checkpoint_locked(
@@ -318,6 +367,7 @@ class PostgresFencedRunSink:
             cursor,
             checkpoint.run_id,
             checkpoint.seq,
+            str(payload["schema_version"]),
             content_digest,
         )
         if stored is not None:
@@ -374,6 +424,7 @@ class PostgresFencedRunSink:
                     cursor,
                     checkpoint.run_id,
                     checkpoint.seq,
+                    str(checkpoint_payload_for_write(checkpoint)["schema_version"]),
                     content_digest,
                 )
 
@@ -429,14 +480,17 @@ class PostgresFencedRunSink:
         self,
         cursor: object,
         invocation: DurableModelInvocation,
+        payload: dict[str, Any],
         content_digest: str,
     ) -> CommitResult | None:
         from psycopg import sql
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "SELECT content_digest FROM {} WHERE run_id = %s AND logical_call_id = %s "
-                "AND revision = %s"
+                "SELECT content_digest, payload, submitted_blobs, run_id, logical_call_id, "
+                "revision, schema_version, dispatch_id, dispatch_attempt, dispatch_state, "
+                "idempotency_key, request_digest, digest_generation, evidence_policy, result_ref, "
+                "failure_code FROM {} WHERE run_id = %s AND logical_call_id = %s AND revision = %s"
             ).format(self._table("invocation_record")),
             (invocation.run_id, invocation.logical_call_id, invocation.revision),
         )
@@ -444,6 +498,8 @@ class PostgresFencedRunSink:
             cursor.fetchone(),  # type: ignore[attr-defined]
             content_digest,
             sequence=invocation.revision,
+            typed_fields=_INVOCATION_TYPED_FIELDS,
+            expected_typed_values=tuple(payload[field] for field in _INVOCATION_TYPED_FIELDS),
         )
 
     def _invocation_head(self, cursor: object, run_id: str, logical_call_id: str) -> object:
@@ -452,7 +508,11 @@ class PostgresFencedRunSink:
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
                 "SELECT record.revision, record.content_digest, record.payload, "
-                "record.submitted_blobs "
+                "record.submitted_blobs, record.run_id, record.logical_call_id, record.revision, "
+                "record.schema_version, record.dispatch_id, record.dispatch_attempt, "
+                "record.dispatch_state, record.idempotency_key, record.request_digest, "
+                "record.digest_generation, record.evidence_policy, record.result_ref, "
+                "record.failure_code "
                 "FROM {} AS head LEFT JOIN {} AS record "
                 "ON record.run_id = head.run_id "
                 "AND record.logical_call_id = head.logical_call_id "
@@ -480,7 +540,16 @@ class PostgresFencedRunSink:
         if head_row[0] is None or head_row[1] is None or not isinstance(head_row[2], dict):
             return ""
         previous_digest = str(head_row[1])
-        if _checked_stored_digest(head_row[2], head_row[3], head_row[1]) is None:
+        stored_typed_values = tuple(head_row[4:])
+        if (
+            _checked_stored_digest(head_row[2], head_row[3], head_row[1]) is None
+            or int(head_row[0]) != stored_typed_values[2]
+            or not _payload_matches_typed_values(
+                head_row[2],
+                _INVOCATION_TYPED_FIELDS,
+                stored_typed_values,
+            )
+        ):
             return previous_digest
         decoded = decode_model_invocation(head_row[2])
         if not decoded.ok or decoded.value is None:
@@ -538,13 +607,30 @@ class PostgresFencedRunSink:
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "SELECT EXISTS (SELECT 1 FROM {} WHERE run_id = %s "
-                "AND logical_call_id = %s AND dispatch_id = %s)"
+                "SELECT content_digest, payload, submitted_blobs, run_id, logical_call_id, "
+                "revision, schema_version, dispatch_id, dispatch_attempt, dispatch_state, "
+                "idempotency_key, request_digest, digest_generation, evidence_policy, result_ref, "
+                "failure_code FROM {} WHERE run_id = %s AND logical_call_id = %s"
             ).format(self._table("invocation_record")),
-            (invocation.run_id, invocation.logical_call_id, invocation.dispatch_id),
+            (invocation.run_id, invocation.logical_call_id),
         )
-        row = cursor.fetchone()  # type: ignore[attr-defined]
-        return bool(row[0])
+        for row in cursor:  # type: ignore[operator]
+            stored_typed_values = tuple(row[3:])
+            if (
+                _checked_stored_digest(row[1], row[2], row[0]) is None
+                or not _payload_matches_typed_values(
+                    row[1],
+                    _INVOCATION_TYPED_FIELDS,
+                    stored_typed_values,
+                )
+            ):
+                return True
+            decoded = decode_model_invocation(row[1])
+            if not decoded.ok or decoded.value is None:
+                return True
+            if decoded.value.dispatch_id == invocation.dispatch_id:
+                return True
+        return False
 
     def _commit_invocation_locked(
         self,
@@ -583,7 +669,7 @@ class PostgresFencedRunSink:
         if not self._references_resolve(cursor, invocation.run_id, references, submitted):
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         content_digest = _record_digest(payload, submitted)
-        stored = self._invocation_coordinate(cursor, invocation, content_digest)
+        stored = self._invocation_coordinate(cursor, invocation, payload, content_digest)
         if stored is not None:
             return stored, content_digest
         transition_winner = self._invocation_transition_winner(cursor, invocation)
@@ -656,7 +742,12 @@ class PostgresFencedRunSink:
             with self.database.cursor(connection) as cursor:
                 if not self._current_writer_locked(cursor, writer_token):
                     return CommitResult(status="fenced")
-                return self._invocation_coordinate(cursor, invocation, content_digest)
+                return self._invocation_coordinate(
+                    cursor,
+                    invocation,
+                    invocation.to_json(),
+                    content_digest,
+                )
 
     def commit_invocation(
         self,
@@ -745,7 +836,8 @@ class PostgresFencedRunSink:
                 cursor.execute(
                     sql.SQL(
                         "SELECT head.sequence, record.content_digest, record.payload, "
-                        "record.submitted_blobs FROM {} AS head LEFT JOIN {} AS record "
+                        "record.submitted_blobs, record.run_id, record.sequence, "
+                        "record.schema_version FROM {} AS head LEFT JOIN {} AS record "
                         "ON record.run_id = head.run_id AND record.sequence = head.sequence "
                         "WHERE head.run_id = %s"
                     ).format(self._table("checkpoint_head"), self._table("checkpoint_record")),
@@ -757,7 +849,17 @@ class PostgresFencedRunSink:
                 lambda checkpoint: CheckpointRecord(seq=checkpoint.seq, checkpoint=checkpoint)
             )
         sequence = int(row[0])
-        if row[1] is None or _checked_stored_digest(row[2], row[3], row[1]) is None:
+        stored_typed_values = tuple(row[4:])
+        if (
+            row[1] is None
+            or _checked_stored_digest(row[2], row[3], row[1]) is None
+            or stored_typed_values[:2] != (run_id, sequence)
+            or not _payload_matches_typed_values(
+                row[2],
+                _CHECKPOINT_TYPED_FIELDS,
+                stored_typed_values,
+            )
+        ):
             return CHECKPOINT_CODEC.corrupt(
                 "PostgreSQL checkpoint head or content digest is inconsistent",
                 sequence=sequence,
@@ -791,7 +893,12 @@ class PostgresFencedRunSink:
                 cursor.execute(
                     sql.SQL(
                         "SELECT head.revision, record.content_digest, record.payload, "
-                        "record.submitted_blobs FROM {} AS head LEFT JOIN {} AS record "
+                        "record.submitted_blobs, record.run_id, record.logical_call_id, "
+                        "record.revision, record.schema_version, record.dispatch_id, "
+                        "record.dispatch_attempt, record.dispatch_state, record.idempotency_key, "
+                        "record.request_digest, record.digest_generation, record.evidence_policy, "
+                        "record.result_ref, record.failure_code "
+                        "FROM {} AS head LEFT JOIN {} AS record "
                         "ON record.run_id = head.run_id "
                         "AND record.logical_call_id = head.logical_call_id "
                         "AND record.revision = head.revision "
@@ -803,7 +910,17 @@ class PostgresFencedRunSink:
         if row is None:
             return MODEL_INVOCATION_CODEC.missing()
         revision = int(row[0])
-        if row[1] is None or _checked_stored_digest(row[2], row[3], row[1]) is None:
+        stored_typed_values = tuple(row[4:])
+        if (
+            row[1] is None
+            or _checked_stored_digest(row[2], row[3], row[1]) is None
+            or stored_typed_values[:3] != (run_id, logical_call_id, revision)
+            or not _payload_matches_typed_values(
+                row[2],
+                _INVOCATION_TYPED_FIELDS,
+                stored_typed_values,
+            )
+        ):
             return MODEL_INVOCATION_CODEC.corrupt(
                 "PostgreSQL invocation head or content digest is inconsistent",
                 sequence=revision,
