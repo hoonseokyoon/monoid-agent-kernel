@@ -22,7 +22,8 @@ if not _selected():
     pytest.skip("PostgreSQL service profile is not selected", allow_module_level=True)
 
 import psycopg  # noqa: E402
-from psycopg import sql  # noqa: E402
+from psycopg import IsolationLevel, sql  # noqa: E402
+from psycopg_pool import ConnectionPool  # noqa: E402
 
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresConfig,
@@ -535,3 +536,94 @@ def test_fresh_claim_samples_database_clock_after_unique_conflict_rollback(
     assert lease.writer_token.generation == 1
     assert lease.writer_token.owner_id == "worker-b"
     assert lease.observed_at >= blocker_time + timedelta(milliseconds=700)
+
+
+@pytest.mark.parametrize(
+    "isolation_level",
+    [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE],
+)
+def test_claim_reconciliation_enforces_read_committed_on_caller_pool(
+    postgres_database: PostgresDatabase,
+    isolation_level: IsolationLevel,
+) -> None:
+    PostgresMigrations(postgres_database).apply()
+
+    def configure(connection: psycopg.Connection[tuple[object, ...]]) -> None:
+        connection.isolation_level = isolation_level
+
+    application_name = f"monoid-pr02-{isolation_level.name.lower()}-waiter"
+    caller_pool = ConnectionPool(
+        postgres_database.config.dsn,
+        kwargs={"application_name": application_name},
+        min_size=1,
+        max_size=2,
+        open=False,
+        configure=configure,
+    )
+    caller_pool.open(wait=True, timeout=10)
+    waiter_database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=2,
+            application_name=application_name,
+        ),
+        pool=caller_pool,
+    )
+    waiter_database.open()
+    waiter_store = PostgresWriterAuthorityStore(waiter_database)
+    waiter_store.check_ready()
+
+    with waiter_database.connection() as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW transaction_isolation")
+                assert cursor.fetchone()[0] == isolation_level.name.lower().replace("_", " ")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with postgres_database.connection() as blocking_connection:
+                with blocking_connection.transaction():
+                    with blocking_connection.cursor() as cursor:
+                        cursor.execute(
+                            sql.SQL(
+                                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                                "INSERT INTO {}.{} "
+                                "(run_id, owner_id, generation, leased_until, revoked, "
+                                "updated_at) "
+                                "SELECT %s, %s, 1, db_now + interval '10 seconds', false, "
+                                "db_now FROM sampled"
+                            ).format(
+                                sql.Identifier(postgres_database.config.schema),
+                                sql.Identifier("run_authority"),
+                            ),
+                            ("run-isolation", "committed-owner"),
+                        )
+
+                    def claim() -> WriterLeaseUnavailable:
+                        try:
+                            waiter_store.claim(
+                                "run-isolation",
+                                "waiting-owner",
+                                timedelta(seconds=2),
+                            )
+                        except WriterLeaseUnavailable as exc:
+                            return exc
+                        raise AssertionError("conflicting claimant unexpectedly acquired the lease")
+
+                    future = executor.submit(claim)
+                    _wait_until_application_blocks_on_lock(
+                        postgres_database,
+                        waiter_database.config.application_name,
+                    )
+            unavailable = future.result(timeout=5)
+    finally:
+        waiter_database.close()
+        caller_pool.close()
+
+    assert unavailable.authority.writer_token == WriterToken(
+        run_id="run-isolation",
+        owner_id="committed-owner",
+        generation=1,
+    )

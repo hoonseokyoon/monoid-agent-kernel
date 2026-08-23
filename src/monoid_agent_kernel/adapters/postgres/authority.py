@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import timedelta
-from typing import Any
+from typing import Any, Iterator
 
 from monoid_agent_kernel.adapters.postgres.migrations import (
     MigrationStatus,
@@ -70,6 +71,18 @@ class PostgresWriterAuthorityStore:
             raise PostgresSchemaIncompatible(
                 "PostgreSQL writer authority store requires a successful check_ready()"
             )
+
+    @staticmethod
+    @contextmanager
+    def _transaction(connection: Any) -> Iterator[None]:
+        """Run one authority operation with the statement snapshots its protocol requires."""
+
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                # This must be the transaction's first statement. In particular, an absent-row
+                # conflict needs a new snapshot after ON CONFLICT waits for a committed winner.
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            yield
 
     def _read_locked(self, cursor: object, run_id: str) -> WriterAuthority | None:
         from psycopg import sql
@@ -183,7 +196,7 @@ class PostgresWriterAuthorityStore:
         _validate_ttl(ttl)
 
         with self.database.connection() as connection:
-            with connection.transaction():
+            with self._transaction(connection):
                 with connection.cursor() as cursor:
                     current = self._read_locked(cursor, run_id)
                     if current is None:
@@ -213,7 +226,7 @@ class PostgresWriterAuthorityStore:
         from psycopg import sql
 
         with self.database.connection() as connection:
-            with connection.transaction():
+            with self._transaction(connection):
                 with connection.cursor() as cursor:
                     current = self._read_locked(cursor, writer_token.run_id)
                     if (
@@ -263,7 +276,7 @@ class PostgresWriterAuthorityStore:
         from psycopg import sql
 
         with self.database.connection() as connection:
-            with connection.transaction():
+            with self._transaction(connection):
                 with connection.cursor() as cursor:
                     current = self._read_locked(cursor, writer_token.run_id)
                     if current is None or current.writer_token != writer_token:
@@ -304,7 +317,7 @@ class PostgresWriterAuthorityStore:
         from psycopg import sql
 
         with self.database.connection() as connection:
-            with connection.transaction():
+            with self._transaction(connection):
                 with connection.cursor() as cursor:
                     cursor.execute(
                         sql.SQL(
