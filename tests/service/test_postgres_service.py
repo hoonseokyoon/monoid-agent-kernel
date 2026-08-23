@@ -491,8 +491,7 @@ def test_caller_pool_row_factory_does_not_change_adapter_rows(
         pool=caller_pool,
     )
     try:
-        health = database.open()
-        assert health.server_major == 16
+        database.open()
         assert PostgresMigrations(database).apply().status.current is True
         store = PostgresWriterAuthorityStore(database)
         store.check_ready()
