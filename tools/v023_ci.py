@@ -112,6 +112,24 @@ def exact_requirements(lock: dict[str, Any]) -> list[str]:
     ]
 
 
+def verify_installed(lock: dict[str, Any]) -> dict[str, str]:
+    """Verify that the service process imports the exact SDK campaign, not a broad-extra drift."""
+    import importlib.metadata
+
+    expected = {
+        name: str(entry["exact"]) for name, entry in lock["python_dependencies"].items()
+    }
+    actual: dict[str, str] = {}
+    for name in expected:
+        try:
+            actual[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise ValueError(f"campaign dependency is not installed: {name}") from exc
+    if actual != expected:
+        raise ValueError(f"installed SDK campaign differs from lock: {actual}, expected {expected}")
+    return actual
+
+
 def resolve_profile(
     lock: dict[str, Any],
     *,
@@ -177,6 +195,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-lock")
     commands.add_parser("exact-requirements")
+    commands.add_parser("verify-installed")
 
     resolve = commands.add_parser("resolve-profile")
     resolve.add_argument("--head-ref", required=True)
@@ -200,6 +219,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "exact-requirements":
         print(" ".join(exact_requirements(lock)))
+        return 0
+    if arguments.command == "verify-installed":
+        print(json.dumps(verify_installed(lock), sort_keys=True))
         return 0
     if arguments.command == "resolve-profile":
         profile = resolve_profile(

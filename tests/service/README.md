@@ -21,6 +21,7 @@ python -m pip install -e ".[dev,durable-host]"
 python tools/v023_ci.py validate-lock
 $campaignRequirements = (python tools/v023_ci.py exact-requirements) -split " "
 python -m pip install @campaignRequirements
+python tools/v023_ci.py verify-installed
 docker compose -f tests/service/compose.yml up -d --wait
 python -m pytest -q tests/service -m service
 docker compose -f tests/service/compose.yml down --volumes

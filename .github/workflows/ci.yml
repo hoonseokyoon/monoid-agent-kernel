@@ -246,6 +246,7 @@ jobs:
         run: |
           python -m pip install -e ".[dev,durable-host]"
           python tools/v023_ci.py exact-requirements | xargs python -m pip install
+          python tools/v023_ci.py verify-installed
       - name: Start PostgreSQL and MinIO
         run: docker compose -f tests/service/compose.yml up -d --wait
       - name: Run combined service integration
