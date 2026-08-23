@@ -305,19 +305,12 @@ class PostgresWriterAuthorityStore:
         self._require_ready()
         if not is_safe_opaque_id(run_id):
             raise ValueError("writer authority run_id must be a bounded opaque id")
-        from psycopg import sql
 
         with self.database.transaction() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    sql.SQL(
-                        "SELECT run_id, owner_id, generation, leased_until, revoked, "
-                        "clock_timestamp() FROM {} WHERE run_id = %s"
-                    ).format(self._qualified_table()),
-                    (run_id,),
-                )
-                row = cursor.fetchone()
-        return None if row is None else _authority_from_row(row)
+                # Keep the returned row version and observed_at on one linearized boundary.
+                # `_read_locked` acquires the row before sampling the database clock.
+                return self._read_locked(cursor, run_id)
 
 
 __all__ = ["PostgresWriterAuthorityStore"]

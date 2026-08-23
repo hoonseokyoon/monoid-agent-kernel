@@ -661,6 +661,61 @@ def test_lock_wait_samples_database_clock_after_the_row_lock(
     assert replacement.observed_at > first.leased_until
 
 
+def test_read_observes_a_prior_inflight_authority_mutation(
+    postgres_database: PostgresDatabase,
+) -> None:
+    PostgresMigrations(postgres_database).apply()
+    first_store = PostgresWriterAuthorityStore(postgres_database)
+    first_store.check_ready()
+    first = first_store.claim("run-read-lock", "worker-a", timedelta(seconds=10))
+
+    reader_database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=2,
+            application_name="monoid-pr02-authority-reader",
+        )
+    )
+    reader_database.open()
+    reader_store = PostgresWriterAuthorityStore(reader_database)
+    reader_store.check_ready()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with postgres_database.connection() as blocking_connection:
+                with blocking_connection.transaction():
+                    with blocking_connection.cursor() as cursor:
+                        cursor.execute(
+                            sql.SQL(
+                                "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
+                                "UPDATE {}.{} AS authority SET "
+                                "leased_until = sampled.db_now, revoked = true, "
+                                "updated_at = sampled.db_now FROM sampled "
+                                "WHERE authority.run_id = %s"
+                            ).format(
+                                sql.Identifier(postgres_database.config.schema),
+                                sql.Identifier("run_authority"),
+                            ),
+                            (first.writer_token.run_id,),
+                        )
+                        assert cursor.rowcount == 1
+                    future = executor.submit(reader_store.read, first.writer_token.run_id)
+                    _wait_until_application_blocks_on_lock(
+                        postgres_database,
+                        reader_database.config.application_name,
+                    )
+            observed = future.result(timeout=5)
+    finally:
+        reader_database.close()
+
+    assert observed is not None
+    assert observed.writer_token == first.writer_token
+    assert observed.revoked is True
+    assert observed.observed_at >= observed.leased_until
+
+
 def test_fresh_claim_samples_database_clock_after_unique_conflict_rollback(
     postgres_database: PostgresDatabase,
 ) -> None:
