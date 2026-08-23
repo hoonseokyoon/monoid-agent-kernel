@@ -46,7 +46,10 @@ from monoid_agent_kernel.core.model_invocation import (  # noqa: E402
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
 )
+from monoid_agent_kernel.errors import DurableModelCallError  # noqa: E402
 from monoid_agent_kernel.hosting import WriterToken  # noqa: E402
+from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
+from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
 
 
 _POSTGRES_TARGETS = [
@@ -372,6 +375,25 @@ def test_checkpoint_sequence_respects_postgres_bigint_boundaries(
     assert result.status == "conflict"
     assert result.sequence == 10**30
     assert _table_count(sink_harness, "checkpoint_record", run_id) == 1
+
+
+@pytest.mark.parametrize("bad_sequence", [-1, "invalid", True])
+def test_invalid_checkpoint_sequence_returns_conflict_without_evidence(
+    sink_harness: _SinkHarness,
+    bad_sequence: object,
+) -> None:
+    run_id = f"run-invalid-sequence-{type(bad_sequence).__name__}"
+    token = sink_harness.claim(run_id)
+
+    result = sink_harness.sink.commit_checkpoint(
+        RunCheckpoint(run_id=run_id, seq=bad_sequence),  # type: ignore[arg-type]
+        {},
+        writer_token=token,
+    )
+
+    assert result.status == "conflict"
+    assert result.sequence is None
+    assert _table_count(sink_harness, "checkpoint_record", run_id) == 0
 
 
 def test_invocation_revision_outside_postgres_bigint_is_conflict(
@@ -803,19 +825,47 @@ def test_invocation_transition_rejects_a_corrupt_prior_digest(
     assert sink_harness.sink.load_invocation(run_id, "call-1").status == "corrupt"
 
 
-def test_invocation_outbox_policy_is_rejected_before_insert(
+@pytest.mark.parametrize("evidence_policy", ["required", "outbox"])
+def test_invocation_unsupported_evidence_policy_is_rejected_before_insert(
     sink_harness: _SinkHarness,
+    evidence_policy: str,
 ) -> None:
-    run_id = "run-outbox-unsupported"
+    run_id = f"run-evidence-{evidence_policy}-unsupported"
     token = sink_harness.claim(run_id)
 
     result = sink_harness.sink.commit_invocation(
-        _invocation(run_id, 1, "reserved", evidence_policy="outbox"),
+        _invocation(run_id, 1, "reserved", evidence_policy=evidence_policy),
         {},
         writer_token=token,
     )
 
     assert result.status == "conflict"
+    assert _table_count(sink_harness, "invocation_record", run_id) == 0
+
+
+def test_required_evidence_lifecycle_is_rejected_before_dispatch_reservation(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-required-lifecycle-unsupported"
+    token = sink_harness.claim(run_id)
+    lifecycle = FencedModelCallLifecycle(
+        sink=sink_harness.sink,  # type: ignore[arg-type]
+        writer_token=token,
+        evidence_policy="required",
+    )
+    reservation = ModelDispatchReservation(
+        logical_call_id="call-required",
+        dispatch_attempt=1,
+        dispatch_id="dispatch-required",
+        request_digest="a" * 64,
+        digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+        idempotency_key=f"key-{hashlib.sha256(run_id.encode()).hexdigest()}",
+    )
+
+    with pytest.raises(DurableModelCallError) as raised:
+        lifecycle.reserve(reservation)
+
+    assert raised.value.error_code == "durable_invocation_conflict"
     assert _table_count(sink_harness, "invocation_record", run_id) == 0
 
 

@@ -350,7 +350,9 @@ class PostgresFencedRunSink:
     ) -> tuple[CommitResult, str]:
         if not isinstance(checkpoint, RunCheckpoint):
             return CommitResult(status="conflict"), ""
-        if type(checkpoint.seq) is not int or not 0 <= checkpoint.seq <= _POSTGRES_BIGINT_MAX:
+        if type(checkpoint.seq) is not int or checkpoint.seq < 0:
+            return CommitResult(status="conflict"), ""
+        if checkpoint.seq > _POSTGRES_BIGINT_MAX:
             return CommitResult(status="conflict", sequence=checkpoint.seq), ""
         submitted = self._validated_blobs(blobs)
         if submitted is None:
@@ -651,7 +653,7 @@ class PostgresFencedRunSink:
         if (
             type(stage_evidence) is not bool
             or stage_evidence
-            or invocation.evidence_policy == "outbox"
+            or invocation.evidence_policy != "passive"
         ):
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         submitted = self._validated_blobs(blobs)
