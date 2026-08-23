@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.serial, pytest.mark.service]
 def test_pinned_minio_supports_checked_conditional_put() -> None:
     boto3 = pytest.importorskip("boto3")
     botocore_config = pytest.importorskip("botocore.config")
+    botocore_exceptions = pytest.importorskip("botocore.exceptions")
     endpoint = os.environ.get("MONOID_MINIO_ENDPOINT")
     if not endpoint:
         pytest.fail("MONOID_MINIO_ENDPOINT is required for the selected service profile")
@@ -50,6 +51,21 @@ def test_pinned_minio_supports_checked_conditional_put() -> None:
             ChecksumSHA256=checksum,
         )
         assert result["ResponseMetadata"]["HTTPStatusCode"] == 200
+        replacement = b"different-bytes-must-not-replace-the-first-writer"
+        replacement_checksum = base64.b64encode(hashlib.sha256(replacement).digest()).decode(
+            "ascii"
+        )
+        with pytest.raises(botocore_exceptions.ClientError) as raised:
+            client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=replacement,
+                IfNoneMatch="*",
+                ChecksumSHA256=replacement_checksum,
+            )
+        error = raised.value.response
+        assert error["ResponseMetadata"]["HTTPStatusCode"] == 412
+        assert error["Error"]["Code"] == "PreconditionFailed"
         loaded = client.get_object(Bucket=bucket, Key=key)["Body"].read()
         assert loaded == body
         assert hashlib.sha256(loaded).digest() == hashlib.sha256(body).digest()

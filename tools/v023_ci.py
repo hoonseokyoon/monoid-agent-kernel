@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import platform
 import re
+import sysconfig
+import tarfile
+import urllib.request
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -17,6 +22,7 @@ PYPROJECT_PATH = ROOT / "pyproject.toml"
 ALLOWED_PROFILES = frozenset({"core", "postgres", "objectstore", "temporal", "combined"})
 PROFILE_LABELS = frozenset(f"ci:{profile}" for profile in ALLOWED_PROFILES)
 BRANCH_PATTERN = re.compile(r"(?:^|/)v0[.]23-pr(?P<number>[0-9]{2})(?:-|$)")
+MAX_TEMPORAL_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
 def _load_lock() -> dict[str, Any]:
@@ -130,6 +136,148 @@ def verify_installed(lock: dict[str, Any]) -> dict[str, str]:
     return actual
 
 
+def temporal_archive_spec(lock: dict[str, Any]) -> dict[str, str]:
+    """Select the exact Temporal CLI archive and checksum for the current platform."""
+    system_names = {"darwin": "darwin", "linux": "linux", "windows": "windows"}
+    system = system_names.get(platform.system().lower())
+    machine = (
+        platform.machine()
+        or os.environ.get("PROCESSOR_ARCHITEW6432")
+        or os.environ.get("PROCESSOR_ARCHITECTURE")
+        or ""
+    ).lower()
+    if not machine:
+        interpreter_platform = sysconfig.get_platform().lower()
+        if "amd64" in interpreter_platform or "x86_64" in interpreter_platform:
+            machine = "amd64"
+        elif "arm64" in interpreter_platform or "aarch64" in interpreter_platform:
+            machine = "arm64"
+    architecture = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }.get(machine)
+    if system is None or architecture is None:
+        raise ValueError(
+            f"Temporal CLI campaign does not support platform {platform.system()}/{machine}"
+        )
+
+    temporal = lock["services"]["temporal_cli"]
+    version = str(temporal["version"])
+    platform_key = f"{system}_{architecture}"
+    checksum = temporal["archive_sha256"].get(platform_key)
+    if not checksum:
+        raise ValueError(f"Temporal CLI checksum is missing for {platform_key}")
+    filename = f"temporal_cli_{version.removeprefix('v')}_{system}_{architecture}.tar.gz"
+    return {
+        "platform": platform_key,
+        "version": version,
+        "filename": filename,
+        "sha256": str(checksum),
+        "url": f"https://github.com/temporalio/cli/releases/download/{version}/{filename}",
+        "executable_name": "temporal.exe" if system == "windows" else "temporal",
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_checked_archive(*, url: str, destination: Path, expected_sha256: str) -> None:
+    temporary = destination.with_name(f"{destination.name}.part")
+    request = urllib.request.Request(url, headers={"User-Agent": "monoid-v0.23-ci"})
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_TEMPORAL_ARCHIVE_BYTES:
+                    raise ValueError("Temporal CLI archive exceeds the bounded download size")
+                digest.update(chunk)
+                output.write(chunk)
+        observed = digest.hexdigest()
+        if observed != expected_sha256:
+            raise ValueError(
+                f"Temporal CLI archive checksum mismatch: {observed}, expected {expected_sha256}"
+            )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _extract_temporal_executable(
+    *, archive: Path, destination: Path, executable_name: str
+) -> None:
+    with tarfile.open(archive, mode="r:gz") as bundle:
+        candidates = [
+            member
+            for member in bundle.getmembers()
+            if member.isfile() and Path(member.name).name == executable_name
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                "Temporal CLI archive must contain exactly one regular executable; "
+                f"found {[member.name for member in candidates]}"
+            )
+        member = candidates[0]
+        if member.size > MAX_TEMPORAL_ARCHIVE_BYTES:
+            raise ValueError("Temporal CLI executable exceeds the bounded extraction size")
+        source = bundle.extractfile(member)
+        if source is None:
+            raise ValueError("Temporal CLI executable cannot be read from the verified archive")
+        payload = source.read(MAX_TEMPORAL_ARCHIVE_BYTES + 1)
+        if len(payload) != member.size or len(payload) > MAX_TEMPORAL_ARCHIVE_BYTES:
+            raise ValueError("Temporal CLI executable size differs from its archive metadata")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.part")
+    try:
+        temporary.write_bytes(payload)
+        if os.name != "nt":
+            temporary.chmod(0o755)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def prepare_temporal_cli(lock: dict[str, Any], cache_dir: Path) -> dict[str, str]:
+    """Download, verify, and extract the exact platform Temporal CLI campaign artifact."""
+    spec = temporal_archive_spec(lock)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archive = cache_dir / spec["filename"]
+    if archive.exists():
+        observed = _sha256_file(archive)
+        if observed != spec["sha256"]:
+            raise ValueError(
+                f"cached Temporal CLI archive checksum mismatch: {observed}, "
+                f"expected {spec['sha256']}"
+            )
+    else:
+        _download_checked_archive(
+            url=spec["url"],
+            destination=archive,
+            expected_sha256=spec["sha256"],
+        )
+
+    destination = cache_dir / spec["platform"] / spec["version"] / spec["executable_name"]
+    _extract_temporal_executable(
+        archive=archive,
+        destination=destination,
+        executable_name=spec["executable_name"],
+    )
+    return {
+        **spec,
+        "archive": str(archive.resolve()),
+        "executable": str(destination.resolve()),
+    }
+
+
 def resolve_profile(
     lock: dict[str, Any],
     *,
@@ -197,6 +345,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("exact-requirements")
     commands.add_parser("verify-installed")
 
+    temporal_cli = commands.add_parser("prepare-temporal-cli")
+    temporal_cli.add_argument("--cache-dir", type=Path, required=True)
+
     resolve = commands.add_parser("resolve-profile")
     resolve.add_argument("--head-ref", required=True)
     resolve.add_argument("--labels-json", default="[]")
@@ -222,6 +373,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "verify-installed":
         print(json.dumps(verify_installed(lock), sort_keys=True))
+        return 0
+    if arguments.command == "prepare-temporal-cli":
+        print(json.dumps(prepare_temporal_cli(lock, arguments.cache_dir), sort_keys=True))
         return 0
     if arguments.command == "resolve-profile":
         profile = resolve_profile(

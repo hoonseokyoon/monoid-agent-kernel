@@ -29,6 +29,20 @@ def test_campaign_lock_and_tracked_service_artifacts_are_consistent() -> None:
     assert lock["services"]["postgres18"]["major"] == 18
     assert lock["services"]["temporal_cli"]["version"] == "v1.8.2"
     assert lock["services"]["temporal_cli"]["embedded_server"] == "1.31.2"
+    temporal_archive = module.temporal_archive_spec(lock)
+    assert temporal_archive["version"] == "v1.8.2"
+    assert len(temporal_archive["sha256"]) == 64
+    assert temporal_archive["filename"].endswith(".tar.gz")
+
+
+def test_temporal_cli_preparation_rejects_a_corrupt_cached_archive(tmp_path: Path) -> None:
+    module = _load_ci_module()
+    lock = module.validate_lock()
+    archive = module.temporal_archive_spec(lock)
+    tmp_path.joinpath(archive["filename"]).write_bytes(b"not-the-locked-archive")
+
+    with pytest.raises(ValueError, match="cached Temporal CLI archive checksum mismatch"):
+        module.prepare_temporal_cli(lock, tmp_path)
 
 
 @pytest.mark.parametrize(

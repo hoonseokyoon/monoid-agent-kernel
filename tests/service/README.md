@@ -40,4 +40,5 @@ docker compose -f tests/service/compose.yml down --volumes
 | `release` | PostgreSQL 16/18 + MinIO container matrix |
 
 Temporal은 test process가 `WorkflowEnvironment.start_local()`로 시작하고 종료한다. Docker Compose는
-PostgreSQL과 MinIO만 소유한다.
+PostgreSQL과 MinIO만 소유한다. Temporal test는 현재 OS/architecture의 공식 CLI archive를
+campaign lock SHA-256과 비교하고, 검증한 archive에서 추출한 executable을 local server로 실행한다.

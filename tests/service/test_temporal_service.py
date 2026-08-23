@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -32,9 +36,31 @@ def test_pinned_temporal_local_server_executes_workflow() -> None:
         pytest.fail("MONOID_TEMPORAL_CLI_VERSION is required for the selected service profile")
     assert cli_version.startswith("v")
 
+    root = Path(__file__).resolve().parents[2]
+    cache_dir = Path(
+        os.environ.get("MONOID_TEMPORAL_CLI_CACHE", root / ".tmp/temporal-cli-cache")
+    )
+    prepared = subprocess.run(
+        [
+            sys.executable,
+            str(root / "tools/v023_ci.py"),
+            "prepare-temporal-cli",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert prepared.returncode == 0, prepared.stderr or prepared.stdout
+    artifact = json.loads(prepared.stdout)
+    assert artifact["version"] == cli_version
+    executable = artifact["executable"]
+
     async def run() -> str:
         async with await WorkflowEnvironment.start_local(
-            dev_server_download_version=cli_version,
+            dev_server_existing_path=executable,
             dev_server_log_level="warn",
         ) as environment:
             task_queue = f"monoid-v023-{uuid.uuid4()}"
