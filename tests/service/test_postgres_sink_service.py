@@ -245,14 +245,13 @@ def test_global_blob_rows_are_acquired_in_digest_order(
 
     left_sha, left = _blob(b"left-lock")
     right_sha, right = _blob(b"right-lock")
-    reversed_input = {
-        right_sha: right[right_sha],
-        left_sha: left[left_sha],
-    }
+    by_digest = {left_sha: left[left_sha], right_sha: right[right_sha]}
+    reversed_input = dict(reversed(sorted(by_digest.items())))
     cursor = RecordingCursor()
 
     sink_harness.sink._persist_blobs(cursor, "run-lock-order", reversed_input)
 
+    assert list(reversed_input) == sorted((left_sha, right_sha), reverse=True)
     assert cursor.inserted_digests == sorted((left_sha, right_sha))
 
 

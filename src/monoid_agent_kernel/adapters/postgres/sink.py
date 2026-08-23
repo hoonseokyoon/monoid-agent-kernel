@@ -245,7 +245,8 @@ class PostgresFencedRunSink:
     ) -> None:
         from psycopg import sql
 
-        for sha256, value in blobs.items():
+        for sha256 in sorted(blobs):
+            value = blobs[sha256]
             cursor.execute(  # type: ignore[attr-defined]
                 sql.SQL(
                     "INSERT INTO {} (sha256, size_bytes, content) VALUES (%s, %s, %s) "
