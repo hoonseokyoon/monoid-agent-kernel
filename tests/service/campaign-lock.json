@@ -14,6 +14,11 @@
       "requirement": "boto3>=1.37.32,<2",
       "exact": "1.43.78"
     },
+    "botocore": {
+      "requirement": "botocore>=1.43.78,<1.44",
+      "exact": "1.43.78",
+      "role": "boto3 transitive implementation lock"
+    },
     "temporalio": {
       "requirement": "temporalio>=1.17,<2",
       "exact": "1.31.0"

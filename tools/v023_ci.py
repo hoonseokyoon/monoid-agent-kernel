@@ -50,6 +50,7 @@ def validate_lock() -> dict[str, Any]:
         "psycopg",
         "psycopg-pool",
         "boto3",
+        "botocore",
         "temporalio",
     }:
         raise ValueError("campaign Python dependency set is invalid")
@@ -114,6 +115,7 @@ def exact_requirements(lock: dict[str, Any]) -> list[str]:
         f"psycopg[binary]=={dependencies['psycopg']['exact']}",
         f"psycopg-pool=={dependencies['psycopg-pool']['exact']}",
         f"boto3=={dependencies['boto3']['exact']}",
+        f"botocore=={dependencies['botocore']['exact']}",
         f"temporalio=={dependencies['temporalio']['exact']}",
     ]
 

@@ -29,6 +29,7 @@ def test_campaign_lock_and_tracked_service_artifacts_are_consistent() -> None:
     assert lock["services"]["postgres18"]["major"] == 18
     assert lock["services"]["temporal_cli"]["version"] == "v1.8.2"
     assert lock["services"]["temporal_cli"]["embedded_server"] == "1.31.2"
+    assert lock["python_dependencies"]["botocore"]["exact"] == "1.43.78"
     temporal_archive = module.temporal_archive_spec(lock)
     assert temporal_archive["version"] == "v1.8.2"
     assert len(temporal_archive["sha256"]) == 64
@@ -94,6 +95,8 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "fast-pr-${{ github.event.pull_request.number || github.ref }}" in fast
     assert "ready_for_review" in full
     assert "workflow_dispatch" in full
+    assert ".[dev,openai,reference-dbos]" in full
+    assert '(unit or contract) and serial and not service' in full
     assert "full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
     assert "converted_to_draft" in cancel
     assert "full-pr-${{ github.event.pull_request.number || github.ref }}" in cancel

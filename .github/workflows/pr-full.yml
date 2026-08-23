@@ -74,16 +74,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install
-        run: python -m pip install -e ".[dev,openai]"
+        run: python -m pip install -e ".[dev,openai,reference-dbos]"
       - name: Run complete unit and contract gate
         run: >
           python -m pytest -q -n 4
           -m "(unit or contract) and not serial and not service"
           --durations=25
-      - name: Run serial contract gate
+      - name: Run serial unit and contract gate
         run: >
           python -m pytest -q
-          -m "contract and serial and not service"
+          -m "(unit or contract) and serial and not service"
           --durations=25
 
   service:

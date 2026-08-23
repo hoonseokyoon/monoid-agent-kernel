@@ -221,8 +221,9 @@ lazy import한다. package root는 adapter를 re-export하지 않는다.
 
 PR 1 compatibility spike는 boto3 1.37.32에서 conditional PUT/checksum/multipart API를,
 temporalio 1.17.0에서 local environment, Signal-With-Start, Replayer API를 확인했다. campaign
-exact SDK는 psycopg 3.3.4, psycopg-pool 3.3.1, boto3 1.43.78, temporalio 1.31.0이다. Temporal local
-service는 CLI v1.8.2와 embedded Server 1.31.2를 사용한다. exact SDK, service image digest,
+exact SDK는 psycopg 3.3.4, psycopg-pool 3.3.1, boto3 1.43.78, transitive botocore 1.43.78,
+temporalio 1.31.0이다. Temporal local service는 CLI v1.8.2와 embedded Server 1.31.2를 사용한다.
+exact SDK, service image digest,
 Temporal CLI archive checksum은 `tests/service/campaign-lock.json`이 소유한다.
 
 별도 distribution 분리는 v0.23 완료 뒤 dependency cadence와 maintainer 부담을 근거로 결정한다.
