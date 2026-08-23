@@ -192,7 +192,10 @@ def test_explicit_migration_lifecycle_and_doctor(
     before = migrations.status()
     assert before.schema_exists is False
     assert before.current_version == 0
-    assert tuple(item.migration_id for item in migrations.plan().pending) == ("0001_authority",)
+    assert tuple(item.migration_id for item in migrations.plan().pending) == (
+        "0001_authority",
+        "0002_checkpoint_invocation",
+    )
     assert migrations.doctor().ok is False
     with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
         store.read("run-unready")
@@ -202,9 +205,12 @@ def test_explicit_migration_lifecycle_and_doctor(
         store.check_ready()
 
     first = migrations.apply()
-    assert tuple(item.migration_id for item in first.applied) == ("0001_authority",)
+    assert tuple(item.migration_id for item in first.applied) == (
+        "0001_authority",
+        "0002_checkpoint_invocation",
+    )
     assert first.status.current is True
-    assert first.status.current_version == 1
+    assert first.status.current_version == 2
     assert first.status.schema == postgres_database.config.schema
 
     repeated = migrations.apply()
@@ -260,11 +266,11 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
                         sql.Identifier(postgres_database.config.schema),
                         sql.Identifier("monoid_schema_migrations"),
                     ),
-                    ("0002_forward_marker", 2, "f" * 64, 1, 1),
+                    ("0003_forward_marker", 3, "f" * 64, 1, 1),
                 )
 
     compatible = migrations.status()
-    assert compatible.current_version == 2
+    assert compatible.current_version == 3
     assert compatible.pending == ()
     assert compatible.reader_compatible is True
     assert compatible.writer_compatible is True
@@ -274,13 +280,13 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
             with connection.cursor() as cursor:
                 cursor.execute(
                     sql.SQL(
-                        "UPDATE {}.{} SET reader_floor = 2, writer_floor = 2 "
+                        "UPDATE {}.{} SET reader_floor = 3, writer_floor = 3 "
                         "WHERE migration_id = %s"
                     ).format(
                         sql.Identifier(postgres_database.config.schema),
                         sql.Identifier("monoid_schema_migrations"),
                     ),
-                    ("0002_forward_marker",),
+                    ("0003_forward_marker",),
                 )
 
     incompatible = migrations.status()
@@ -323,7 +329,10 @@ def test_migration_advisory_lock_serializes_independent_runners(
         for database in peer_databases:
             database.close()
 
-    assert sorted(applied, key=len) == [(), ("0001_authority",)]
+    assert sorted(applied, key=len) == [
+        (),
+        ("0001_authority", "0002_checkpoint_invocation"),
+    ]
     assert PostgresMigrations(postgres_database).status().current is True
 
 
@@ -375,7 +384,10 @@ def test_migration_path_resists_pooled_temp_table_shadowing(
 
         result = PostgresMigrations(database).apply()
         assert result.status.current is True
-        assert tuple(item.migration_id for item in result.applied) == ("0001_authority",)
+        assert tuple(item.migration_id for item in result.applied) == (
+            "0001_authority",
+            "0002_checkpoint_invocation",
+        )
 
         with database.connection() as connection:
             with connection.transaction():
@@ -461,7 +473,7 @@ def test_migration_schema_cannot_shadow_pg_catalog_builtins(
                             sql.Identifier(schema),
                             sql.Identifier("monoid_schema_migrations"),
                         ),
-                        ("9999_default_probe", 2, "f" * 64, 1, 1),
+                            ("9999_default_probe", 3, "f" * 64, 1, 1),
                     )
                     assert cursor.fetchone()[0].year >= 2020
                 raise RollBackDefaultProbe
@@ -576,7 +588,10 @@ def test_migration_lock_wait_enforces_read_committed_on_caller_pools(
         for caller_pool in caller_pools:
             caller_pool.close()
 
-    assert sorted(applied, key=len) == [(), ("0001_authority",)]
+    assert sorted(applied, key=len) == [
+        (),
+        ("0001_authority", "0002_checkpoint_invocation"),
+    ]
     assert PostgresMigrations(postgres_database).status().current is True
 
 

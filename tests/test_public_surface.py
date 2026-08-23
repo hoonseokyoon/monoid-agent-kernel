@@ -747,6 +747,8 @@ assert postgres.__all__ == [
     'bundled_migrations',
     'PostgresMigrations',
     'PostgresWriterAuthorityStore',
+    'PostgresBlobCorrupt',
+    'PostgresFencedRunSink',
 ]
 assert all(hasattr(postgres, name) for name in postgres.__all__)
 assert object_store.__all__ == []

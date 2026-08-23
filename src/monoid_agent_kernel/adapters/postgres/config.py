@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z", re.ASCII)
 _RESERVED_SCHEMA_NAMES = frozenset({"information_schema"})
+_MAX_POSTGRES_BYTEA_BYTES = (1 << 30) - 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -21,6 +22,7 @@ class PostgresConfig:
     connect_timeout_s: int = 10
     pool_timeout_s: float = 30.0
     application_name: str = "monoid-agent-kernel"
+    max_bytea_blob_bytes: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if type(self.dsn) is not str or not self.dsn.strip() or len(self.dsn) > 8192:
@@ -59,6 +61,13 @@ class PostgresConfig:
             or not all(character.isprintable() for character in self.application_name)
         ):
             raise ValueError("PostgreSQL application_name must be a bounded printable string")
+        if (
+            type(self.max_bytea_blob_bytes) is not int
+            or not 1 <= self.max_bytea_blob_bytes <= _MAX_POSTGRES_BYTEA_BYTES
+        ):
+            raise ValueError(
+                "PostgreSQL max_bytea_blob_bytes must be between 1 and 1073741823"
+            )
 
 
 __all__ = ["PostgresConfig"]
