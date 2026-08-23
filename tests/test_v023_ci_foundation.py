@@ -46,6 +46,30 @@ def test_temporal_cli_preparation_rejects_a_corrupt_cached_archive(tmp_path: Pat
         module.prepare_temporal_cli(lock, tmp_path)
 
 
+def test_exact_sdk_verification_fails_when_a_locked_distribution_cannot_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_ci_module()
+    lock = module.validate_lock()
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "version",
+        lambda name: lock["python_dependencies"][name]["exact"],
+    )
+    imported: list[str] = []
+
+    def import_module(name: str) -> object:
+        imported.append(name)
+        if name == "temporalio":
+            raise ImportError("simulated broken native dependency")
+        return object()
+
+    monkeypatch.setattr(module.importlib, "import_module", import_module)
+    with pytest.raises(ValueError, match="cannot be imported: temporalio"):
+        module.verify_installed(lock)
+    assert imported == ["psycopg", "psycopg_pool", "boto3", "botocore", "temporalio"]
+
+
 @pytest.mark.parametrize(
     ("head_ref", "label", "expected"),
     [
@@ -83,6 +107,48 @@ def test_service_profile_rejects_missing_multiple_and_wrong_labels() -> None:
             head_ref="codex/v0.23-pr01-ci",
             labels=["ci:postgres"],
         )
+
+
+@pytest.mark.parametrize(
+    ("head_ref", "labels", "expected"),
+    [
+        ("codex/v0.23-production-adapters", [], "combined"),
+        ("codex/v0.23-production-adapters", ["ci:combined"], "combined"),
+        ("develop", [], "combined"),
+        ("feature/unrelated", [], "core"),
+        ("feature/service-change", ["ci:postgres"], "postgres"),
+    ],
+)
+def test_terminal_and_non_campaign_branches_have_total_profile_resolution(
+    head_ref: str,
+    labels: list[str],
+    expected: str,
+) -> None:
+    module = _load_ci_module()
+    lock = module.validate_lock()
+    assert module.resolve_profile(lock, head_ref=head_ref, labels=labels) == expected
+
+
+def test_terminal_branch_rejects_a_profile_weaker_than_combined() -> None:
+    module = _load_ci_module()
+    lock = module.validate_lock()
+    with pytest.raises(ValueError, match="requires ci:combined"):
+        module.resolve_profile(
+            lock,
+            head_ref="codex/v0.23-production-adapters",
+            labels=["ci:core"],
+        )
+
+
+def test_service_modules_do_not_skip_selected_sdk_import_failures() -> None:
+    for path in (
+        ROOT / "tests/service/test_postgres_service.py",
+        ROOT / "tests/service/test_object_store_service.py",
+        ROOT / "tests/service/test_temporal_service.py",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "pytest.importorskip" not in source
+        assert "allow_module_level=True" in source
 
 
 def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:

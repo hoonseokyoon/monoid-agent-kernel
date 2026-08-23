@@ -12,7 +12,9 @@ import pytest
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.serial, pytest.mark.service, pytest.mark.slow]
-temporalio = pytest.importorskip("temporalio")
+
+if os.environ.get("MONOID_SERVICE_PROFILE") not in {"temporal", "combined"}:
+    pytest.skip("Temporal service profile is not selected", allow_module_level=True)
 
 from temporalio import workflow  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
@@ -26,10 +28,6 @@ class _ServiceSmokeWorkflow:
         return value
 
 
-@pytest.mark.skipif(
-    os.environ.get("MONOID_SERVICE_PROFILE") not in {"temporal", "combined"},
-    reason="Temporal service profile is not selected",
-)
 def test_pinned_temporal_local_server_executes_workflow() -> None:
     cli_version = os.environ.get("MONOID_TEMPORAL_CLI_VERSION")
     if not cli_version:

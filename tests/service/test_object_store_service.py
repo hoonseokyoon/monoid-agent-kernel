@@ -11,14 +11,15 @@ import pytest
 pytestmark = [pytest.mark.integration, pytest.mark.serial, pytest.mark.service]
 
 
-@pytest.mark.skipif(
-    os.environ.get("MONOID_SERVICE_PROFILE") not in {"objectstore", "combined"},
-    reason="object-store service profile is not selected",
-)
+if os.environ.get("MONOID_SERVICE_PROFILE") not in {"objectstore", "combined"}:
+    pytest.skip("object-store service profile is not selected", allow_module_level=True)
+
+import boto3  # noqa: E402
+from botocore import config as botocore_config  # noqa: E402
+from botocore import exceptions as botocore_exceptions  # noqa: E402
+
+
 def test_pinned_minio_supports_checked_conditional_put() -> None:
-    boto3 = pytest.importorskip("boto3")
-    botocore_config = pytest.importorskip("botocore.config")
-    botocore_exceptions = pytest.importorskip("botocore.exceptions")
     endpoint = os.environ.get("MONOID_MINIO_ENDPOINT")
     if not endpoint:
         pytest.fail("MONOID_MINIO_ENDPOINT is required for the selected service profile")

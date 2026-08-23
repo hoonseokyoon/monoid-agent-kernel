@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -22,6 +24,17 @@ PYPROJECT_PATH = ROOT / "pyproject.toml"
 ALLOWED_PROFILES = frozenset({"core", "postgres", "objectstore", "temporal", "combined"})
 PROFILE_LABELS = frozenset(f"ci:{profile}" for profile in ALLOWED_PROFILES)
 BRANCH_PATTERN = re.compile(r"(?:^|/)v0[.]23-pr(?P<number>[0-9]{2})(?:-|$)")
+CAMPAIGN_TERMINAL_PROFILES = {
+    "codex/v0.23-production-adapters": "combined",
+    "develop": "combined",
+}
+SDK_IMPORT_MODULES = {
+    "psycopg": "psycopg",
+    "psycopg-pool": "psycopg_pool",
+    "boto3": "boto3",
+    "botocore": "botocore",
+    "temporalio": "temporalio",
+}
 MAX_TEMPORAL_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
@@ -122,8 +135,6 @@ def exact_requirements(lock: dict[str, Any]) -> list[str]:
 
 def verify_installed(lock: dict[str, Any]) -> dict[str, str]:
     """Verify that the service process imports the exact SDK campaign, not a broad-extra drift."""
-    import importlib.metadata
-
     expected = {
         name: str(entry["exact"]) for name, entry in lock["python_dependencies"].items()
     }
@@ -135,6 +146,11 @@ def verify_installed(lock: dict[str, Any]) -> dict[str, str]:
             raise ValueError(f"campaign dependency is not installed: {name}") from exc
     if actual != expected:
         raise ValueError(f"installed SDK campaign differs from lock: {actual}, expected {expected}")
+    for distribution, module_name in SDK_IMPORT_MODULES.items():
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            raise ValueError(f"campaign dependency cannot be imported: {distribution}") from exc
     return actual
 
 
@@ -288,25 +304,42 @@ def resolve_profile(
     requested_profile: str | None = None,
 ) -> str:
     selected_labels = sorted(PROFILE_LABELS.intersection(labels))
+    matched = BRANCH_PATTERN.search(head_ref)
+    terminal_expected = CAMPAIGN_TERMINAL_PROFILES.get(head_ref)
     if requested_profile:
         if requested_profile not in ALLOWED_PROFILES:
             raise ValueError(f"unknown manually requested profile: {requested_profile}")
         selected = requested_profile
-    else:
+    elif matched is not None:
         if len(selected_labels) != 1:
             raise ValueError(
                 "ready PR must carry exactly one service profile label; "
                 f"found {selected_labels}"
             )
         selected = selected_labels[0].split(":", 1)[1]
+    elif terminal_expected is not None:
+        if len(selected_labels) > 1:
+            raise ValueError(
+                "campaign terminal PR accepts at most one service profile label; "
+                f"found {selected_labels}"
+            )
+        selected = (
+            selected_labels[0].split(":", 1)[1] if selected_labels else terminal_expected
+        )
+    else:
+        if len(selected_labels) > 1:
+            raise ValueError(
+                "non-campaign PR accepts at most one service profile label; "
+                f"found {selected_labels}"
+            )
+        selected = selected_labels[0].split(":", 1)[1] if selected_labels else "core"
 
-    matched = BRANCH_PATTERN.search(head_ref)
-    if matched is None:
-        if not requested_profile:
-            raise ValueError(f"cannot derive v0.23 PR sequence from head ref: {head_ref!r}")
-        return selected
-    expected = lock["pull_request_profiles"][matched.group("number")]
-    if selected != expected:
+    expected = (
+        lock["pull_request_profiles"][matched.group("number")]
+        if matched is not None
+        else terminal_expected
+    )
+    if expected is not None and selected != expected:
         raise ValueError(
             f"{head_ref!r} requires ci:{expected}, received ci:{selected}"
         )

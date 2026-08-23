@@ -255,6 +255,11 @@ CI foundation PR에서 현재 단일 `.github/workflows/ci.yml`을 다음 의미
 | integration | v0.23 통합 브랜치와 `develop` push | 영향받은 서비스와 combined gate |
 | release | release PR/tag/manual | L3 전체 matrix와 wheel audit |
 
+구현 PR은 계획에 지정된 `ci:<profile>` label을 요구한다. 최종
+`codex/v0.23-production-adapters` → `develop` 통합 PR과 `develop` → `main` release PR은
+`combined` profile을 자동 선택하며 다른 profile label을 거부한다. 이 캠페인 밖의 Ready PR은
+service label이 없으면 `core`, 하나 있으면 해당 profile을 선택한다.
+
 PR 1 capability gate가 Draft 수동 Codex review 미지원을 확인하면 앞의 두 PR workflow를 다음과
 같이 대체한다.
 

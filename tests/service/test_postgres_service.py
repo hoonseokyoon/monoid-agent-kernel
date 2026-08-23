@@ -12,7 +12,12 @@ def _selected() -> bool:
     return os.environ.get("MONOID_SERVICE_PROFILE") in {"postgres", "objectstore", "combined"}
 
 
-@pytest.mark.skipif(not _selected(), reason="PostgreSQL service profile is not selected")
+if not _selected():
+    pytest.skip("PostgreSQL service profile is not selected", allow_module_level=True)
+
+import psycopg  # noqa: E402
+
+
 @pytest.mark.parametrize(
     ("dsn_variable", "expected_major", "profiles"),
     [
@@ -27,7 +32,6 @@ def test_pinned_postgresql_service_is_reachable(
 ) -> None:
     if os.environ["MONOID_SERVICE_PROFILE"] not in profiles:
         pytest.skip(f"PostgreSQL {expected_major} is outside the selected profile")
-    psycopg = pytest.importorskip("psycopg")
     dsn = os.environ.get(dsn_variable)
     if not dsn:
         pytest.fail(f"{dsn_variable} is required for the selected service profile")
