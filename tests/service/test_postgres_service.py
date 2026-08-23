@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Iterator
 
 import pytest
@@ -32,6 +32,10 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresMigrations,
     PostgresSchemaIncompatible,
     PostgresWriterAuthorityStore,
+)
+from monoid_agent_kernel.adapters.postgres.authority import (  # noqa: E402
+    _ELAPSED_TTL_INTERVAL,
+    _ttl_microseconds,
 )
 from monoid_agent_kernel.hosting import WriterLease, WriterLeaseUnavailable, WriterToken  # noqa: E402
 
@@ -144,6 +148,38 @@ def test_pinned_postgresql_service_is_reachable(
             assert cursor.fetchone() == (1,)
 
     assert version_number // 10000 == expected_major
+
+
+def test_writer_ttl_is_an_elapsed_duration_across_dst(
+    postgres_database: PostgresDatabase,
+) -> None:
+    base = datetime(2026, 3, 7, 17, tzinfo=UTC)
+    ttl = timedelta(hours=24)
+    query = (
+        "SELECT extract(epoch FROM ((%s::timestamptz + "
+        + _ELAPSED_TTL_INTERVAL
+        + ") - %s::timestamptz)), "
+        "extract(epoch FROM ((%s::timestamptz + %s) - %s::timestamptz))"
+    )
+    with postgres_database.connection() as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL TIME ZONE 'America/New_York'")
+                cursor.execute(
+                    query,
+                    (
+                        base,
+                        _ttl_microseconds(ttl),
+                        base,
+                        base,
+                        ttl,
+                        base,
+                    ),
+                )
+                elapsed_seconds, calendar_seconds = cursor.fetchone()
+
+    assert elapsed_seconds == 86_400
+    assert calendar_seconds == 82_800
 
 
 def test_explicit_migration_lifecycle_and_doctor(

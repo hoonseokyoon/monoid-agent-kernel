@@ -23,11 +23,16 @@ from monoid_agent_kernel.hosting import (
 
 
 _AUTHORITY_TABLE = "run_authority"
+_ELAPSED_TTL_INTERVAL = "(%s::text || ' microseconds')::interval"
 
 
-def _validate_ttl(ttl: object) -> None:
+def _ttl_microseconds(ttl: object) -> int:
     if type(ttl) is not timedelta or ttl <= timedelta(0):
         raise ValueError("writer lease ttl must be a positive timedelta")
+    # psycopg preserves ``timedelta.days`` in PostgreSQL's interval day field. Adding that field
+    # to timestamptz follows calendar days in the session timezone and can be 23 or 25 hours at a
+    # DST boundary. Encode the complete duration as time-only microseconds instead.
+    return ((ttl.days * 86_400) + ttl.seconds) * 1_000_000 + ttl.microseconds
 
 
 def _authority_from_row(row: Any) -> WriterAuthority:
@@ -98,7 +103,7 @@ class PostgresWriterAuthorityStore:
         cursor: object,
         run_id: str,
         owner_id: str,
-        ttl: timedelta,
+        ttl_microseconds: int,
     ) -> WriterLease | None:
         from psycopg import sql
 
@@ -123,14 +128,16 @@ class PostgresWriterAuthorityStore:
             sql.SQL(
                 "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
                 "UPDATE {} AS authority SET "
-                "leased_until = sampled.db_now + %s, revoked = false, "
+                "leased_until = sampled.db_now + "
+                + _ELAPSED_TTL_INTERVAL
+                + ", revoked = false, "
                 "updated_at = sampled.db_now FROM sampled "
                 "WHERE authority.run_id = %s AND authority.owner_id = %s "
                 "AND authority.generation = 1 AND authority.revoked "
                 "RETURNING authority.run_id, authority.owner_id, authority.generation, "
                 "authority.leased_until, authority.revoked, sampled.db_now"
             ).format(self._qualified_table()),
-            (ttl, run_id, owner_id),
+            (ttl_microseconds, run_id, owner_id),
         )
         activated_row = cursor.fetchone()  # type: ignore[attr-defined]
         if activated_row is None:  # pragma: no cover - this transaction owns its inserted row
@@ -147,7 +154,7 @@ class PostgresWriterAuthorityStore:
         cursor: object,
         run_id: str,
         owner_id: str,
-        ttl: timedelta,
+        ttl_microseconds: int,
     ) -> WriterLease:
         from psycopg import sql
 
@@ -156,13 +163,15 @@ class PostgresWriterAuthorityStore:
                 "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
                 "UPDATE {} AS authority SET "
                 "owner_id = %s, generation = authority.generation + 1, "
-                "leased_until = sampled.db_now + %s, revoked = false, "
+                "leased_until = sampled.db_now + "
+                + _ELAPSED_TTL_INTERVAL
+                + ", revoked = false, "
                 "updated_at = sampled.db_now "
                 "FROM sampled WHERE authority.run_id = %s "
                 "RETURNING authority.run_id, authority.owner_id, authority.generation, "
                 "authority.leased_until, authority.revoked, sampled.db_now"
             ).format(self._qualified_table()),
-            (owner_id, ttl, run_id),
+            (owner_id, ttl_microseconds, run_id),
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
         if row is None:  # pragma: no cover - caller holds the existing row lock
@@ -180,13 +189,13 @@ class PostgresWriterAuthorityStore:
             raise ValueError("writer claim run_id must be a bounded opaque id")
         if not is_safe_opaque_id(owner_id):
             raise ValueError("writer claim owner_id must be a bounded opaque id")
-        _validate_ttl(ttl)
+        ttl_microseconds = _ttl_microseconds(ttl)
 
         with self.database.transaction() as connection:
             with connection.cursor() as cursor:
                 current = self._read_locked(cursor, run_id)
                 if current is None:
-                    inserted = self._insert_first(cursor, run_id, owner_id, ttl)
+                    inserted = self._insert_first(cursor, run_id, owner_id, ttl_microseconds)
                     if inserted is not None:
                         return inserted
                     # A concurrent absent-row insert committed while ON CONFLICT waited. This
@@ -202,13 +211,13 @@ class PostgresWriterAuthorityStore:
                             observed_at=current.observed_at,
                         )
                     raise WriterLeaseUnavailable(current)
-                return self._take_over(cursor, run_id, owner_id, ttl)
+                return self._take_over(cursor, run_id, owner_id, ttl_microseconds)
 
     def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
         self._require_ready()
         if not isinstance(writer_token, WriterToken):
             raise TypeError("writer renew requires WriterToken")
-        _validate_ttl(ttl)
+        ttl_microseconds = _ttl_microseconds(ttl)
         from psycopg import sql
 
         with self.database.transaction() as connection:
@@ -220,7 +229,9 @@ class PostgresWriterAuthorityStore:
                     sql.SQL(
                         "WITH sampled AS (SELECT clock_timestamp() AS db_now) "
                         "UPDATE {} AS authority SET "
-                        "leased_until = sampled.db_now + %s, updated_at = sampled.db_now "
+                        "leased_until = sampled.db_now + "
+                        + _ELAPSED_TTL_INTERVAL
+                        + ", updated_at = sampled.db_now "
                         "FROM sampled WHERE authority.run_id = %s "
                         "AND authority.owner_id = %s AND authority.generation = %s "
                         "AND NOT authority.revoked AND authority.leased_until > sampled.db_now "
@@ -229,7 +240,7 @@ class PostgresWriterAuthorityStore:
                         "sampled.db_now"
                     ).format(self._qualified_table()),
                     (
-                        ttl,
+                        ttl_microseconds,
                         writer_token.run_id,
                         writer_token.owner_id,
                         writer_token.generation,
