@@ -39,11 +39,27 @@ def test_pinned_minio_supports_checked_conditional_put() -> None:
     )
     bucket = f"monoid-v023-{uuid.uuid4().hex}"
     key = "sha256/service-smoke"
+    checksum_mismatch_key = "sha256/checksum-mismatch"
     body = b"monoid-v0.23-object-store-service-smoke"
     checksum = base64.b64encode(hashlib.sha256(body).digest()).decode("ascii")
 
     client.create_bucket(Bucket=bucket)
     try:
+        wrong_checksum = base64.b64encode(hashlib.sha256(b"wrong-digest").digest()).decode(
+            "ascii"
+        )
+        with pytest.raises(botocore_exceptions.ClientError) as checksum_mismatch:
+            client.put_object(
+                Bucket=bucket,
+                Key=checksum_mismatch_key,
+                Body=body,
+                IfNoneMatch="*",
+                ChecksumSHA256=wrong_checksum,
+            )
+        checksum_error = checksum_mismatch.value.response
+        assert checksum_error["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert checksum_error["Error"]["Code"] == "XAmzContentChecksumMismatch"
+
         result = client.put_object(
             Bucket=bucket,
             Key=key,
@@ -72,4 +88,5 @@ def test_pinned_minio_supports_checked_conditional_put() -> None:
         assert hashlib.sha256(loaded).digest() == hashlib.sha256(body).digest()
     finally:
         client.delete_object(Bucket=bucket, Key=key)
+        client.delete_object(Bucket=bucket, Key=checksum_mismatch_key)
         client.delete_bucket(Bucket=bucket)

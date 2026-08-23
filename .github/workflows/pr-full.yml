@@ -2,7 +2,7 @@ name: V0.23 PR full
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -29,7 +29,12 @@ concurrency:
 jobs:
   profile:
     name: Validate L2 profile
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'),
+      github.event.label.name)))
     runs-on: ubuntu-latest
     outputs:
       profile: ${{ steps.resolve.outputs.profile }}
@@ -143,7 +148,11 @@ jobs:
     needs: [profile, core, service]
     if: >-
       always() &&
-      (github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false)
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'),
+      github.event.label.name))))
     runs-on: ubuntu-latest
     steps:
       - name: Require profile, core, and selected service success

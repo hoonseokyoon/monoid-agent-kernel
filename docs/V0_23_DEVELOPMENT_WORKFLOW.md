@@ -250,7 +250,7 @@ CI foundation PR에서 현재 단일 `.github/workflows/ci.yml`을 다음 의미
 | workflow | trigger | 내용 |
 |---|---|---|
 | fast PR | 모든 `pull_request` push | L1 fast gate |
-| full PR | non-Draft `opened`/`reopened`, `ready_for_review`, 명시적 manual dispatch | L2 PR gate |
+| full PR | non-Draft `opened`/`reopened`, `ready_for_review`, plan-owned `ci:<profile>` label 변경, 명시적 manual dispatch | L2 PR gate |
 | full cancel sentinel | `converted_to_draft` | 같은 PR의 진행 중 L2 run 취소; code checkout/test 없음 |
 | integration | v0.23 통합 브랜치와 `develop` push | 영향받은 서비스와 combined gate |
 | release | release PR/tag/manual | L3 전체 matrix와 wheel audit |
@@ -261,6 +261,9 @@ CI foundation PR에서 현재 단일 `.github/workflows/ci.yml`을 다음 의미
 service label이 없으면 `core`, 하나 있으면 해당 profile을 선택한다.
 Draft `opened`/`reopened` payload는 full workflow의 profile과 required gate를 모두 skip한다. 처음부터
 Ready로 생성했거나 Ready 상태로 reopen한 PR은 같은 L2 required gate를 실행한다.
+non-Draft campaign PR이 profile label 없이 열려 최초 profile 검증이 실패해도 plan-owned
+`ci:core`, `ci:postgres`, `ci:objectstore`, `ci:temporal`, `ci:combined` label을 추가하거나 제거하면
+L2 required gate를 다시 실행한다. 다른 label 변경은 L2를 실행하지 않는다.
 
 PR 1 capability gate가 Draft 수동 Codex review 미지원을 확인하면 앞의 두 PR workflow를 다음과
 같이 대체한다.
