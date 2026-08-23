@@ -180,6 +180,13 @@ EXPECTED_CONTRACTS_ALL = [
 ]
 
 REMOVED_PUBLIC_SURFACE_NAMES = [
+    "WriterAuthority",
+    "WriterLease",
+    "RenewResult",
+    "ReleaseResult",
+    "WriterLeaseUnavailable",
+    "WriterAuthorityStore",
+    "renew_writer_lease",
     "WriterToken",
     "CommitResult",
     "ModelInvocationRecord",
@@ -402,6 +409,13 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
     import monoid_agent_kernel.hosting as hosting
 
     assert hosting.__all__ == [
+        "WriterAuthority",
+        "WriterLease",
+        "RenewResult",
+        "ReleaseResult",
+        "WriterLeaseUnavailable",
+        "WriterAuthorityStore",
+        "renew_writer_lease",
         "WriterToken",
         "CommitResult",
         "ModelInvocationRecord",
@@ -713,7 +727,28 @@ import monoid_agent_kernel.adapters.object_store as object_store
 import monoid_agent_kernel.adapters.temporal as temporal
 
 assert adapters.__all__ == []
-assert postgres.__all__ == []
+assert postgres.__all__ == [
+    'PostgresConfig',
+    'PostgresDependencyMissing',
+    'PostgresDatabaseClosed',
+    'UnsupportedPostgresVersion',
+    'PostgresHealth',
+    'PostgresDatabase',
+    'SCHEMA_VERSION',
+    'PostgresMigrationError',
+    'PostgresMigrationDrift',
+    'PostgresSchemaIncompatible',
+    'MigrationInfo',
+    'InstalledMigration',
+    'MigrationStatus',
+    'MigrationPlan',
+    'MigrationApplyResult',
+    'PostgresDoctorReport',
+    'bundled_migrations',
+    'PostgresMigrations',
+    'PostgresWriterAuthorityStore',
+]
+assert all(hasattr(postgres, name) for name in postgres.__all__)
 assert object_store.__all__ == []
 assert temporal.__all__ == []
 blocked = [

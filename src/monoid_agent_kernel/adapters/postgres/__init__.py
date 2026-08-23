@@ -1,7 +1,47 @@
-"""PostgreSQL adapter namespace.
+"""PostgreSQL production adapter with an optional, lazy psycopg boundary."""
 
-The concrete adapter is introduced incrementally during v0.23.  Importing this namespace never
-loads psycopg; implementation modules own that optional dependency boundary.
-"""
+from .authority import PostgresWriterAuthorityStore
+from .config import PostgresConfig
+from .migrations import (
+    SCHEMA_VERSION,
+    InstalledMigration,
+    MigrationApplyResult,
+    MigrationInfo,
+    MigrationPlan,
+    MigrationStatus,
+    PostgresDoctorReport,
+    PostgresMigrationDrift,
+    PostgresMigrationError,
+    PostgresMigrations,
+    PostgresSchemaIncompatible,
+    bundled_migrations,
+)
+from .pool import (
+    PostgresDatabase,
+    PostgresDatabaseClosed,
+    PostgresDependencyMissing,
+    PostgresHealth,
+    UnsupportedPostgresVersion,
+)
 
-__all__: list[str] = []
+__all__ = [
+    "PostgresConfig",
+    "PostgresDependencyMissing",
+    "PostgresDatabaseClosed",
+    "UnsupportedPostgresVersion",
+    "PostgresHealth",
+    "PostgresDatabase",
+    "SCHEMA_VERSION",
+    "PostgresMigrationError",
+    "PostgresMigrationDrift",
+    "PostgresSchemaIncompatible",
+    "MigrationInfo",
+    "InstalledMigration",
+    "MigrationStatus",
+    "MigrationPlan",
+    "MigrationApplyResult",
+    "PostgresDoctorReport",
+    "bundled_migrations",
+    "PostgresMigrations",
+    "PostgresWriterAuthorityStore",
+]
