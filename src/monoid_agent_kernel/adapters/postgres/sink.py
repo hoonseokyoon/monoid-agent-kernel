@@ -811,6 +811,7 @@ class PostgresFencedRunSink:
         return lambda sha256: self._read_blob(run_id, sha256)
 
     def _read_blob(self, run_id: str, sha256: str) -> bytes:
+        self._require_ready()
         if not is_safe_opaque_id(run_id) or not is_recorded_digest(sha256):
             raise KeyError(sha256)
         from psycopg import sql

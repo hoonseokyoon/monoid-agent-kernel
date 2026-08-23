@@ -1153,6 +1153,20 @@ def test_checked_readers_classify_future_and_corrupt_payloads(
 def test_sink_readiness_requires_reader_and_writer_compatibility(
     sink_harness: _SinkHarness,
 ) -> None:
+    run_id = "run-reader-incompatible"
+    token = sink_harness.claim(run_id)
+    sha256, blobs = _blob(b"lazy-before-forward-migration")
+    assert (
+        sink_harness.sink.commit_checkpoint(
+            _checkpoint_with_blob(run_id, 1, sha256, "loaded-before-forward"),
+            blobs,
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+    loaded = sink_harness.sink.latest_checked(run_id)
+    assert loaded.value is not None
+
     with sink_harness.database.transaction() as connection:
         with sink_harness.database.cursor(connection) as cursor:
             cursor.execute(
@@ -1169,11 +1183,13 @@ def test_sink_readiness_requires_reader_and_writer_compatibility(
                 ("0003_reader_incompatible", 3, "f" * 64, 3, 2),
             )
 
-    sink = PostgresFencedRunSink(sink_harness.database)
+    sink = sink_harness.sink
     with pytest.raises(PostgresSchemaIncompatible, match="reader and writer"):
         sink.check_ready()
     with pytest.raises(PostgresSchemaIncompatible, match="successful check_ready"):
-        sink.latest_checked("run-reader-incompatible")
+        sink.latest_checked(run_id)
+    with pytest.raises(PostgresSchemaIncompatible, match="successful check_ready"):
+        loaded.value.blob(sha256)
 
 
 def test_sink_uses_positional_rows_with_a_caller_dict_pool(
