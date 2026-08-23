@@ -162,13 +162,19 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "types: [opened, reopened, ready_for_review, labeled, unlabeled]" in full
     assert "ready_for_review" in full
     assert "workflow_dispatch" in full
-    assert full.count("github.event.pull_request.draft == false") == 2
+    assert "name: Classify L2 trigger" in full
+    assert "mode=dormant" in full
+    assert "mode=diagnostic" in full
+    assert "mode=required" in full
     assert full.count("contains(fromJSON(") == 2
     assert full.count('"ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"') == 2
-    assert "'L2 diagnostic gate' || 'L2 required gate'" in full
+    assert "name: L2 ${{ needs.trigger.outputs.mode || 'dormant' }} gate" in full
+    assert "Record dormant trigger without qualification authority" in full
+    assert "needs: [trigger, profile, core, service]" in full
+    assert "full-${{" in full and "'dormant-'" in full
     assert ".[dev,openai,reference-dbos]" in full
     assert '(unit or contract) and serial and not service' in full
-    assert "full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
+    assert "pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}" in full
     assert "      - name: Record qualified merge candidate\n        if: always()" not in full
     assert (
         "      - uses: actions/upload-artifact@v4\n"

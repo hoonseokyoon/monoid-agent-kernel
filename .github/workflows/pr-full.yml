@@ -23,18 +23,38 @@ permissions:
   contents: read
 
 concurrency:
-  group: full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: full-${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'), github.event.label.name) == false) && 'dormant-' || '' }}pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  trigger:
+    name: Classify L2 trigger
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+    steps:
+      - name: Classify required, diagnostic, or dormant execution
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          LABEL_EVENT: ${{ github.event.action == 'labeled' || github.event.action == 'unlabeled' }}
+          RELEVANT_LABEL: ${{ contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'), github.event.label.name) }}
+        run: |
+          mode=dormant
+          if test "$EVENT_NAME" = workflow_dispatch; then
+            mode=diagnostic
+          elif test "$PR_DRAFT" = false; then
+            if test "$LABEL_EVENT" != true || test "$RELEVANT_LABEL" = true; then
+              mode=required
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
   profile:
     name: Validate L2 profile
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.draft == false &&
-      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'),
-      github.event.label.name)))
+    needs: trigger
+    if: needs.trigger.outputs.mode != 'dormant'
     runs-on: ubuntu-latest
     outputs:
       profile: ${{ steps.resolve.outputs.profile }}
@@ -144,18 +164,18 @@ jobs:
         run: docker compose -f tests/service/compose.yml down --volumes
 
   gate:
-    name: ${{ github.event_name == 'workflow_dispatch' && 'L2 diagnostic gate' || 'L2 required gate' }}
-    needs: [profile, core, service]
-    if: >-
-      always() &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event.pull_request.draft == false &&
-      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
-      contains(fromJSON('["ci:core","ci:postgres","ci:objectstore","ci:temporal","ci:combined"]'),
-      github.event.label.name))))
+    name: L2 ${{ needs.trigger.outputs.mode || 'dormant' }} gate
+    needs: [trigger, profile, core, service]
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Record dormant trigger without qualification authority
+        if: needs.trigger.outputs.mode == 'dormant'
+        run: echo "This event does not create L2 merge evidence."
       - name: Require profile, core, and selected service success
+        if: >-
+          needs.trigger.outputs.mode == 'required' ||
+          needs.trigger.outputs.mode == 'diagnostic'
         env:
           PROFILE_RESULT: ${{ needs.profile.result }}
           CORE_RESULT: ${{ needs.core.result }}

@@ -242,6 +242,8 @@ workflow를 Pending으로 남길 수 있어 merge gate가 불명확해진다. �
 - [GitHub Actions pull_request activity types](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
 - [Workflow concurrency와 진행 중 run 취소](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 - [Skip된 required check의 Pending 동작](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs?apiVersion=2022-11-28)
+- [조건부 skip job의 Success 처리](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-jobs-with-conditions)
+- [Required status check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)
 
 ### 7.4 workflow 분리 기준
 
@@ -259,11 +261,24 @@ CI foundation PR에서 현재 단일 `.github/workflows/ci.yml`을 다음 의미
 `codex/v0.23-production-adapters` → `develop` 통합 PR과 `develop` → `main` release PR은
 `combined` profile을 자동 선택하며 다른 profile label을 거부한다. 이 캠페인 밖의 Ready PR은
 service label이 없으면 `core`, 하나 있으면 해당 profile을 선택한다.
-Draft `opened`/`reopened` payload는 full workflow의 profile과 required gate를 모두 skip한다. 처음부터
-Ready로 생성했거나 Ready 상태로 reopen한 PR은 같은 L2 required gate를 실행한다.
+Draft `opened`/`reopened` payload는 profile/core/service를 skip하고 `L2 dormant gate`만 실행한다.
+처음부터 Ready로 생성했거나 Ready 상태로 reopen한 PR은 `L2 required gate`를 실행한다.
 non-Draft campaign PR이 profile label 없이 열려 최초 profile 검증이 실패해도 plan-owned
 `ci:core`, `ci:postgres`, `ci:objectstore`, `ci:temporal`, `ci:combined` label을 추가하거나 제거하면
 L2 required gate를 다시 실행한다. 다른 label 변경은 L2를 실행하지 않는다.
+
+full workflow는 모든 event를 lightweight trigger job에서 다음 세 mode로 분류한다.
+
+| mode | event | final check identity | merge authority |
+|---|---|---|---|
+| required | non-Draft opened/reopened/ready, plan-owned profile label 변경 | `L2 required gate` | 있음; core/service 결과를 항상 검사 |
+| diagnostic | manual dispatch | `L2 diagnostic gate` | 없음 |
+| dormant | Draft event, 다른 label 변경 | `L2 dormant gate` | 없음 |
+
+final gate job은 조건부 skip하지 않는다. required/diagnostic mode에서는 dependency 결과를 검사하고,
+dormant mode에서는 qualification authority가 없음을 기록한다. GitHub가 조건부 skip job을 Success로
+처리하므로 dormant event가 `L2 required gate` 이름을 생성하지 않게 check identity를 분리한다. 다른
+label 변경은 `full-dormant-pr-*` concurrency group을 사용해 실행 중 required L2를 취소하지 않는다.
 
 PR 1 capability gate가 Draft 수동 Codex review 미지원을 확인하면 앞의 두 PR workflow를 다음과
 같이 대체한다.
@@ -279,9 +294,9 @@ SHA의 full check가 없으므로 merge가 차단된다. 개발자는 Draft로 �
 head에 label을 다시 붙인다. 긴 review cycle에서 의도하지 않은 서비스 matrix 반복을 두 경로 모두
 막는다.
 
-수동 `workflow_dispatch`는 `L2 diagnostic gate` check를 만든다. Ready 이벤트만 `L2 required gate`
-check를 만들며 branch protection은 이 이름만 요구한다. 수동 진단의 ref/profile 선택이 required
-merge evidence를 대체하지 않는다.
+수동 `workflow_dispatch`는 `L2 diagnostic gate` check를 만든다. non-Draft Ready 진입과 plan-owned
+profile label 변경은 `L2 required gate` check를 만들며 branch protection은 이 이름만 요구한다.
+수동 진단과 dormant event는 required merge evidence를 대체하지 않는다.
 
 fast workflow는 자체 key를 사용한다.
 
@@ -291,18 +306,19 @@ concurrency:
   cancel-in-progress: true
 ```
 
-full PR workflow와 cancel-sentinel workflow는 의도적으로 같은 key를 사용한다.
+required/diagnostic full run과 cancel-sentinel workflow는 의도적으로 같은 key를 사용한다.
 
 ```yaml
 concurrency:
-  group: full-pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: full-<required-or-dormant>pr-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 ```
 
 새 Ready checkpoint는 이전 L2를 취소한다. `converted_to_draft` sentinel도 같은 key로 진행 중 L2를
 취소한 뒤 즉시 끝난다. GitHub concurrency group은 같은 repository의 서로 다른 workflow 사이에도
 적용된다. workflow 이름을 key에 넣지 않는 이유가 이 cross-workflow cancellation이다. release
-artifact publish 단계는 별도 concurrency group과 `cancel-in-progress: false`를 사용한다.
+artifact publish 단계는 별도 concurrency group과 `cancel-in-progress: false`를 사용한다. dormant
+label event는 `full-dormant-pr-*` key를 사용해 required run을 취소하지 않는다.
 
 ### 7.5 서비스 profile
 
