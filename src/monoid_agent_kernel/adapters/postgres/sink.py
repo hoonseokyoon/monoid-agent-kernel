@@ -451,7 +451,8 @@ class PostgresFencedRunSink:
 
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
-                "SELECT record.revision, record.content_digest, record.payload "
+                "SELECT record.revision, record.content_digest, record.payload, "
+                "record.submitted_blobs "
                 "FROM {} AS head LEFT JOIN {} AS record "
                 "ON record.run_id = head.run_id "
                 "AND record.logical_call_id = head.logical_call_id "
@@ -479,10 +480,18 @@ class PostgresFencedRunSink:
         if head_row[0] is None or head_row[1] is None or not isinstance(head_row[2], dict):
             return ""
         previous_digest = str(head_row[1])
+        if _checked_stored_digest(head_row[2], head_row[3], head_row[1]) is None:
+            return previous_digest
         decoded = decode_model_invocation(head_row[2])
         if not decoded.ok or decoded.value is None:
             return previous_digest
         previous = decoded.value
+        if (
+            previous.run_id != invocation.run_id
+            or previous.logical_call_id != invocation.logical_call_id
+            or previous.revision != int(head_row[0])
+        ):
+            return previous_digest
         if invocation.revision != previous.revision + 1:
             return previous_digest
         invocation_payload = invocation.to_json()
@@ -547,7 +556,11 @@ class PostgresFencedRunSink:
     ) -> tuple[CommitResult, str]:
         if not isinstance(invocation, DurableModelInvocation):
             return CommitResult(status="conflict"), ""
-        if type(stage_evidence) is not bool or stage_evidence:
+        if (
+            type(stage_evidence) is not bool
+            or stage_evidence
+            or invocation.evidence_policy == "outbox"
+        ):
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         submitted = self._validated_blobs(blobs)
         if submitted is None:

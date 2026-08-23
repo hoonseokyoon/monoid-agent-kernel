@@ -163,6 +163,7 @@ def _invocation(
     succeeded_blob: str = "",
     request_digest: str = "a" * 64,
     duration_ms: float | None = None,
+    evidence_policy: str = "passive",
 ) -> DurableModelInvocation:
     receipt = None
     result_ref = ""
@@ -185,6 +186,7 @@ def _invocation(
         dispatch_state=state,  # type: ignore[arg-type]
         request_digest=request_digest,
         digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+        evidence_policy=evidence_policy,  # type: ignore[arg-type]
         receipt=receipt,
         result_ref=result_ref,
         failure_code=failure_code,
@@ -561,6 +563,60 @@ def test_invocation_lifecycle_result_blob_and_retry_rules(
         ).status
         == "conflict"
     )
+
+
+def test_invocation_transition_rejects_a_corrupt_prior_digest(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-corrupt-transition"
+    token = sink_harness.claim(run_id)
+    reserved = _invocation(run_id, 1, "reserved")
+    assert sink_harness.sink.commit_invocation(reserved, {}, writer_token=token).status == (
+        "committed"
+    )
+
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT payload FROM {} WHERE run_id = %s AND logical_call_id = %s "
+                    "AND revision = %s"
+                ).format(sql.Identifier(sink_harness.database.config.schema, "invocation_record")),
+                (run_id, "call-1", 1),
+            )
+            changed = {**cursor.fetchone()[0], "dispatch_state": "dispatch_started"}
+            cursor.execute(
+                sql.SQL(
+                    "UPDATE {} SET payload = %s WHERE run_id = %s AND logical_call_id = %s "
+                    "AND revision = %s"
+                ).format(sql.Identifier(sink_harness.database.config.schema, "invocation_record")),
+                (Json(changed), run_id, "call-1", 1),
+            )
+
+    result = sink_harness.sink.commit_invocation(
+        _invocation(run_id, 2, "settled"),
+        {},
+        writer_token=token,
+    )
+    assert result.status == "conflict"
+    assert _table_count(sink_harness, "invocation_record", run_id) == 1
+    assert sink_harness.sink.load_invocation(run_id, "call-1").status == "corrupt"
+
+
+def test_invocation_outbox_policy_is_rejected_before_insert(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-outbox-unsupported"
+    token = sink_harness.claim(run_id)
+
+    result = sink_harness.sink.commit_invocation(
+        _invocation(run_id, 1, "reserved", evidence_policy="outbox"),
+        {},
+        writer_token=token,
+    )
+
+    assert result.status == "conflict"
+    assert _table_count(sink_harness, "invocation_record", run_id) == 0
 
 
 def test_competing_checkpoint_and_invocation_coordinates_have_one_winner(
