@@ -326,6 +326,87 @@ def test_migration_advisory_lock_serializes_independent_runners(
     assert PostgresMigrations(postgres_database).status().current is True
 
 
+def test_migration_path_resists_pooled_temp_table_shadowing(
+    postgres_database: PostgresDatabase,
+) -> None:
+    caller_pool = ConnectionPool(
+        postgres_database.config.dsn,
+        min_size=1,
+        max_size=1,
+        open=False,
+    )
+    caller_pool.open(wait=True, timeout=10)
+    database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=1,
+            application_name="monoid-pr02-temp-shadow",
+        ),
+        pool=caller_pool,
+    )
+    database.open()
+    try:
+        with database.connection() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TEMP TABLE monoid_schema_migrations (
+                            migration_id text,
+                            ordinal smallint,
+                            checksum_sha256 character(64),
+                            reader_floor smallint,
+                            writer_floor smallint,
+                            applied_at timestamp with time zone
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE TEMP TABLE run_authority (
+                            leased_until timestamp with time zone,
+                            revoked boolean
+                        )
+                        """
+                    )
+
+        result = PostgresMigrations(database).apply()
+        assert result.status.current is True
+        assert tuple(item.migration_id for item in result.applied) == ("0001_authority",)
+
+        with database.connection() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT count(*) FROM pg_temp.monoid_schema_migrations")
+                    assert cursor.fetchone() == (0,)
+                    cursor.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_class AS relation
+                            JOIN pg_namespace AS namespace
+                              ON namespace.oid = relation.relnamespace
+                            WHERE namespace.nspname = %s
+                              AND relation.relname = 'run_authority_expiry_idx'
+                              AND relation.relkind = 'i'
+                        ), EXISTS (
+                            SELECT 1
+                            FROM pg_class AS relation
+                            WHERE relation.relnamespace = pg_my_temp_schema()
+                              AND relation.relname = 'run_authority_expiry_idx'
+                              AND relation.relkind = 'i'
+                        )
+                        """,
+                        (database.config.schema,),
+                    )
+                    assert cursor.fetchone() == (True, False)
+    finally:
+        database.close()
+        caller_pool.close()
+
+
 @pytest.mark.parametrize(
     "isolation_level",
     [IsolationLevel.REPEATABLE_READ, IsolationLevel.SERIALIZABLE],

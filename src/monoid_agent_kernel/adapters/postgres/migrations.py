@@ -164,7 +164,12 @@ class PostgresMigrations:
         from psycopg import sql
 
         cursor.execute(  # type: ignore[attr-defined]
-            sql.SQL("SET LOCAL search_path TO {}, pg_catalog").format(sql.Identifier(schema))
+            # PostgreSQL searches the temporary schema first when pg_temp is omitted, even from
+            # an explicit path. Put it last so pooled-session temp objects cannot shadow trusted
+            # migration relations; keep pg_catalog ahead of it for built-in function resolution.
+            sql.SQL("SET LOCAL search_path TO {}, pg_catalog, pg_temp").format(
+                sql.Identifier(schema)
+            )
         )
 
     def _inspect(self, connection: object) -> MigrationStatus:
@@ -319,10 +324,12 @@ class PostgresMigrations:
                             ),
                         )
             after = self._inspect(connection)
-        if not after.current:
-            raise PostgresSchemaIncompatible(
-                "PostgreSQL migrations completed without a current compatible schema"
-            )
+            if not after.current:
+                # Preserve migration atomicity: a failed postcondition must roll back the same
+                # transaction instead of committing a partially applied schema.
+                raise PostgresSchemaIncompatible(
+                    "PostgreSQL migrations completed without a current compatible schema"
+                )
         return MigrationApplyResult(
             applied=tuple(source.info for source in pending_sources),
             status=after,
