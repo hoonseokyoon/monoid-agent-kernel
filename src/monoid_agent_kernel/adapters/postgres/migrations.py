@@ -180,7 +180,7 @@ class PostgresMigrations:
 
         schema = self.database.config.schema
         sources = _sources()
-        with connection.cursor() as cursor:  # type: ignore[attr-defined]
+        with self.database.cursor(connection) as cursor:
             schema_exists = self._schema_exists(cursor, schema)
             if not schema_exists:
                 return MigrationStatus(
@@ -293,7 +293,7 @@ class PostgresMigrations:
 
         schema = self.database.config.schema
         with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.database.cursor(connection) as cursor:
                 cursor.execute(
                     "SELECT pg_catalog.pg_advisory_xact_lock("
                     "pg_catalog.hashtextextended(%s, 0))",
@@ -305,7 +305,7 @@ class PostgresMigrations:
                 source for source in _sources() if source.info.migration_id in pending_ids
             )
             if pending_sources:
-                with connection.cursor() as cursor:
+                with self.database.cursor(connection) as cursor:
                     cursor.execute(
                         sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema))
                     )

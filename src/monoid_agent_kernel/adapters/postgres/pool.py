@@ -23,6 +23,12 @@ class UnsupportedPostgresVersion(RuntimeError):
     """The connected server is older than the supported production floor."""
 
 
+def _tuple_row(_cursor: object) -> type[tuple]:
+    """Return positional rows without importing the optional psycopg package."""
+
+    return tuple
+
+
 @dataclass(frozen=True, kw_only=True)
 class PostgresHealth:
     server_version_num: int
@@ -143,12 +149,19 @@ class PostgresDatabase:
             yield connection
 
     @contextmanager
+    def cursor(self, connection: Any) -> Iterator[Any]:
+        """Create an adapter cursor whose rows are positional regardless of caller pool policy."""
+
+        with connection.cursor(row_factory=_tuple_row) as cursor:
+            yield cursor
+
+    @contextmanager
     def transaction(self) -> Iterator[Any]:
         """Start the adapter's READ COMMITTED transaction with a trusted local search path."""
 
         with self.connection() as connection:
             with connection.transaction():
-                with connection.cursor() as cursor:
+                with self.cursor(connection) as cursor:
                     # This is deliberately the first statement. Adapter linearization may wait on
                     # row, unique-index, or advisory locks and then needs a new statement snapshot.
                     cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -162,7 +175,7 @@ class PostgresDatabase:
         """Verify connectivity, supported major version, and database-clock availability."""
 
         with self.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.cursor(connection) as cursor:
                 cursor.execute(
                     "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, "
                     "pg_catalog.clock_timestamp()"

@@ -194,7 +194,7 @@ class PostgresWriterAuthorityStore:
         ttl_microseconds = _ttl_microseconds(ttl)
 
         with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.database.cursor(connection) as cursor:
                 current = self._read_locked(cursor, run_id)
                 if current is None:
                     inserted = self._insert_first(cursor, run_id, owner_id, ttl_microseconds)
@@ -223,7 +223,7 @@ class PostgresWriterAuthorityStore:
         from psycopg import sql
 
         with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.database.cursor(connection) as cursor:
                 current = self._read_locked(cursor, writer_token.run_id)
                 if current is None or current.writer_token != writer_token or not current.active:
                     return RenewResult(status="fenced", authority=current)
@@ -270,7 +270,7 @@ class PostgresWriterAuthorityStore:
         from psycopg import sql
 
         with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.database.cursor(connection) as cursor:
                 current = self._read_locked(cursor, writer_token.run_id)
                 if current is None or current.writer_token != writer_token:
                     return ReleaseResult(status="fenced", authority=current)
@@ -309,7 +309,7 @@ class PostgresWriterAuthorityStore:
             raise ValueError("writer authority run_id must be a bounded opaque id")
 
         with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
+            with self.database.cursor(connection) as cursor:
                 # Keep the returned row version and observed_at on one linearized boundary.
                 # `_read_locked` acquires the row before sampling the database clock.
                 return self._read_locked(cursor, run_id)

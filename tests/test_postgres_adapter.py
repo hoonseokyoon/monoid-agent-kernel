@@ -38,13 +38,15 @@ class _FakeConnection:
     def __init__(self) -> None:
         self.cursor_value = _FakeCursor((160015, datetime(2026, 8, 24, tzinfo=UTC)))
         self.transactions = 0
+        self.row_factories: list[object | None] = []
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
         self.transactions += 1
         yield
 
-    def cursor(self) -> _FakeCursor:
+    def cursor(self, *, row_factory: object | None = None) -> _FakeCursor:
+        self.row_factories.append(row_factory)
         return self.cursor_value
 
 
@@ -143,6 +145,7 @@ def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
     database = PostgresDatabase(PostgresConfig(dsn="postgresql://unused/service"), pool=pool)
     database.open()
     pool.connection_value.cursor_value.executed.clear()
+    pool.connection_value.row_factories.clear()
 
     with database.transaction():
         pass
@@ -151,6 +154,8 @@ def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
         ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", None),
         ("SET LOCAL search_path TO pg_catalog, pg_temp", None),
     ]
+    assert len(pool.connection_value.row_factories) == 1
+    assert getattr(pool.connection_value.row_factories[0], "__name__", "") == "_tuple_row"
     database.close()
 
 

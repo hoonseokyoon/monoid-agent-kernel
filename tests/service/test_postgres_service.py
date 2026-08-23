@@ -23,6 +23,7 @@ if not _selected():
 
 import psycopg  # noqa: E402
 from psycopg import IsolationLevel, sql  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
 from psycopg_pool import ConnectionPool  # noqa: E402
 
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
@@ -466,6 +467,46 @@ def test_migration_schema_cannot_shadow_pg_catalog_builtins(
                 raise RollBackDefaultProbe
     except RollBackDefaultProbe:
         pass
+
+
+def test_caller_pool_row_factory_does_not_change_adapter_rows(
+    postgres_database: PostgresDatabase,
+) -> None:
+    caller_pool = ConnectionPool(
+        postgres_database.config.dsn,
+        kwargs={"row_factory": dict_row},
+        min_size=1,
+        max_size=1,
+        open=False,
+    )
+    caller_pool.open(wait=True, timeout=10)
+    database = PostgresDatabase(
+        PostgresConfig(
+            dsn=postgres_database.config.dsn,
+            schema=postgres_database.config.schema,
+            min_pool_size=1,
+            max_pool_size=1,
+            application_name="monoid-pr02-dict-row",
+        ),
+        pool=caller_pool,
+    )
+    try:
+        health = database.open()
+        assert health.server_major == 16
+        assert PostgresMigrations(database).apply().status.current is True
+        store = PostgresWriterAuthorityStore(database)
+        store.check_ready()
+        lease = store.claim("run-dict-row", "worker-a", timedelta(seconds=10))
+        assert store.read("run-dict-row").writer_token == lease.writer_token  # type: ignore[union-attr]
+
+        with database.connection() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT 1 AS value")
+                    assert cursor.fetchone() == {"value": 1}
+    finally:
+        database.close()
+        caller_pool.close()
 
 
 @pytest.mark.parametrize(
