@@ -27,6 +27,7 @@ from monoid_agent_kernel.hosting import (
     DurableStreamSealResult,
     DurableStreamWriteError,
     WriterToken,
+    durable_model_stream_id,
 )
 
 
@@ -387,6 +388,8 @@ def test_model_stream_observer_coalesces_utf8_batches_and_seals_each_lane() -> N
 
     output = next(identity for identity in store.heads if identity.channel == "output")
     reasoning = next(identity for identity in store.heads if identity.channel == "reasoning")
+    assert output.stream_id == durable_model_stream_id(_context().run_id, _context().turn_id)
+    assert output.stream_id != _context().stream_id
     output_bytes = b"".join(
         value.data for value in store.chunks[(output, store.heads[output].generation)]
     )

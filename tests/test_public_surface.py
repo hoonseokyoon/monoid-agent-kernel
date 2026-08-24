@@ -487,6 +487,7 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "ObjectGcReceipt",
         "MAX_STREAM_CHUNK_BYTES",
         "MAX_STREAM_READ_CHUNKS",
+        "durable_model_stream_id",
         "StreamState",
         "StreamOpenStatus",
         "StreamResetStatus",

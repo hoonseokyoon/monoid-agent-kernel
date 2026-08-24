@@ -639,9 +639,10 @@ Host-defined private lanes use the same `DurableStreamIdentity` contract directl
 thresholds bound coalescing; a copied-context daemon performs ordered flushes. Observer failures
 retain the existing model-stream rule: they do not replace a paid provider result. A `fenced`
 store result revokes the shared activation authority, so later kernel publication fails closed.
-AgentLoop derives `stream_id` from the durable logical-call address. A recovered completed call
-reuses its sealed generation; the first delta from an admitted replacement dispatch lazily resets
-that lane to a new generation before persisting bytes.
+The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
+leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
+call reuses its sealed generation; the first delta from an admitted replacement dispatch lazily
+resets that lane to a new generation before persisting bytes.
 
 Persist reconnect state as `(generation, cursor)`. Call `read_after()` only with cursor values
 returned by a prior read. `ok` returns complete UTF-8 chunks and `next_cursor`; `reset` tells the

@@ -203,6 +203,13 @@ class PostgresObjectStoreDurableStreamStore:
             "pg_catalog.hashtextextended(%s, 0))",
             (f"monoid-agent-kernel:object:{self.database.config.schema}:{stat.sha256}",),
         )
+        # GC uses the same digest lock. The stat captured before this transaction can become stale
+        # while GC deletes an unassociated object, so physical storage is authoritative only after
+        # this lock has been acquired and before metadata is made available/associated.
+        if not self._stat_matches(self.object_store.stat(stat.sha256), stat):
+            raise PostgresDurableStreamCorrupt(
+                "ObjectStore stream object changed before digest-locked association"
+            )
         cursor.execute(  # type: ignore[attr-defined]
             sql.SQL(
                 "SELECT size_bytes, locator, generation, state FROM {} WHERE sha256 = %s"
@@ -432,6 +439,58 @@ class PostgresObjectStoreDurableStreamStore:
             )
         return chunk
 
+    def _precheck_append(
+        self,
+        identity: DurableStreamIdentity,
+        *,
+        generation: int,
+        start_offset: int,
+        end_offset: int,
+        sha256: str,
+        writer_token: WriterToken,
+    ) -> DurableStreamAppendResult | None:
+        """Reject without uploading, then release database locks before ObjectStore I/O."""
+
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                if not self._current_writer_locked(cursor, writer_token):
+                    return DurableStreamAppendResult(status="fenced")
+                current = self._head_locked(cursor, identity)
+                if current is None:
+                    return DurableStreamAppendResult(status="conflict")
+                if not _identity_matches(current.identity, identity):
+                    return DurableStreamAppendResult(status="conflict", head=current)
+                if generation != current.generation:
+                    return DurableStreamAppendResult(status="old_generation", head=current)
+                existing = self._chunk_at(cursor, identity, generation, start_offset)
+                if existing is not None:
+                    if existing.end_offset != end_offset or existing.sha256 != sha256:
+                        return DurableStreamAppendResult(status="conflict", head=current)
+                    expected = BlobStat(
+                        sha256=existing.sha256,
+                        size_bytes=existing.size_bytes,
+                        locator=existing.locator,
+                    )
+                    if not self._stat_matches(self.object_store.stat(existing.sha256), expected):
+                        raise PostgresDurableStreamCorrupt(
+                            "idempotent stream chunk no longer has its checked object"
+                        )
+                    return DurableStreamAppendResult(
+                        status="already_committed",
+                        head=current,
+                        chunk=existing,
+                    )
+                if current.state == "sealed":
+                    return DurableStreamAppendResult(status="sealed", head=current)
+                if self._run_is_terminal(cursor, identity.run_id):
+                    return DurableStreamAppendResult(status="run_terminal", head=current)
+                if start_offset != current.cursor_bytes:
+                    return DurableStreamAppendResult(
+                        status="gap" if start_offset > current.cursor_bytes else "conflict",
+                        head=current,
+                    )
+        return None
+
     def append(
         self,
         identity: DurableStreamIdentity,
@@ -463,6 +522,17 @@ class PostgresObjectStoreDurableStreamStore:
         if checked is None:
             return DurableStreamAppendResult(status="fenced")
         identity, writer_token = checked
+        sha256 = hashlib.sha256(data).hexdigest()
+        prechecked = self._precheck_append(
+            identity,
+            generation=generation,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            sha256=sha256,
+            writer_token=writer_token,
+        )
+        if prechecked is not None:
+            return prechecked
         stat = self._put_checked(data)
         from psycopg import sql
 

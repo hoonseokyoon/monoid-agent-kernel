@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
@@ -2956,12 +2957,9 @@ class AgentLoop:
                     run_id=self.spec.run_id,
                     root_run_id=self._validated_root_run_id(),
                     turn_id=turn_id,
-                    # The logical call address is stable across activation/process replacement.
-                    # Reusing it gives durable observers one reconnectable stream coordinate while
-                    # preserving uniqueness across parent, child, and later-turn calls.
-                    stream_id=(
-                        f"stream_{logical_model_call_id(self.spec.run_id, turn_id)}"
-                    ),
+                    # This execution-local ID remains unique for legacy model-content sidecars.
+                    # Durable observers derive their reconnect address from run/turn lineage.
+                    stream_id=f"stream_{uuid.uuid4().hex}",
                     step=step,
                     provider=provider,
                     model=model,

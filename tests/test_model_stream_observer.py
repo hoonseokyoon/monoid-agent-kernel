@@ -12,7 +12,6 @@ from support.runtime import runtime_config, runtime_provider, tool_binding
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, PromptSpec, SubagentDefinition
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.events import AgentEvent
-from monoid_agent_kernel.core.model_invocation import logical_model_call_id
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
@@ -145,9 +144,7 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
     assert context.run_id == result.run_id
     assert context.root_run_id == result.run_id
     assert context.turn_id == "turn_0001"
-    assert context.stream_id == (
-        f"stream_{logical_model_call_id(result.run_id, context.turn_id)}"
-    )
+    assert context.stream_id.startswith("stream_")
     assert context.step == 1
     assert context.provider == "test-provider"
     assert context.model == "gpt-5.5"

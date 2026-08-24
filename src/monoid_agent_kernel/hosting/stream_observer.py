@@ -24,6 +24,7 @@ from monoid_agent_kernel.hosting.streams import (
     DurableStreamHead,
     DurableStreamIdentity,
     DurableStreamStore,
+    durable_model_stream_id,
 )
 
 
@@ -176,7 +177,10 @@ class _DurableModelStreamWriter:
     def _identity(self, channel: str) -> DurableStreamIdentity:
         return DurableStreamIdentity(
             run_id=self._context.run_id,
-            stream_id=self._context.stream_id,
+            stream_id=durable_model_stream_id(
+                self._context.run_id,
+                self._context.turn_id,
+            ),
             logical_call_id=logical_model_call_id(
                 self._context.run_id,
                 self._context.turn_id,

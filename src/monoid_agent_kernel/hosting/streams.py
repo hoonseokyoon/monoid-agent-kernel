@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias, get_args
 
 from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
+from monoid_agent_kernel.core.model_invocation import logical_model_call_id
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id, is_safe_taxonomy_code
 from monoid_agent_kernel.hosting.blobs import is_content_sha256
 from monoid_agent_kernel.hosting.contracts import WriterToken
@@ -52,6 +53,12 @@ StreamSealStatus: TypeAlias = Literal[
     "run_terminal",
 ]
 StreamReadStatus: TypeAlias = Literal["ok", "reset", "gap", "not_found"]
+
+
+def durable_model_stream_id(run_id: str, turn_id: str) -> str:
+    """Derive the reconnectable private stream address for one logical model call."""
+
+    return f"stream_{logical_model_call_id(run_id, turn_id)}"
 
 
 def _portable_non_negative(value: object, field_name: str) -> None:
@@ -321,6 +328,7 @@ class DurableStreamStore(Protocol):
 __all__ = [
     "MAX_STREAM_CHUNK_BYTES",
     "MAX_STREAM_READ_CHUNKS",
+    "durable_model_stream_id",
     "StreamState",
     "StreamOpenStatus",
     "StreamResetStatus",

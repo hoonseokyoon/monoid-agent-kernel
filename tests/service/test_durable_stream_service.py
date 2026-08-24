@@ -29,12 +29,15 @@ from psycopg import sql  # noqa: E402
 from monoid_agent_kernel.adapters.object_store import (  # noqa: E402
     S3ContentAddressedBlobStore,
     S3ObjectStoreConfig,
+    S3ObjectStoreAdmin,
 )
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresConfig,
     PostgresDatabase,
+    PostgresDurableStreamCorrupt,
     PostgresFencedRunSink,
     PostgresMigrations,
+    PostgresObjectGarbageCollector,
     PostgresObjectStoreDurableStreamStore,
     PostgresWriterAuthorityStore,
 )
@@ -51,6 +54,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     DurableModelStreamObserver,
     DurableStreamIdentity,
     WriterToken,
+    durable_model_stream_id,
 )
 
 
@@ -141,6 +145,44 @@ class _BlockingGetStore:
         return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
 
 
+class _CountingPutStore:
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.puts = 0
+
+    def put_if_absent(self, sha256: str, data: bytes) -> object:
+        self.puts += 1
+        return self.delegate.put_if_absent(sha256, data)  # type: ignore[attr-defined,no-any-return]
+
+    def stat(self, sha256: str) -> object:
+        return self.delegate.stat(sha256)  # type: ignore[attr-defined,no-any-return]
+
+    def get_checked(self, sha256: str) -> bytes:
+        return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
+
+
+class _BlockingStatStore:
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.captured = threading.Event()
+        self.release = threading.Event()
+        self._block_once = True
+
+    def put_if_absent(self, sha256: str, data: bytes) -> object:
+        return self.delegate.put_if_absent(sha256, data)  # type: ignore[attr-defined,no-any-return]
+
+    def stat(self, sha256: str) -> object:
+        value = self.delegate.stat(sha256)  # type: ignore[attr-defined]
+        if self._block_once:
+            self._block_once = False
+            self.captured.set()
+            assert self.release.wait(10)
+        return value
+
+    def get_checked(self, sha256: str) -> bytes:
+        return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
+
+
 @pytest.fixture
 def harness(postgres_target: tuple[str, int]) -> Iterator[_Harness]:
     dsn, expected_major = postgres_target
@@ -148,6 +190,10 @@ def harness(postgres_target: tuple[str, int]) -> Iterator[_Harness]:
     client = _client()
     bucket = f"monoid-v023-stream-{uuid.uuid4().hex}"
     client.create_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    client.put_bucket_versioning(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
     database = PostgresDatabase(
         PostgresConfig(
             dsn=dsn,
@@ -189,6 +235,13 @@ def harness(postgres_target: tuple[str, int]) -> Iterator[_Harness]:
         objects = client.list_objects_v2(Bucket=bucket).get("Contents", [])  # type: ignore[attr-defined]
         for value in objects:
             client.delete_object(Bucket=bucket, Key=value["Key"])  # type: ignore[attr-defined]
+        versions = client.list_object_versions(Bucket=bucket)  # type: ignore[attr-defined]
+        for value in (*versions.get("Versions", []), *versions.get("DeleteMarkers", [])):
+            client.delete_object(  # type: ignore[attr-defined]
+                Bucket=bucket,
+                Key=value["Key"],
+                VersionId=value["VersionId"],
+            )
         client.delete_bucket(Bucket=bucket)  # type: ignore[attr-defined]
 
 
@@ -433,7 +486,7 @@ def test_actual_stream_store_fences_takeover_and_model_observer_persists(
 
     output_identity = DurableStreamIdentity(
         run_id=observer_run,
-        stream_id=context.stream_id,
+        stream_id=durable_model_stream_id(observer_run, context.turn_id),
         logical_call_id=logical_model_call_id(observer_run, context.turn_id),
         channel="output",
     )
@@ -441,6 +494,154 @@ def test_actual_stream_store_fences_takeover_and_model_observer_persists(
     assert output.status == "ok"
     assert b"".join(chunk.data for chunk in output.chunks) == b"durable answer"
     assert output.head is not None and output.head.state == "sealed"
+
+
+def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) -> None:
+    counting = _CountingPutStore(harness.streams.object_store)
+    streams = PostgresObjectStoreDurableStreamStore(
+        harness.database,
+        counting,  # type: ignore[arg-type]
+    )
+    streams.check_ready()
+    run_id = f"run-stream-precheck-{uuid.uuid4().hex}"
+    token = harness.claim(run_id, "precheck-worker")
+    identity = _identity(run_id, suffix="precheck")
+    assert streams.open(identity, writer_token=token).status == "opened"
+
+    assert streams.append(
+        identity,
+        generation=1,
+        start_offset=99,
+        data=b"gap",
+        writer_token=token,
+    ).status == "gap"
+    assert counting.puts == 0
+
+    data = b"accepted"
+    assert streams.append(
+        identity,
+        generation=1,
+        start_offset=0,
+        data=data,
+        writer_token=token,
+    ).status == "committed"
+    assert counting.puts == 1
+    assert streams.seal(
+        identity,
+        generation=1,
+        final_size_bytes=len(data),
+        final_sha256=hashlib.sha256(data).hexdigest(),
+        writer_token=token,
+    ).status == "sealed"
+    assert streams.append(
+        identity,
+        generation=1,
+        start_offset=len(data),
+        data=b"after-seal",
+        writer_token=token,
+    ).status == "sealed"
+    assert counting.puts == 1
+
+    assert streams.reset(
+        identity,
+        expected_generation=1,
+        reset_id="precheck-reset",
+        writer_token=token,
+    ).status == "reset"
+    assert streams.append(
+        identity,
+        generation=1,
+        start_offset=len(data),
+        data=b"old-generation",
+        writer_token=token,
+    ).status == "old_generation"
+    assert counting.puts == 1
+
+    terminal_run = f"run-stream-precheck-terminal-{uuid.uuid4().hex}"
+    terminal_token = harness.claim(terminal_run, "terminal-precheck-worker")
+    terminal_identity = _identity(terminal_run, suffix="terminal-precheck")
+    assert streams.open(terminal_identity, writer_token=terminal_token).status == "opened"
+    assert harness.sink.settle_terminal(
+        TerminalOutcome(
+            run_id=terminal_run,
+            kind="completed",
+            retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+        ),
+        writer_token=terminal_token,
+    ).status == "committed"
+    assert streams.append(
+        terminal_identity,
+        generation=1,
+        start_offset=0,
+        data=b"after-terminal",
+        writer_token=terminal_token,
+    ).status == "run_terminal"
+    assert counting.puts == 1
+
+    stale_run = f"run-stream-precheck-stale-{uuid.uuid4().hex}"
+    stale = harness.claim(stale_run, "stale-precheck-worker")
+    stale_identity = _identity(stale_run, suffix="stale-precheck")
+    assert streams.open(stale_identity, writer_token=stale).status == "opened"
+    assert harness.authority.release(stale).status == "released"
+    harness.claim(stale_run, "current-precheck-worker")
+    assert streams.append(
+        stale_identity,
+        generation=1,
+        start_offset=0,
+        data=b"stale-writer",
+        writer_token=stale,
+    ).status == "fenced"
+    assert counting.puts == 1
+
+
+def test_gc_delete_between_put_check_and_digest_lock_cannot_publish_chunk(
+    harness: _Harness,
+) -> None:
+    data = b"digest-lock-race"
+    sha256 = hashlib.sha256(data).hexdigest()
+    delegate = harness.streams.object_store
+    delegate.put_if_absent(sha256, data)  # type: ignore[attr-defined]
+    admin = S3ObjectStoreAdmin(delegate.config, client=_client())  # type: ignore[attr-defined]
+    collector = PostgresObjectGarbageCollector(harness.database, admin)
+    collector.check_ready()
+    plan = collector.plan(grace_period=timedelta(0))
+    assert [candidate.sha256 for candidate in plan.candidates] == [sha256]
+
+    blocking = _BlockingStatStore(delegate)
+    streams = PostgresObjectStoreDurableStreamStore(
+        harness.database,
+        blocking,  # type: ignore[arg-type]
+    )
+    streams.check_ready()
+    run_id = f"run-stream-gc-race-{uuid.uuid4().hex}"
+    token = harness.claim(run_id, "gc-race-worker")
+    identity = _identity(run_id, suffix="gc-race")
+    assert streams.open(identity, writer_token=token).status == "opened"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        append_future = executor.submit(
+            lambda: streams.append(
+                identity,
+                generation=1,
+                start_offset=0,
+                data=data,
+                writer_token=token,
+            )
+        )
+        assert blocking.captured.wait(10)
+        try:
+            receipts = collector.apply(plan)
+        finally:
+            blocking.release.set()
+        assert [receipt.status for receipt in receipts] == ["deleted"]
+        with pytest.raises(PostgresDurableStreamCorrupt, match="digest-locked association"):
+            append_future.result(timeout=20)
+
+    assert delegate.stat(sha256) is None  # type: ignore[attr-defined]
+    replay = streams.read_after(identity, generation=1, cursor=0)
+    assert replay.status == "ok"
+    assert replay.head is not None and replay.head.cursor_bytes == 0
+    assert replay.chunks == ()
 
 
 def test_actual_stream_terminal_reset_races_and_slow_seal_do_not_starve_renewal(

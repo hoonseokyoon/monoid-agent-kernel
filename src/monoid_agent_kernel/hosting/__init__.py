@@ -106,6 +106,7 @@ from .streams import (
     StreamResetStatus,
     StreamSealStatus,
     StreamState,
+    durable_model_stream_id,
 )
 from .stream_observer import (
     DurableModelStreamObserver,
@@ -184,6 +185,7 @@ __all__ = [
     "ObjectGcReceipt",
     "MAX_STREAM_CHUNK_BYTES",
     "MAX_STREAM_READ_CHUNKS",
+    "durable_model_stream_id",
     "StreamState",
     "StreamOpenStatus",
     "StreamResetStatus",
