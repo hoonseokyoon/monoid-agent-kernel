@@ -709,6 +709,58 @@ def test_worker_group_rejects_a_shutdown_window_shorter_than_supervisor_cleanup(
         )
 
 
+def test_owned_executor_cleanup_does_not_join_a_stuck_activity_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeWorker:
+        def __init__(self, client: object, **kwargs: Any) -> None:
+            del client, kwargs
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            del exc_info
+
+    monkeypatch.setattr(worker_module, "Worker", FakeWorker)
+    group = worker_module.TemporalWorkerGroup(
+        client=object(),
+        workflow_task_queue="workflow-v1",
+        activity_task_queue="activity-v1",
+        activation_activity=_activity(_AuthorityStore()),
+        max_concurrent_activities=1,
+        graceful_shutdown_timeout_s=2,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    future: Any = None
+
+    def block() -> None:
+        started.set()
+        assert release.wait(2)
+
+    async def run() -> float:
+        nonlocal future
+        async with group:
+            future = group._activity_executor.submit(block)
+            assert started.wait(1)
+            exit_started = time.monotonic()
+        return time.monotonic() - exit_started
+
+    release_timer = threading.Timer(0.5, release.set)
+    release_timer.start()
+    try:
+        exit_elapsed = asyncio.run(run())
+        assert exit_elapsed < 0.25
+        assert group._activity_executor._shutdown is True
+    finally:
+        release.set()
+        release_timer.cancel()
+        release_timer.join()
+        if future is not None:
+            future.result(timeout=1)
+
+
 def test_worker_group_preserves_a_user_owned_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

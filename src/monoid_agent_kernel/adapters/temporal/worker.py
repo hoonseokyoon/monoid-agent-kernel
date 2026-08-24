@@ -100,7 +100,7 @@ class TemporalWorkerGroup:
             )
         except BaseException:
             if self._owns_executor:
-                self._activity_executor.shutdown(wait=True)
+                self._activity_executor.shutdown(wait=False, cancel_futures=True)
             raise
         self._stack: AsyncExitStack | None = None
         self._closed = False
@@ -113,7 +113,11 @@ class TemporalWorkerGroup:
         stack = AsyncExitStack()
         await stack.__aenter__()
         if self._owns_executor:
-            stack.callback(self._activity_executor.shutdown, wait=True)
+            stack.callback(
+                self._activity_executor.shutdown,
+                wait=False,
+                cancel_futures=True,
+            )
         try:
             await stack.enter_async_context(self.activity_worker)
             await stack.enter_async_context(self.workflow_worker)

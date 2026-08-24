@@ -328,7 +328,10 @@ retain that distinct cause.
 `TemporalWorkerGroup` creates an Activity executor sized to `max_concurrent_activities` by default.
 An externally owned executor must be active and expose at least that many worker threads. Reserve
 that capacity for Activity work; unrelated tasks in a shared pool can still delay the initial
-heartbeat and lease claim.
+heartbeat and lease claim. After the Temporal graceful-drain window, an owned executor stops
+accepting work and cancels queued futures without joining a stuck running call. This keeps group
+exit bounded and leaves final process termination to the host supervisor. Externally owned
+executors retain their host-managed lifecycle.
 
 A drain before provider entry commits a resumable `graceful_drain` receipt. A drain after durable
 `dispatch_started` and before trustworthy provider evidence commits `dispatch_unknown` with
