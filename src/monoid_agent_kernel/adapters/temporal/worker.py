@@ -56,6 +56,14 @@ class TemporalWorkerGroup:
             activity_executor, ThreadPoolExecutor
         ):
             raise TypeError("threaded Temporal Activities require ThreadPoolExecutor")
+        if activity_executor is not None:
+            executor_capacity = getattr(activity_executor, "_max_workers", None)
+            if type(executor_capacity) is not int or executor_capacity < max_concurrent_activities:
+                raise ValueError(
+                    "activity_executor capacity must cover max_concurrent_activities"
+                )
+            if getattr(activity_executor, "_shutdown", True):
+                raise ValueError("activity_executor must be active")
         minimum_graceful_timeout = max(
             float(activation_activity.policy.heartbeat_interval_s),
             float(activation_activity.policy.supervisor_join_timeout_s),

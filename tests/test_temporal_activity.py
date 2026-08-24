@@ -588,13 +588,14 @@ def test_worker_group_preserves_a_user_owned_executor(
             del exc_info
 
     monkeypatch.setattr(worker_module, "Worker", FakeWorker)
-    executor = worker_module.ThreadPoolExecutor(max_workers=1)
+    executor = worker_module.ThreadPoolExecutor(max_workers=2)
     try:
         group = worker_module.TemporalWorkerGroup(
             client=object(),
             workflow_task_queue="workflow-v1",
             activity_task_queue="activity-v1",
             activation_activity=_activity(_AuthorityStore()),
+            max_concurrent_activities=2,
             graceful_shutdown_timeout_s=2,
             activity_executor=executor,
         )
@@ -607,6 +608,46 @@ def test_worker_group_preserves_a_user_owned_executor(
         assert executor.submit(lambda: "owned-by-host").result() == "owned-by-host"
     finally:
         executor.shutdown(wait=True)
+
+
+def test_worker_group_rejects_an_undersized_external_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "Worker", lambda *args, **kwargs: (args, kwargs))
+    executor = worker_module.ThreadPoolExecutor(max_workers=1)
+    try:
+        with pytest.raises(ValueError, match="capacity"):
+            worker_module.TemporalWorkerGroup(
+                client=object(),
+                workflow_task_queue="workflow-v1",
+                activity_task_queue="activity-v1",
+                activation_activity=_activity(_AuthorityStore()),
+                max_concurrent_activities=2,
+                graceful_shutdown_timeout_s=2,
+                activity_executor=executor,
+            )
+        assert executor.submit(lambda: "still-host-owned").result() == "still-host-owned"
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_worker_group_rejects_a_shutdown_external_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "Worker", lambda *args, **kwargs: (args, kwargs))
+    executor = worker_module.ThreadPoolExecutor(max_workers=1)
+    executor.shutdown(wait=True)
+
+    with pytest.raises(ValueError, match="must be active"):
+        worker_module.TemporalWorkerGroup(
+            client=object(),
+            workflow_task_queue="workflow-v1",
+            activity_task_queue="activity-v1",
+            activation_activity=_activity(_AuthorityStore()),
+            max_concurrent_activities=1,
+            graceful_shutdown_timeout_s=2,
+            activity_executor=executor,
+        )
 
 
 def test_worker_group_releases_an_owned_executor_after_constructor_failure(

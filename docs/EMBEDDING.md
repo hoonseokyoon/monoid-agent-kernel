@@ -322,6 +322,11 @@ window. Shutdown maps to `graceful_drain` by default; set
 `worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN` when an orderly host termination should
 retain that distinct cause.
 
+`TemporalWorkerGroup` creates an Activity executor sized to `max_concurrent_activities` by default.
+An externally owned executor must be active and expose at least that many worker threads. Reserve
+that capacity for Activity work; unrelated tasks in a shared pool can still delay the initial
+heartbeat and lease claim.
+
 A drain before provider entry commits a resumable `graceful_drain` receipt. A drain after durable
 `dispatch_started` and before trustworthy provider evidence commits `dispatch_unknown` with
 `after_reconciliation` eligibility. This result blocks automatic paid-call replay. A worker crash
