@@ -427,6 +427,109 @@ def test_terminal_commit_fences_every_active_dispatch_settlement(
     assert harness.admission.receipt(token.run_id, "command-1") == receipt
 
 
+def test_dispatch_claim_skips_an_uncommitted_terminal_winner(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    token, _ = harness.seed(tmp_path, "terminal-claim-serialization")
+    harness.admission.admit(_request(token.run_id, "command-1"))
+    outcome = TerminalOutcome(
+        run_id=token.run_id,
+        kind="cancelled",
+        retry_eligibility=RetryEligibility.FORBIDDEN,
+        error_code="cancelled",
+    )
+
+    with harness.database.connection() as blocking_connection:
+        with blocking_connection.transaction():
+            with blocking_connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL("SELECT 1 FROM {} WHERE run_id = %s FOR UPDATE").format(
+                        sql.Identifier(harness.database.config.schema, "run_authority")
+                    ),
+                    (token.run_id,),
+                )
+                assert cursor.fetchone() == (1,)
+                terminal_result, _, _ = harness.sink._commit_terminal_locked(cursor, outcome)
+                assert terminal_result.status == "committed"
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        harness.admission.claim_dispatch,
+                        "owner-a",
+                        "claim-during-terminal",
+                        lease_s=2,
+                    )
+                    assert future.result(timeout=2) is None
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT delivery_state, attempt_count FROM {} "
+                        "WHERE run_id = %s AND command_id = %s"
+                    ).format(
+                        sql.Identifier(
+                            harness.database.config.schema,
+                            "activation_dispatch_outbox",
+                        )
+                    ),
+                    (token.run_id, "command-1"),
+                )
+                assert cursor.fetchone() == ("pending", 0)
+
+    receipt = harness.admission.receipt(token.run_id, "command-1")
+    assert receipt is not None and receipt.state == "run_terminal"
+    assert harness.admission.claim_dispatch("owner-a", "terminal-reconcile", lease_s=1) is None
+    assert harness.admission.receipt(token.run_id, "command-1") == receipt
+
+
+def test_dispatch_claim_readback_waits_for_an_uncommitted_terminal_winner(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    token, _ = harness.seed(tmp_path, "terminal-claim-readback")
+    harness.admission.admit(_request(token.run_id, "command-1"))
+    original = harness.admission.claim_dispatch("owner-a", "claim-1", lease_s=10)
+    assert original is not None
+    outcome = TerminalOutcome(
+        run_id=token.run_id,
+        kind="cancelled",
+        retry_eligibility=RetryEligibility.FORBIDDEN,
+        error_code="cancelled",
+    )
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with harness.database.connection() as blocking_connection:
+            with blocking_connection.transaction():
+                with blocking_connection.cursor() as cursor:
+                    cursor.execute(
+                        sql.SQL("SELECT 1 FROM {} WHERE run_id = %s FOR UPDATE").format(
+                            sql.Identifier(harness.database.config.schema, "run_authority")
+                        ),
+                        (token.run_id,),
+                    )
+                    assert cursor.fetchone() == (1,)
+                    terminal_result, _, _ = harness.sink._commit_terminal_locked(cursor, outcome)
+                    assert terminal_result.status == "committed"
+                    future = executor.submit(
+                        harness.admission.claim_dispatch,
+                        "owner-a",
+                        "claim-1",
+                        lease_s=10,
+                    )
+                    time.sleep(0.1)
+                    assert not future.done()
+        assert future.result(timeout=5) is None
+    finally:
+        executor.shutdown(wait=True)
+
+    receipt = harness.admission.receipt(token.run_id, "command-1")
+    assert receipt is not None and receipt.state == "run_terminal"
+    with pytest.raises(DispatchClaimLost):
+        harness.admission.acknowledge_dispatch(
+            original.token,
+            DispatchResult(status="accepted", dispatch_ref="temporal:too-late"),
+        )
+
+
 def test_concurrent_admission_converges_and_assigns_one_sequence_per_run(
     harness: _Harness,
     tmp_path: Path,

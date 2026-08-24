@@ -184,8 +184,9 @@ per-run command order across competing workers. Delivery is at least once: the t
 once. A rejected command enters `dead_letter` and blocks later commands in that run until an operator
 resolves the lane. A canonical terminal winner excludes that run from new claims. Unbound pending,
 leased, or delivered commands converge to `run_terminal` without another transport call. Active
-claim settlement shares the run-authority lock with terminal selection, so commit order decides the
-winner and no acknowledge, retry, or reject mutation can follow the terminal commit.
+claim finalization and settlement share the run-authority lock with terminal selection, so commit
+order decides the winner and no claim, acknowledge, retry, or reject mutation can follow the
+terminal commit.
 
 After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
 `bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.

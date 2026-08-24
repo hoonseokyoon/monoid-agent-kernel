@@ -530,6 +530,8 @@ class PostgresCommandAdmissionStore:
                 row = cursor.fetchone()
                 if row is None:
                     return None
+                if not self._lock_run(cursor, str(row[0])):
+                    return None
                 return self._stored(cursor, str(row[0]), str(row[1]))
 
     def _reconcile_one_terminal_dispatch(
@@ -584,6 +586,7 @@ class PostgresCommandAdmissionStore:
         if (
             stored.delivery_state != "leased"
             or not stored.lease_active
+            or stored.run_terminal
             or stored.claim_owner != owner_id
             or stored.claim_id != claim_id
             or stored.claim_generation < 1
@@ -632,6 +635,8 @@ class PostgresCommandAdmissionStore:
                     )
                     existing_key = cursor.fetchone()
                     if existing_key is not None:
+                        if not self._lock_run(cursor, str(existing_key[0])):
+                            return None
                         existing = self._stored(
                             cursor,
                             str(existing_key[0]),
@@ -659,6 +664,7 @@ class PostgresCommandAdmissionStore:
                             "FROM {} AS dispatch JOIN {} AS admission "
                             "ON admission.run_id = dispatch.run_id "
                             "AND admission.command_id = dispatch.command_id "
+                            "JOIN {} AS authority ON authority.run_id = dispatch.run_id "
                             "WHERE ((dispatch.delivery_state = 'pending' "
                             "AND dispatch.available_at <= pg_catalog.clock_timestamp()) "
                             "OR (dispatch.delivery_state = 'leased' "
@@ -674,7 +680,8 @@ class PostgresCommandAdmissionStore:
                             "AND prior_dispatch.delivery_state <> 'delivered') "
                             "ORDER BY dispatch.available_at, dispatch.created_at, "
                             "dispatch.run_id, admission.command_sequence "
-                            "FOR UPDATE OF dispatch SKIP LOCKED LIMIT 1) "
+                            "FOR UPDATE OF dispatch SKIP LOCKED "
+                            "FOR SHARE OF authority SKIP LOCKED LIMIT 1) "
                             "UPDATE {} AS dispatch SET delivery_state = 'leased', "
                             "attempt_count = dispatch.attempt_count + 1, claim_owner = %s, "
                             "claim_id = %s, claim_generation = dispatch.claim_generation + 1, "
@@ -689,6 +696,7 @@ class PostgresCommandAdmissionStore:
                         ).format(
                             self._table("activation_dispatch_outbox"),
                             self._table("activation_admission_record"),
+                            self._table("run_authority"),
                             self._table("terminal_record"),
                             self._table("activation_dispatch_outbox"),
                             self._table("activation_admission_record"),
