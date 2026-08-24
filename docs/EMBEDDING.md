@@ -311,6 +311,10 @@ or row-lock waits cannot stop heartbeat or deadline enforcement. Control propaga
 `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
 renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+The control supervisor keeps heartbeating while one bounded cleanup task joins renewal and releases
+the exact writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry returns
+retryable lease loss and leaves any uncooperative cleanup thread daemonized under revoked local
+authority.
 A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
 an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
 observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.

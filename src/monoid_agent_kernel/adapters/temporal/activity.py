@@ -164,7 +164,8 @@ class _TemporalLeaseSupervisor:
         self._policy = policy
         self._write_authority = write_authority
         self._cancellation_token = cancellation_token
-        self._stop = threading.Event()
+        self._control_stop = threading.Event()
+        self._renewal_stop = threading.Event()
         self._control_wake = threading.Event()
         self._failure = threading.Event()
         self._control_thread: threading.Thread | None = None
@@ -213,18 +214,54 @@ class _TemporalLeaseSupervisor:
         self._renewal_thread.start()
         self._control_wake.set()
 
-    def stop_and_join(self) -> bool:
-        self._stop.set()
-        self._control_wake.set()
-        deadline = time.monotonic() + float(self._policy.supervisor_join_timeout_s)
-        threads = tuple(
-            thread
-            for thread in (self._control_thread, self._renewal_thread)
-            if thread is not None
+    def cleanup(self, lease: WriterLease | None) -> ReleaseResult | None:
+        if lease is not None and not isinstance(lease, WriterLease):
+            raise TypeError("lease supervisor cleanup requires WriterLease or None")
+        completed = threading.Event()
+        outcome: list[ReleaseResult | BaseException | None] = []
+
+        def run_cleanup() -> None:
+            try:
+                self._renewal_stop.set()
+                renewal_thread = self._renewal_thread
+                if renewal_thread is not None:
+                    renewal_thread.join()
+                released = None if lease is None else self._store.release(lease.writer_token)
+                outcome.append(released)
+            except BaseException as exc:  # surfaced through the stable Activity taxonomy below
+                outcome.append(exc)
+            finally:
+                completed.set()
+
+        cleanup_thread = threading.Thread(
+            target=run_cleanup,
+            name="monoid-temporal-lease-cleanup",
+            daemon=True,
         )
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        if any(thread.is_alive() for thread in threads):
+        cleanup_thread.start()
+        if not completed.wait(float(self._policy.supervisor_join_timeout_s)):
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation lease cleanup timed out")
+        cleanup_thread.join()
+        if len(outcome) != 1:
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation lease cleanup produced no result")
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            if isinstance(result, Exception):
+                raise result
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation lease cleanup failed")
+        return result
+
+    def stop_control_and_join(self) -> bool:
+        self._control_stop.set()
+        self._control_wake.set()
+        control_thread = self._control_thread
+        if control_thread is None:
+            return True
+        control_thread.join(float(self._policy.supervisor_join_timeout_s))
+        if control_thread.is_alive():
             self._fail()
             return False
         return True
@@ -256,18 +293,21 @@ class _TemporalLeaseSupervisor:
         try:
             while True:
                 self._observe_control()
-                if self._stop.is_set() or self._failure.is_set():
+                if self._control_stop.is_set():
                     return
                 now = time.monotonic()
                 _, lease_deadline = self._lease_snapshot()
-                if lease_deadline is not None and now >= lease_deadline:
+                if (
+                    not self._failure.is_set()
+                    and lease_deadline is not None
+                    and now >= lease_deadline
+                ):
                     self._fail()
-                    return
                 if now >= next_heartbeat:
                     activity.heartbeat()
                     next_heartbeat = now + heartbeat_interval
                 deadlines = [next_heartbeat]
-                if lease_deadline is not None:
+                if not self._failure.is_set() and lease_deadline is not None:
                     deadlines.append(lease_deadline)
                 wait_s = max(0.0, min(deadlines) - time.monotonic())
                 self._control_wake.wait(wait_s)
@@ -280,7 +320,7 @@ class _TemporalLeaseSupervisor:
         next_renew = time.monotonic() + renew_interval
         try:
             while True:
-                if self._stop.wait(max(0.0, next_renew - time.monotonic())):
+                if self._renewal_stop.wait(max(0.0, next_renew - time.monotonic())):
                     return
                 if self._failure.is_set():
                     return
@@ -308,7 +348,7 @@ class _TemporalLeaseSupervisor:
                     self._fail()
                     return
                 with self._lease_lock:
-                    if self._stop.is_set() or self._failure.is_set():
+                    if self._renewal_stop.is_set() or self._failure.is_set():
                         return
                     self._lease = renewed.lease
                     self._lease_deadline = renewed_deadline
@@ -475,25 +515,27 @@ class TemporalActivationActivity:
         except Exception as exc:
             primary_error = exc
         finally:
-            supervisor_stopped = supervisor.stop_and_join()
+            try:
+                released = supervisor.cleanup(lease)
+                if lease is not None:
+                    if not isinstance(released, ReleaseResult):
+                        raise TypeError(
+                            "writer authority store returned an invalid release result"
+                        )
+                    if released.status not in {"released", "already_released"}:
+                        raise WriteAuthorityRevoked()
+            except Exception as exc:
+                release_error = exc
+            supervisor_stopped = supervisor.stop_control_and_join()
             try:
                 supervisor.assert_healthy()
             except Exception as exc:
                 if primary_error is None:
                     primary_error = exc
-            if not supervisor_stopped:
+            if not supervisor_stopped and release_error is None:
                 release_error = _SupervisorUnhealthy(
                     "Temporal activation lease supervisor did not stop"
                 )
-            elif lease is not None:
-                try:
-                    released = self.authority_store.release(lease.writer_token)
-                    if not isinstance(released, ReleaseResult):
-                        raise TypeError("writer authority store returned an invalid release result")
-                    if released.status not in {"released", "already_released"}:
-                        raise WriteAuthorityRevoked()
-                except Exception as exc:
-                    release_error = exc
             write_authority.revoke()
 
         if primary_error is not None:

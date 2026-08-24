@@ -417,6 +417,110 @@ def test_blocked_renewal_revokes_authority_at_the_local_lease_deadline() -> None
     assert store.release_count == 1
 
 
+def test_activity_heartbeats_while_cleanup_joins_a_blocked_renewal() -> None:
+    renewal_blocked = threading.Event()
+    drive_finished = threading.Event()
+    heartbeat_after_drive = threading.Event()
+
+    class CleanupRenewalStore(_AuthorityStore):
+        def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
+            if self.renew_count == 1:
+                renewal_blocked.set()
+                assert heartbeat_after_drive.wait(1)
+            return super().renew(writer_token, ttl)
+
+    def observe_heartbeat(*details: object) -> None:
+        assert details == ()
+        if renewal_blocked.is_set() and drive_finished.is_set():
+            heartbeat_after_drive.set()
+
+    def finish_while_renewal_is_blocked(kwargs: dict[str, Any]) -> object:
+        del kwargs
+        assert renewal_blocked.wait(1)
+        drive_finished.set()
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    store = CleanupRenewalStore()
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = observe_heartbeat
+    _DriverDouble.behavior = finish_while_renewal_is_blocked
+
+    raw = environment.run(_activity(store).run, _command().to_json())
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert heartbeat_after_drive.is_set()
+    assert store.release_count == 1
+
+
+def test_activity_heartbeats_while_writer_release_is_blocked() -> None:
+    release_blocked = threading.Event()
+    heartbeat_during_release = threading.Event()
+
+    class BlockingReleaseStore(_AuthorityStore):
+        def release(self, writer_token: WriterToken) -> ReleaseResult:
+            release_blocked.set()
+            assert heartbeat_during_release.wait(1)
+            return super().release(writer_token)
+
+    def observe_heartbeat(*details: object) -> None:
+        assert details == ()
+        if release_blocked.is_set():
+            heartbeat_during_release.set()
+
+    store = BlockingReleaseStore()
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = observe_heartbeat
+    raw = environment.run(_activity(store).run, _command().to_json())
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert heartbeat_during_release.is_set()
+    assert store.release_count == 1
+
+
+def test_writer_cleanup_timeout_is_bounded_and_retryable() -> None:
+    release_started = threading.Event()
+    allow_release = threading.Event()
+    release_completed = threading.Event()
+
+    class StuckReleaseStore(_AuthorityStore):
+        def release(self, writer_token: WriterToken) -> ReleaseResult:
+            release_started.set()
+            assert allow_release.wait(1)
+            result = super().release(writer_token)
+            release_completed.set()
+            return result
+
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        supervisor_join_timeout_s=0.05,
+        local_task_wait_s=1,
+    )
+    release_timer = threading.Timer(0.4, allow_release.set)
+    release_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            ActivityEnvironment().run(
+                _activity(StuckReleaseStore(), policy=policy).run,
+                _command().to_json(),
+            )
+        elapsed = time.monotonic() - started
+        assert raised.value.type == "monoid.activation_lease_lost"
+        assert raised.value.non_retryable is False
+        assert release_started.is_set()
+        assert elapsed < 0.25
+    finally:
+        allow_release.set()
+        release_timer.cancel()
+        release_timer.join()
+        assert release_completed.wait(1)
+
+
 def test_worker_shutdown_policy_can_report_host_shutdown() -> None:
     store = _AuthorityStore()
     environment = ActivityEnvironment()

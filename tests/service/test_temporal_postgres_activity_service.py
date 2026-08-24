@@ -57,6 +57,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationCommand,
     ActivationRuntime,
     AdmissionRequest,
+    ReleaseResult,
     RenewResult,
     WriterLease,
     WriterToken,
@@ -122,9 +123,11 @@ class _DelayedAmbiguousAuthority:
     inner: PostgresWriterAuthorityStore
     first_claim_delay_s: float = 1.5
     first_periodic_renew_delay_s: float = 1.5
+    first_release_delay_s: float = 1.5
     claim_calls: int = 0
     read_calls: int = 0
     renew_calls: int = 0
+    release_calls: int = 0
     owner_ids: list[str] = field(default_factory=list)
 
     def __getattr__(self, name: str) -> Any:
@@ -151,6 +154,12 @@ class _DelayedAmbiguousAuthority:
         if self.renew_calls == 2:
             time.sleep(self.first_periodic_renew_delay_s)
         return self.inner.renew(writer_token, ttl)
+
+    def release(self, writer_token: WriterToken) -> ReleaseResult:
+        self.release_calls += 1
+        if self.release_calls == 1:
+            time.sleep(self.first_release_delay_s)
+        return self.inner.release(writer_token)
 
 
 @dataclass
@@ -379,10 +388,10 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                 run_sink=harness.sink,
                 loop_factory=_loop_factory(tmp_path, spec, adapter),
                 policy=TemporalActivityPolicy(
-                    writer_lease_ttl_s=2,
-                    writer_lease_renew_interval_s=0.25,
+                    writer_lease_ttl_s=5,
+                    writer_lease_renew_interval_s=0.5,
                     heartbeat_interval_s=0.1,
-                    supervisor_join_timeout_s=2,
+                    supervisor_join_timeout_s=4,
                     local_task_wait_s=5,
                 ),
             )
@@ -412,6 +421,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert response_loss_authority.claim_calls == 4
     assert response_loss_authority.read_calls == 1
     assert response_loss_authority.renew_calls >= 2
+    assert response_loss_authority.release_calls == 1
     assert response_loss_authority.owner_ids[0] == response_loss_authority.owner_ids[1]
     assert len(set(response_loss_authority.owner_ids)) == 3
     authority = harness.authority.read(run_id)
