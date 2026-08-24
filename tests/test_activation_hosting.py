@@ -27,7 +27,7 @@ from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
 from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.outcome import RetryEligibility, TerminalOutcome
 from monoid_agent_kernel.core.result import Suspension
-from monoid_agent_kernel.core.spec import AgentRunSpec
+from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError
 from monoid_agent_kernel.hosting import CommitResult, WriterToken
 from monoid_agent_kernel.hosting.activation import (
@@ -42,6 +42,7 @@ from monoid_agent_kernel.hosting.activation import (
 from monoid_agent_kernel.hosting.execution import FencedEventSink, FencedTerminalBridge
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
 
 
@@ -267,6 +268,7 @@ def _loop_factory(
     factory_calls: list[str],
     *,
     run_root_name: str = "replacement-runs",
+    limits: RunLimits | None = None,
 ):
     def build(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
         factory_calls.append(command.identity_sha256)
@@ -275,6 +277,7 @@ def _loop_factory(
                 run_id=command.run_id,
                 workspace_root=spec.workspace_root,
                 run_root=tmp_path / run_root_name,
+                limits=limits or spec.limits,
             ),
             model_adapter=adapter,
             runtime_config_provider=runtime_provider(runtime_config("fs.write")),
@@ -823,6 +826,52 @@ def test_terminal_commit_response_loss_reconstructs_canonical_winner(tmp_path: P
     assert receipt.terminal is True
     assert receipt.outcome_kind == winner.kind
     assert receipt.retry_eligibility is winner.retry_eligibility
+
+
+def test_activation_preserves_terminal_tool_limit_receipt(tmp_path: Path) -> None:
+    harness, token, checkpoint, spec = _seed_checkpoint(
+        tmp_path,
+        run_id="activation-terminal-tool-limit",
+    )
+    command = _command(checkpoint)
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call("fs_write", {"path": "first.txt", "content": "one"}, "c1"),
+                    fake_tool_call("fs_write", {"path": "second.txt", "content": "two"}, "c2"),
+                )
+            )
+        ]
+    )
+
+    first = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=_loop_factory(
+            tmp_path,
+            spec,
+            adapter,
+            [],
+            limits=RunLimits(max_tool_calls=1),
+        ),
+    ).drive(command)
+    duplicate = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=lambda command, runtime: (_ for _ in ()).throw(
+            AssertionError((command, runtime))
+        ),
+    ).drive(command)
+
+    assert duplicate == first
+    assert first.boundary_reason == "limited"
+    assert first.state == "limited"
+    assert first.terminal is True
+    assert first.outcome_kind == "limited"
+    assert first.retry_eligibility is RetryEligibility.FORBIDDEN
+    assert first.error_code == "max_tool_calls_exceeded"
+    assert harness.sink.read_terminal(command.run_id) is not None
 
 
 def test_activation_rejects_stale_source_before_constructing_loop(tmp_path: Path) -> None:

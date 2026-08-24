@@ -433,14 +433,16 @@ class ActivationReceipt:
         event_cursor = raw_receipt.get("event_cursor", 0)
         stream_cursor = raw_receipt.get("stream_cursor", 0)
         state = state_from_suspension(suspension).value
-        terminal = suspension.reason == "terminal"
+        terminal = raw_receipt.get("terminal")
         if (
             not is_portable_json_integer(checkpoint_seq)
             or checkpoint_seq > checkpoint.seq
             or checkpoint_seq <= command.source_checkpoint_seq
             or not is_recorded_digest(checkpoint_sha256)
             or raw_receipt.get("state") != state
-            or raw_receipt.get("terminal") is not terminal
+            or type(terminal) is not bool
+            or (suspension.reason == "terminal" and not terminal)
+            or (terminal and suspension.reason not in {"terminal", "limited"})
             or raw_receipt.get("command_identity_sha256") != command.identity_sha256
             or not is_portable_json_integer(event_cursor)
             or event_cursor < 0
