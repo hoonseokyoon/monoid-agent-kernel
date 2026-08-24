@@ -583,6 +583,46 @@ def test_model_stream_observer_resets_stale_lanes_when_replacement_ends_without_
         assert store.chunks.get((identity, 2), []) == []
 
 
+@pytest.mark.parametrize("final_text", (None, ""))
+def test_model_stream_observer_treats_completed_no_text_as_authoritative_empty(
+    final_text: str | None,
+) -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(run_id=context.run_id, owner_id="worker-1", generation=1)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=durable_model_stream_id(context.run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(context.run_id, context.turn_id),
+        channel="output",
+    )
+    reasoning = replace(output, channel="reasoning")
+    for identity, data in ((output, b"stale output"), (reasoning, b"stale reasoning")):
+        assert store.open(identity, writer_token=token).status == "opened"
+        assert store.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=token,
+        ).status == "committed"
+
+    replacement = _observer(store, authority).open(context)
+    replacement.close(ModelStreamOutcome(status="completed", final_text=final_text))
+
+    for identity in (output, reasoning):
+        assert store.heads[identity].generation == 2
+        assert store.heads[identity].state == "sealed"
+        assert store.heads[identity].cursor_bytes == 0
+        assert store.chunks.get((identity, 2), []) == []
+
+    recovered = _observer(store, authority).open(context)
+    recovered.close(ModelStreamOutcome(status="completed", final_text=final_text))
+    assert store.heads[output].generation == 2
+    assert store.heads[reasoning].generation == 2
+
+
 def test_model_stream_observer_rebuilds_truncated_recovered_output_from_final_text() -> None:
     store = _MemoryStreamStore()
     authority = ActivationWriteAuthority()

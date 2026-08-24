@@ -443,12 +443,18 @@ class _DurableModelStreamWriter:
 
     def _reset_abandoned_replacement_lanes(self, outcome: ModelStreamOutcome) -> None:
         if outcome.status == "completed":
-            return
-        # A completed recovery can re-close the bytes committed by its interrupted process.
-        # Every other terminal classification belongs to a replacement execution. When that
-        # execution emitted no delta, push() had no opportunity to clear the prior generation;
-        # do it before sealing so reconnect readers cannot observe the abandoned prefix as the
-        # replacement's result.
+            # Text completions carry an authoritative value that the reconciliation path can
+            # compare with the hydrated output. A completed tool-call/empty-text turn has no
+            # replacement delta, so non-empty pre-existing private lanes are unverifiable and
+            # must be cleared together. Once cleared, a repeated recovery is idempotent.
+            if outcome.final_text not in {None, ""} or not any(
+                lane.reset_before_append and lane.head.cursor_bytes > 0
+                for lane in self._lanes.values()
+            ):
+                return
+        # Matching completed recovery returned above. The remaining paths have no delta that
+        # could clear a prior generation. Reset before sealing so reconnect readers cannot
+        # observe an abandoned prefix as the replacement's result.
         for lane in sorted(
             self._lanes.values(),
             key=lambda candidate: candidate.identity.channel,
