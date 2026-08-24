@@ -61,7 +61,7 @@ building against, and securing the kernel.
 | [V0_22_RELEASE_AUDIT.md](V0_22_RELEASE_AUDIT.md) | v0.22 production-boundary scope, compatibility and package gates, rollout obligations, exclusions, and validation evidence. |
 | [V0_23_DEVELOPMENT_WORKFLOW.md](V0_23_DEVELOPMENT_WORKFLOW.md) | Sequential PR and review routine, Draft/Ready CI checkpoints, actual-service profiles, cost controls, and release workflow. |
 | [V0_23_IMPLEMENTATION_PLAN.md](V0_23_IMPLEMENTATION_PLAN.md) | Pre-implementation audit, recommended PostgreSQL/ObjectStore/Temporal and durable-stream architecture, PR sequence, risks, and owner approval matrix. |
-| [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Pending evidence checklist for storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release artifacts. |
+| [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Qualified storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release-delivery evidence. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
