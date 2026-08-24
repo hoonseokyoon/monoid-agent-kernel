@@ -91,6 +91,9 @@ and exporter failure policy.
 | `monoid.postgres.object_gc.receipt.count` | `1` | cumulative receipt class `deleted|skipped|precondition_failed` |
 
 Each collection performs exact aggregate queries. PostgreSQL statement timeout bounds every query.
+Schema compatibility, schema version, and all aggregates come from one `REPEATABLE READ, READ ONLY`
+transaction. Outbox lag and maximum-attempt signals include pending rows available at collection
+time plus rows whose lease has expired; delayed rows and active leases do not contribute.
 Choose a cadence that matches table volume, retain collection latency in host telemetry, and move
 high-frequency product dashboards to host-owned projections.
 

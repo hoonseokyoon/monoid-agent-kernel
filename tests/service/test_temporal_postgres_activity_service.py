@@ -141,12 +141,16 @@ class _BlockingAdapter:
 class _StreamingCountingAdapter:
     calls: int = 0
     one_shot_calls: int = 0
+    private_chunks: tuple[str, str] = (
+        "private-stream-alpha-7e6501 ",
+        "private-stream-beta-90cf42",
+    )
 
     async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
         del request
         self.calls += 1
-        yield TextDelta("private combined ")
-        yield TextDelta("streamed result")
+        for chunk in self.private_chunks:
+            yield TextDelta(chunk)
         yield TurnComplete(response_id="combined-stream-response", stop_reason="stop")
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
@@ -611,13 +615,15 @@ def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
 
     try:
         status, receipt, history_json = asyncio.run(run())
-        private_content = "private combined streamed result"
+        private_content = "".join(adapter.private_chunks)
+        receipt_json = json.dumps(receipt.to_json(), sort_keys=True)
         assert status.phase == "waiting"
         assert receipt.activation_receipt is not None
         assert adapter.calls == 1
         assert adapter.one_shot_calls == 0
-        assert private_content not in history_json
-        assert private_content not in json.dumps(receipt.to_json(), sort_keys=True)
+        for private_chunk in adapter.private_chunks:
+            assert private_chunk not in history_json
+            assert private_chunk not in receipt_json
 
         with harness.database.transaction(read_only=True) as connection:
             with harness.database.cursor(connection) as cursor:
@@ -666,7 +672,8 @@ def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
             ("monoid.postgres.outbox.max_attempts", (("queue", "activation"),))
         ] == 0
         public_snapshot = json.dumps(snapshot.to_json(), sort_keys=True)
-        assert private_content not in public_snapshot
+        for private_chunk in adapter.private_chunks:
+            assert private_chunk not in public_snapshot
         assert run_id not in public_snapshot
         assert bucket not in public_snapshot
     finally:

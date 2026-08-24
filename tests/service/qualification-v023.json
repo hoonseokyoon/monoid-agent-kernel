@@ -146,6 +146,14 @@
         "profiles": ["combined", "objectstore", "postgres"]
       },
       {
+        "node_id": "tests/service/test_postgres_service.py::test_operations_outbox_lag_uses_claimable_rows_only",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_operations_snapshot_keeps_schema_and_aggregates_point_in_time",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
         "node_id": "tests/service/test_durable_stream_service.py::test_actual_operations_snapshot_and_s3_doctor_are_public_and_content_free",
         "profiles": ["combined", "objectstore"]
       },

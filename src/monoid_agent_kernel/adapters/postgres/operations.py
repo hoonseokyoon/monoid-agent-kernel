@@ -37,12 +37,10 @@ class PostgresOperations:
             raise TypeError("PostgresOperations database must be PostgresDatabase")
         self.database = database
         self._ready = False
-        self._schema_version = 0
 
     def check_ready(self) -> MigrationStatus:
         self._ready = False
         status = PostgresMigrations(self.database).require_reader_compatible()
-        self._schema_version = status.current_version
         self._ready = True
         return status
 
@@ -71,133 +69,153 @@ class PostgresOperations:
         self._require_ready()
         from psycopg import sql
 
-        try:
-            status = PostgresMigrations(self.database).require_reader_compatible()
-        except Exception:
-            self._ready = False
-            raise
-        self._schema_version = status.current_version
         with self.database.transaction(
             read_only=True,
             isolation_level="repeatable_read",
         ) as connection:
-            with self.database.cursor(connection) as cursor:
-                collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
-                authority = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT count(*), "
-                        "count(*) FILTER (WHERE NOT revoked AND leased_until > %s), "
-                        "count(*) FILTER (WHERE NOT revoked AND leased_until <= %s), "
-                        "count(*) FILTER (WHERE revoked), "
-                        "extract(epoch FROM (min(leased_until) FILTER "
-                        "(WHERE NOT revoked AND leased_until > %s) - %s)) "
-                        "FROM {}"
-                    ).format(self._table("run_authority")),
-                    (collected_at, collected_at, collected_at, collected_at),
-                )
-                activation_outbox = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE delivery_state = 'pending'), "
-                        "count(*) FILTER (WHERE delivery_state = 'leased'), "
-                        "count(*) FILTER (WHERE delivery_state = 'delivered'), "
-                        "count(*) FILTER (WHERE delivery_state = 'run_terminal'), "
-                        "count(*) FILTER (WHERE delivery_state = 'dead_letter'), "
-                        "coalesce(max(attempt_count) FILTER "
-                        "(WHERE delivery_state IN ('pending', 'leased')), 0), "
-                        "extract(epoch FROM (%s - min(created_at) FILTER "
-                        "(WHERE delivery_state IN ('pending', 'leased')))) "
-                        "FROM {}"
-                    ).format(self._table("activation_dispatch_outbox")),
-                    (collected_at,),
-                )
-                evidence_outbox = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE delivery_state = 'pending' AND "
-                        "(lease_owner IS NULL OR leased_until <= %s)), "
-                        "count(*) FILTER (WHERE delivery_state = 'pending' "
-                        "AND lease_owner IS NOT NULL AND leased_until > %s), "
-                        "count(*) FILTER (WHERE delivery_state = 'delivered'), "
-                        "count(*) FILTER (WHERE delivery_state = 'dead_letter'), "
-                        "coalesce(max(attempt_count) FILTER "
-                        "(WHERE delivery_state = 'pending'), 0), "
-                        "extract(epoch FROM (%s - min(created_at) FILTER "
-                        "(WHERE delivery_state = 'pending'))) "
-                        "FROM {}"
-                    ).format(self._table("model_evidence_outbox")),
-                    (collected_at, collected_at, collected_at),
-                )
-                invocations = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE record.dispatch_state = 'reserved'), "
-                        "count(*) FILTER (WHERE record.dispatch_state = 'dispatch_started'), "
-                        "count(*) FILTER (WHERE record.dispatch_state = 'settled'), "
-                        "count(*) FILTER (WHERE record.dispatch_state = 'unknown') "
-                        "FROM {} AS head JOIN {} AS record "
-                        "ON record.run_id = head.run_id "
-                        "AND record.logical_call_id = head.logical_call_id "
-                        "AND record.revision = head.revision"
-                    ).format(
-                        self._table("invocation_head"),
-                        self._table("invocation_record"),
-                    ),
-                )
-                stream_heads = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE state = 'open'), "
-                        "count(*) FILTER (WHERE state = 'sealed'), "
-                        "coalesce(sum(cursor_bytes), 0), "
-                        "coalesce(sum(cursor_bytes) FILTER (WHERE state = 'open'), 0), "
-                        "extract(epoch FROM (%s - min(opened_at) FILTER (WHERE state = 'open'))) "
-                        "FROM {}"
-                    ).format(self._table("durable_stream_head")),
-                    (collected_at,),
-                )
-                stream_chunks = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT count(*), coalesce(sum(end_offset - start_offset), 0) FROM {}"
-                    ).format(self._table("durable_stream_chunk")),
-                )
-                objects = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE blob.state = 'available'), "
-                        "count(*) FILTER (WHERE blob.state = 'deleted'), "
-                        "coalesce(sum(blob.size_bytes) FILTER (WHERE blob.state = 'available'), 0), "
-                        "(SELECT count(*) FROM {}), "
-                        "count(*) FILTER (WHERE blob.state = 'available' AND NOT EXISTS "
-                        "(SELECT 1 FROM {} AS association WHERE association.sha256 = blob.sha256)) "
-                        "FROM {} AS blob"
-                    ).format(
-                        self._table("run_object_blob"),
-                        self._table("run_object_blob"),
-                        self._table("object_blob"),
-                    ),
-                )
-                gc_receipts = self._one(
-                    cursor,
-                    sql.SQL(
-                        "SELECT "
-                        "count(*) FILTER (WHERE status IN ('deleted', 'already_missing')), "
-                        "count(*) FILTER (WHERE status IN "
-                        "('skipped_associated', 'skipped_generation')), "
-                        "count(*) FILTER (WHERE status = 'precondition_failed') "
-                        "FROM {}"
-                    ).format(self._table("object_gc_receipt")),
-                )
+            try:
+                status = PostgresMigrations(self.database)._require_reader_compatible(connection)
+                schema_version = status.current_version
+                with self.database.cursor(connection) as cursor:
+                    collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
+                    authority = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT count(*), "
+                            "count(*) FILTER (WHERE NOT revoked AND leased_until > %s), "
+                            "count(*) FILTER (WHERE NOT revoked AND leased_until <= %s), "
+                            "count(*) FILTER (WHERE revoked), "
+                            "extract(epoch FROM (min(leased_until) FILTER "
+                            "(WHERE NOT revoked AND leased_until > %s) - %s)) "
+                            "FROM {}"
+                        ).format(self._table("run_authority")),
+                        (collected_at, collected_at, collected_at, collected_at),
+                    )
+                    activation_outbox = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE delivery_state = 'pending'), "
+                            "count(*) FILTER (WHERE delivery_state = 'leased'), "
+                            "count(*) FILTER (WHERE delivery_state = 'delivered'), "
+                            "count(*) FILTER (WHERE delivery_state = 'run_terminal'), "
+                            "count(*) FILTER (WHERE delivery_state = 'dead_letter'), "
+                            "coalesce(max(attempt_count) FILTER (WHERE "
+                            "(delivery_state = 'pending' AND available_at <= %s) OR "
+                            "(delivery_state = 'leased' AND leased_until <= %s)), 0), "
+                            "extract(epoch FROM (%s - min(created_at) FILTER "
+                            "(WHERE (delivery_state = 'pending' AND available_at <= %s) OR "
+                            "(delivery_state = 'leased' AND leased_until <= %s)))) "
+                            "FROM {}"
+                        ).format(self._table("activation_dispatch_outbox")),
+                        (
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                        ),
+                    )
+                    evidence_outbox = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE delivery_state = 'pending' AND "
+                            "(lease_owner IS NULL OR leased_until <= %s)), "
+                            "count(*) FILTER (WHERE delivery_state = 'pending' "
+                            "AND lease_owner IS NOT NULL AND leased_until > %s), "
+                            "count(*) FILTER (WHERE delivery_state = 'delivered'), "
+                            "count(*) FILTER (WHERE delivery_state = 'dead_letter'), "
+                            "coalesce(max(attempt_count) FILTER (WHERE "
+                            "delivery_state = 'pending' AND available_at <= %s AND "
+                            "(lease_owner IS NULL OR leased_until <= %s)), 0), "
+                            "extract(epoch FROM (%s - min(created_at) FILTER "
+                            "(WHERE delivery_state = 'pending' AND available_at <= %s AND "
+                            "(lease_owner IS NULL OR leased_until <= %s)))) "
+                            "FROM {}"
+                        ).format(self._table("model_evidence_outbox")),
+                        (
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                            collected_at,
+                        ),
+                    )
+                    invocations = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE record.dispatch_state = 'reserved'), "
+                            "count(*) FILTER (WHERE record.dispatch_state = 'dispatch_started'), "
+                            "count(*) FILTER (WHERE record.dispatch_state = 'settled'), "
+                            "count(*) FILTER (WHERE record.dispatch_state = 'unknown') "
+                            "FROM {} AS head JOIN {} AS record "
+                            "ON record.run_id = head.run_id "
+                            "AND record.logical_call_id = head.logical_call_id "
+                            "AND record.revision = head.revision"
+                        ).format(
+                            self._table("invocation_head"),
+                            self._table("invocation_record"),
+                        ),
+                    )
+                    stream_heads = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE state = 'open'), "
+                            "count(*) FILTER (WHERE state = 'sealed'), "
+                            "coalesce(sum(cursor_bytes), 0), "
+                            "coalesce(sum(cursor_bytes) FILTER (WHERE state = 'open'), 0), "
+                            "extract(epoch FROM (%s - min(opened_at) FILTER "
+                            "(WHERE state = 'open'))) FROM {}"
+                        ).format(self._table("durable_stream_head")),
+                        (collected_at,),
+                    )
+                    stream_chunks = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT count(*), coalesce(sum(end_offset - start_offset), 0) FROM {}"
+                        ).format(self._table("durable_stream_chunk")),
+                    )
+                    objects = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE blob.state = 'available'), "
+                            "count(*) FILTER (WHERE blob.state = 'deleted'), "
+                            "coalesce(sum(blob.size_bytes) FILTER "
+                            "(WHERE blob.state = 'available'), 0), "
+                            "(SELECT count(*) FROM {}), "
+                            "count(*) FILTER (WHERE blob.state = 'available' AND NOT EXISTS "
+                            "(SELECT 1 FROM {} AS association "
+                            "WHERE association.sha256 = blob.sha256)) "
+                            "FROM {} AS blob"
+                        ).format(
+                            self._table("run_object_blob"),
+                            self._table("run_object_blob"),
+                            self._table("object_blob"),
+                        ),
+                    )
+                    gc_receipts = self._one(
+                        cursor,
+                        sql.SQL(
+                            "SELECT "
+                            "count(*) FILTER (WHERE status IN ('deleted', 'already_missing')), "
+                            "count(*) FILTER (WHERE status IN "
+                            "('skipped_associated', 'skipped_generation')), "
+                            "count(*) FILTER (WHERE status = 'precondition_failed') "
+                            "FROM {}"
+                        ).format(self._table("object_gc_receipt")),
+                    )
+            except Exception:
+                self._ready = False
+                raise
 
         metrics = [
-            OperationalMetric(name="monoid.postgres.schema.version", value=self._schema_version),
+            OperationalMetric(name="monoid.postgres.schema.version", value=schema_version),
             *(
                 OperationalMetric(
                     name="monoid.postgres.authority.count",
