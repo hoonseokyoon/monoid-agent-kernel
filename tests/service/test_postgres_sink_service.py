@@ -377,7 +377,6 @@ def external_sink_harness(postgres_target: tuple[str, int]) -> Iterator[_Externa
             multipart_threshold_bytes=6 * 1024 * 1024,
             multipart_part_bytes=5 * 1024 * 1024,
             max_object_bytes=32 * 1024 * 1024,
-            admin_delete_mode="version_id",
         )
     object_store = S3ContentAddressedBlobStore(
         object_config,

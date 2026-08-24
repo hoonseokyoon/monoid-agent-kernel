@@ -201,7 +201,6 @@ def _admin(
     bucket: str,
     *,
     prefix: str,
-    admin_delete_mode: str = "if_match",
 ) -> S3ObjectStoreAdmin:
     return S3ObjectStoreAdmin(
         S3ObjectStoreConfig(
@@ -212,7 +211,6 @@ def _admin(
             multipart_threshold_bytes=6 * _MIB,
             multipart_part_bytes=5 * _MIB,
             max_object_bytes=32 * _MIB,
-            admin_delete_mode=admin_delete_mode,  # type: ignore[arg-type]
         ),
         client=client,
     )
@@ -452,37 +450,27 @@ def test_s3_admin_inventory_conditional_delete_and_response_loss_on_pinned_minio
     object_store_bucket: tuple[object, str],
 ) -> None:
     client, bucket = object_store_bucket
+    unversioned_admin = _admin(client, bucket, prefix="admin-versioning-required")
+    with pytest.raises(BlobCorrupt, match="enabled bucket versioning"):
+        unversioned_admin.inventory_page(limit=1)
+
     client.put_bucket_versioning(  # type: ignore[attr-defined]
         Bucket=bucket,
         VersioningConfiguration={"Status": "Enabled"},
     )
-    if_match_admin = _admin(client, bucket, prefix="admin-version-mode-required")
-    if_match_runtime = _store(client, bucket, prefix="admin-version-mode-required")
-    if_match_data = b"versioned bucket requires version delete mode"
-    if_match_sha256 = hashlib.sha256(if_match_data).hexdigest()
-    if_match_runtime.put_if_absent(if_match_sha256, if_match_data)
-    if_match_entry = if_match_admin.inventory_page(limit=1).entries[0]
-    with pytest.raises(BlobCorrupt, match="admin_delete_mode='version_id'"):
-        if_match_admin.delete_if_match(if_match_sha256, if_match_entry.delete_token)
-    assert if_match_runtime.stat(if_match_sha256) is not None
-
-    admin = _admin(client, bucket, prefix="admin-delete", admin_delete_mode="version_id")
+    admin = _admin(client, bucket, prefix="admin-delete")
     runtime = _store(client, bucket, prefix="admin-delete")
-    values = (b"admin object one", b"admin object two")
+    values = (b"admin object one", b"admin object two", b"admin object three")
     digests = tuple(hashlib.sha256(value).hexdigest() for value in values)
     for sha256, value in zip(digests, values, strict=True):
         runtime.put_if_absent(sha256, value)
 
     first = admin.inventory_page(limit=1)
-    second = admin.inventory_page(continuation_token=first.next_token, limit=1)
+    second = admin.inventory_page(continuation_token=first.next_token, limit=10)
     entries = first.entries + second.entries
     assert {entry.sha256 for entry in entries} == set(digests)
 
     first_entry = next(entry for entry in entries if entry.sha256 == digests[0])
-    wrong_entry = next(entry for entry in entries if entry.sha256 == digests[1])
-    assert admin.delete_if_match(first_entry.sha256, wrong_entry.delete_token).status == (
-        "precondition_failed"
-    )
     assert admin.delete_if_match(first_entry.sha256, first_entry.delete_token).status == "deleted"
     assert runtime.stat(first_entry.sha256) is None
 
@@ -491,13 +479,39 @@ def test_s3_admin_inventory_conditional_delete_and_response_loss_on_pinned_minio
         _ResponseLossOnceClient(client, operation="delete"),
         bucket,
         prefix="admin-delete",
-        admin_delete_mode="version_id",
     )
     assert response_loss_admin.delete_if_match(
         second_entry.sha256,
         second_entry.delete_token,
     ).status == "deleted"
     assert runtime.stat(second_entry.sha256) is None
+
+    recreated_entry = next(entry for entry in entries if entry.sha256 == digests[2])
+    recreated_key = admin.config.object_key(recreated_entry.sha256)
+    original = client.head_object(Bucket=bucket, Key=recreated_key)  # type: ignore[attr-defined]
+    checksum = base64.b64encode(hashlib.sha256(values[2]).digest()).decode("ascii")
+    client.put_object(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        Key=recreated_key,
+        Body=values[2],
+        Metadata=original["Metadata"],
+        ChecksumSHA256=checksum,
+    )
+    recreated = client.head_object(Bucket=bucket, Key=recreated_key)  # type: ignore[attr-defined]
+    assert recreated["ETag"] == original["ETag"]
+    assert recreated["VersionId"] != original["VersionId"]
+
+    assert admin.delete_if_match(
+        recreated_entry.sha256,
+        recreated_entry.delete_token,
+    ).status == "deleted"
+    remaining_versions = client.list_object_versions(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        Prefix=recreated_key,
+    ).get("Versions", [])
+    assert original["VersionId"] not in {value["VersionId"] for value in remaining_versions}
+    assert recreated["VersionId"] in {value["VersionId"] for value in remaining_versions}
+    assert runtime.stat(recreated_entry.sha256) is not None
 
 
 def test_s3_admin_incomplete_multipart_inventory_and_abort_on_pinned_minio(

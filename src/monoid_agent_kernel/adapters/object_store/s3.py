@@ -502,11 +502,21 @@ class S3ContentAddressedBlobStore(_S3Client):
 class S3ObjectStoreAdmin(_S3Client):
     """Privileged bounded inventory, safe deletion, and multipart cleanup surface.
 
-    The ``if_match`` mode combines a HEAD preflight with server-side DeleteObject If-Match
-    for unversioned buckets.
-    The ``version_id`` mode requires bucket versioning and targets the exact inventoried version;
-    use it for compatible services that do not enforce conditional delete headers.
+    Object inventory and deletion require bucket versioning and target the exact inventoried
+    version. This prevents same-content recreation from satisfying a stale garbage-collection
+    token. Multipart cleanup remains available independently of object versioning.
     """
+
+    def _require_enabled_versioning(self) -> None:
+        kwargs: dict[str, object] = {"Bucket": self.config.bucket}
+        if self.config.expected_bucket_owner is not None:
+            kwargs["ExpectedBucketOwner"] = self.config.expected_bucket_owner
+        try:
+            response = self._client.get_bucket_versioning(**kwargs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._raise_failure("get_bucket_versioning", exc)
+        if not isinstance(response, Mapping) or response.get("Status") != "Enabled":
+            raise BlobCorrupt("S3 object administration requires enabled bucket versioning")
 
     @staticmethod
     def _page_limit(limit: object) -> int:
@@ -534,6 +544,7 @@ class S3ObjectStoreAdmin(_S3Client):
         continuation_token: str | None = None,
         limit: int = 1000,
     ) -> ObjectInventoryPage:
+        self._require_enabled_versioning()
         checked_limit = self._page_limit(limit)
         checked_token = self._token(continuation_token, "inventory continuation_token")
         kwargs: dict[str, object] = {
@@ -571,37 +582,36 @@ class S3ObjectStoreAdmin(_S3Client):
                 or type(delete_token) is not str
             ):
                 raise BlobCorrupt("S3 object inventory entry is malformed")
-            if self.config.admin_delete_mode == "version_id":
-                try:
-                    current = self._client.head_object(  # type: ignore[attr-defined]
-                        **self._location(sha256)
-                    )
-                except Exception as exc:
-                    if _is_missing(exc):
-                        continue
-                    self._raise_failure("head_object for versioned inventory", exc)
-                if not isinstance(current, Mapping):
-                    raise BlobCorrupt("S3 versioned inventory metadata is malformed")
-                current_size = current.get("ContentLength")
-                current_modified = current.get("LastModified")
-                current_etag = current.get("ETag")
-                current_version = current.get("VersionId")
-                if (
-                    type(current_size) is not int
-                    or current_size < 0
-                    or not isinstance(current_modified, datetime)
-                    or type(current_etag) is not str
-                    or type(current_version) is not str
-                    or not current_version
-                    or current_version == "null"
-                ):
-                    raise BlobCorrupt("S3 versioned inventory metadata is malformed")
-                size_bytes = current_size
-                last_modified = current_modified
-                delete_token = self._encode_versioned_delete_token(
-                    current_etag,
-                    current_version,
+            try:
+                current = self._client.head_object(  # type: ignore[attr-defined]
+                    **self._location(sha256)
                 )
+            except Exception as exc:
+                if _is_missing(exc):
+                    continue
+                self._raise_failure("head_object for versioned inventory", exc)
+            if not isinstance(current, Mapping):
+                raise BlobCorrupt("S3 versioned inventory metadata is malformed")
+            current_size = current.get("ContentLength")
+            current_modified = current.get("LastModified")
+            current_etag = current.get("ETag")
+            current_version = current.get("VersionId")
+            if (
+                type(current_size) is not int
+                or current_size < 0
+                or not isinstance(current_modified, datetime)
+                or type(current_etag) is not str
+                or type(current_version) is not str
+                or not current_version
+                or current_version == "null"
+            ):
+                raise BlobCorrupt("S3 versioned inventory metadata is malformed")
+            size_bytes = current_size
+            last_modified = current_modified
+            delete_token = self._encode_versioned_delete_token(
+                current_etag,
+                current_version,
+            )
             entries.append(
                 ObjectInventoryEntry(
                     sha256=sha256,
@@ -648,63 +658,43 @@ class S3ObjectStoreAdmin(_S3Client):
             raise ValueError("S3 versioned delete_token is invalid")
         return value["etag"], value["version_id"]
 
-    def _current_delete_identity(self, sha256: str) -> tuple[str, str | None] | None:
-        try:
-            response = self._client.head_object(**self._location(sha256))  # type: ignore[attr-defined]
-        except Exception as exc:
-            if _is_missing(exc):
-                return None
-            self._raise_failure("head_object for conditional delete", exc)
-        token = response.get("ETag") if isinstance(response, Mapping) else None
-        version_id = response.get("VersionId") if isinstance(response, Mapping) else None
-        if type(token) is not str or not token:
-            raise BlobCorrupt("S3 conditional delete metadata has no ETag")
-        if version_id is not None and type(version_id) is not str:
-            raise BlobCorrupt("S3 conditional delete metadata has malformed VersionId")
-        if self.config.admin_delete_mode == "if_match" and type(version_id) is str:
-            raise BlobCorrupt(
-                "S3 versioned delete requires admin_delete_mode='version_id'"
-            )
-        if self.config.admin_delete_mode == "version_id" and (
-            type(version_id) is not str or not version_id or version_id == "null"
-        ):
-            raise BlobCorrupt("S3 versioned delete requires bucket versioning evidence")
-        return (
-            token,
-            version_id
-            if self.config.admin_delete_mode == "version_id" and type(version_id) is str
-            else None,
-        )
-
-    def _version_exists(self, sha256: str, version_id: str) -> bool:
+    def _target_version_etag(self, sha256: str, version_id: str) -> str | None:
         kwargs = self._location(sha256)
         kwargs["VersionId"] = version_id
         try:
-            self._client.head_object(**kwargs)  # type: ignore[attr-defined]
+            response = self._client.head_object(**kwargs)  # type: ignore[attr-defined]
         except Exception as exc:
             if _is_missing(exc) or _error_details(exc)[1] == "NoSuchVersion":
-                return False
-            self._raise_failure("head_object for version delete reconciliation", exc)
-        return True
+                return None
+            self._raise_failure("head_object for version delete", exc)
+        token = response.get("ETag") if isinstance(response, Mapping) else None
+        observed_version = response.get("VersionId") if isinstance(response, Mapping) else None
+        if (
+            type(token) is not str
+            or not token
+            or type(observed_version) is not str
+            or observed_version != version_id
+        ):
+            raise BlobCorrupt("S3 version delete metadata is malformed")
+        return token
+
+    def _version_exists(self, sha256: str, version_id: str) -> bool:
+        return self._target_version_etag(sha256, version_id) is not None
 
     def delete_if_match(self, sha256: str, delete_token: str) -> ObjectDeleteResult:
+        self._require_enabled_versioning()
         if not is_content_sha256(sha256):
             raise ValueError("S3 delete sha256 must be a lowercase SHA-256 digest")
         checked_token = self._token(delete_token, "delete_token")
         assert checked_token is not None
-        if self.config.admin_delete_mode == "version_id":
-            expected_etag, expected_version = self._decode_versioned_delete_token(checked_token)
-        else:
-            expected_etag, expected_version = checked_token, None
-        current = self._current_delete_identity(sha256)
-        if current is None:
+        expected_etag, expected_version = self._decode_versioned_delete_token(checked_token)
+        current_etag = self._target_version_etag(sha256, expected_version)
+        if current_etag is None:
             return ObjectDeleteResult(status="already_missing")
-        if current != (expected_etag, expected_version):
+        if current_etag != expected_etag:
             return ObjectDeleteResult(status="precondition_failed")
         delete_kwargs = self._location(sha256)
-        delete_kwargs["IfMatch"] = expected_etag
-        if expected_version is not None:
-            delete_kwargs["VersionId"] = expected_version
+        delete_kwargs["VersionId"] = expected_version
         try:
             self._client.delete_object(**delete_kwargs)  # type: ignore[attr-defined]
         except Exception as exc:
@@ -712,15 +702,8 @@ class S3ObjectStoreAdmin(_S3Client):
                 return ObjectDeleteResult(status="already_missing")
             if _is_precondition(exc):
                 return ObjectDeleteResult(status="precondition_failed")
-            if expected_version is not None:
-                if not self._version_exists(sha256, expected_version):
-                    return ObjectDeleteResult(status="deleted")
-                self._raise_failure("delete_object", exc)
-            current = self._current_delete_identity(sha256)
-            if current is None:
+            if not self._version_exists(sha256, expected_version):
                 return ObjectDeleteResult(status="deleted")
-            if current != (expected_etag, expected_version):
-                return ObjectDeleteResult(status="precondition_failed")
             self._raise_failure("delete_object", exc)
         return ObjectDeleteResult(status="deleted")
 

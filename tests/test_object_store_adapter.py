@@ -81,6 +81,10 @@ class _FakeS3:
             raise _S3Error(404, "NoSuchVersion")
         return self._response(value)
 
+    def get_bucket_versioning(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"Status": "Enabled"} if self.versioned else {}
+
     def get_object(self, **kwargs: Any) -> dict[str, Any]:
         value = self.objects.get(self._location(kwargs))
         if value is None:
@@ -218,7 +222,7 @@ class _FakeS3:
         if kwargs.get("VersionId") not in {None, value.get("version_id")}:
             raise _S3Error(404, "NoSuchVersion")
         etag = value.get("etag", f'"{hashlib.md5(value["data"]).hexdigest()}"')  # noqa: S324
-        if kwargs.get("IfMatch") != etag:
+        if "IfMatch" in kwargs and kwargs["IfMatch"] != etag:
             raise _S3Error(412, "PreconditionFailed")
         del self.objects[location]
         if fault == "response_lost":
@@ -296,7 +300,7 @@ def _admin(
     client: _FakeS3 | None = None,
     **changes: Any,
 ) -> tuple[S3ObjectStoreAdmin, _FakeS3]:
-    client = client or _FakeS3(versioned=changes.get("admin_delete_mode") == "version_id")
+    client = client or _FakeS3(versioned=True)
     return S3ObjectStoreAdmin(_config(**changes), client=client), client
 
 
@@ -321,8 +325,6 @@ def test_s3_config_is_bounded_and_hides_sensitive_values() -> None:
         _config(multipart_part_bytes=5 * _MIB, max_object_bytes=50_001 * _MIB)
     with pytest.raises(ValueError, match="requires aws:kms"):
         _config(sse_kms_key_id="key-id")
-    with pytest.raises(ValueError, match="admin_delete_mode"):
-        _config(admin_delete_mode="unsafe")
 
 
 def test_object_store_namespace_import_does_not_load_optional_sdks() -> None:
@@ -529,7 +531,11 @@ def test_admin_inventory_is_bounded_parses_only_exact_content_keys_and_condition
 
     assert {entry.sha256 for entry in entries} == set(digests)
     victim = next(entry for entry in entries if entry.sha256 == digests[0])
-    assert admin.delete_if_match(victim.sha256, '"wrong"').status == "precondition_failed"
+    victim_version = client.objects[
+        (admin.config.bucket, admin.config.object_key(victim.sha256))
+    ]["version_id"]
+    wrong_token = admin._encode_versioned_delete_token('"wrong"', victim_version)
+    assert admin.delete_if_match(victim.sha256, wrong_token).status == "precondition_failed"
     assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "deleted"
     assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "already_missing"
 
@@ -558,8 +564,8 @@ def test_admin_incomplete_multipart_inventory_token_and_abort_are_explicit() -> 
     assert admin.abort_incomplete_multipart(uploads[0]).status == "already_missing"
 
 
-def test_admin_version_id_mode_rejects_a_recreated_current_version() -> None:
-    admin, client = _admin(admin_delete_mode="version_id")
+def test_admin_exact_version_token_does_not_delete_a_recreated_current_version() -> None:
+    admin, client = _admin()
     runtime = S3ContentAddressedBlobStore(admin.config, client=client)
     data = b"versioned conditional deletion"
     sha256 = hashlib.sha256(data).hexdigest()
@@ -568,26 +574,26 @@ def test_admin_version_id_mode_rejects_a_recreated_current_version() -> None:
     location = (admin.config.bucket, admin.config.object_key(sha256))
     client.objects[location]["version_id"] = "replacement-version"
 
-    assert admin.delete_if_match(sha256, entry.delete_token).status == "precondition_failed"
+    assert admin.delete_if_match(sha256, entry.delete_token).status == "already_missing"
+    assert runtime.stat(sha256) is not None
     current = admin.inventory_page(limit=1).entries[0]
     assert admin.delete_if_match(sha256, current.delete_token).status == "deleted"
 
 
-def test_admin_if_match_mode_rejects_versioned_bucket() -> None:
-    client = _FakeS3(versioned=True)
-    admin, _ = _admin(client, admin_delete_mode="if_match")
+def test_admin_inventory_requires_enabled_bucket_versioning() -> None:
+    client = _FakeS3(versioned=False)
+    admin, _ = _admin(client)
     runtime = S3ContentAddressedBlobStore(admin.config, client=client)
-    data = b"versioned if-match deletion"
+    data = b"unversioned inventory must fail closed"
     sha256 = hashlib.sha256(data).hexdigest()
     runtime.put_if_absent(sha256, data)
-    entry = admin.inventory_page(limit=1).entries[0]
 
-    with pytest.raises(BlobCorrupt, match="admin_delete_mode='version_id'"):
-        admin.delete_if_match(sha256, entry.delete_token)
+    with pytest.raises(BlobCorrupt, match="enabled bucket versioning"):
+        admin.inventory_page(limit=1)
 
 
 def test_admin_version_delete_propagates_failure_while_target_still_exists() -> None:
-    admin, client = _admin(admin_delete_mode="version_id")
+    admin, client = _admin()
     runtime = S3ContentAddressedBlobStore(admin.config, client=client)
     data = b"retryable version delete failure"
     sha256 = hashlib.sha256(data).hexdigest()

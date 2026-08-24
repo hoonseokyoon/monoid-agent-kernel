@@ -43,10 +43,6 @@ class S3ObjectStoreConfig:
     multipart_threshold_bytes: int = 8 * 1024 * 1024
     multipart_part_bytes: int = 8 * 1024 * 1024
     max_object_bytes: int = 5 * 1024 * 1024 * 1024
-    # `if_match` requires an unversioned bucket and server-side DeleteObject If-Match
-    # enforcement. `version_id` requires bucket versioning and deletes only the exact version
-    # captured by admin inventory.
-    admin_delete_mode: Literal["if_match", "version_id"] = "if_match"
     expected_bucket_owner: str | None = None
     server_side_encryption: Literal["AES256", "aws:kms"] | None = None
     sse_kms_key_id: str | None = field(default=None, repr=False)
@@ -111,8 +107,6 @@ class S3ObjectStoreConfig:
             )
         if self.max_object_bytes > self.multipart_part_bytes * _MAX_MULTIPART_PARTS:
             raise ValueError("S3 max_object_bytes would exceed the 10,000 multipart part limit")
-        if self.admin_delete_mode not in {"if_match", "version_id"}:
-            raise ValueError("S3 admin_delete_mode is outside the supported vocabulary")
         if self.expected_bucket_owner is not None and (
             type(self.expected_bucket_owner) is not str
             or _ACCOUNT_PATTERN.fullmatch(self.expected_bucket_owner) is None
