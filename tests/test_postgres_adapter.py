@@ -32,6 +32,8 @@ class _FakeCursor:
         self.executed.append((statement, parameters))
 
     def fetchone(self) -> tuple[object, ...]:
+        if self.executed and "statement_timestamp()" in str(self.executed[-1][0]):
+            return (datetime(2026, 8, 24, tzinfo=UTC), "30000ms", "300000ms")
         return self.row
 
 
@@ -175,13 +177,31 @@ def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
         ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", None),
         ("SET LOCAL search_path TO pg_catalog, pg_temp", None),
         (
-            "SELECT pg_catalog.set_config('lock_timeout', %s, true), "
+            "SELECT pg_catalog.statement_timestamp(), "
+            "pg_catalog.set_config('lock_timeout', %s, true), "
             "pg_catalog.set_config('statement_timeout', %s, true)",
             ("30000ms", "300000ms"),
         ),
     ]
     assert len(pool.connection_value.row_factories) == 1
     assert getattr(pool.connection_value.row_factories[0], "__name__", "") == "_tuple_row"
+    database.close()
+
+
+def test_read_snapshot_returns_the_first_setup_statement_boundary() -> None:
+    pool = _FakePool()
+    database = PostgresDatabase(PostgresConfig(dsn="postgresql://unused/service"), pool=pool)
+    database.open()
+    pool.connection_value.cursor_value.executed.clear()
+
+    with database.read_snapshot() as (connection, snapshot_boundary):
+        assert connection is pool.connection_value
+        assert snapshot_boundary == datetime(2026, 8, 24, tzinfo=UTC)
+
+    assert pool.connection_value.cursor_value.executed[0] == (
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        None,
+    )
     database.close()
 
 
