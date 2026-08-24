@@ -153,17 +153,18 @@ class _TemporalLeaseSupervisor:
         self,
         *,
         store: WriterAuthorityStore,
-        lease: WriterLease,
         policy: TemporalActivityPolicy,
         write_authority: ActivationWriteAuthority,
         cancellation_token: CancellationToken,
     ) -> None:
         self._store = store
-        self._lease = lease
+        self._lease: WriterLease | None = None
+        self._lease_lock = threading.Lock()
         self._policy = policy
         self._write_authority = write_authority
         self._cancellation_token = cancellation_token
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._failure = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -179,8 +180,19 @@ class _TemporalLeaseSupervisor:
         )
         self._thread.start()
 
+    def install_lease(self, lease: WriterLease) -> None:
+        if not isinstance(lease, WriterLease):
+            raise TypeError("lease supervisor requires WriterLease")
+        self.assert_healthy()
+        with self._lease_lock:
+            if self._lease is not None:
+                raise RuntimeError("lease supervisor authority can only be installed once")
+            self._lease = lease
+        self._wake.set()
+
     def stop_and_join(self) -> bool:
         self._stop.set()
+        self._wake.set()
         thread = self._thread
         if thread is None:
             return True
@@ -210,7 +222,7 @@ class _TemporalLeaseSupervisor:
         renew_interval = float(self._policy.writer_lease_renew_interval_s)
         now = time.monotonic()
         next_heartbeat = now + heartbeat_interval
-        next_renew = now + renew_interval
+        next_renew: float | None = None
         try:
             while True:
                 self._observe_control()
@@ -220,20 +232,29 @@ class _TemporalLeaseSupervisor:
                 if now >= next_heartbeat:
                     activity.heartbeat()
                     next_heartbeat = now + heartbeat_interval
-                if now >= next_renew:
+                with self._lease_lock:
+                    lease = self._lease
+                if lease is not None and next_renew is None:
+                    next_renew = now + renew_interval
+                if lease is not None and next_renew is not None and now >= next_renew:
                     renewed = renew_writer_lease(
                         self._store,
-                        self._lease.writer_token,
+                        lease.writer_token,
                         self._policy.writer_lease_ttl,
                         write_authority=self._write_authority,
                     )
                     if renewed.status != "renewed" or renewed.lease is None:
                         self._fail()
                         return
-                    self._lease = renewed.lease
+                    with self._lease_lock:
+                        self._lease = renewed.lease
                     next_renew = now + renew_interval
-                wait_s = max(0.0, min(next_heartbeat, next_renew) - time.monotonic())
-                self._stop.wait(wait_s)
+                deadlines = [next_heartbeat]
+                if next_renew is not None:
+                    deadlines.append(next_renew)
+                wait_s = max(0.0, min(deadlines) - time.monotonic())
+                self._wake.wait(wait_s)
+                self._wake.clear()
         except BaseException:  # the public Activity exposes only a stable failure taxonomy
             self._fail()
 
@@ -324,27 +345,32 @@ class TemporalActivationActivity:
                 non_retryable=True,
             ) from None
 
+        write_authority = ActivationWriteAuthority()
+        cancellation_token = CancellationToken()
+        supervisor = _TemporalLeaseSupervisor(
+            store=self.authority_store,
+            policy=self.policy,
+            write_authority=write_authority,
+            cancellation_token=cancellation_token,
+        )
+        lease: WriterLease | None = None
+        result: TemporalActivationResult | None = None
+        primary_error: Exception | None = None
+        release_error: Exception | None = None
+        supervisor_stopped = True
         try:
             info = activity.info()
             owner_id = _activity_owner_id(info.task_token)
             activity.heartbeat()
+            supervisor.start()
             lease = claim_writer_lease(
                 self.authority_store,
                 command.run_id,
                 owner_id,
                 self.policy.writer_lease_ttl,
             )
-        except Exception as exc:
-            raise _application_error(exc) from None
-
-        write_authority = ActivationWriteAuthority()
-        cancellation_token = CancellationToken()
-        supervisor: _TemporalLeaseSupervisor | None = None
-        result: TemporalActivationResult | None = None
-        primary_error: Exception | None = None
-        release_error: Exception | None = None
-        supervisor_stopped = True
-        try:
+            supervisor.assert_healthy()
+            write_authority.assert_active()
             renewed = renew_writer_lease(
                 self.authority_store,
                 lease.writer_token,
@@ -354,18 +380,15 @@ class TemporalActivationActivity:
             if renewed.status != "renewed" or renewed.lease is None:
                 raise WriteAuthorityRevoked()
             lease = renewed.lease
+            supervisor.assert_healthy()
+            write_authority.assert_active()
+            supervisor.install_lease(lease)
+            supervisor.assert_healthy()
+            write_authority.assert_active()
             if activity.is_cancelled():
                 cancellation_token.cancel(InterruptionCause.USER_CANCEL)
             if activity.is_worker_shutdown():
                 cancellation_token.cancel(self.policy.worker_shutdown_cause)
-            supervisor = _TemporalLeaseSupervisor(
-                store=self.authority_store,
-                lease=lease,
-                policy=self.policy,
-                write_authority=write_authority,
-                cancellation_token=cancellation_token,
-            )
-            supervisor.start()
             activation = self.admission_store.bind_activation(
                 command,
                 writer_token=lease.writer_token,
@@ -389,14 +412,17 @@ class TemporalActivationActivity:
         except Exception as exc:
             primary_error = exc
         finally:
-            if supervisor is not None:
-                supervisor_stopped = supervisor.stop_and_join()
-                try:
-                    supervisor.assert_healthy()
-                except Exception as exc:
-                    if primary_error is None:
-                        primary_error = exc
-            if supervisor_stopped:
+            supervisor_stopped = supervisor.stop_and_join()
+            try:
+                supervisor.assert_healthy()
+            except Exception as exc:
+                if primary_error is None:
+                    primary_error = exc
+            if not supervisor_stopped:
+                release_error = _SupervisorUnhealthy(
+                    "Temporal activation lease supervisor did not stop"
+                )
+            elif lease is not None:
                 try:
                     released = self.authority_store.release(lease.writer_token)
                     if not isinstance(released, ReleaseResult):
@@ -405,10 +431,6 @@ class TemporalActivationActivity:
                         raise WriteAuthorityRevoked()
                 except Exception as exc:
                     release_error = exc
-            else:
-                release_error = _SupervisorUnhealthy(
-                    "Temporal activation lease supervisor did not stop"
-                )
             write_authority.revoke()
 
         if primary_error is not None:

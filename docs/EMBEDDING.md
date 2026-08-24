@@ -304,10 +304,11 @@ checkpoint restore, and terminal settlement remain inside this finite Activity.
 
 The Activity derives a content-free owner ID from the Temporal task token, claims an independent
 PostgreSQL writer generation, and starts a copied-context supervisor thread. The supervisor renews
-the PostgreSQL lease, sends empty heartbeats, and propagates Activity cancellation or worker
-shutdown through the exact `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation
-authority. A heartbeat or renewal ambiguity revokes `ActivationWriteAuthority`, and every later
-checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+the PostgreSQL lease, sends empty heartbeats from before the potentially blocking writer claim, and
+propagates Activity cancellation or worker shutdown through the exact
+`ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat or
+renewal ambiguity revokes `ActivationWriteAuthority`, and every later checkpoint, invocation,
+event, and terminal publication fails closed at the PostgreSQL fence.
 A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
 an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
 observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.

@@ -282,6 +282,60 @@ def test_activity_reconciles_a_lost_claim_response_with_the_same_owner() -> None
     assert store.release_count == 1
 
 
+def test_activity_heartbeats_while_the_writer_claim_is_blocked() -> None:
+    periodic_heartbeat = threading.Event()
+    heartbeat_count = 0
+
+    class BlockingClaimStore(_AuthorityStore):
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            assert periodic_heartbeat.wait(1)
+            return super().claim(run_id, owner_id, ttl)
+
+    def observe_heartbeat(*details: object) -> None:
+        nonlocal heartbeat_count
+        assert details == ()
+        heartbeat_count += 1
+        if heartbeat_count >= 2:
+            periodic_heartbeat.set()
+
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = observe_heartbeat
+    raw = environment.run(_activity(BlockingClaimStore()).run, _command().to_json())
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert heartbeat_count >= 2
+
+
+def test_heartbeat_failure_during_claim_prevents_activation_drive() -> None:
+    heartbeat_failed = threading.Event()
+    heartbeat_count = 0
+
+    class ClaimAfterHeartbeatFailure(_AuthorityStore):
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            assert heartbeat_failed.wait(1)
+            time.sleep(0.05)
+            return super().claim(run_id, owner_id, ttl)
+
+    def fail_periodic_heartbeat(*details: object) -> None:
+        nonlocal heartbeat_count
+        assert details == ()
+        heartbeat_count += 1
+        if heartbeat_count >= 2:
+            heartbeat_failed.set()
+            raise ConnectionError("private heartbeat transport failure")
+
+    store = ClaimAfterHeartbeatFailure()
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = fail_periodic_heartbeat
+    with pytest.raises(ApplicationError) as raised:
+        environment.run(_activity(store).run, _command().to_json())
+
+    assert raised.value.type == "monoid.activation_lease_lost"
+    assert raised.value.non_retryable is False
+    assert _DriverDouble.constructed == []
+    assert store.release_count == 1
+
+
 def test_worker_shutdown_policy_can_report_host_shutdown() -> None:
     store = _AuthorityStore()
     environment = ActivityEnvironment()

@@ -118,6 +118,7 @@ class _BlockingAdapter:
 @dataclass
 class _AmbiguousFirstClaim:
     inner: PostgresWriterAuthorityStore
+    first_claim_delay_s: float = 1.5
     claim_calls: int = 0
     read_calls: int = 0
     owner_ids: list[str] = field(default_factory=list)
@@ -128,6 +129,8 @@ class _AmbiguousFirstClaim:
     def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
         self.claim_calls += 1
         self.owner_ids.append(owner_id)
+        if self.claim_calls == 1:
+            time.sleep(self.first_claim_delay_s)
         lease = self.inner.claim(run_id, owner_id, ttl)
         if self.claim_calls <= 2:
             raise ConnectionError("private committed PostgreSQL claim response was lost")
@@ -349,7 +352,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                 run_policy=TemporalRunPolicy(
                     activity_task_queue=activity_queue,
                     activity_start_to_close_timeout_s=30,
-                    activity_heartbeat_timeout_s=2,
+                    activity_heartbeat_timeout_s=1,
                     activity_max_attempts=3,
                 ),
             )
