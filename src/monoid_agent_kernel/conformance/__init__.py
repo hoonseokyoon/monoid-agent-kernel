@@ -28,6 +28,11 @@ from .contracts import (
     run_model_io_observer_contract,
     run_redactor_contract,
 )
+from .blob_store import (
+    CONTENT_ADDRESSED_BLOB_STORE_PROFILE,
+    ContentAddressedBlobStoreFactory,
+    run_content_addressed_blob_store_contract,
+)
 from .fixtures import CompatibilityFixture, load_compatibility_fixtures
 from .provenance import (
     CONFORMANCE_EVIDENCE_KIND,
@@ -106,6 +111,9 @@ __all__ = [
     "run_fenced_run_sink_contract",
     "run_model_io_observer_contract",
     "run_redactor_contract",
+    "CONTENT_ADDRESSED_BLOB_STORE_PROFILE",
+    "ContentAddressedBlobStoreFactory",
+    "run_content_addressed_blob_store_contract",
     "CompatibilityFixture",
     "load_compatibility_fixtures",
     "CONFORMANCE_EVIDENCE_KIND",
