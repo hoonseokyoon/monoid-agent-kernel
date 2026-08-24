@@ -605,6 +605,82 @@ v0.19.2 makes no production rolling-upgrade claim for that profile.
 
 ## Streaming and cursor ownership
 
+### Durable private model streams
+
+Use `PostgresObjectStoreDurableStreamStore` when reconnect must survive process replacement. The
+store keeps generation, UTF-8 byte cursor, chunk metadata, and the final digest in PostgreSQL. A
+`ContentAddressedBlobStore` keeps immutable private chunk bytes. The host supplies the same exact
+`WriterToken` and activation-wide `ActivationWriteAuthority` used by checkpoint, invocation,
+event, and terminal publication:
+
+```python
+from monoid_agent_kernel.adapters.postgres import PostgresObjectStoreDurableStreamStore
+from monoid_agent_kernel.hosting import DurableModelStreamObserver
+
+streams = PostgresObjectStoreDurableStreamStore(database, object_store)
+streams.check_ready()
+
+loop = make_loop(
+    model_stream_observer_factories=(
+        lambda: DurableModelStreamObserver(
+            streams,
+            writer_token=writer_token,
+            write_authority=write_authority,
+            chunk_bytes=64 * 1024,
+            flush_interval_s=0.25,
+            max_buffer_bytes=1024 * 1024,
+        ),
+    ),
+)
+```
+
+The observer opens one `output` lane and normally opens `reasoning` when that channel first emits
+content. A replacement that finds prior output also hydrates reasoning. `ModelCallRunner` signals
+every actual adapter entry before durable `dispatch_started` publication. The observer resets every
+pre-existing kernel lane at that boundary. A reset failure leaves the invocation `reserved` and
+prevents provider entry. Provider-free settled success or failure recovery receives no dispatch
+signal and preserves the committed generation. Direct `ModelCallRunner` integrations pass a
+`before_dispatch` callback that calls `begin_model_stream_dispatch()`.
+
+The loop also passes a `before_settlement` callback that calls
+`prepare_model_stream_settlement()`. The durable observer flushes all accepted output and reasoning
+bytes before the lifecycle publishes a recoverable success or refusal. The generation stays open
+until ordinary close seals it. A crash after invocation settlement can therefore recover the full
+generation and seal it without reconstructing reasoning. A preparation failure commits
+`dispatch_unknown`, invokes `abort_model_stream()`, and leaves the generation unsealed for
+diagnosis. The first-delta reset remains a fallback for direct integrations that omit the dispatch
+callback. Host-defined private lanes use the same `DurableStreamIdentity` contract directly. Byte
+and time thresholds bound coalescing; a copied-context daemon performs ordered flushes. Generic
+observer factory, open, push, and close failures stay isolated. Dispatch- and settlement-aware
+extensions opt into fail-closed preparation. A `fenced` store result revokes the shared activation
+authority, so later kernel publication fails closed.
+The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
+leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
+call reuses and seals its prior generation; the first delta from an admitted replacement dispatch
+cannot mix with the prior generation because reset already committed before adapter entry.
+On a completed close, the observer compares the output lane's byte length and SHA-256 with the
+settled `final_text`. A mismatch means recovery found an unflushed/truncated prefix; the observer
+rebuilds output in a new generation from that authoritative final text before sealing it.
+
+Persist reconnect state as `(generation, cursor)`. Call `read_after()` only with cursor values
+returned by a prior read. `ok` returns complete UTF-8 chunks and `next_cursor`; `reset` tells the
+consumer to discard the old generation and restart from cursor zero; `gap` reports an ahead or
+non-boundary cursor. A stable reset ID makes process-response loss idempotent. Seal records the
+final byte length and SHA-256 after checked ObjectStore reads. PostgreSQL serializes append, reset,
+seal, and terminal settlement through the run authority row. An append committed before terminal
+remains readable; a new append ordered after terminal returns `run_terminal`.
+
+Each append holds the run-authority and stream-head locks through one bounded ObjectStore put;
+terminal settlement, reset, takeover, and renewal then linearize after that chunk commit. Configure
+ObjectStore request timeouts, lease TTL/renewal margin, and `supervisor_join_timeout_s` as one
+operational budget. Seal releases those locks before its multi-chunk checked-read pass and validates
+the captured head again before publication.
+
+Stream metadata contains opaque IDs, channel taxonomy, offsets, sizes, and digests. It contains no
+model text. `read_after()` returns private bytes and performs no tenant authorization; expose it
+only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
+apply tenant scoping in that wrapper.
+
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
 Reference facade exposes the same behavior through `subscribe_events()`:

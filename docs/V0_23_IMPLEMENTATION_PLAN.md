@@ -651,6 +651,15 @@ durable stream은 private high-volume content와 public lifecycle event를 분�
 - final byte length와 SHA-256
 - terminal 뒤 no-late-delta
 - writer fencing과 process replacement
+- runner의 실제 provider-dispatch 시작 신호와 provider를 호출하지 않는 settled recovery를 구분한다.
+  replacement는 `dispatch_started` commit과 adapter entry 전에 prior generation을 reset한다.
+  reset 실패는 invocation을 `reserved`로 유지하고 provider entry를 막는다. provider-free
+  success/failure recovery는 committed generation을 보존하며 success는 authoritative final
+  output도 reconcile한다.
+- provider terminal 뒤 durable settlement 전에 accepted output/reasoning buffer를 모두 flush한다.
+  flush 성공은 generation을 open으로 유지하고, invocation settlement 뒤 close 또는 recovery가
+  seal한다. flush 실패는 `stream_settlement_uncommitted` unknown으로 수렴하며 자동 provider
+  재호출을 막고 해당 generation을 seal하지 않는다.
 
 ### 12.3 storage
 

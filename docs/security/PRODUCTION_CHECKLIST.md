@@ -85,6 +85,10 @@ default must be changed for production.
       (`model_calls.jsonl` carries metadata only), and no projection, hydration
       path or HTTP route serves the replay corpus, so filesystem access is the
       only control over it (`monoid validate` and `monoid gc` read it in place).
+- [ ] Durable private stream reads are exposed only through a product-authenticated tenant/run
+      projection. PostgreSQL stream metadata stays content-free, ObjectStore chunk access remains
+      private, reconnect accepts committed cursor boundaries, and retention covers every old
+      generation retained after reset.
 - [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
       MCP servers, and untrusted processes cannot modify committed `events.jsonl`
       prefixes; the Reference warm offset index relies on this append-only boundary.

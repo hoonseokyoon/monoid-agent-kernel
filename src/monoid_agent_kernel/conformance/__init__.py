@@ -33,6 +33,12 @@ from .blob_store import (
     ContentAddressedBlobStoreFactory,
     run_content_addressed_blob_store_contract,
 )
+from .durable_stream import (
+    DURABLE_STREAM_STORE_PROFILE,
+    DurableStreamStoreHarness,
+    DurableStreamStoreHarnessFactory,
+    run_durable_stream_store_contract,
+)
 from .fixtures import CompatibilityFixture, load_compatibility_fixtures
 from .provenance import (
     CONFORMANCE_EVIDENCE_KIND,
@@ -114,6 +120,10 @@ __all__ = [
     "CONTENT_ADDRESSED_BLOB_STORE_PROFILE",
     "ContentAddressedBlobStoreFactory",
     "run_content_addressed_blob_store_contract",
+    "DURABLE_STREAM_STORE_PROFILE",
+    "DurableStreamStoreHarness",
+    "DurableStreamStoreHarnessFactory",
+    "run_durable_stream_store_contract",
     "CompatibilityFixture",
     "load_compatibility_fixtures",
     "CONFORMANCE_EVIDENCE_KIND",

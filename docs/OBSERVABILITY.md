@@ -445,8 +445,10 @@ Autonomous runs use `AgentLoop.stream_model_calls=True` to select provider strea
 from egress. `model_stream_observer_factories` creates passive observers for live presentation or
 private persistence. Each observer receives output/reasoning fragments and a terminal outcome for
 one provider call; tool-call fragments remain inside model-turn assembly. A fresh observer is
-created for every activation and subagent, and observer failures remain isolated from the model
-call. `model_content_file=True` adds a writer owned by the run recorder and persists
+created for every activation and subagent. Generic observer failures remain isolated from the model
+call. Dispatch- and settlement-aware durable writers opt into fail-closed preparation: reset must
+complete before provider entry, and accepted private deltas must flush before recoverable durable
+settlement. `model_content_file=True` adds a writer owned by the run recorder and persists
 `stream_opened`, `stream_segment`, `stream_closed`, and `settled_text` records to the optional
 private `model-content.jsonl` sidecar.
 
