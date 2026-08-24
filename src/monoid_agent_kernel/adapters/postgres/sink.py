@@ -634,6 +634,17 @@ class PostgresFencedRunSink:
             winner_digest=winner_digest,
         )
 
+    def _terminal_exists(self, cursor: object, run_id: str) -> bool:
+        from psycopg import sql
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL("SELECT 1 FROM {} WHERE run_id = %s").format(
+                self._table("terminal_record")
+            ),
+            (run_id,),
+        )
+        return cursor.fetchone() is not None  # type: ignore[attr-defined]
+
     def _commit_event_locked(
         self,
         cursor: object,
@@ -653,6 +664,16 @@ class PostgresFencedRunSink:
         duplicate_id = self._event_id_winner(cursor, event, content_digest)
         if duplicate_id is not None:
             return duplicate_id, content_digest, payload
+        if self._terminal_exists(cursor, event.run_id):
+            return (
+                CommitResult(
+                    status="conflict",
+                    sequence=event.seq,
+                    content_digest=content_digest,
+                ),
+                content_digest,
+                payload,
+            )
 
         from psycopg import sql
         from psycopg.types.json import Json
@@ -705,7 +726,16 @@ class PostgresFencedRunSink:
             with self.database.cursor(connection) as cursor:
                 if not self._current_writer_locked(cursor, writer_token):
                     return CommitResult(status="fenced")
-                return self._event_coordinate(cursor, event, payload, content_digest)
+                stored = self._event_coordinate(cursor, event, payload, content_digest)
+                if stored is not None:
+                    return stored
+                if self._terminal_exists(cursor, event.run_id):
+                    return CommitResult(
+                        status="conflict",
+                        sequence=event.seq,
+                        content_digest=content_digest,
+                    )
+                return None
 
     def append_event(
         self,
@@ -1670,6 +1700,32 @@ class PostgresFencedRunSink:
         ):
             raise RuntimeError("PostgreSQL event record is corrupt")
         return event
+
+    def latest_event_sequence(self, run_id: str) -> int:
+        """Return the integrity-checked authoritative event cursor for a run."""
+
+        self._require_ready()
+        if not is_safe_opaque_id(run_id):
+            raise ValueError("PostgreSQL event run_id must be a bounded opaque id")
+        from psycopg import sql
+
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL("SELECT sequence FROM {} WHERE run_id = %s").format(
+                        self._table("event_head")
+                    ),
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return 0
+        sequence = row[0]
+        if not is_portable_json_integer(sequence) or sequence < 1:
+            raise RuntimeError("PostgreSQL event head is corrupt")
+        if self.read_event(run_id, sequence) is None:
+            raise RuntimeError("PostgreSQL event head references a missing record")
+        return sequence
 
     def read_terminal(self, run_id: str) -> TerminalOutcome | None:
         """Read and verify the first-writer terminal winner for a run."""

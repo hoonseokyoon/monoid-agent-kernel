@@ -158,6 +158,28 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         source=("core/outcome.py:TerminalOutcome.from_json",),
         legacy_reader=True,
     ),
+    _monoid_artifact(
+        "activation-command.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/activation.py:ActivationCommand.from_json",),
+        legacy_reader=True,
+        notes=(
+            "Content-free finite-activation identity with an opaque private payload address and "
+            "a canonical source-checkpoint digest."
+        ),
+    ),
+    _monoid_artifact(
+        "activation-receipt.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/activation.py:ActivationReceipt.from_json",),
+        legacy_reader=True,
+        notes=(
+            "Content-free operational copy reconstructed from the canonical checkpoint receipt "
+            "and terminal winner."
+        ),
+    ),
     CompatibilityArtifact(
         key="model-stream-live",
         kind="wire",

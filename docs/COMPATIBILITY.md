@@ -45,6 +45,8 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
 | `terminal-outcome` | wire | `monoid.terminal-outcome.v1` | strict | `monoid.terminal-outcome.v1`<br>`native-agent-runner.terminal-outcome.v1` |
+| `activation-command` | wire | `monoid.activation-command.v1` | strict | `monoid.activation-command.v1`<br>`native-agent-runner.activation-command.v1` |
+| `activation-receipt` | wire | `monoid.activation-receipt.v1` | strict | `monoid.activation-receipt.v1`<br>`native-agent-runner.activation-receipt.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
@@ -92,6 +94,17 @@ so an ambiguous paid call cannot be classified for automatic retry.
 The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
 limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
 contract window, so deploy the current strict reader before a writer that can emit it.
+
+`monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
+or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded
+opaque payload address. Private input content, attempts, timestamps, and orchestrator identifiers
+stay outside the command, so retry and process replacement preserve the same identity.
+`monoid.activation-receipt.v1` is the content-free operational copy of the boundary stored in the
+canonical checkpoint receipt. It carries checkpoint identity, lifecycle state, event/stream
+cursors, terminal reference, and portable outcome taxonomy. Hosts reconstruct it from durable
+state after response loss; later checkpoint heads retain the original per-command boundary
+identity. The boundary digest blanks its own nested digest field before hashing to avoid a
+self-reference. Model output and raw exceptions never enter the receipt.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The

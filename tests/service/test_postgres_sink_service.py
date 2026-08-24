@@ -11,7 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Callable, Iterator, Literal
+from pathlib import Path
+from typing import Any, Callable, Iterator, Literal
 
 import pytest
 
@@ -27,6 +28,7 @@ if not _selected():
     pytest.skip("PostgreSQL service profile is not selected", allow_module_level=True)
 
 import psycopg  # noqa: E402
+from support.runtime import runtime_config, runtime_provider  # noqa: E402
 from psycopg import sql  # noqa: E402
 from psycopg.rows import dict_row  # noqa: E402
 from psycopg.types.json import Json  # noqa: E402
@@ -44,7 +46,10 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresWriterAuthorityStore,
 )
 from monoid_agent_kernel.core._util import canonical_sha256  # noqa: E402
-from monoid_agent_kernel.core.checkpoint import RunCheckpoint  # noqa: E402
+from monoid_agent_kernel.core.checkpoint import (  # noqa: E402
+    LocalFsCheckpointStore,
+    RunCheckpoint,
+)
 from monoid_agent_kernel.core.events import AgentEvent, make_agent_event  # noqa: E402
 from monoid_agent_kernel.core.model_invocation import (  # noqa: E402
     MODEL_REQUEST_DIGEST_GENERATION,
@@ -54,15 +59,22 @@ from monoid_agent_kernel.core.outcome import (  # noqa: E402
     RetryEligibility,
     TerminalOutcome,
 )
+from monoid_agent_kernel.core.spec import AgentRunSpec  # noqa: E402
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
+from monoid_agent_kernel.errors import ModelAdapterError  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
+    ActivationCommand,
+    ActivationDriver,
+    ActivationRuntime,
     BlobNotFound,
     BlobTooLarge,
     CommitResult,
     WriterToken,
 )
 from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
+from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
 
 
 _POSTGRES_TARGETS = [
@@ -77,6 +89,26 @@ _POSTGRES_TARGETS = [
         {"combined"},
     ),
 ]
+
+
+class _RetryableActivationAdapter:
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        raise ModelAdapterError(
+            "private provider failure",
+            error_code="provider_unavailable",
+            retryable=True,
+        )
+
+
+@dataclass
+class _CountingActivationAdapter:
+    calls: int = 0
+
+    def next_turn(self, request: Any) -> ModelTurn:
+        del request
+        self.calls += 1
+        return ModelTurn(final_text="ok")
 
 
 @pytest.fixture(
@@ -331,6 +363,19 @@ def sink_harness(postgres_target: tuple[str, int]) -> Iterator[_SinkHarness]:
                         )
         finally:
             database.close()
+
+
+@pytest.fixture
+def activation_sink(sink_harness: _SinkHarness) -> Iterator[PostgresFencedRunSink]:
+    config = replace(
+        sink_harness.database.config,
+        application_name="monoid-pr07-activation-test",
+        max_bytea_blob_bytes=1024 * 1024,
+    )
+    with PostgresDatabase(config) as database:
+        sink = PostgresFencedRunSink(database)
+        sink.check_ready()
+        yield sink
 
 
 @pytest.fixture
@@ -1328,9 +1373,15 @@ def test_event_and_terminal_records_are_immutable_and_restart_safe(
 
     event_commit = sink_harness.sink.append_event(event, writer_token=token)
     terminal_commit = sink_harness.sink.settle_terminal(terminal, writer_token=token)
+    late_event = make_agent_event(
+        run_id=run_id,
+        seq=2,
+        event_type="run.finished",
+    )
 
     assert event_commit.status == "committed"
     assert terminal_commit.status == "committed"
+    assert sink_harness.sink.latest_event_sequence(run_id) == 1
     reopened = sink_harness.reopen()
     assert reopened.read_event(run_id, 1) == event
     assert reopened.read_terminal(run_id) == terminal
@@ -1338,6 +1389,9 @@ def test_event_and_terminal_records_are_immutable_and_restart_safe(
     assert reopened.sink.settle_terminal(terminal, writer_token=token).status == (
         "already_committed"
     )
+    assert reopened.sink.append_event(late_event, writer_token=token).status == "conflict"
+    assert reopened.read_event(run_id, 2) is None
+    assert reopened.sink.latest_event_sequence(run_id) == 1
     assert (
         reopened.sink.append_event(replace(event, level="warning"), writer_token=token).status
         == "conflict"
@@ -1355,6 +1409,105 @@ def test_event_and_terminal_records_are_immutable_and_restart_safe(
     )
     assert sink_harness.sink.capabilities.durable_events is True
     assert sink_harness.sink.capabilities.terminal_first_writer_wins is True
+
+
+def test_activation_process_replacement_converges_on_postgres_receipt(
+    sink_harness: _SinkHarness,
+    activation_sink: PostgresFencedRunSink,
+    tmp_path: Path,
+) -> None:
+    run_id = "run-neutral-activation"
+    spec = AgentRunSpec(
+        run_id=run_id,
+        workspace_root=tmp_path / "workspace",
+        run_root=tmp_path / "source-runs",
+    )
+    spec.workspace_root.mkdir(parents=True)
+    source_store = LocalFsCheckpointStore(spec.run_root)
+    source = AgentLoop(
+        spec=spec,
+        model_adapter=_RetryableActivationAdapter(),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+        checkpoint_store=source_store,
+    )
+    source.open()
+    assert source.run_until_suspended("resume on PostgreSQL").reason == "turn_failed"
+    source.release_parked()
+    source_record = source_store.latest(run_id)
+    assert source_record is not None
+
+    token = sink_harness.claim(run_id)
+    assert (
+        activation_sink.commit_checkpoint(
+            source_record.checkpoint,
+            {},
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+    request_digest = canonical_sha256({"run_id": run_id, "command_id": "input-1"})
+    command = ActivationCommand(
+        run_id=run_id,
+        command_id="input-1",
+        command_sequence=1,
+        kind="control",
+        source_checkpoint_seq=source_record.seq,
+        source_checkpoint_sha256=canonical_sha256(source_record.checkpoint.to_json()),
+        request_digest=request_digest,
+        payload_ref=f"blob:{request_digest}",
+    )
+    adapter = _CountingActivationAdapter()
+    factory_calls = 0
+
+    def loop_factory(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
+        nonlocal factory_calls
+        factory_calls += 1
+        return AgentLoop(
+            spec=AgentRunSpec(
+                run_id=command.run_id,
+                workspace_root=spec.workspace_root,
+                run_root=tmp_path / "postgres-activation-runs",
+            ),
+            model_adapter=adapter,
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            run_sink=runtime.run_sink,
+            writer_token=runtime.writer_token,
+            write_authority=runtime.write_authority,
+            authoritative_event_sinks=(runtime.event_sink,),
+            event_sequence_seed=runtime.event_sequence_seed,
+            status_file=False,
+        )
+
+    first = ActivationDriver(
+        sink=activation_sink,
+        writer_token=token,
+        loop_factory=loop_factory,
+    ).drive(command)
+
+    assert (first.boundary_reason, first.error_code, first.provider_error_code) == (
+        "settled",
+        "",
+        "",
+    )
+    assert first.event_cursor == activation_sink.latest_event_sequence(run_id)
+    assert adapter.calls == 1
+    assert factory_calls == 1
+    assert sink_harness.authority.release(token).status == "released"
+    replacement_token = sink_harness.claim(run_id, "worker-b")
+
+    def forbidden_factory(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
+        del command, runtime
+        raise AssertionError("canonical receipt must bypass loop construction")
+
+    replacement = ActivationDriver(
+        sink=activation_sink,
+        writer_token=replacement_token,
+        loop_factory=forbidden_factory,
+    ).drive(command)
+
+    assert replacement == first
+    assert adapter.calls == 1
+    assert factory_calls == 1
 
 
 def test_required_evidence_binds_exact_current_settled_invocation(

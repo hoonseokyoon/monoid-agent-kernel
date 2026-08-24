@@ -193,6 +193,14 @@ REMOVED_PUBLIC_SURFACE_NAMES = [
     "StorageCapabilities",
     "FencedCheckpointStore",
     "FencedRunSink",
+    "ActivationCommand",
+    "ResolvedActivationInput",
+    "ActivationReceipt",
+    "ActivationRuntime",
+    "ActivationDriver",
+    "FencedEventSink",
+    "FencedTerminalBridge",
+    "TerminalSettlement",
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
@@ -416,6 +424,19 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "WriterLeaseUnavailable",
         "WriterAuthorityStore",
         "renew_writer_lease",
+        "ActivationCommandKind",
+        "ActivationCommand",
+        "ResolvedActivationInput",
+        "ActivationReceipt",
+        "ActivationRuntime",
+        "ActivationLoopFactory",
+        "ActivationFaultHook",
+        "ActivationInputResolver",
+        "ActivationDriver",
+        "FencedEventSink",
+        "FencedTerminalBridge",
+        "TerminalCommitStatus",
+        "TerminalSettlement",
         "BlobStat",
         "BlobPutResult",
         "BlobStoreError",
@@ -851,6 +872,23 @@ def test_v022_injected_constructor_dependencies_are_keyword_only() -> None:
         (ModelCallRunner, "current_write_authority"),
         (ModelCallRunner, "lifecycle_hook"),
         (TaskManager, "write_authority"),
+    ):
+        (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"
+
+
+def test_v023_authoritative_event_dependencies_are_keyword_only() -> None:
+    """Durable journal injection preserves the pre-v0.23 positional constructor shapes."""
+    import dataclasses
+
+    from monoid_agent_kernel.loop import AgentLoop
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    for cls, name in (
+        (AgentLoop, "authoritative_event_sinks"),
+        (AgentLoop, "event_sequence_seed"),
+        (AgentRecorder, "authoritative_event_sinks"),
+        (AgentRecorder, "event_sequence_seed"),
     ):
         (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
         assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"

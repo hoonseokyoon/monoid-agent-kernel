@@ -148,6 +148,45 @@ Reconstruct the loop with the same run ID, compatible runtime definition, worksp
 blob store. Restore the checked checkpoint before accepting a new input. Stop recovery and surface
 an actionable failure for corrupt or unsupported state.
 
+### Finite activation hosting
+
+Use `monoid_agent_kernel.hosting.ActivationDriver` when an external scheduler, workflow engine, or
+queue worker owns process replacement. The host admits one stable `ActivationCommand`, claims a
+`WriterToken`, and drives the restored loop to one durable suspension boundary:
+
+```python
+from monoid_agent_kernel.hosting import ActivationCommand, ActivationDriver
+
+command = ActivationCommand.from_json(admitted_command)
+receipt = ActivationDriver(
+    sink=fenced_run_sink,
+    writer_token=writer_token,
+    loop_factory=build_loop,
+    input_resolver=resolve_private_input,
+).drive(command)
+```
+
+The command contains digests and an opaque payload address. For an `input` command, the resolver
+loads private content and returns `ResolvedActivationInput` whose request digest and payload address
+match the admitted command. A `control` command resumes host-prepared checkpoint state without
+injecting another user message. A duplicate command whose marker is already in the canonical
+checkpoint returns the same content-free `ActivationReceipt` without resolving input or opening a
+loop. The checkpoint keeps that command's original boundary sequence and digest inside its private
+receipt, so later commands may advance the head without changing an earlier command's returned
+receipt. The digest hashes the boundary checkpoint with that receipt's own digest field blanked,
+which avoids a self-reference while retaining the rest of the exact boundary identity.
+
+The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`, and
+`write_authority`. It also configures
+`authoritative_event_sinks=(runtime.event_sink,)`, seeds `event_sequence_seed` from the runtime, and
+keeps `emit_output_deltas=False` until a durable private stream sink is configured. The resulting
+event order is durable journal first, then local projections. A terminal winner closes new public
+event coordinates while preserving exact retries of events committed before terminal settlement.
+
+Treat `ActivationReceipt` as an operational copy. Reconstruct it from the canonical checkpoint and
+terminal readback after a response loss. Store model output and raw provider errors only in the
+private checkpoint/blob channels referenced by the receipt.
+
 ## Golden path B: hosted/multi-tenant product
 
 The hosted example creates two `RunnerBackend` instances over one SQLite database. This diagram is

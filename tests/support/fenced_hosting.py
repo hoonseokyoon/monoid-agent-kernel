@@ -282,8 +282,21 @@ class DeterministicFencedRunSink:
         existing = self._stored_result(self._events, key, digest, sequence=event.seq)
         if existing is not None:
             return existing
+        if event.run_id in self._terminals:
+            return CommitResult(
+                status="conflict",
+                sequence=event.seq,
+                content_digest=digest,
+            )
         self._events[key] = (digest, event)
         return CommitResult(status="committed", sequence=event.seq, content_digest=digest)
+
+    def latest_event_sequence(self, run_id: str) -> int:
+        with self._lock:
+            return max(
+                (sequence for stored_run_id, sequence in self._events if stored_run_id == run_id),
+                default=0,
+            )
 
     def settle_terminal(
         self,
@@ -308,6 +321,11 @@ class DeterministicFencedRunSink:
             return existing
         self._terminals[outcome.run_id] = (digest, outcome)
         return CommitResult(status="committed", content_digest=digest)
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        with self._lock:
+            stored = self._terminals.get(run_id)
+            return stored[1] if stored is not None else None
 
     def commit_invocation(
         self,
