@@ -395,7 +395,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                 policy=TemporalActivityPolicy(
                     writer_lease_ttl_s=5,
                     writer_lease_renew_interval_s=0.5,
-                    heartbeat_interval_s=0.1,
+                    heartbeat_interval_s=5,
                     authority_call_timeout_s=4,
                     driver_call_timeout_s=20,
                     supervisor_join_timeout_s=4,

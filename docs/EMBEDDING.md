@@ -331,16 +331,18 @@ with time reserved for cleanup. Timeout or supervisor loss revokes local write a
 the exact activation token, ignores a late driver result, and returns the Temporal Activity
 executor slot. Configure PostgreSQL lock and statement timeouts below this driver bound so an
 in-flight fenced mutation aborts inside the database first. The control supervisor keeps
-heartbeating while one bounded cleanup task joins driver and renewal work and releases the exact
-writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry returns retryable
-lease loss and leaves any uncooperative cleanup thread daemonized under revoked local authority.
+heartbeating while one bounded copied-context cleanup task joins driver and renewal work and
+releases the exact writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry
+returns retryable lease loss and leaves any uncooperative cleanup thread daemonized under revoked
+local authority.
 A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
 an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
 observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.
 A writer fence observed during activation binding is retryable lease loss. A deterministic loop
 wiring violation is a non-retryable configuration conflict.
 
-Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. Keep
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`; runtime caps the
+effective interval to half of the actual Activity heartbeat timeout. Keep
 `authority_call_timeout_s`, `driver_call_timeout_s`, and the cleanup reserve within its
 `activity_start_to_close_timeout_s`; runtime caps both bootstrap and driver phases to the actual
 remaining attempt budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and

@@ -185,13 +185,18 @@ class _TemporalLeaseSupervisor:
         self._renewal_stop = threading.Event()
         self._control_wake = threading.Event()
         self._failure = threading.Event()
+        self._heartbeat_interval_s: float | None = None
         self._control_thread: threading.Thread | None = None
         self._renewal_thread: threading.Thread | None = None
         self._driver_thread: threading.Thread | None = None
 
-    def start(self) -> None:
+    def start(self, *, heartbeat_interval_s: float) -> None:
         if self._control_thread is not None:
             raise RuntimeError("lease supervisor can only be started once")
+        self._heartbeat_interval_s = _require_duration(
+            heartbeat_interval_s,
+            "effective Temporal heartbeat interval",
+        )
         activity_context = contextvars.copy_context()
         self._control_thread = threading.Thread(
             target=activity_context.run,
@@ -418,8 +423,10 @@ class _TemporalLeaseSupervisor:
             finally:
                 completed.set()
 
+        cleanup_context = contextvars.copy_context()
         cleanup_thread = threading.Thread(
-            target=run_cleanup,
+            target=cleanup_context.run,
+            args=(run_cleanup,),
             name="monoid-temporal-lease-cleanup",
             daemon=True,
         )
@@ -472,7 +479,10 @@ class _TemporalLeaseSupervisor:
             return self._lease, self._lease_deadline
 
     def _run_control(self) -> None:
-        heartbeat_interval = float(self._policy.heartbeat_interval_s)
+        heartbeat_interval = self._heartbeat_interval_s
+        if heartbeat_interval is None:
+            self._fail()
+            return
         now = time.monotonic()
         next_heartbeat = now + heartbeat_interval
         try:
@@ -590,6 +600,26 @@ def _activity_phase_timeout(
     return timeout
 
 
+def _activity_heartbeat_interval(info: Any, *, configured_interval_s: float) -> float:
+    """Cap heartbeat cadence to half of the server-enforced Activity timeout."""
+
+    configured = _require_duration(
+        configured_interval_s,
+        "configured Temporal heartbeat interval",
+    )
+    heartbeat_timeout = getattr(info, "heartbeat_timeout", None)
+    if heartbeat_timeout is None:
+        return configured
+    if not isinstance(heartbeat_timeout, timedelta):
+        raise _SupervisorUnhealthy("Temporal Activity heartbeat timeout is invalid")
+    safe_interval = heartbeat_timeout.total_seconds() / 2
+    if safe_interval < 0.001:
+        raise _ActivityBudgetConflict(
+            "Temporal Activity heartbeat timeout cannot support a safe cadence"
+        )
+    return min(configured, safe_interval)
+
+
 def _application_error(exc: Exception) -> ApplicationError:
     if isinstance(exc, WriterLeaseUnavailable):
         retry_delay_s = min(
@@ -700,8 +730,12 @@ class TemporalActivationActivity:
                 cleanup_timeout_s=float(self.policy.supervisor_join_timeout_s),
                 phase_name="bootstrap",
             )
+            heartbeat_interval = _activity_heartbeat_interval(
+                info,
+                configured_interval_s=float(self.policy.heartbeat_interval_s),
+            )
             activity.heartbeat()
-            supervisor.start()
+            supervisor.start(heartbeat_interval_s=heartbeat_interval)
             bootstrap = supervisor.bootstrap(
                 command,
                 owner_id,

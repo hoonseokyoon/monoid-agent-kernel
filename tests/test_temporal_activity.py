@@ -351,6 +351,10 @@ def test_bootstrap_preserves_the_activity_context_for_every_store_call() -> None
             observed.append(("renew", tenant_context.get(None)))
             return super().renew(writer_token, ttl)
 
+        def release(self, writer_token: WriterToken) -> ReleaseResult:
+            observed.append(("release", tenant_context.get(None)))
+            return super().release(writer_token)
+
     class ContextAdmissionStore(_AdmissionStore):
         def bind_activation(
             self,
@@ -379,6 +383,51 @@ def test_bootstrap_preserves_the_activity_context_for_every_store_call() -> None
         ("renew", "tenant-context-a"),
         ("bind", "tenant-context-a"),
     ]
+    assert ("release", "tenant-context-a") in observed
+
+
+def test_control_heartbeat_is_capped_to_the_server_activity_timeout() -> None:
+    heartbeat_times: list[float] = []
+    environment = ActivityEnvironment()
+    environment.info = environment.info.__class__(
+        **{
+            **environment.info.__dict__,
+            "heartbeat_timeout": timedelta(seconds=0.1),
+            "start_to_close_timeout": timedelta(seconds=2),
+        }
+    )
+    def observe_heartbeat(*details: object) -> None:
+        assert details == ()
+        heartbeat_times.append(time.monotonic())
+
+    environment.on_heartbeat = observe_heartbeat
+
+    def wait_through_heartbeats(kwargs: dict[str, Any]) -> object:
+        del kwargs
+        time.sleep(0.22)
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    _DriverDouble.behavior = wait_through_heartbeats
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.4,
+        heartbeat_interval_s=1,
+        authority_call_timeout_s=0.5,
+        driver_call_timeout_s=1,
+        supervisor_join_timeout_s=0.1,
+        local_task_wait_s=1,
+    )
+
+    result = environment.run(
+        _activity(_AuthorityStore(), policy=policy).run,
+        _command().to_json(),
+    )
+
+    assert result["run_id"] == "temporal-activity-run"
+    assert len(heartbeat_times) >= 4
 
 
 def test_activity_reconciles_a_lost_claim_response_with_the_same_owner() -> None:
