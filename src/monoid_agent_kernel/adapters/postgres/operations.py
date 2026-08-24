@@ -90,27 +90,40 @@ class PostgresOperations:
                     activation_outbox = self._one(
                         cursor,
                         sql.SQL(
+                            "WITH dispatch_rows AS ("
+                            "SELECT dispatch.*, (((dispatch.delivery_state = 'pending' "
+                            "AND dispatch.available_at <= %s) OR "
+                            "(dispatch.delivery_state = 'leased' "
+                            "AND dispatch.leased_until <= %s)) "
+                            "AND NOT EXISTS (SELECT 1 FROM {} AS terminal "
+                            "WHERE terminal.run_id = dispatch.run_id) "
+                            "AND NOT EXISTS (SELECT 1 FROM {} AS prior_dispatch "
+                            "JOIN {} AS prior_admission "
+                            "ON prior_admission.run_id = prior_dispatch.run_id "
+                            "AND prior_admission.command_id = prior_dispatch.command_id "
+                            "WHERE prior_admission.run_id = admission.run_id "
+                            "AND prior_admission.command_sequence < admission.command_sequence "
+                            "AND prior_dispatch.delivery_state <> 'delivered')) AS actionable "
+                            "FROM {} AS dispatch JOIN {} AS admission "
+                            "ON admission.run_id = dispatch.run_id "
+                            "AND admission.command_id = dispatch.command_id) "
                             "SELECT "
                             "count(*) FILTER (WHERE delivery_state = 'pending'), "
                             "count(*) FILTER (WHERE delivery_state = 'leased'), "
                             "count(*) FILTER (WHERE delivery_state = 'delivered'), "
                             "count(*) FILTER (WHERE delivery_state = 'run_terminal'), "
                             "count(*) FILTER (WHERE delivery_state = 'dead_letter'), "
-                            "coalesce(max(attempt_count) FILTER (WHERE "
-                            "(delivery_state = 'pending' AND available_at <= %s) OR "
-                            "(delivery_state = 'leased' AND leased_until <= %s)), 0), "
-                            "extract(epoch FROM (%s - min(created_at) FILTER "
-                            "(WHERE (delivery_state = 'pending' AND available_at <= %s) OR "
-                            "(delivery_state = 'leased' AND leased_until <= %s)))) "
-                            "FROM {}"
-                        ).format(self._table("activation_dispatch_outbox")),
-                        (
-                            collected_at,
-                            collected_at,
-                            collected_at,
-                            collected_at,
-                            collected_at,
+                            "coalesce(max(attempt_count) FILTER (WHERE actionable), 0), "
+                            "extract(epoch FROM (%s - min(created_at) "
+                            "FILTER (WHERE actionable))) FROM dispatch_rows"
+                        ).format(
+                            self._table("terminal_record"),
+                            self._table("activation_dispatch_outbox"),
+                            self._table("activation_admission_record"),
+                            self._table("activation_dispatch_outbox"),
+                            self._table("activation_admission_record"),
                         ),
+                        (collected_at, collected_at, collected_at),
                     )
                     evidence_outbox = self._one(
                         cursor,

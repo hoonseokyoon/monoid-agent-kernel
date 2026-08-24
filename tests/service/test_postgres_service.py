@@ -325,6 +325,7 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
     activation_rows = (
         (
             "activation-ready",
+            1,
             "pending",
             2,
             sampled_at - timedelta(minutes=1),
@@ -333,6 +334,7 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
         ),
         (
             "activation-delayed",
+            1,
             "pending",
             9,
             sampled_at + timedelta(days=1),
@@ -341,11 +343,39 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
         ),
         (
             "activation-leased",
+            1,
             "leased",
             8,
             sampled_at - timedelta(days=1),
             sampled_at + timedelta(days=1),
             sampled_at - timedelta(days=1),
+        ),
+        (
+            "activation-ordered",
+            1,
+            "pending",
+            4,
+            sampled_at + timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=4),
+        ),
+        (
+            "activation-ordered",
+            2,
+            "pending",
+            12,
+            sampled_at - timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=3),
+        ),
+        (
+            "activation-terminal",
+            1,
+            "pending",
+            13,
+            sampled_at - timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=5),
         ),
     )
     evidence_rows = (
@@ -377,8 +407,10 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
     schema = sql.Identifier(postgres_database.config.schema)
     with postgres_database.transaction() as connection:
         with postgres_database.cursor(connection) as cursor:
+            activation_runs: set[str] = set()
             for index, (
                 run_id,
+                command_sequence,
                 state,
                 attempts,
                 available_at,
@@ -389,26 +421,34 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
                 start=1,
             ):
                 command_id = f"command-{index}"
-                cursor.execute(
-                    sql.SQL(
-                        "INSERT INTO {}.{} "
-                        "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
-                        "VALUES (%s, %s, 1, %s, false, %s)"
-                    ).format(schema, sql.Identifier("run_authority")),
-                    (run_id, f"authority-{index}", sampled_at + timedelta(days=2), sampled_at),
-                )
+                if run_id not in activation_runs:
+                    cursor.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.{} "
+                            "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                            "VALUES (%s, %s, 1, %s, false, %s)"
+                        ).format(schema, sql.Identifier("run_authority")),
+                        (
+                            run_id,
+                            f"authority-{index}",
+                            sampled_at + timedelta(days=2),
+                            sampled_at,
+                        ),
+                    )
+                    activation_runs.add(run_id)
                 cursor.execute(
                     sql.SQL(
                         "INSERT INTO {}.{} "
                         "(run_id, command_id, command_sequence, command_kind, request_digest, "
                         "payload_ref, request_identity_sha256, admitted_identity_sha256, "
                         "admitted_content_digest, admitted_payload, created_at, updated_at) "
-                        "VALUES (%s, %s, 1, 'input', %s, %s, %s, %s, %s, "
+                        "VALUES (%s, %s, %s, 'input', %s, %s, %s, %s, %s, "
                         "'{{}}'::json, %s, %s)"
                     ).format(schema, sql.Identifier("activation_admission_record")),
                     (
                         run_id,
                         command_id,
+                        command_sequence,
                         f"{index:064x}",
                         f"blob:payload-{index}",
                         f"{index + 10:064x}",
@@ -439,6 +479,17 @@ def test_operations_outbox_lag_uses_claimable_rows_only(
                         created_at,
                     ),
                 )
+
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.{} "
+                    "(run_id, schema_version, outcome_kind, retry_eligibility, "
+                    "checkpoint_sequence, error_code, content_digest, payload, committed_at) "
+                    "VALUES ('activation-terminal', 'test-terminal.v1', 'cancelled', "
+                    "'forbidden', NULL, 'cancelled', %s, '{{}}'::json, %s)"
+                ).format(schema, sql.Identifier("terminal_record")),
+                (f"{999:064x}", sampled_at),
+            )
 
             for index, (
                 run_id,
