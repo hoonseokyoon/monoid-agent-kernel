@@ -57,6 +57,14 @@ def _is_ambiguous_database_error(exc: Exception) -> bool:
     return isinstance(exc, (InterfaceError, OperationalError))
 
 
+def _is_unique_violation(exc: Exception) -> bool:
+    try:
+        from psycopg.errors import UniqueViolation
+    except ImportError:  # pragma: no cover - database operations already require psycopg
+        return False
+    return isinstance(exc, UniqueViolation)
+
+
 def _content_digest(payload: dict[str, object]) -> str:
     return canonical_sha256(payload)
 
@@ -79,6 +87,7 @@ class _StoredAdmission:
     claim_id: str
     claim_generation: int
     lease_active: bool
+    retry_delay_microseconds: int
 
 
 class PostgresCommandAdmissionStore:
@@ -157,8 +166,8 @@ class PostgresCommandAdmissionStore:
                 "admission.activation_payload, dispatch.delivery_state, dispatch.attempt_count, "
                 "dispatch.dispatch_ref, dispatch.last_error_code, "
                 "COALESCE(dispatch.claim_owner, ''), COALESCE(dispatch.claim_id, ''), "
-                "dispatch.claim_generation, "
-                "COALESCE(dispatch.leased_until > pg_catalog.clock_timestamp(), false) "
+                "dispatch.claim_generation, dispatch.leased_until, "
+                "dispatch.retry_delay_microseconds "
                 "FROM {} AS admission JOIN {} AS dispatch "
                 "ON dispatch.run_id = admission.run_id "
                 "AND dispatch.command_id = admission.command_id "
@@ -171,7 +180,21 @@ class PostgresCommandAdmissionStore:
             (run_id, command_id),
         )
         row = cursor.fetchone()  # type: ignore[attr-defined]
-        return None if row is None else tuple(row)
+        if row is None:
+            return None
+        # PostgreSQL may evaluate a SELECT target-list clock expression before FOR UPDATE finishes
+        # waiting. Sample the DB clock in a second statement, after this transaction owns the row
+        # lock, so a settlement cannot use authority that expired during lock contention.
+        cursor.execute("SELECT pg_catalog.clock_timestamp()")  # type: ignore[attr-defined]
+        clock_row = cursor.fetchone()  # type: ignore[attr-defined]
+        if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
+            raise RuntimeError("PostgreSQL dispatch clock query returned no row")
+        leased_until = row[20]
+        try:
+            lease_active = leased_until is not None and leased_until > clock_row[0]
+        except TypeError as exc:
+            raise PostgresAdmissionCorrupt("dispatch lease timestamp is invalid") from exc
+        return (*tuple(row[:20]), lease_active, row[21])
 
     @staticmethod
     def _decode_row(row: tuple[object, ...]) -> _StoredAdmission:
@@ -243,6 +266,8 @@ class PostgresCommandAdmissionStore:
             or type(row[17]) is not str
             or type(row[18]) is not str
             or type(row[20]) is not bool
+            or type(row[21]) is not int
+            or row[21] < 0
         ):
             raise PostgresAdmissionCorrupt("dispatch outbox metadata is invalid")
         return _StoredAdmission(
@@ -256,6 +281,7 @@ class PostgresCommandAdmissionStore:
             claim_id=row[18],
             claim_generation=claim_generation,
             lease_active=row[20],
+            retry_delay_microseconds=row[21],
         )
 
     def _stored(
@@ -573,7 +599,8 @@ class PostgresCommandAdmissionStore:
                             "leased_until = pg_catalog.clock_timestamp() + "
                             + _ELAPSED_TTL_INTERVAL
                             + ", "
-                            "last_error_code = '', updated_at = pg_catalog.clock_timestamp() "
+                            "last_error_code = '', retry_delay_microseconds = 0, "
+                            "updated_at = pg_catalog.clock_timestamp() "
                             "FROM candidate WHERE dispatch.run_id = candidate.run_id "
                             "AND dispatch.command_id = candidate.command_id "
                             "RETURNING dispatch.run_id, dispatch.command_id"
@@ -595,7 +622,7 @@ class PostgresCommandAdmissionStore:
         except (AdmissionConflict, DispatchClaimLost):
             raise
         except Exception as exc:
-            if not _is_ambiguous_database_error(exc):
+            if not (_is_ambiguous_database_error(exc) or _is_unique_violation(exc)):
                 raise
             try:
                 stored = self._claim_by_id(claim_id)
@@ -603,6 +630,8 @@ class PostgresCommandAdmissionStore:
                 raise exc
             if stored is None:
                 raise exc
+            if stored.claim_owner != owner_id:
+                raise AdmissionConflict("dispatch claim ID belongs to another owner") from None
             return self._dispatch_claim(stored, owner_id, claim_id)
 
     @staticmethod
@@ -658,7 +687,8 @@ class PostgresCommandAdmissionStore:
                             sql.SQL(
                                 "UPDATE {} SET delivery_state = 'delivered', leased_until = NULL, "
                                 "dispatch_ref = %s, delivered_at = pg_catalog.clock_timestamp(), "
-                                "last_error_code = '', updated_at = pg_catalog.clock_timestamp() "
+                                "last_error_code = '', retry_delay_microseconds = 0, "
+                                "updated_at = pg_catalog.clock_timestamp() "
                                 "WHERE run_id = %s AND command_id = %s"
                             ).format(self._table("activation_dispatch_outbox")),
                             (result.dispatch_ref, token.run_id, token.command_id),
@@ -703,6 +733,7 @@ class PostgresCommandAdmissionStore:
         ):
             raise ValueError("dispatch retry delay must be in the range [0, 86400]")
         from psycopg import sql
+        delay_microseconds = _duration_microseconds(float(delay_s))
 
         try:
             with self.database.transaction() as connection:
@@ -713,6 +744,7 @@ class PostgresCommandAdmissionStore:
                         and stored.delivery_state == delivery_state
                         and self._token_matches(stored, token)
                         and stored.last_error_code == error_code
+                        and stored.retry_delay_microseconds == delay_microseconds
                     ):
                         pass
                     else:
@@ -724,13 +756,15 @@ class PostgresCommandAdmissionStore:
                                 + _ELAPSED_TTL_INTERVAL
                                 + ", "
                                 "dispatch_ref = '', delivered_at = NULL, last_error_code = %s, "
+                                "retry_delay_microseconds = %s, "
                                 "updated_at = pg_catalog.clock_timestamp() "
                                 "WHERE run_id = %s AND command_id = %s"
                             ).format(self._table("activation_dispatch_outbox")),
                             (
                                 delivery_state,
-                                _duration_microseconds(float(delay_s)),
+                                delay_microseconds,
                                 error_code,
+                                delay_microseconds,
                                 token.run_id,
                                 token.command_id,
                             ),
@@ -750,6 +784,7 @@ class PostgresCommandAdmissionStore:
                 or stored.delivery_state != delivery_state
                 or not self._token_matches(stored, token)
                 or stored.last_error_code != error_code
+                or stored.retry_delay_microseconds != delay_microseconds
             ):
                 raise exc
             return self._receipt_from_stored(stored)

@@ -95,6 +95,9 @@ CREATE TABLE __MONOID_SCHEMA__.activation_dispatch_outbox (
             AND last_error_code ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
         )
     ),
+    retry_delay_microseconds bigint NOT NULL DEFAULT 0 CHECK (
+        retry_delay_microseconds >= 0
+    ),
     created_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     updated_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     PRIMARY KEY (run_id, command_id),
@@ -113,6 +116,19 @@ CREATE TABLE __MONOID_SCHEMA__.activation_dispatch_outbox (
     ),
     CHECK (
         delivery_state <> 'dead_letter' OR last_error_code <> ''
+    ),
+    CHECK (
+        attempt_count::bigint = claim_generation
+    ),
+    CHECK (
+        (claim_generation = 0 AND claim_owner IS NULL AND claim_id IS NULL)
+        OR (claim_generation > 0 AND claim_owner IS NOT NULL AND claim_id IS NOT NULL)
+    ),
+    CHECK (
+        delivery_state = 'pending' OR attempt_count > 0
+    ),
+    CHECK (
+        delivery_state = 'pending' OR retry_delay_microseconds = 0
     )
 );
 

@@ -322,6 +322,8 @@ class AdmissionReceipt:
         if type(self.state) is not str or self.state not in get_args(AdmissionState):
             raise ValueError("admission receipt state is outside the portable vocabulary")
         _require_nonnegative_integer(self.attempt_count, "admission receipt attempt count")
+        if self.state != "prepared" and self.attempt_count < 1:
+            raise ValueError("post-claim admission receipt requires a dispatch attempt")
         if self.dispatch_ref and not is_safe_opaque_address(self.dispatch_ref):
             raise ValueError("admission receipt dispatch_ref must be an opaque address")
         if self.error_code and not is_safe_taxonomy_code(self.error_code):
@@ -353,20 +355,25 @@ class AdmissionReceipt:
             self.dispatch_ref or self.activation_command is not None or self.activation_receipt is not None
         ):
             raise ValueError("prepared admission receipt carries later-state evidence")
+        if self.state == "prepared" and self.attempt_count == 0 and self.error_code:
+            raise ValueError("unclaimed admission receipt cannot carry a dispatch error")
         if self.state == "dispatched" and (
             not self.dispatch_ref
+            or self.error_code
             or self.activation_command is not None
             or self.activation_receipt is not None
         ):
             raise ValueError("dispatched admission receipt evidence is inconsistent")
         if self.state == "activation_claimed" and (
             not self.dispatch_ref
+            or self.error_code
             or self.activation_command is None
             or self.activation_receipt is not None
         ):
             raise ValueError("claimed admission receipt evidence is inconsistent")
         if self.state == "completed" and (
             not self.dispatch_ref
+            or self.error_code
             or self.activation_command is None
             or self.activation_receipt is None
         ):

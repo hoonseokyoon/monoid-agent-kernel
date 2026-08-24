@@ -358,6 +358,20 @@ def test_postgres_dispatch_claims_preserve_order_expiry_and_fencing(
         delay_s=0,
     )
     assert retry.state == "prepared" and retry.error_code == "transport_busy"
+    assert (
+        harness.admission.retry_dispatch(
+            next_claim.token,
+            error_code="transport_busy",
+            delay_s=0,
+        )
+        == retry
+    )
+    with pytest.raises(DispatchClaimLost):
+        harness.admission.retry_dispatch(
+            next_claim.token,
+            error_code="transport_busy",
+            delay_s=1,
+        )
     final_claim = harness.admission.claim_dispatch("owner-a", "claim-4", lease_s=1)
     assert final_claim is not None and final_claim.attempt == 2
     dead = harness.admission.reject_dispatch(
@@ -365,6 +379,67 @@ def test_postgres_dispatch_claims_preserve_order_expiry_and_fencing(
         error_code="unsupported_command",
     )
     assert dead.state == "dead_letter"
+
+
+@pytest.mark.parametrize("settlement", ("acknowledge", "retry", "reject"))
+def test_dispatch_settlement_rechecks_expiry_after_row_lock_wait(
+    harness: _Harness,
+    tmp_path: Path,
+    settlement: str,
+) -> None:
+    token, _ = harness.seed(tmp_path, f"settlement-lock-{settlement}")
+    harness.admission.admit(_request(token.run_id, "command-1"))
+    claim = harness.admission.claim_dispatch("owner-a", "claim-1", lease_s=0.3)
+    assert claim is not None
+
+    def settle() -> None:
+        if settlement == "acknowledge":
+            harness.admission.acknowledge_dispatch(
+                claim.token,
+                DispatchResult(status="accepted", dispatch_ref="temporal:lock-wait"),
+            )
+        elif settlement == "retry":
+            harness.admission.retry_dispatch(
+                claim.token,
+                error_code="transport_busy",
+                delay_s=0,
+            )
+        else:
+            harness.admission.reject_dispatch(
+                claim.token,
+                error_code="transport_rejected",
+            )
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with harness.database.connection() as blocking_connection:
+            with blocking_connection.transaction():
+                with blocking_connection.cursor() as cursor:
+                    cursor.execute(
+                        sql.SQL(
+                            "SELECT 1 FROM {} WHERE run_id = %s AND command_id = %s FOR UPDATE"
+                        ).format(
+                            sql.Identifier(
+                                harness.database.config.schema,
+                                "activation_dispatch_outbox",
+                            )
+                        ),
+                        (token.run_id, "command-1"),
+                    )
+                    assert cursor.fetchone() == (1,)
+                    future = executor.submit(settle)
+                    time.sleep(0.05)
+                    assert not future.done()
+                    time.sleep(0.3)
+        with pytest.raises(DispatchClaimLost):
+            future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True)
+
+    receipt = harness.admission.receipt(token.run_id, "command-1")
+    assert receipt is not None and receipt.state == "prepared"
+    replacement = harness.admission.claim_dispatch("owner-b", "claim-2", lease_s=1)
+    assert replacement is not None and replacement.attempt == 2
 
 
 def test_postgres_claim_race_has_one_winner(
@@ -390,6 +465,27 @@ def test_postgres_claim_race_has_one_winner(
     assert [result for result in results if result is not None] == [
         harness.admission.receipt(token.run_id, "command-1").command  # type: ignore[union-attr]
     ]
+
+
+def test_concurrent_reuse_of_one_claim_id_returns_one_exact_claim(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    first_token, _ = harness.seed(tmp_path, "claim-id-race-a")
+    second_token, _ = harness.seed(tmp_path, "claim-id-race-b")
+    harness.admission.admit(_request(first_token.run_id, "command-1"))
+    harness.admission.admit(_request(second_token.run_id, "command-1"))
+    barrier = threading.Barrier(2)
+
+    def claim(_: int):
+        barrier.wait(timeout=5)
+        return harness.admission.claim_dispatch("owner-a", "shared-claim", lease_s=2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, range(2)))
+
+    assert claims[0] is not None
+    assert claims == [claims[0], claims[0]]
 
 
 def test_duplicate_transport_delivery_applies_one_activation(

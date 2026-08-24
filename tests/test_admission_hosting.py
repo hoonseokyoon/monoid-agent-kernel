@@ -270,6 +270,20 @@ def test_admission_receipt_states_bind_exact_activation_identity() -> None:
         raw_completion[field_name] = invalid_value
         with pytest.raises(ValueError, match="completion is inconsistent"):
             AdmissionReceipt.from_json(invalid)
+    for receipt in receipts[1:]:
+        invalid = receipt.to_json()
+        invalid["attempt_count"] = 0
+        with pytest.raises(ValueError, match="requires a dispatch attempt"):
+            AdmissionReceipt.from_json(invalid)
+    unclaimed_error = receipts[0].to_json()
+    unclaimed_error["error_code"] = "transport_busy"
+    with pytest.raises(ValueError, match="unclaimed admission receipt"):
+        AdmissionReceipt.from_json(unclaimed_error)
+    for receipt in receipts[1:4]:
+        invalid = receipt.to_json()
+        invalid["error_code"] = "transport_busy"
+        with pytest.raises(ValueError, match="evidence is inconsistent"):
+            AdmissionReceipt.from_json(invalid)
 
 
 @pytest.mark.parametrize(
