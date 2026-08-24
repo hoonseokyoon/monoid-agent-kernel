@@ -37,6 +37,7 @@ from monoid_agent_kernel.core._verified_file import (
 )
 from monoid_agent_kernel.core.events import AgentEvent, EventBus, EventSink, make_agent_event
 from monoid_agent_kernel.core.json_ingress import (
+    is_portable_json_integer,
     json_nesting_within_limit,
     loads_json_ingress,
     normalize_json_ingress,
@@ -472,6 +473,10 @@ class AgentRecorder:
     # Shared process-local mutation capability. Standalone recorders receive an always-active
     # default; hosted loops inject the activation's authority.
     write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
+    # Host-owned durable journals run before local file/status projections. A replacement may seed
+    # the event sequence from that journal even when this process has a fresh run directory.
+    authoritative_event_sinks: tuple[EventSink, ...] = field(default=(), kw_only=True)
+    event_sequence_seed: int = field(default=0, kw_only=True)
     # Digests already written by ``settled_text``. Per-recorder, so a resumed run may re-append a
     # record whose digest is already in the file; that duplicates identical content, which the
     # content-addressed join resolves the same either way.
@@ -515,6 +520,11 @@ class AgentRecorder:
         event_file_sink: JsonlEventSink | None = None
         self._check_writer_authority()
         try:
+            if (
+                not is_portable_json_integer(self.event_sequence_seed)
+                or self.event_sequence_seed < 0
+            ):
+                raise ValueError("event_sequence_seed must be a non-negative portable integer")
             self.run_dir = self.run_root / self.run_id
             self.artifacts_dir = self.run_dir / "artifacts"
             self.artifacts_dir.mkdir(parents=True, exist_ok=self.reopen)
@@ -527,7 +537,12 @@ class AgentRecorder:
                 advertised_last_seq=advertised_last_seq,
             )
             self._check_writer_authority()
-            initial_seq = _verified_event_sequence_seed(events_path, tail)
+            local_sequence = _verified_event_sequence_seed(events_path, tail)
+            if self.authoritative_event_sinks and local_sequence > self.event_sequence_seed:
+                raise EventLogCorruption(
+                    "local event projection is ahead of the authoritative event journal"
+                )
+            initial_seq = max(local_sequence, self.event_sequence_seed)
             self._check_writer_authority()
             transcript_file = (self.run_dir / "transcript.jsonl").open("a", encoding="utf-8")
             self._transcript_file = transcript_file
@@ -536,7 +551,7 @@ class AgentRecorder:
             self._check_writer_authority()
             event_file_sink = JsonlEventSink(events_path)
             self._check_writer_authority()
-            sinks: list[EventSink] = [event_file_sink]
+            sinks: list[EventSink] = [*self.authoritative_event_sinks, event_file_sink]
             if self.status_file:
                 sinks.append(StatusJsonSink(self.run_dir / "status.json"))
             sinks.extend(self.extra_event_sinks)

@@ -93,6 +93,7 @@ from monoid_agent_kernel.core.media import (
 )
 from monoid_agent_kernel.core.json_ingress import (
     UnportableValueError,
+    is_portable_json_integer,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -1365,6 +1366,10 @@ class AgentLoop:
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
+    # Durable host journals are ordered before local recorder projections. Hosts seed the shared
+    # EventBus from their authoritative cursor when a fresh process restores an existing run.
+    authoritative_event_sinks: tuple[EventSink, ...] = ()
+    event_sequence_seed: int = 0
     # Base provenance for model calls made by this run. AgentLoop supplies the authoritative
     # run/turn identity per call while preserving caller-owned Skill, batch, trace, and attributes.
     invocation_context: InvocationContext | None = None
@@ -1515,6 +1520,11 @@ class AgentLoop:
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
         if not isinstance(self.write_authority, ActivationWriteAuthority):
             raise AgentConfigError("write_authority must be an ActivationWriteAuthority")
+        if (
+            not is_portable_json_integer(self.event_sequence_seed)
+            or self.event_sequence_seed < 0
+        ):
+            raise AgentConfigError("event_sequence_seed must be a non-negative portable integer")
         self._authority_unsubscribe = self.write_authority.add_revoke_callback(
             self._wake_for_writer_authority_loss
         )

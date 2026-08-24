@@ -9,6 +9,17 @@ from .authority import (
     WriterLeaseUnavailable,
     renew_writer_lease,
 )
+from .activation import (
+    ActivationCommand,
+    ActivationCommandKind,
+    ActivationDriver,
+    ActivationFaultHook,
+    ActivationInputResolver,
+    ActivationLoopFactory,
+    ActivationReceipt,
+    ActivationRuntime,
+    ResolvedActivationInput,
+)
 from .blobs import (
     BlobCorrupt,
     BlobNotFound,
@@ -27,6 +38,12 @@ from .contracts import (
     ModelInvocationRecord,
     StorageCapabilities,
     WriterToken,
+)
+from .execution import (
+    FencedEventSink,
+    FencedTerminalBridge,
+    TerminalCommitStatus,
+    TerminalSettlement,
 )
 from .object_store_admin import (
     IncompleteMultipartPage,
@@ -49,6 +66,19 @@ __all__ = [
     "WriterLeaseUnavailable",
     "WriterAuthorityStore",
     "renew_writer_lease",
+    "ActivationCommandKind",
+    "ActivationCommand",
+    "ResolvedActivationInput",
+    "ActivationReceipt",
+    "ActivationRuntime",
+    "ActivationLoopFactory",
+    "ActivationFaultHook",
+    "ActivationInputResolver",
+    "ActivationDriver",
+    "FencedEventSink",
+    "FencedTerminalBridge",
+    "TerminalCommitStatus",
+    "TerminalSettlement",
     "BlobStat",
     "BlobPutResult",
     "BlobStoreError",
