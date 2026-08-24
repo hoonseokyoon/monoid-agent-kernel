@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 import uuid
@@ -39,6 +40,7 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresMigrations,
     PostgresObjectGarbageCollector,
     PostgresObjectStoreDurableStreamStore,
+    PostgresOperations,
     PostgresWriterAuthorityStore,
 )
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority  # noqa: E402
@@ -282,6 +284,54 @@ def test_actual_postgres_objectstore_passes_reusable_stream_contract(
     )
 
     assert all(outcome.passed for outcome in outcomes), [outcome.to_json() for outcome in outcomes]
+
+
+def test_actual_operations_snapshot_and_s3_doctor_are_public_and_content_free(
+    harness: _Harness,
+) -> None:
+    private_content = b"private-operations-qualification-payload"
+    run_id = f"run-private-operations-{uuid.uuid4().hex}"
+    token = harness.claim(run_id, "operations-worker")
+    identity = _identity(run_id, suffix="operations")
+    assert harness.streams.open(identity, writer_token=token).status == "opened"
+    assert harness.streams.append(
+        identity,
+        generation=1,
+        start_offset=0,
+        data=private_content,
+        writer_token=token,
+    ).status == "committed"
+
+    operations = PostgresOperations(harness.database)
+    assert operations.check_ready().current is True
+    snapshot = operations.snapshot()
+    by_identity = {
+        (metric.name, metric.attributes): metric.value for metric in snapshot.metrics
+    }
+
+    assert by_identity[
+        ("monoid.postgres.authority.count", (("state", "active"),))
+    ] >= 1
+    assert by_identity[("monoid.postgres.stream.head.count", (("state", "open"),))] >= 1
+    assert by_identity[("monoid.postgres.stream.chunk.count", ())] >= 1
+    assert by_identity[("monoid.postgres.stream.chunk.bytes", ())] >= len(private_content)
+    assert by_identity[("monoid.postgres.object.association.count", ())] >= 1
+
+    snapshot_json = json.dumps(snapshot.to_json(), sort_keys=True)
+    assert private_content.decode() not in snapshot_json
+    assert run_id not in snapshot_json
+    assert harness.database.config.schema not in snapshot_json
+    assert harness.database.config.dsn not in snapshot_json
+
+    delegate = harness.streams.object_store
+    admin = S3ObjectStoreAdmin(delegate.config, client=_client())  # type: ignore[attr-defined]
+    doctor = admin.doctor()
+    public_report = repr(doctor)
+    assert doctor.ok is True
+    assert doctor.reachable is True
+    assert doctor.versioning_enabled is True
+    assert delegate.config.bucket not in public_report  # type: ignore[attr-defined]
+    assert os.environ["MONOID_MINIO_ENDPOINT"] not in public_report
 
 
 def test_actual_postgres_objectstore_stream_reconnect_reset_seal_and_terminal_race(

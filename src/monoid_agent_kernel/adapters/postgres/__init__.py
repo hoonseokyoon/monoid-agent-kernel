@@ -29,6 +29,7 @@ from .object_store import (
     PostgresObjectGarbageCollector,
     PostgresObjectStoreFencedRunSink,
 )
+from .operations import PostgresOperations
 from .sink import PostgresBlobCorrupt, PostgresFencedRunSink
 from .streams import PostgresDurableStreamCorrupt, PostgresObjectStoreDurableStreamStore
 
@@ -59,6 +60,7 @@ __all__ = [
     "PostgresObjectAssociationCorrupt",
     "PostgresObjectStoreFencedRunSink",
     "PostgresObjectGarbageCollector",
+    "PostgresOperations",
     "PostgresDurableStreamCorrupt",
     "PostgresObjectStoreDurableStreamStore",
 ]

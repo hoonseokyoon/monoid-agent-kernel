@@ -161,15 +161,21 @@ class PostgresDatabase:
             yield cursor
 
     @contextmanager
-    def transaction(self) -> Iterator[Any]:
+    def transaction(self, *, read_only: bool = False) -> Iterator[Any]:
         """Start the adapter's READ COMMITTED transaction with a trusted local search path."""
+
+        if type(read_only) is not bool:
+            raise TypeError("PostgreSQL transaction read_only must be a boolean")
 
         with self.connection() as connection:
             with connection.transaction():
                 with self.cursor(connection) as cursor:
                     # This is deliberately the first statement. Adapter linearization may wait on
                     # row, unique-index, or advisory locks and then needs a new statement snapshot.
-                    cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    cursor.execute(
+                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                        + (", READ ONLY" if read_only else "")
+                    )
                     # Caller-provided pooled sessions may carry an untrusted search_path. Adapter
                     # relations are schema-qualified; built-ins resolve from pg_catalog, and temp
                     # objects remain reachable only after it. SET LOCAL restores caller state.

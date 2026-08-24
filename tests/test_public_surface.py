@@ -490,6 +490,10 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "ObjectGcCandidate",
         "ObjectGcPlan",
         "ObjectGcReceipt",
+        "OperationalMetric",
+        "OperationalSnapshot",
+        "OperationalMetricSink",
+        "record_operational_snapshot",
         "MAX_STREAM_CHUNK_BYTES",
         "MAX_STREAM_READ_CHUNKS",
         "durable_model_stream_id",
@@ -851,6 +855,7 @@ assert postgres.__all__ == [
     'PostgresObjectAssociationCorrupt',
     'PostgresObjectStoreFencedRunSink',
     'PostgresObjectGarbageCollector',
+    'PostgresOperations',
     'PostgresDurableStreamCorrupt',
     'PostgresObjectStoreDurableStreamStore',
 ]
@@ -859,6 +864,7 @@ assert object_store.__all__ == [
     'S3ObjectStoreConfig',
     'S3DependencyMissing',
     'S3ObjectStoreFailure',
+    'S3ObjectStoreDoctorReport',
     'S3ContentAddressedBlobStore',
     'S3ObjectStoreAdmin',
 ]

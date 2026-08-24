@@ -87,6 +87,12 @@ from .object_store_admin import (
     ObjectInventoryPage,
     ObjectStoreAdmin,
 )
+from .operations import (
+    OperationalMetric,
+    OperationalMetricSink,
+    OperationalSnapshot,
+    record_operational_snapshot,
+)
 from .streams import (
     MAX_STREAM_CHUNK_BYTES,
     MAX_STREAM_READ_CHUNKS,
@@ -183,6 +189,10 @@ __all__ = [
     "ObjectGcCandidate",
     "ObjectGcPlan",
     "ObjectGcReceipt",
+    "OperationalMetric",
+    "OperationalSnapshot",
+    "OperationalMetricSink",
+    "record_operational_snapshot",
     "MAX_STREAM_CHUNK_BYTES",
     "MAX_STREAM_READ_CHUNKS",
     "durable_model_stream_id",

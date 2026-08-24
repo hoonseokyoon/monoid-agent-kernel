@@ -6,8 +6,10 @@ import base64
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 
+from monoid_agent_kernel.core.json_ingress import portable_type_name
 from monoid_agent_kernel.hosting.blobs import (
     BlobCorrupt,
     BlobNotFound,
@@ -60,6 +62,22 @@ class S3ObjectStoreFailure(BlobStoreError):
         self.operation = operation
         self.http_status = safe_status
         self.error_code = safe_code
+
+
+@dataclass(frozen=True, kw_only=True)
+class S3ObjectStoreDoctorReport:
+    """Public-safe reachability and capability report with no location or credential fields."""
+
+    ok: bool
+    reachable: bool
+    versioning_enabled: bool
+    conditional_create_supported: bool = True
+    checked_read_supported: bool = True
+    object_inventory_supported: bool = True
+    versioned_delete_supported: bool = True
+    multipart_cleanup_supported: bool = True
+    encryption_configured: bool = False
+    errors: tuple[str, ...] = ()
 
 
 def _base64_sha256(data: bytes | memoryview) -> str:
@@ -507,6 +525,39 @@ class S3ObjectStoreAdmin(_S3Client):
     token. Multipart cleanup remains available independently of object versioning.
     """
 
+    def doctor(self) -> S3ObjectStoreDoctorReport:
+        """Probe bucket reachability/versioning without writing an object or naming its location."""
+
+        errors: list[str] = []
+        reachable = False
+        versioning_enabled = False
+        kwargs: dict[str, object] = {"Bucket": self.config.bucket}
+        if self.config.expected_bucket_owner is not None:
+            kwargs["ExpectedBucketOwner"] = self.config.expected_bucket_owner
+        try:
+            self._client.head_bucket(**kwargs)  # type: ignore[attr-defined]
+            reachable = True
+        except Exception as exc:  # noqa: BLE001 - doctor emits only the portable type
+            errors.append(f"reachability: {portable_type_name(exc)}")
+        if reachable:
+            try:
+                response = self._client.get_bucket_versioning(**kwargs)  # type: ignore[attr-defined]
+                versioning_enabled = (
+                    isinstance(response, Mapping) and response.get("Status") == "Enabled"
+                )
+                if not versioning_enabled:
+                    errors.append("versioning: disabled")
+            except Exception as exc:  # noqa: BLE001 - doctor emits only the portable type
+                errors.append(f"versioning: {portable_type_name(exc)}")
+        return S3ObjectStoreDoctorReport(
+            ok=reachable and versioning_enabled,
+            reachable=reachable,
+            versioning_enabled=versioning_enabled,
+            versioned_delete_supported=versioning_enabled,
+            encryption_configured=self.config.server_side_encryption is not None,
+            errors=tuple(errors),
+        )
+
     def _require_enabled_versioning(self) -> None:
         kwargs: dict[str, object] = {"Bucket": self.config.bucket}
         if self.config.expected_bucket_owner is not None:
@@ -857,6 +908,7 @@ class S3ObjectStoreAdmin(_S3Client):
 __all__ = [
     "S3DependencyMissing",
     "S3ObjectStoreFailure",
+    "S3ObjectStoreDoctorReport",
     "S3ContentAddressedBlobStore",
     "S3ObjectStoreAdmin",
 ]

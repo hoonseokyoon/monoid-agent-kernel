@@ -31,6 +31,7 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresDatabase,
     PostgresMigrationDrift,
     PostgresMigrations,
+    PostgresOperations,
     PostgresSchemaIncompatible,
     PostgresWriterAuthorityStore,
 )
@@ -257,11 +258,59 @@ def test_migration_checksum_drift_fails_closed(postgres_database: PostgresDataba
     assert any("PostgresMigrationDrift" in error for error in report.errors)
 
 
+def test_operations_snapshot_is_read_only_and_aggregate_only(
+    postgres_database: PostgresDatabase,
+) -> None:
+    operations = PostgresOperations(postgres_database)
+    with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
+        operations.snapshot()
+
+    PostgresMigrations(postgres_database).apply()
+    assert operations.check_ready().current is True
+    snapshot = operations.snapshot()
+
+    assert snapshot.source == "postgres"
+    assert snapshot.collected_at.tzinfo is not None
+    assert snapshot.metrics
+    assert snapshot.metrics == tuple(
+        sorted(snapshot.metrics, key=lambda metric: (metric.name, metric.attributes))
+    )
+    assert {metric.name for metric in snapshot.metrics} >= {
+        "monoid.postgres.authority.count",
+        "monoid.postgres.invocation.count",
+        "monoid.postgres.object.count",
+        "monoid.postgres.outbox.oldest_age",
+        "monoid.postgres.schema.version",
+        "monoid.postgres.stream.chunk.bytes",
+    }
+    public = repr(snapshot.to_json())
+    assert postgres_database.config.schema not in public
+    assert postgres_database.config.dsn not in public
+
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        with postgres_database.transaction(read_only=True) as connection:
+            with postgres_database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                        "VALUES ('readonly-probe', 'readonly-probe', 1, "
+                        "pg_catalog.clock_timestamp() + interval '1 minute', false, "
+                        "pg_catalog.clock_timestamp())"
+                    ).format(
+                        sql.Identifier(postgres_database.config.schema),
+                        sql.Identifier("run_authority"),
+                    )
+                )
+
+
 def test_forward_schema_uses_declared_reader_and_writer_floors(
     postgres_database: PostgresDatabase,
 ) -> None:
     migrations = PostgresMigrations(postgres_database)
     migrations.apply()
+    operations = PostgresOperations(postgres_database)
+    assert operations.check_ready().current_version == 6
     with postgres_database.connection() as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
@@ -282,6 +331,12 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
     assert compatible.pending == ()
     assert compatible.reader_compatible is True
     assert compatible.writer_compatible is True
+    version_metric = next(
+        metric
+        for metric in operations.snapshot().metrics
+        if metric.name == "monoid.postgres.schema.version"
+    )
+    assert version_metric.value == 7
 
     with postgres_database.connection() as connection:
         with connection.transaction():
@@ -304,6 +359,10 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
         migrations.require_reader_compatible()
     with pytest.raises(PostgresSchemaIncompatible, match="not current"):
         migrations.require_writer_compatible()
+    with pytest.raises(PostgresSchemaIncompatible, match="not current"):
+        operations.snapshot()
+    with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
+        operations.snapshot()
 
 
 def test_migration_advisory_lock_serializes_independent_runners(
