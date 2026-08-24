@@ -69,13 +69,8 @@ class PostgresOperations:
         self._require_ready()
         from psycopg import sql
 
-        with self.database.transaction(
-            read_only=True,
-            isolation_level="repeatable_read",
-        ) as connection:
+        with self.database.read_snapshot() as (connection, collected_at):
             try:
-                with self.database.cursor(connection) as cursor:
-                    collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
                 status = PostgresMigrations(self.database)._require_reader_compatible(connection)
                 schema_version = status.current_version
                 with self.database.cursor(connection) as cursor:

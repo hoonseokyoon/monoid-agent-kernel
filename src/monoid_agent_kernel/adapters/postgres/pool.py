@@ -161,13 +161,13 @@ class PostgresDatabase:
             yield cursor
 
     @contextmanager
-    def transaction(
+    def _configured_transaction(
         self,
         *,
-        read_only: bool = False,
-        isolation_level: Literal["read_committed", "repeatable_read"] = "read_committed",
-    ) -> Iterator[Any]:
-        """Start a bounded adapter transaction with a trusted local search path."""
+        read_only: bool,
+        isolation_level: Literal["read_committed", "repeatable_read"],
+    ) -> Iterator[tuple[Any, datetime]]:
+        """Start one configured transaction and return its setup-statement boundary."""
 
         if type(read_only) is not bool:
             raise TypeError("PostgreSQL transaction read_only must be a boolean")
@@ -195,14 +195,46 @@ class PostgresDatabase:
                     # objects remain reachable only after it. SET LOCAL restores caller state.
                     cursor.execute("SET LOCAL search_path TO pg_catalog, pg_temp")
                     cursor.execute(
-                        "SELECT pg_catalog.set_config('lock_timeout', %s, true), "
+                        "SELECT pg_catalog.statement_timestamp(), "
+                        "pg_catalog.set_config('lock_timeout', %s, true), "
                         "pg_catalog.set_config('statement_timeout', %s, true)",
                         (
                             _timeout_milliseconds(self.config.lock_timeout_s),
                             _timeout_milliseconds(self.config.statement_timeout_s),
                         ),
                     )
-                yield connection
+                    setup = cursor.fetchone()
+                    if setup is None or not isinstance(setup[0], datetime):
+                        raise RuntimeError(
+                            "PostgreSQL transaction setup returned no snapshot boundary"
+                        )
+                    setup_boundary = setup[0]
+                yield connection, setup_boundary
+
+    @contextmanager
+    def transaction(
+        self,
+        *,
+        read_only: bool = False,
+        isolation_level: Literal["read_committed", "repeatable_read"] = "read_committed",
+    ) -> Iterator[Any]:
+        """Start a bounded adapter transaction with a trusted local search path."""
+
+        with self._configured_transaction(
+            read_only=read_only,
+            isolation_level=isolation_level,
+        ) as (connection, _setup_boundary):
+            yield connection
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[tuple[Any, datetime]]:
+        """Yield one repeatable read-only connection and its first-statement boundary."""
+
+        with self._configured_transaction(
+            read_only=True,
+            isolation_level="repeatable_read",
+        ) as snapshot:
+            yield snapshot
 
     def health(self) -> PostgresHealth:
         """Verify connectivity, supported major version, and database-clock availability."""

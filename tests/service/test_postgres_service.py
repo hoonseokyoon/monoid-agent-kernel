@@ -288,10 +288,8 @@ def test_operations_snapshot_is_read_only_and_aggregate_only(
     assert postgres_database.config.schema not in public
     assert postgres_database.config.dsn not in public
 
-    with postgres_database.transaction(
-        read_only=True,
-        isolation_level="repeatable_read",
-    ) as connection:
+    with postgres_database.read_snapshot() as (connection, snapshot_boundary):
+        assert snapshot_boundary.tzinfo is not None
         with postgres_database.cursor(connection) as cursor:
             cursor.execute(
                 "SELECT pg_catalog.current_setting('transaction_isolation'), "
