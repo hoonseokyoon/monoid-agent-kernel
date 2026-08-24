@@ -148,6 +148,253 @@ Reconstruct the loop with the same run ID, compatible runtime definition, worksp
 blob store. Restore the checked checkpoint before accepting a new input. Stop recovery and surface
 an actionable failure for corrupt or unsupported state.
 
+### Finite activation hosting
+
+Use `PostgresCommandAdmissionStore` at the product ingress to create one immutable admitted command
+and its dispatch outbox row in a single transaction. The caller supplies a stable command ID,
+request digest, and opaque private payload address. An exact retry returns the current receipt;
+reusing the ID for a different request raises `AdmissionConflict`.
+
+`PostgresConfig.lock_timeout_s` and `statement_timeout_s` apply transaction-local PostgreSQL
+limits to every adapter operation. Their defaults are 30 and 300 seconds. Set both below the host's
+outer operation timeout so a database lock or statement aborts before it can retain a worker slot.
+`pool_timeout_s` independently bounds connection-pool acquisition.
+
+```python
+from monoid_agent_kernel.adapters.postgres import PostgresCommandAdmissionStore
+from monoid_agent_kernel.hosting import AdmissionRequest, CommandOutboxDispatcher
+
+admission = PostgresCommandAdmissionStore(postgres_database)
+admission.check_ready()
+receipt = admission.admit(
+    AdmissionRequest(
+        run_id=run_id,
+        command_id=command_id,
+        kind="input",
+        request_digest=request_digest,
+        payload_ref=private_payload_ref,
+    )
+)
+dispatcher = CommandOutboxDispatcher(
+    store=admission,
+    transport=orchestrator_transport,
+    owner_id=dispatcher_id,
+)
+dispatcher.dispatch_once()
+```
+
+`dispatch_once()` performs one finite claim/send/settle attempt. The host owns polling, threads,
+shutdown, credentials, and health reporting. Dispatch uses database-clock leases and preserves
+per-run command order across competing workers. Delivery is at least once: the transport deduplicates
+`AdmittedCommand.identity_sha256`, and the activation path applies the immutable command identity
+once. `lease_s` must be in the portable `(0, MAX_COMMAND_DISPATCH_LEASE_S]` range, whose maximum is
+86,400 seconds. Retry policies return a finite non-negative delay; the dispatcher caps it at the
+portable `MAX_COMMAND_RETRY_DELAY_S` value of 86,400 seconds before store settlement. A rejected
+command enters `dead_letter` and blocks later commands in that run until an operator
+resolves the lane. A canonical terminal winner excludes that run from new claims. Unbound pending,
+leased, or delivered commands converge to `run_terminal` without another transport call. Active
+claim finalization and settlement share the run-authority lock with terminal selection, so commit
+order decides the winner and no claim, acknowledge, retry, or reject mutation can follow the
+terminal commit. `receipt()` reads admission, activation, and terminal evidence from one PostgreSQL
+statement snapshot, preserving monotonic state projection across concurrent binding and terminal
+commits.
+
+After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
+`bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.
+This allows several commands to be admitted before an earlier command advances the checkpoint.
+The store requires every preceding command sequence to have its canonical checkpoint receipt before
+binding the next command. Concurrent or out-of-order Activity delivery therefore cannot create two
+bindings from the same source checkpoint. Replacement workers receive the same stored
+`ActivationCommand`; stale writers are fenced before readback.
+
+Use `monoid_agent_kernel.hosting.ActivationDriver` when an external scheduler, workflow engine, or
+queue worker owns process replacement. The host admits one stable `ActivationCommand`, claims a
+`WriterToken`, and drives the restored loop to one durable suspension boundary:
+
+```python
+from monoid_agent_kernel.hosting import ActivationCommand, ActivationDriver
+
+command = ActivationCommand.from_json(admitted_command)
+receipt = ActivationDriver(
+    sink=fenced_run_sink,
+    writer_token=writer_token,
+    loop_factory=build_loop,
+    input_resolver=resolve_private_input,
+).drive(command)
+```
+
+The command contains digests and an opaque payload address. For an `input` command, the resolver
+loads private content and returns `ResolvedActivationInput` whose request digest and payload address
+match the admitted command. A `control` command resumes host-prepared checkpoint state without
+injecting another user message. A duplicate command whose marker is already in the canonical
+checkpoint returns the same content-free `ActivationReceipt` without resolving input or opening a
+loop. The checkpoint keeps that command's original boundary sequence and digest inside its private
+receipt, so later commands may advance the head without changing an earlier command's returned
+receipt. The digest hashes the boundary checkpoint with that receipt's own digest field blanked,
+which avoids a self-reference while retaining the rest of the exact boundary identity.
+
+The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`,
+`write_authority`, and `cancellation_token`. It also configures
+`authoritative_event_sinks=(runtime.event_sink,)`, seeds `event_sequence_seed` from the runtime, and
+keeps `emit_output_deltas=False` until a durable private stream sink is configured. The resulting
+event order is durable journal first, then local projections. A terminal winner closes new public
+event coordinates while preserving exact retries of events committed before terminal settlement.
+
+Treat `ActivationReceipt` as an operational copy. Reconstruct it from the canonical checkpoint and
+terminal readback after a response loss. Store model output and raw provider errors only in the
+private checkpoint/blob channels referenced by the receipt.
+
+### Temporal run orchestration
+
+Install `monoid-agent-kernel[durable-host]`, check every storage adapter for readiness, and compose
+the versioned per-run Workflow with the production threaded Activity:
+
+```python
+from monoid_agent_kernel.adapters.temporal import (
+    TemporalRunPolicy,
+    TemporalSignalWithStartTransport,
+)
+from monoid_agent_kernel.adapters.temporal.activity import (
+    TemporalActivationActivity,
+    TemporalActivityPolicy,
+)
+from monoid_agent_kernel.adapters.temporal.worker import TemporalWorkerGroup
+
+authority_store.check_ready()
+admission_store.check_ready()
+fenced_run_sink.check_ready()
+
+policy = TemporalRunPolicy(activity_task_queue="monoid-activation-v1")
+transport = TemporalSignalWithStartTransport(
+    client=temporal_client,
+    event_loop=temporal_client_loop,
+    workflow_task_queue="monoid-run-v1",
+    run_policy=policy,
+)
+
+activation = TemporalActivationActivity(
+    authority_store=authority_store,
+    admission_store=admission_store,
+    run_sink=fenced_run_sink,
+    loop_factory=build_loop,
+    input_resolver=resolve_private_input,
+    policy=TemporalActivityPolicy(
+        writer_lease_ttl_s=30,
+        writer_lease_renew_interval_s=10,
+        heartbeat_interval_s=5,
+        authority_call_timeout_s=30,
+        driver_call_timeout_s=3300,
+        supervisor_join_timeout_s=30,
+        local_task_wait_s=300,
+    ),
+)
+
+workers = TemporalWorkerGroup(
+    client=temporal_client,
+    workflow_task_queue="monoid-run-v1",
+    activity_task_queue=policy.activity_task_queue,
+    activation_activity=activation,
+    max_concurrent_activities=10,
+    graceful_shutdown_timeout_s=30,
+)
+
+async with workers:
+    await serve_until_shutdown()
+```
+
+`TemporalActivationActivity.run` is registered as the exported
+`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name with
+`no_thread_cancel_exception=True`. It accepts an `AdmittedCommand.to_json()` payload and returns
+`TemporalActivationResult.to_json()`. The result binds the exact command identity to a canonical
+receipt ref and terminal flag. Database access, private payload resolution, provider and tool calls,
+checkpoint restore, and terminal settlement remain inside this finite Activity.
+
+The Activity derives a content-free owner ID from the Temporal task token, claims an independent
+PostgreSQL writer generation, and starts a copied-context control supervisor before the potentially
+blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
+worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
+evidence. Claim, initial exact-token renewal, and durable activation binding run in one bounded
+copied-context daemon bootstrap worker, so a stuck database lock cannot retain the Temporal
+Activity executor slot. The configured authority timeout is capped by the current Activity
+attempt's remaining start-to-close budget with cleanup reserve. A timed-out bootstrap cannot enter
+the driver and releases a late exact token. An independent
+renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
+deadline enforcement. Its first renewal is scheduled from the installed lease's remaining
+monotonic budget and runs immediately when bootstrap consumed the normal safety margin. Control
+propagation uses the exact
+`ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
+renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
+checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+The `ActivationDriver` runs in a copied-context daemon worker. `driver_call_timeout_s` bounds that
+worker and is further capped by the current Activity attempt's remaining start-to-close budget,
+with time reserved for cleanup. Timeout or supervisor loss revokes local write authority, cancels
+the exact activation token, ignores a late driver result, and returns the Temporal Activity
+executor slot. Configure PostgreSQL lock and statement timeouts below this driver bound so an
+in-flight fenced mutation aborts inside the database first. The control supervisor keeps
+heartbeating while one bounded copied-context cleanup task joins driver and renewal work and
+releases the exact writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry
+returns retryable lease loss and leaves any uncooperative cleanup thread daemonized under revoked
+local authority.
+A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
+an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
+observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.
+A writer fence observed during activation binding is retryable lease loss. A deterministic loop
+wiring violation is a non-retryable configuration conflict.
+
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`; runtime caps the
+effective interval to half of the actual Activity heartbeat timeout. Keep
+`authority_call_timeout_s`, `driver_call_timeout_s`, and the cleanup reserve within its
+`activity_start_to_close_timeout_s`; runtime caps both bootstrap and driver phases to the actual
+remaining attempt budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and
+`statement_timeout_s` below the relevant Activity bound. The Activity policy requires the writer
+lease TTL to cover at least two renewal intervals. A start-to-close timeout that cannot contain the
+configured cleanup reserve fails as a non-retryable configuration conflict before writer claim.
+Give
+`graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
+composition requires this timeout to cover the configured heartbeat interval, authority call
+timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set
+`worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN` when an orderly host termination should
+retain that distinct cause.
+
+`TemporalWorkerGroup` creates an Activity executor sized to `max_concurrent_activities` by default.
+An externally owned executor must be active and expose at least that many worker threads. Reserve
+that capacity for Activity work; unrelated tasks in a shared pool can still delay the initial
+heartbeat and lease claim. After the Temporal graceful-drain window, an owned executor stops
+accepting work and cancels queued futures without joining a stuck running call. This keeps group
+exit bounded and leaves final process termination to the host supervisor. Externally owned
+executors retain their host-managed lifecycle.
+
+A drain before provider entry commits a resumable `graceful_drain` receipt. A drain after durable
+`dispatch_started` and before trustworthy provider evidence commits `dispatch_unknown` with
+`after_reconciliation` eligibility. This result blocks automatic paid-call replay. A worker crash
+after the settled invocation commit lets the replacement generation reuse the stored result with
+zero additional provider calls.
+
+The Temporal client is asynchronous. Keep its owner event loop running and call the synchronous
+`transport.dispatch()` from the PostgreSQL outbox polling thread. Async code already executing on
+the owner loop calls `await transport.dispatch_async(command)`. The synchronous method rejects an
+owner-loop call because waiting there would deadlock the client. Both methods return after Temporal
+server acceptance; the PostgreSQL admission receipt remains the client-facing canonical handle.
+
+Signal-With-Start uses a deterministic digest-derived Workflow ID and targets an existing running
+Workflow when present. A lost response can produce another Signal. The Workflow compares the
+PostgreSQL sequence and immutable admitted-command identity, buffers future sequences, and schedules
+one Activity for each sequence. A closed Workflow ID rejects another start, allowing the outbox lane
+to enter an operator-visible terminal/dead-letter disposition.
+
+The Workflow checks Temporal's Continue-As-New suggestion after every completed Activity. It waits
+for Signal handlers, transfers no in-flight Activity, and carries ordered pending commands, the next
+sequence, latest receipt ref, policy, build, and operational counters into the new Run ID. Keep
+`history_rollover_command_limit=0` in production to follow the service suggestion. A small positive
+value is a deterministic qualification hook.
+
+Temporal history and Query status contain opaque IDs, digests, refs, sequence counters, bounded
+policy values, and public-safe taxonomies. Store prompt, response, reasoning, model result,
+workspace bytes, checkpoint bytes, credentials, and raw exception text in private storage. Replay
+`tests/fixtures/temporal_replay_v1/run-workflow-v1.json` with Temporal `Replayer` before changing the
+Workflow command sequence or Activity options. Use Temporal patching or Worker Versioning for a
+change that would produce different commands for an existing history.
+
 ## Golden path B: hosted/multi-tenant product
 
 The hosted example creates two `RunnerBackend` instances over one SQLite database. This diagram is
@@ -358,6 +605,82 @@ v0.19.2 makes no production rolling-upgrade claim for that profile.
 
 ## Streaming and cursor ownership
 
+### Durable private model streams
+
+Use `PostgresObjectStoreDurableStreamStore` when reconnect must survive process replacement. The
+store keeps generation, UTF-8 byte cursor, chunk metadata, and the final digest in PostgreSQL. A
+`ContentAddressedBlobStore` keeps immutable private chunk bytes. The host supplies the same exact
+`WriterToken` and activation-wide `ActivationWriteAuthority` used by checkpoint, invocation,
+event, and terminal publication:
+
+```python
+from monoid_agent_kernel.adapters.postgres import PostgresObjectStoreDurableStreamStore
+from monoid_agent_kernel.hosting import DurableModelStreamObserver
+
+streams = PostgresObjectStoreDurableStreamStore(database, object_store)
+streams.check_ready()
+
+loop = make_loop(
+    model_stream_observer_factories=(
+        lambda: DurableModelStreamObserver(
+            streams,
+            writer_token=writer_token,
+            write_authority=write_authority,
+            chunk_bytes=64 * 1024,
+            flush_interval_s=0.25,
+            max_buffer_bytes=1024 * 1024,
+        ),
+    ),
+)
+```
+
+The observer opens one `output` lane and normally opens `reasoning` when that channel first emits
+content. A replacement that finds prior output also hydrates reasoning. `ModelCallRunner` signals
+every actual adapter entry before durable `dispatch_started` publication. The observer resets every
+pre-existing kernel lane at that boundary. A reset failure leaves the invocation `reserved` and
+prevents provider entry. Provider-free settled success or failure recovery receives no dispatch
+signal and preserves the committed generation. Direct `ModelCallRunner` integrations pass a
+`before_dispatch` callback that calls `begin_model_stream_dispatch()`.
+
+The loop also passes a `before_settlement` callback that calls
+`prepare_model_stream_settlement()`. The durable observer flushes all accepted output and reasoning
+bytes before the lifecycle publishes a recoverable success or refusal. The generation stays open
+until ordinary close seals it. A crash after invocation settlement can therefore recover the full
+generation and seal it without reconstructing reasoning. A preparation failure commits
+`dispatch_unknown`, invokes `abort_model_stream()`, and leaves the generation unsealed for
+diagnosis. The first-delta reset remains a fallback for direct integrations that omit the dispatch
+callback. Host-defined private lanes use the same `DurableStreamIdentity` contract directly. Byte
+and time thresholds bound coalescing; a copied-context daemon performs ordered flushes. Generic
+observer factory, open, push, and close failures stay isolated. Dispatch- and settlement-aware
+extensions opt into fail-closed preparation. A `fenced` store result revokes the shared activation
+authority, so later kernel publication fails closed.
+The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
+leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
+call reuses and seals its prior generation; the first delta from an admitted replacement dispatch
+cannot mix with the prior generation because reset already committed before adapter entry.
+On a completed close, the observer compares the output lane's byte length and SHA-256 with the
+settled `final_text`. A mismatch means recovery found an unflushed/truncated prefix; the observer
+rebuilds output in a new generation from that authoritative final text before sealing it.
+
+Persist reconnect state as `(generation, cursor)`. Call `read_after()` only with cursor values
+returned by a prior read. `ok` returns complete UTF-8 chunks and `next_cursor`; `reset` tells the
+consumer to discard the old generation and restart from cursor zero; `gap` reports an ahead or
+non-boundary cursor. A stable reset ID makes process-response loss idempotent. Seal records the
+final byte length and SHA-256 after checked ObjectStore reads. PostgreSQL serializes append, reset,
+seal, and terminal settlement through the run authority row. An append committed before terminal
+remains readable; a new append ordered after terminal returns `run_terminal`.
+
+Each append holds the run-authority and stream-head locks through one bounded ObjectStore put;
+terminal settlement, reset, takeover, and renewal then linearize after that chunk commit. Configure
+ObjectStore request timeouts, lease TTL/renewal margin, and `supervisor_join_timeout_s` as one
+operational budget. Seal releases those locks before its multi-chunk checked-read pass and validates
+the captured head again before publication.
+
+Stream metadata contains opaque IDs, channel taxonomy, offsets, sizes, and digests. It contains no
+model text. `read_after()` returns private bytes and performs no tenant authorization; expose it
+only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
+apply tenant scoping in that wrapper.
+
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
 Reference facade exposes the same behavior through `subscribe_events()`:
@@ -457,6 +780,18 @@ Publish portable metrics for:
 - gateway usage, retries, quota denials, and provider latency;
 - approval age and callback completion latency;
 - drain, shutdown, recovery, and terminal projection outcomes.
+
+The v0.23 PostgreSQL production adapter exposes `PostgresOperations.check_ready()` and
+`snapshot()` for exact, aggregate-only operational collection. Route a snapshot through
+`record_operational_snapshot()` to a host-owned sink. `OtelOperationalMetricSink` provides an
+optional observable-gauge bridge under the `[otel]` extra. Keep collection cadence, exporter
+failure handling, resource attributes, and alert thresholds in the host.
+
+Use `PostgresMigrations.doctor()` for database/schema readiness and
+`S3ObjectStoreAdmin.doctor()` for read-only bucket reachability/versioning readiness. Keep
+run-scoped authority reads and destructive admin operations on private operator routes. The full
+startup, rolling migration, drain, GC, backup/restore, and corruption procedures are in
+[Production adapter operations](PRODUCTION_OPERATIONS.md).
 
 The Reference inbox assembly additionally reports lease age, stale claims, watchdog recovery, and
 command claim age. A DBOS evaluation reports workflow, queue, executor-slot, and application-version

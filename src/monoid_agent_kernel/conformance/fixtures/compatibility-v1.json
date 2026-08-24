@@ -256,6 +256,206 @@
           }
         ]
       }
+    },
+    {
+      "fixture_id": "admission-request-v023-v1",
+      "artifact": "admission-request",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.admission-request.v1",
+        "run_id": "fixture_run_v023",
+        "command_id": "fixture_command_v023",
+        "kind": "input",
+        "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "payload_ref": "blob:fixture-input-v023",
+        "identity_sha256": "d4889b247344501014d25b95b0a17b51b0c0c2d21a0716f7c1923c2fa313f7f2"
+      }
+    },
+    {
+      "fixture_id": "admitted-command-v023-v1",
+      "artifact": "admitted-command",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.admitted-command.v1",
+        "run_id": "fixture_run_v023",
+        "command_id": "fixture_command_v023",
+        "command_sequence": 1,
+        "kind": "input",
+        "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "payload_ref": "blob:fixture-input-v023",
+        "request_identity_sha256": "d4889b247344501014d25b95b0a17b51b0c0c2d21a0716f7c1923c2fa313f7f2",
+        "identity_sha256": "c848ffd7993bf024328d811169b60025f688b5d04d3b9559ab7e7050bd2b2d68"
+      }
+    },
+    {
+      "fixture_id": "activation-command-v023-v1",
+      "artifact": "activation-command",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.activation-command.v1",
+        "run_id": "fixture_run_v023",
+        "command_id": "fixture_command_v023",
+        "command_sequence": 1,
+        "kind": "input",
+        "source_checkpoint_seq": 0,
+        "source_checkpoint_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "payload_ref": "blob:fixture-input-v023",
+        "identity_sha256": "e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2"
+      }
+    },
+    {
+      "fixture_id": "activation-receipt-v023-v1",
+      "artifact": "activation-receipt",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.activation-receipt.v1",
+        "run_id": "fixture_run_v023",
+        "command_id": "fixture_command_v023",
+        "command_sequence": 1,
+        "command_identity_sha256": "e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2",
+        "checkpoint_seq": 1,
+        "checkpoint_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "checkpoint_ref": "checkpoint:fixture_run_v023/1",
+        "state": "completed",
+        "boundary_reason": "terminal",
+        "terminal": true,
+        "terminal_ref": "terminal:fixture_run_v023",
+        "applied_input_ref": "activation:e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2",
+        "event_cursor": 2,
+        "stream_cursor": 3,
+        "outcome_kind": "completed",
+        "retry_eligibility": "not_applicable",
+        "error_code": "",
+        "provider_error_code": "",
+        "interruption_cause": ""
+      }
+    },
+    {
+      "fixture_id": "admission-receipt-v023-v1",
+      "artifact": "admission-receipt",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.admission-receipt.v1",
+        "command": {
+          "schema_version": "monoid.admitted-command.v1",
+          "run_id": "fixture_run_v023",
+          "command_id": "fixture_command_v023",
+          "command_sequence": 1,
+          "kind": "input",
+          "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "payload_ref": "blob:fixture-input-v023",
+          "request_identity_sha256": "d4889b247344501014d25b95b0a17b51b0c0c2d21a0716f7c1923c2fa313f7f2",
+          "identity_sha256": "c848ffd7993bf024328d811169b60025f688b5d04d3b9559ab7e7050bd2b2d68"
+        },
+        "state": "completed",
+        "attempt_count": 1,
+        "dispatch_ref": "temporal:fixture-run-v023",
+        "error_code": "",
+        "activation_command": {
+          "schema_version": "monoid.activation-command.v1",
+          "run_id": "fixture_run_v023",
+          "command_id": "fixture_command_v023",
+          "command_sequence": 1,
+          "kind": "input",
+          "source_checkpoint_seq": 0,
+          "source_checkpoint_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "payload_ref": "blob:fixture-input-v023",
+          "identity_sha256": "e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2"
+        },
+        "activation_receipt": {
+          "schema_version": "monoid.activation-receipt.v1",
+          "run_id": "fixture_run_v023",
+          "command_id": "fixture_command_v023",
+          "command_sequence": 1,
+          "command_identity_sha256": "e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2",
+          "checkpoint_seq": 1,
+          "checkpoint_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "checkpoint_ref": "checkpoint:fixture_run_v023/1",
+          "state": "completed",
+          "boundary_reason": "terminal",
+          "terminal": true,
+          "terminal_ref": "terminal:fixture_run_v023",
+          "applied_input_ref": "activation:e23e799e787a21a3996972e37734f8247d15510a9965b3e58f12301e6e4ca8c2",
+          "event_cursor": 2,
+          "stream_cursor": 3,
+          "outcome_kind": "completed",
+          "retry_eligibility": "not_applicable",
+          "error_code": "",
+          "provider_error_code": "",
+          "interruption_cause": ""
+        }
+      }
+    },
+    {
+      "fixture_id": "temporal-run-policy-v023-v1",
+      "artifact": "temporal-run-policy",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.temporal-run-policy.v1",
+        "activity_task_queue": "fixture-activity-v023",
+        "activity_start_to_close_timeout_s": 3600,
+        "activity_heartbeat_timeout_s": 30,
+        "activity_max_attempts": 3,
+        "history_rollover_command_limit": 0
+      }
+    },
+    {
+      "fixture_id": "temporal-run-state-v023-v1",
+      "artifact": "temporal-run-state",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.temporal-run-state.v1",
+        "workflow_build": "monoid.temporal-run-workflow.v1",
+        "run_id": "fixture_run_v023",
+        "policy": {
+          "schema_version": "monoid.temporal-run-policy.v1",
+          "activity_task_queue": "fixture-activity-v023",
+          "activity_start_to_close_timeout_s": 3600,
+          "activity_heartbeat_timeout_s": 30,
+          "activity_max_attempts": 3,
+          "history_rollover_command_limit": 0
+        },
+        "next_command_sequence": 1,
+        "pending_commands": [],
+        "latest_receipt_ref": "",
+        "rollover_count": 0,
+        "duplicate_signal_count": 0,
+        "last_error_code": ""
+      }
+    },
+    {
+      "fixture_id": "temporal-activation-result-v023-v1",
+      "artifact": "temporal-activation-result",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.temporal-activation-result.v1",
+        "run_id": "fixture_run_v023",
+        "command_id": "fixture_command_v023",
+        "command_sequence": 1,
+        "command_identity_sha256": "c848ffd7993bf024328d811169b60025f688b5d04d3b9559ab7e7050bd2b2d68",
+        "receipt_ref": "receipt:fixture-run-v023/1",
+        "terminal": true
+      }
+    },
+    {
+      "fixture_id": "temporal-run-status-v023-v1",
+      "artifact": "temporal-run-status",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.temporal-run-status.v1",
+        "run_id": "fixture_run_v023",
+        "phase": "waiting",
+        "next_command_sequence": 1,
+        "in_flight_sequence": 0,
+        "pending_count": 0,
+        "pending_head_sequence": 0,
+        "latest_receipt_ref": "",
+        "rollover_count": 0,
+        "duplicate_signal_count": 0,
+        "last_error_code": ""
+      }
     }
   ]
 }

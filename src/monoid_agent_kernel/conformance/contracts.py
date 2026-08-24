@@ -3339,7 +3339,7 @@ def _run_fenced_run_sink_contract(
                     ),
                     observation(
                         "new_generation_appends_event",
-                        expected="committed",
+                        expected="conflict",
                         actual=current_event.status,
                     ),
                     observation(
@@ -3356,7 +3356,7 @@ def _run_fenced_run_sink_contract(
                         "same_run_event_sequence_payloads",
                         expected=(
                             canonical_sha256(event.to_json()),
-                            canonical_sha256(_contract_event(run_id, seq=2).to_json()),
+                            None,
                         ),
                         actual=same_run_event_payloads,
                     ),
@@ -3442,12 +3442,17 @@ def _run_fenced_run_sink_contract(
         harness = factory()
         run_id = _contract_run_id(namespace, "terminal")
         token = _contract_writer(harness, run_id)
+        empty_event_cursor = harness.sink.latest_event_sequence(run_id)
         event = _contract_event(run_id, seq=1)
         first_event = harness.sink.append_event(event, writer_token=token)
         terminal = _contract_terminal(run_id)
         first_terminal = harness.sink.settle_terminal(terminal, writer_token=token)
+        late_event = _contract_event(run_id, seq=2)
+        late_event_result = harness.sink.append_event(late_event, writer_token=token)
         harness = harness.reopen()
         reopened_event = harness.read_event(run_id, event.seq)
+        reopened_late_event = harness.read_event(run_id, late_event.seq)
+        reopened_event_cursor = harness.sink.latest_event_sequence(run_id)
         reopened_terminal = harness.read_terminal(run_id)
         repeated_event = harness.sink.append_event(event, writer_token=token)
         conflicting_event = _contract_event(run_id, seq=1, level="warning")
@@ -3615,12 +3620,32 @@ def _run_fenced_run_sink_contract(
                 "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
                 FENCED_RUN_SINK_CONTRACT_PROFILE,
                 (
+                    observation(
+                        "event_cursor_empty",
+                        expected=0,
+                        actual=empty_event_cursor,
+                    ),
                     observation("event_first", expected="committed", actual=first_event.status),
                     observation(
                         "event_repeat", expected="already_committed", actual=repeated_event.status
                     ),
                     observation(
                         "event_conflict", expected="conflict", actual=conflict_event.status
+                    ),
+                    observation(
+                        "event_after_terminal",
+                        expected="conflict",
+                        actual=late_event_result.status,
+                    ),
+                    observation(
+                        "event_after_terminal_not_published",
+                        expected=None,
+                        actual=reopened_late_event,
+                    ),
+                    observation(
+                        "event_cursor_after_terminal",
+                        expected=event.seq,
+                        actual=reopened_event_cursor,
                     ),
                     *(
                         observation(

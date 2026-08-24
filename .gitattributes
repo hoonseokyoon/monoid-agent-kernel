@@ -1,4 +1,5 @@
 *.py text eol=lf
+src/monoid_agent_kernel/adapters/postgres/sql/*.sql text eol=lf
 .nvmrc text eol=lf
 # `vite build` copies studio-ui/index.html verbatim and injects the hashed asset tags with LF.
 # With core.autocrlf=true the template checks out CRLF on Windows, so the generated file comes out
@@ -18,3 +19,6 @@ src/monoid_agent_kernel/reference/studio/web/dist/assets/*.js whitespace=-traili
 # inline-only today, so nothing is broken yet; pinning the tree closes it before the first
 # offloaded fixture rather than after someone spends a day on it.
 tests/fixtures/** -text
+# Temporal history manifests are semantic JSON. Keep them reviewable and cross-platform while
+# leaving any future content-addressed payload chunks under the binary fixture rule above.
+tests/fixtures/temporal_replay_v1/*.json text eol=lf

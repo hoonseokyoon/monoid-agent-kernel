@@ -445,8 +445,10 @@ Autonomous runs use `AgentLoop.stream_model_calls=True` to select provider strea
 from egress. `model_stream_observer_factories` creates passive observers for live presentation or
 private persistence. Each observer receives output/reasoning fragments and a terminal outcome for
 one provider call; tool-call fragments remain inside model-turn assembly. A fresh observer is
-created for every activation and subagent, and observer failures remain isolated from the model
-call. `model_content_file=True` adds a writer owned by the run recorder and persists
+created for every activation and subagent. Generic observer failures remain isolated from the model
+call. Dispatch- and settlement-aware durable writers opt into fail-closed preparation: reset must
+complete before provider entry, and accepted private deltas must flush before recoverable durable
+settlement. `model_content_file=True` adds a writer owned by the run recorder and persists
 `stream_opened`, `stream_segment`, `stream_closed`, and `settled_text` records to the optional
 private `model-content.jsonl` sidecar.
 
@@ -574,6 +576,27 @@ inclusive `from_seq` pagination response. Studio uses the same cursor abstractio
 feed and descendant event polling.
 
 ## Metrics
+
+### Production adapter operational metrics
+
+Run-local `metrics.json` describes one agent run. The PostgreSQL production adapter supplies a
+separate fleet-level snapshot through `PostgresOperations`. Its fixed vocabulary covers migration
+version, authority state, activation and model-evidence outboxes, invocation state, durable stream
+heads/chunks, ObjectStore metadata/associations, and GC receipts.
+
+`OperationalMetric` accepts bounded `monoid.*` names, finite values, fixed units (`1`, `By`, `s`),
+and a small public attribute vocabulary. `OperationalSnapshot` requires canonical unique metric
+identities and a timezone-aware collection timestamp. The PostgreSQL collector emits no run ID,
+owner, schema, object locator, digest, payload, or model content.
+
+Use `record_operational_snapshot(snapshot, sink)` for an explicit collection pass.
+`OtelOperationalMetricSink` lazily creates OpenTelemetry observable gauges and retains the latest
+value per metric identity. The host supplies the meter provider and exporter. Preserve the normal
+telemetry failure boundary in the scheduler that calls the sink; a metrics outage leaves canonical
+run state unchanged.
+
+The metric catalog, suggested signals, query-cost guidance, and operational procedures are in
+[Production adapter operations](PRODUCTION_OPERATIONS.md).
 
 Each run writes `metrics.json` (and emits a `metrics.updated` event per turn) with
 final counters and timing: `status`, `duration_s`, `tool_calls`, shell/background-job counters,

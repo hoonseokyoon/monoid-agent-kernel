@@ -87,6 +87,21 @@ hosted/product runs use `GatewayModelAdapter` through your gateway:
 pip install "monoid-agent-kernel[openai]"
 ```
 
+Production persistence and orchestration adapters install independently. Use `durable-host` for
+the complete PostgreSQL, S3-compatible ObjectStore, and Temporal composition:
+
+```bash
+pip install "monoid-agent-kernel[postgres]"
+pip install "monoid-agent-kernel[object-store-s3]"
+pip install "monoid-agent-kernel[temporal]"
+pip install "monoid-agent-kernel[durable-host]"
+```
+
+The default package keeps these platform SDKs optional. Follow
+[docs/EMBEDDING.md](docs/EMBEDDING.md) for composition and
+[docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md) for migration, readiness, drain,
+metrics, backup/restore, and garbage collection.
+
 ## Quickstart (no servers)
 
 The smallest kernel run needs three of your objects — a spec, a model adapter, and a runtime
@@ -269,6 +284,8 @@ public/private split.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,
 live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)**.
+PostgreSQL/ObjectStore/Temporal startup, migration, metrics, drain, GC, backup/restore, and incident
+procedures are documented in **[docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md)**.
 
 ## Defaults
 

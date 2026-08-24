@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+from monoid_agent_kernel.adapters.temporal import (
+    TemporalActivationResult,
+    TemporalRunPolicy,
+    TemporalRunState,
+    TemporalRunStatus,
+)
 from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
 from monoid_agent_kernel.conformance.report import decode_conformance_report
 from monoid_agent_kernel.core.checkpoint import decode_checkpoint
 from monoid_agent_kernel.core.control import ControlCommand
 from monoid_agent_kernel.core.model_invocation import decode_model_invocation
 from monoid_agent_kernel.core.outcome import TerminalOutcome
+from monoid_agent_kernel.hosting.activation import ActivationCommand, ActivationReceipt
+from monoid_agent_kernel.hosting.admission import (
+    AdmissionReceipt,
+    AdmissionRequest,
+    AdmittedCommand,
+)
 
 
 def test_packaged_compatibility_fixtures_have_stable_unique_ids() -> None:
     fixtures = load_compatibility_fixtures()
 
-    assert len(fixtures) == 10
+    assert len(fixtures) == 19
     assert len({fixture.fixture_id for fixture in fixtures}) == len(fixtures)
 
 
@@ -105,3 +117,28 @@ def test_v1_conformance_report_fixture_matches_checked_reader_outcome() -> None:
     )
 
     assert decode_conformance_report(fixture.payload).status == fixture.expected_status
+
+
+def test_v023_portable_record_fixtures_match_strict_readers() -> None:
+    readers = {
+        "admission-request": AdmissionRequest.from_json,
+        "admitted-command": AdmittedCommand.from_json,
+        "admission-receipt": AdmissionReceipt.from_json,
+        "activation-command": ActivationCommand.from_json,
+        "activation-receipt": ActivationReceipt.from_json,
+        "temporal-run-policy": TemporalRunPolicy.from_json,
+        "temporal-run-state": TemporalRunState.from_json,
+        "temporal-activation-result": TemporalActivationResult.from_json,
+        "temporal-run-status": TemporalRunStatus.from_json,
+    }
+    fixtures = {
+        fixture.artifact: fixture
+        for fixture in load_compatibility_fixtures()
+        if fixture.artifact in readers
+    }
+
+    assert set(fixtures) == set(readers)
+    for artifact, reader in readers.items():
+        fixture = fixtures[artifact]
+        assert fixture.expected_status == "loaded"
+        assert reader(fixture.payload).to_json() == fixture.payload

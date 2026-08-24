@@ -37,6 +37,10 @@ class _RecordingWriter:
     def __init__(self) -> None:
         self.deltas: list[ModelStreamDelta] = []
         self.outcomes: list[ModelStreamOutcome] = []
+        self.dispatches = 0
+
+    def begin_dispatch(self) -> None:
+        self.dispatches += 1
 
     def push(self, delta: ModelStreamDelta) -> None:
         self.deltas.append(delta)
@@ -154,6 +158,7 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
         ModelStreamDelta(channel="output", text="Hel"),
         ModelStreamDelta(channel="output", text="lo"),
     ]
+    assert observer.writers[0].dispatches == 1
     assert observer.writers[0].outcomes == [
         ModelStreamOutcome(
             status="completed",
@@ -167,6 +172,55 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
     settled = next(event for event in sink.events if event.type == "turn.settled")
     assert settled.turn_id == started.turn_id
     assert settled.parent_id == started.event_id
+
+
+def test_dispatch_preparation_failure_aborts_before_provider_entry(tmp_path: Path) -> None:
+    class DispatchFailureWriter:
+        def __init__(self) -> None:
+            self.dispatches = 0
+            self.aborts = 0
+            self.closes = 0
+
+        def begin_dispatch(self) -> None:
+            self.dispatches += 1
+            raise OSError("durable stream reset unavailable")
+
+        def push(self, delta: ModelStreamDelta) -> None:
+            del delta
+            raise AssertionError("provider must not emit")
+
+        def abort(self) -> None:
+            self.aborts += 1
+
+        def close(self, outcome: ModelStreamOutcome) -> None:
+            del outcome
+            self.closes += 1
+
+    class DispatchFailureObserver:
+        def __init__(self) -> None:
+            self.writer = DispatchFailureWriter()
+
+        def open(self, context: ModelStreamContext) -> DispatchFailureWriter:
+            del context
+            return self.writer
+
+    observer = DispatchFailureObserver()
+    adapter = _ScriptedStreamAdapter(
+        [TextDelta("unreachable"), TurnComplete(response_id="unreachable")]
+    )
+    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,))
+
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+    finally:
+        loop.close()
+
+    assert suspension.reason == "terminal"
+    assert adapter.stream_calls == 0
+    assert observer.writer.dispatches == 1
+    assert observer.writer.aborts == 1
+    assert observer.writer.closes == 0
 
 
 @pytest.mark.parametrize("losing_open", ("private", "observer"))
