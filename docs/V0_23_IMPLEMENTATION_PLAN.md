@@ -698,6 +698,8 @@ Redis pubsub, CDN delivery는 후속 최적화다.
 - cloud-specific IAM/KMS provisioning
 
 host가 scheduler와 credential을 소유하고 adapter가 safe operation primitive와 evidence를 제공한다.
+구체적인 startup, rolling migration, drain/takeover, GC, backup/restore, corruption 절차는
+[`PRODUCTION_OPERATIONS.md`](PRODUCTION_OPERATIONS.md)가 소유한다.
 
 ## 14. CI와 실제 서비스 검증
 

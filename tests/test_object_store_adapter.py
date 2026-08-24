@@ -85,6 +85,10 @@ class _FakeS3:
         del kwargs
         return {"Status": "Enabled"} if self.versioned else {}
 
+    def head_bucket(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {}
+
     def get_object(self, **kwargs: Any) -> dict[str, Any]:
         value = self.objects.get(self._location(kwargs))
         if value is None:
@@ -267,6 +271,12 @@ class _SecretFailureS3(_FakeS3):
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         del kwargs
         raise RuntimeError("credential=must-never-reach-public-error")
+
+
+class _DoctorSecretFailureS3(_FakeS3):
+    def head_bucket(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise RuntimeError("credential=must-never-reach-doctor-report")
 
 
 class _MissingBucketS3(_FakeS3):
@@ -538,6 +548,47 @@ def test_admin_inventory_is_bounded_parses_only_exact_content_keys_and_condition
     assert admin.delete_if_match(victim.sha256, wrong_token).status == "precondition_failed"
     assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "deleted"
     assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "already_missing"
+
+
+def test_admin_doctor_reports_read_only_capabilities_and_bucket_versioning() -> None:
+    admin, client = _admin(server_side_encryption="AES256")
+
+    report = admin.doctor()
+
+    assert report.ok is True
+    assert report.reachable is True
+    assert report.versioning_enabled is True
+    assert report.conditional_create_supported is True
+    assert report.checked_read_supported is True
+    assert report.object_inventory_ready is True
+    assert report.versioned_delete_ready is True
+    assert report.multipart_cleanup_supported is True
+    assert report.encryption_configured is True
+    assert report.errors == ()
+    assert client.objects == {}
+    assert client.uploads == {}
+
+
+def test_admin_doctor_fails_closed_for_unversioned_or_unreachable_bucket() -> None:
+    unversioned, _ = _admin(_FakeS3(versioned=False))
+    report = unversioned.doctor()
+
+    assert report.ok is False
+    assert report.reachable is True
+    assert report.versioning_enabled is False
+    assert report.object_inventory_ready is False
+    assert report.versioned_delete_ready is False
+    assert report.errors == ("versioning: disabled",)
+
+    unreachable, _ = _admin(_DoctorSecretFailureS3(versioned=True))
+    failure = unreachable.doctor()
+    public = repr(failure)
+    assert failure.ok is False
+    assert failure.reachable is False
+    assert failure.versioning_enabled is False
+    assert failure.errors == ("reachability: RuntimeError",)
+    assert "credential" not in public
+    assert unreachable.config.bucket not in public
 
 
 def test_admin_incomplete_multipart_inventory_token_and_abort_are_explicit() -> None:

@@ -102,6 +102,29 @@ default must be changed for production.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.
 
+## Production durability adapters
+
+- [ ] PostgreSQL migration and runtime identities are separate; each role is restricted to the
+      selected schema and operation set.
+- [ ] PostgreSQL TLS verifies the server, pool/lock/statement timeouts fit inside the Activity
+      operation budget, and every store passes explicit `check_ready()` before traffic.
+- [ ] `PostgresMigrations.status()`, `plan()`, `doctor()`, and the reviewed explicit `apply()` step
+      agree on migration IDs, checksums, and reader/writer floors.
+- [ ] ObjectStore runtime and admin identities are separate; bucket policy restricts both to the
+      configured prefix and enables only their documented calls.
+- [ ] Bucket versioning is enabled, remote TLS is verified, server-side encryption policy is
+      configured, and `S3ObjectStoreAdmin.doctor()` passes before traffic.
+- [ ] GC begins with a reviewed dry-run plan; apply rechecks association/generation and archives
+      receipts. Multipart cleanup uses a separate reviewed age boundary.
+- [ ] Temporal namespace/task-queue access is scoped to the deployment, and Workflow history
+      contains only content-free command, policy, build, receipt, and status records.
+- [ ] Operational snapshots, doctor reports, public events, receipts, logs, traces, and Temporal
+      history pass a seeded private-marker and credential scan.
+- [ ] Backup/restore rehearsal restores ObjectStore versions before PostgreSQL, runs checked reads,
+      reconciles pending/unknown invocations, and starts dispatchers last.
+- [ ] Rolling deploy, rollback, drain, takeover, corruption response, and credential rotation follow
+      [the production adapter runbook](../PRODUCTION_OPERATIONS.md).
+
 ## Skills, MCP, and memory
 
 - [ ] Skill bundles are treated as code — reviewed or signed before loading.

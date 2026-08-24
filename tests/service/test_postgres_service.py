@@ -31,8 +31,10 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresDatabase,
     PostgresMigrationDrift,
     PostgresMigrations,
+    PostgresOperations,
     PostgresSchemaIncompatible,
     PostgresWriterAuthorityStore,
+    MigrationStatus,
 )
 from monoid_agent_kernel.adapters.postgres.authority import (  # noqa: E402
     _ELAPSED_TTL_INTERVAL,
@@ -257,11 +259,383 @@ def test_migration_checksum_drift_fails_closed(postgres_database: PostgresDataba
     assert any("PostgresMigrationDrift" in error for error in report.errors)
 
 
+def test_operations_snapshot_is_read_only_and_aggregate_only(
+    postgres_database: PostgresDatabase,
+) -> None:
+    operations = PostgresOperations(postgres_database)
+    with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
+        operations.snapshot()
+
+    PostgresMigrations(postgres_database).apply()
+    assert operations.check_ready().current is True
+    snapshot = operations.snapshot()
+
+    assert snapshot.source == "postgres"
+    assert snapshot.collected_at.tzinfo is not None
+    assert snapshot.metrics
+    assert snapshot.metrics == tuple(
+        sorted(snapshot.metrics, key=lambda metric: (metric.name, metric.attributes))
+    )
+    assert {metric.name for metric in snapshot.metrics} >= {
+        "monoid.postgres.authority.count",
+        "monoid.postgres.invocation.count",
+        "monoid.postgres.object.count",
+        "monoid.postgres.outbox.oldest_age",
+        "monoid.postgres.schema.version",
+        "monoid.postgres.stream.chunk.bytes",
+    }
+    public = repr(snapshot.to_json())
+    assert postgres_database.config.schema not in public
+    assert postgres_database.config.dsn not in public
+
+    with postgres_database.read_snapshot() as (connection, snapshot_boundary):
+        assert snapshot_boundary.tzinfo is not None
+        with postgres_database.cursor(connection) as cursor:
+            cursor.execute(
+                "SELECT pg_catalog.current_setting('transaction_isolation'), "
+                "pg_catalog.current_setting('transaction_read_only')"
+            )
+            assert cursor.fetchone() == ("repeatable read", "on")
+
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        with postgres_database.transaction(read_only=True) as connection:
+            with postgres_database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                        "VALUES ('readonly-probe', 'readonly-probe', 1, "
+                        "pg_catalog.clock_timestamp() + interval '1 minute', false, "
+                        "pg_catalog.clock_timestamp())"
+                    ).format(
+                        sql.Identifier(postgres_database.config.schema),
+                        sql.Identifier("run_authority"),
+                    )
+                )
+    with pytest.raises(ValueError, match="isolation_level"):
+        with postgres_database.transaction(isolation_level="serializable"):  # type: ignore[arg-type]
+            pass
+
+
+def test_operations_outbox_lag_uses_claimable_rows_only(
+    postgres_database: PostgresDatabase,
+) -> None:
+    PostgresMigrations(postgres_database).apply()
+    sampled_at = datetime.now(UTC)
+    activation_rows = (
+        (
+            "activation-ready",
+            1,
+            "pending",
+            2,
+            sampled_at - timedelta(minutes=1),
+            None,
+            sampled_at - timedelta(minutes=5),
+        ),
+        (
+            "activation-delayed",
+            1,
+            "pending",
+            9,
+            sampled_at + timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=1),
+        ),
+        (
+            "activation-leased",
+            1,
+            "leased",
+            8,
+            sampled_at - timedelta(days=1),
+            sampled_at + timedelta(days=1),
+            sampled_at - timedelta(days=1),
+        ),
+        (
+            "activation-ordered",
+            1,
+            "pending",
+            4,
+            sampled_at + timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=4),
+        ),
+        (
+            "activation-ordered",
+            2,
+            "pending",
+            12,
+            sampled_at - timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=3),
+        ),
+        (
+            "activation-terminal",
+            1,
+            "pending",
+            13,
+            sampled_at - timedelta(days=1),
+            None,
+            sampled_at - timedelta(days=5),
+        ),
+    )
+    evidence_rows = (
+        (
+            "evidence-ready",
+            3,
+            sampled_at - timedelta(minutes=1),
+            None,
+            None,
+            sampled_at - timedelta(minutes=5),
+        ),
+        (
+            "evidence-delayed",
+            10,
+            sampled_at + timedelta(days=1),
+            None,
+            None,
+            sampled_at - timedelta(days=1),
+        ),
+        (
+            "evidence-leased",
+            11,
+            sampled_at - timedelta(days=1),
+            "evidence-owner",
+            sampled_at + timedelta(days=1),
+            sampled_at - timedelta(days=1),
+        ),
+    )
+    schema = sql.Identifier(postgres_database.config.schema)
+    with postgres_database.transaction() as connection:
+        with postgres_database.cursor(connection) as cursor:
+            activation_runs: set[str] = set()
+            for index, (
+                run_id,
+                command_sequence,
+                state,
+                attempts,
+                available_at,
+                leased_until,
+                created_at,
+            ) in enumerate(
+                activation_rows,
+                start=1,
+            ):
+                command_id = f"command-{index}"
+                if run_id not in activation_runs:
+                    cursor.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.{} "
+                            "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                            "VALUES (%s, %s, 1, %s, false, %s)"
+                        ).format(schema, sql.Identifier("run_authority")),
+                        (
+                            run_id,
+                            f"authority-{index}",
+                            sampled_at + timedelta(days=2),
+                            sampled_at,
+                        ),
+                    )
+                    activation_runs.add(run_id)
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, command_id, command_sequence, command_kind, request_digest, "
+                        "payload_ref, request_identity_sha256, admitted_identity_sha256, "
+                        "admitted_content_digest, admitted_payload, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, 'input', %s, %s, %s, %s, %s, "
+                        "'{{}}'::json, %s, %s)"
+                    ).format(schema, sql.Identifier("activation_admission_record")),
+                    (
+                        run_id,
+                        command_id,
+                        command_sequence,
+                        f"{index:064x}",
+                        f"blob:payload-{index}",
+                        f"{index + 10:064x}",
+                        f"{index + 20:064x}",
+                        f"{index + 30:064x}",
+                        created_at,
+                        created_at,
+                    ),
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, command_id, delivery_state, attempt_count, available_at, "
+                        "claim_owner, claim_id, claim_generation, leased_until, created_at, "
+                        "updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                    ).format(schema, sql.Identifier("activation_dispatch_outbox")),
+                    (
+                        run_id,
+                        command_id,
+                        state,
+                        attempts,
+                        available_at,
+                        f"dispatch-owner-{index}",
+                        f"dispatch-claim-{index}",
+                        attempts,
+                        leased_until,
+                        created_at,
+                        created_at,
+                    ),
+                )
+
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.{} "
+                    "(run_id, schema_version, outcome_kind, retry_eligibility, "
+                    "checkpoint_sequence, error_code, content_digest, payload, committed_at) "
+                    "VALUES ('activation-terminal', 'test-terminal.v1', 'cancelled', "
+                    "'forbidden', NULL, 'cancelled', %s, '{{}}'::json, %s)"
+                ).format(schema, sql.Identifier("terminal_record")),
+                (f"{999:064x}", sampled_at),
+            )
+
+            for index, (
+                run_id,
+                attempts,
+                available_at,
+                lease_owner,
+                leased_until,
+                created_at,
+            ) in enumerate(evidence_rows, start=101):
+                logical_call_id = f"logical-{index}"
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                        "VALUES (%s, %s, 1, %s, false, %s)"
+                    ).format(schema, sql.Identifier("run_authority")),
+                    (run_id, f"authority-{index}", sampled_at + timedelta(days=2), sampled_at),
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, logical_call_id, revision, schema_version, dispatch_id, "
+                        "dispatch_attempt, dispatch_state, idempotency_key, request_digest, "
+                        "digest_generation, evidence_policy, result_ref, failure_code, "
+                        "content_digest, payload, submitted_blobs, committed_at) "
+                        "VALUES (%s, %s, 1, 'test-invocation.v1', %s, 1, 'settled', %s, %s, "
+                        "'test-digest.v1', 'outbox', 'object:test', '', %s, '{{}}'::json, "
+                        "'{{}}'::jsonb, %s)"
+                    ).format(schema, sql.Identifier("invocation_record")),
+                    (
+                        run_id,
+                        logical_call_id,
+                        f"dispatch-{index}",
+                        f"idempotency-{index}",
+                        f"{index:064x}",
+                        f"{index + 30:064x}",
+                        created_at,
+                    ),
+                )
+                cursor.execute(
+                    sql.SQL(
+                        "INSERT INTO {}.{} "
+                        "(run_id, logical_call_id, revision, schema_version, evidence_policy, "
+                        "content_digest, payload, attempt_count, available_at, lease_owner, "
+                        "leased_until, created_at, updated_at) "
+                        "VALUES (%s, %s, 1, 'test-evidence.v1', 'outbox', %s, '{{}}'::json, "
+                        "%s, %s, %s, %s, %s, %s)"
+                    ).format(schema, sql.Identifier("model_evidence_outbox")),
+                    (
+                        run_id,
+                        logical_call_id,
+                        f"{index + 40:064x}",
+                        attempts,
+                        available_at,
+                        lease_owner,
+                        leased_until,
+                        created_at,
+                        created_at,
+                    ),
+                )
+
+    operations = PostgresOperations(postgres_database)
+    operations.check_ready()
+    metrics = {
+        (metric.name, metric.attributes): metric.value for metric in operations.snapshot().metrics
+    }
+    for queue, expected_attempts in (("activation", 2), ("model_evidence", 3)):
+        attributes = (("queue", queue),)
+        assert metrics[("monoid.postgres.outbox.max_attempts", attributes)] == expected_attempts
+        oldest_age = metrics[("monoid.postgres.outbox.oldest_age", attributes)]
+        assert 240 <= oldest_age < 600
+
+
+def test_operations_snapshot_keeps_schema_and_aggregates_point_in_time(
+    postgres_database: PostgresDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migrations = PostgresMigrations(postgres_database)
+    migrations.apply()
+    operations = PostgresOperations(postgres_database)
+    operations.check_ready()
+    inspection_started = threading.Event()
+    mutation_committed = threading.Event()
+    mutation_observed_at: list[datetime] = []
+    original_inspect = PostgresMigrations._inspect
+
+    def inspect_then_pause(
+        migration_store: PostgresMigrations,
+        connection: object,
+    ) -> MigrationStatus:
+        status = original_inspect(migration_store, connection)
+        if not inspection_started.is_set():
+            inspection_started.set()
+            assert mutation_committed.wait(5)
+        return status
+
+    monkeypatch.setattr(PostgresMigrations, "_inspect", inspect_then_pause)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(operations.snapshot)
+        assert inspection_started.wait(5)
+        try:
+            with postgres_database.transaction() as connection:
+                with postgres_database.cursor(connection) as cursor:
+                    cursor.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.{} "
+                            "(migration_id, ordinal, checksum_sha256, reader_floor, "
+                            "writer_floor) VALUES (%s, %s, %s, %s, %s)"
+                        ).format(
+                            sql.Identifier(postgres_database.config.schema),
+                            sql.Identifier("monoid_schema_migrations"),
+                        ),
+                        ("0007_snapshot_marker", 7, "f" * 64, 1, 1),
+                    )
+                    cursor.execute(
+                        sql.SQL(
+                            "INSERT INTO {}.{} "
+                            "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                            "VALUES (%s, %s, 1, pg_catalog.clock_timestamp() + "
+                            "interval '5 minutes', false, pg_catalog.clock_timestamp())"
+                        ).format(
+                            sql.Identifier(postgres_database.config.schema),
+                            sql.Identifier("run_authority"),
+                        ),
+                        ("snapshot-new-run", "snapshot-new-owner"),
+                    )
+                    cursor.execute("SELECT pg_catalog.clock_timestamp()")
+                    mutation_observed_at.append(cursor.fetchone()[0])
+        finally:
+            mutation_committed.set()
+        snapshot = future.result(timeout=5)
+
+    metrics = {(metric.name, metric.attributes): metric.value for metric in snapshot.metrics}
+    assert snapshot.collected_at < mutation_observed_at[0]
+    assert metrics[("monoid.postgres.schema.version", ())] == 6
+    assert metrics[("monoid.postgres.authority.count", (("state", "total"),))] == 0
+    assert migrations.status().current_version == 7
+
+
 def test_forward_schema_uses_declared_reader_and_writer_floors(
     postgres_database: PostgresDatabase,
 ) -> None:
     migrations = PostgresMigrations(postgres_database)
     migrations.apply()
+    operations = PostgresOperations(postgres_database)
+    assert operations.check_ready().current_version == 6
     with postgres_database.connection() as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
@@ -282,6 +656,12 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
     assert compatible.pending == ()
     assert compatible.reader_compatible is True
     assert compatible.writer_compatible is True
+    version_metric = next(
+        metric
+        for metric in operations.snapshot().metrics
+        if metric.name == "monoid.postgres.schema.version"
+    )
+    assert version_metric.value == 7
 
     with postgres_database.connection() as connection:
         with connection.transaction():
@@ -304,6 +684,10 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
         migrations.require_reader_compatible()
     with pytest.raises(PostgresSchemaIncompatible, match="not current"):
         migrations.require_writer_compatible()
+    with pytest.raises(PostgresSchemaIncompatible, match="not current"):
+        operations.snapshot()
+    with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
+        operations.snapshot()
 
 
 def test_migration_advisory_lock_serializes_independent_runners(
@@ -446,9 +830,7 @@ def test_migration_schema_cannot_shadow_pg_catalog_builtins(
     with postgres_database.connection() as connection:
         with connection.transaction():
             with connection.cursor() as cursor:
-                cursor.execute(
-                    sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
-                )
+                cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
                 cursor.execute(
                     sql.SQL(
                         "CREATE FUNCTION {}.{}() RETURNS pg_catalog.timestamptz "

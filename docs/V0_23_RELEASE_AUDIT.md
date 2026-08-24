@@ -238,6 +238,12 @@ Evidence: pending.
 
 Evidence: pending.
 
+PR12 binds these release claims to the tracked qualification manifest at
+`tests/service/qualification-v023.json`. `tools/v023_ci.py validate-lock` verifies every test node
+and its L2 profile set. `write-evidence` embeds the manifest digest and the category mapping filtered
+to tests executed by the selected L2 profile. The release candidate must rerun the same manifest
+through the complete L2 core/service workflows before any checkbox in this audit changes to passed.
+
 ## 12. full release commands and CI
 
 Release candidate에서 실제 command와 결과를 채운다.

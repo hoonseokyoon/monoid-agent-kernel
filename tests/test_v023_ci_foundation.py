@@ -35,6 +35,53 @@ def test_campaign_lock_and_tracked_service_artifacts_are_consistent() -> None:
     assert temporal_archive["embedded_server"] == "1.31.2"
     assert len(temporal_archive["sha256"]) == 64
     assert temporal_archive["filename"].endswith(".tar.gz")
+    qualification = module.validate_qualification_manifest()
+    assert set(qualification["categories"]) == module._QUALIFICATION_CATEGORIES
+    combined = module.qualification_tests_for_profile(qualification, "combined")
+    assert (
+        "tests/service/test_temporal_postgres_activity_service.py::"
+        "test_actual_temporal_postgres_objectstore_stream_path_is_content_private"
+        in combined["privacy_combined"]
+    )
+
+
+def test_qualification_manifest_selects_only_tests_executed_by_each_profile() -> None:
+    module = _load_ci_module()
+    qualification = module.validate_qualification_manifest()
+
+    assert set(module.qualification_tests_for_profile(qualification, "postgres")) == {
+        "migration_rolling",
+        "postgres_authority_sink",
+        "paid_call_crash_matrix",
+        "operations",
+    }
+    assert set(module.qualification_tests_for_profile(qualification, "temporal")) == {
+        "temporal_workflow",
+        "paid_call_crash_matrix",
+        "operations",
+    }
+    assert set(module.qualification_tests_for_profile(qualification, "objectstore")) == {
+        "migration_rolling",
+        "postgres_authority_sink",
+        "objectstore_gc",
+        "paid_call_crash_matrix",
+        "durable_stream",
+        "operations",
+    }
+    assert set(module.qualification_tests_for_profile(qualification, "core")) == {
+        "paid_call_crash_matrix",
+        "operations",
+    }
+    temporal_operations = module.qualification_tests_for_profile(
+        qualification, "temporal"
+    )["operations"]
+    assert temporal_operations == [
+        "tests/test_operations_otel.py::"
+        "test_otel_operational_sink_exports_latest_public_gauges"
+    ]
+    assert set(module.qualification_tests_for_profile(qualification, "combined")) == (
+        module._QUALIFICATION_CATEGORIES
+    )
 
 
 def test_temporal_cli_preparation_rejects_a_corrupt_cached_archive(tmp_path: Path) -> None:
@@ -240,6 +287,10 @@ def test_ci_helper_writes_public_safe_evidence(tmp_path: Path) -> None:
     evidence = json.loads(output.read_text(encoding="utf-8"))
     assert evidence["head_sha"] == "a" * 40
     assert evidence["merge_sha"] == "b" * 40
+    assert evidence["qualification"]["path"] == "tests/service/qualification-v023.json"
+    assert len(evidence["qualification"]["sha256"]) == 64
+    assert evidence["qualification"]["manifest_schema_version"] == 2
+    assert evidence["qualification"]["required_tests"]["paid_call_crash_matrix"]
     serialized = output.read_text(encoding="utf-8").lower()
     assert "password" not in serialized
     assert "secret" not in serialized

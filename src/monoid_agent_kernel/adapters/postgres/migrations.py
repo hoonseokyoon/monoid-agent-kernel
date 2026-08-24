@@ -268,8 +268,16 @@ class PostgresMigrations:
         )
 
     def status(self) -> MigrationStatus:
-        with self.database.transaction() as connection:
+        with self.database.transaction(read_only=True) as connection:
             return self._inspect(connection)
+
+    def _require_reader_compatible(self, connection: object) -> MigrationStatus:
+        status = self._inspect(connection)
+        if not status.reader_compatible or status.pending:
+            raise PostgresSchemaIncompatible(
+                "PostgreSQL schema is not current for this adapter reader"
+            )
+        return status
 
     def plan(self) -> MigrationPlan:
         status = self.status()
@@ -280,12 +288,8 @@ class PostgresMigrations:
         )
 
     def require_reader_compatible(self) -> MigrationStatus:
-        status = self.status()
-        if not status.reader_compatible or status.pending:
-            raise PostgresSchemaIncompatible(
-                "PostgreSQL schema is not current for this adapter reader"
-            )
-        return status
+        with self.database.transaction(read_only=True) as connection:
+            return self._require_reader_compatible(connection)
 
     def require_writer_compatible(self) -> MigrationStatus:
         status = self.status()
