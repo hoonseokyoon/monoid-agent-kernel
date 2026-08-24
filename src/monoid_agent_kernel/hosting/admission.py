@@ -155,6 +155,12 @@ class ActivationBindingConflict(NativeAgentError):
     error_code = "activation_binding_conflict"
 
 
+class ActivationBindingWriterFenced(ActivationBindingConflict):
+    """The exact writer token lost authority while binding an activation."""
+
+    error_code = "activation_binding_writer_fenced"
+
+
 @dataclass(frozen=True, kw_only=True)
 class AdmissionRequest:
     """Caller-selected identity and opaque payload evidence for one durable command."""
@@ -646,6 +652,7 @@ __all__ = [
     "AdmissionRunTerminal",
     "DispatchClaimLost",
     "ActivationBindingConflict",
+    "ActivationBindingWriterFenced",
     "AdmissionRequest",
     "AdmittedCommand",
     "AdmissionReceipt",

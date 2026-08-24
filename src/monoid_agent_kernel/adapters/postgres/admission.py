@@ -27,6 +27,7 @@ from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.hosting.activation import ActivationCommand, ActivationReceipt
 from monoid_agent_kernel.hosting.admission import (
     ActivationBindingConflict,
+    ActivationBindingWriterFenced,
     AdmittedCommand,
     AdmissionConflict,
     AdmissionReceipt,
@@ -998,7 +999,9 @@ class PostgresCommandAdmissionStore:
                     or current.writer_token != writer_token
                     or not current.active
                 ):
-                    raise ActivationBindingConflict("activation binding writer was fenced")
+                    raise ActivationBindingWriterFenced(
+                        "activation binding writer was fenced"
+                    )
                 stored = self._stored(cursor, command.run_id, command.command_id)
                 if stored is None or stored.command != command:
                     raise AdmissionConflict("activation binding admission identity changed")
@@ -1027,7 +1030,9 @@ class PostgresCommandAdmissionStore:
                         or current.writer_token != writer_token
                         or not current.active
                     ):
-                        raise ActivationBindingConflict("activation binding writer was fenced")
+                        raise ActivationBindingWriterFenced(
+                            "activation binding writer was fenced"
+                        )
                     stored = self._stored(
                         cursor,
                         command.run_id,

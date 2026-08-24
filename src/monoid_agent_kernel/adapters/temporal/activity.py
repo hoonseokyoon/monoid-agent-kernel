@@ -24,6 +24,7 @@ from monoid_agent_kernel.hosting.activation import (
 )
 from monoid_agent_kernel.hosting.admission import (
     ActivationBindingConflict,
+    ActivationBindingWriterFenced,
     AdmittedCommand,
     CommandAdmissionStore,
 )
@@ -54,8 +55,10 @@ MAX_TEMPORAL_ACTIVITY_LOCAL_DURATION_S = 7 * 24 * 60 * 60
 _CORRUPT_ERROR_CODES = frozenset(
     {
         "admission_corrupt",
+        "admission_conflict",
         "checkpoint_corrupt",
         "checkpoint_missing",
+        "checkpoint_run_mismatch",
         "invalid_activation_boundary",
         "invalid_activation_receipt",
         "invalid_active_input",
@@ -72,8 +75,11 @@ _CONFIG_CONFLICT_ERROR_CODES = frozenset(
         "activation_boundary_mismatch",
         "activation_identity_mismatch",
         "activation_input_resolver_missing",
+        "activation_loop_config_conflict",
         "activation_payload_mismatch",
         "activation_source_mismatch",
+        "admission_run_terminal",
+        "admission_run_unavailable",
         "loop_run_mismatch",
         "prior_activation_incomplete",
         "run_terminal",
@@ -237,7 +243,10 @@ def _application_error(exc: Exception) -> ApplicationError:
             "Temporal activation writer lease is temporarily unavailable",
             type="monoid.activation_lease_unavailable",
         )
-    if isinstance(exc, (WriteAuthorityRevoked, _SupervisorUnhealthy)):
+    if isinstance(
+        exc,
+        (WriteAuthorityRevoked, _SupervisorUnhealthy, ActivationBindingWriterFenced),
+    ):
         return ApplicationError(
             "Temporal activation lost writer authority",
             type="monoid.activation_lease_lost",

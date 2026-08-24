@@ -71,6 +71,13 @@ ActivationLoopFactory = Callable[["ActivationCommand", "ActivationRuntime"], "Ag
 ActivationFaultHook = Callable[[str, "ActivationCommand"], None]
 ActivationInputResolver = Callable[["ActivationCommand"], "ResolvedActivationInput"]
 
+
+class ActivationLoopConfigurationError(RuntimeError):
+    """A host-built loop violates the activation runtime wiring contract."""
+
+    error_code = "activation_loop_config_conflict"
+
+
 _COMMAND_FIELDS = frozenset(
     {
         "schema_version",
@@ -958,25 +965,41 @@ class ActivationDriver:
                 error_code="loop_run_mismatch",
             )
         if loop.write_authority is not runtime.write_authority:
-            raise RuntimeError("activation loop must bind the exact write authority")
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact write authority"
+            )
         if loop.cancellation_token is not runtime.cancellation_token:
-            raise RuntimeError("activation loop must bind the exact cancellation token")
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact cancellation token"
+            )
         if loop.run_sink is not runtime.run_sink or loop.writer_token != runtime.writer_token:
-            raise RuntimeError("activation loop must bind the exact run sink and writer token")
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact run sink and writer token"
+            )
         if sum(sink is runtime.event_sink for sink in loop.authoritative_event_sinks) != 1:
-            raise RuntimeError(
+            raise ActivationLoopConfigurationError(
                 "activation loop must bind the durable event sink exactly once as authoritative"
             )
         if any(sink is runtime.event_sink for sink in loop.event_sinks):
-            raise RuntimeError("activation loop cannot duplicate the durable event sink")
+            raise ActivationLoopConfigurationError(
+                "activation loop cannot duplicate the durable event sink"
+            )
         if loop.event_sequence_seed != runtime.event_sequence_seed:
-            raise RuntimeError("activation loop must use the authoritative event sequence seed")
+            raise ActivationLoopConfigurationError(
+                "activation loop must use the authoritative event sequence seed"
+            )
         if loop.checkpoint_persist_callback is not None:
-            raise RuntimeError("activation loop cannot install a checkpoint callback")
+            raise ActivationLoopConfigurationError(
+                "activation loop cannot install a checkpoint callback"
+            )
         if loop.emit_output_deltas:
-            raise RuntimeError("activation loop model deltas require the durable stream channel")
+            raise ActivationLoopConfigurationError(
+                "activation loop model deltas require the durable stream channel"
+            )
         if getattr(loop, "_session", None) is not None or getattr(loop, "_finalized", False):
-            raise RuntimeError("activation loop_factory must return an unopened fresh loop")
+            raise ActivationLoopConfigurationError(
+                "activation loop_factory must return an unopened fresh loop"
+            )
 
     def _drive_to_durable_boundary(
         self,
@@ -1012,5 +1035,6 @@ __all__ = [
     "ActivationLoopFactory",
     "ActivationFaultHook",
     "ActivationInputResolver",
+    "ActivationLoopConfigurationError",
     "ActivationDriver",
 ]

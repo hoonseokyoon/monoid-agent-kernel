@@ -44,6 +44,7 @@ from monoid_agent_kernel.core.spec import AgentRunSpec  # noqa: E402
 from monoid_agent_kernel.errors import ModelAdapterError  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationBindingConflict,
+    ActivationBindingWriterFenced,
     ActivationCommand,
     ActivationDriver,
     ActivationRuntime,
@@ -929,7 +930,7 @@ def test_queued_commands_bind_checkpoint_only_when_activated(
         "replacement-worker",
         timedelta(minutes=5),
     ).writer_token
-    with pytest.raises(ActivationBindingConflict):
+    with pytest.raises(ActivationBindingWriterFenced):
         harness.admission.bind_activation(second, writer_token=token)
     assert harness.admission.bind_activation(second, writer_token=replacement) == second_activation
 

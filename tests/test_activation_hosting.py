@@ -36,6 +36,7 @@ from monoid_agent_kernel.hosting.activation import (
     ACTIVATION_RECEIPT_SCHEMA_VERSION,
     ActivationCommand,
     ActivationDriver,
+    ActivationLoopConfigurationError,
     ActivationReceipt,
     ActivationRuntime,
     ResolvedActivationInput,
@@ -1088,7 +1089,7 @@ def test_activation_driver_requires_exact_cancellation_token(tmp_path: Path) -> 
             status_file=False,
         )
 
-    with pytest.raises(RuntimeError, match="exact cancellation token"):
+    with pytest.raises(ActivationLoopConfigurationError, match="exact cancellation token"):
         ActivationDriver(
             sink=harness.sink,
             writer_token=token,

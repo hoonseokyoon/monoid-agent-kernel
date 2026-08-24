@@ -27,6 +27,9 @@ from monoid_agent_kernel.adapters.temporal.activity import (  # noqa: E402
 from monoid_agent_kernel.adapters.temporal.records import TemporalActivationResult  # noqa: E402
 from monoid_agent_kernel.core.interruption import InterruptionCause  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
+    ActivationBindingConflict,
+    ActivationBindingWriterFenced,
+    ActivationLoopConfigurationError,
     AdmissionRequest,
     AdmittedCommand,
     ReleaseResult,
@@ -155,11 +158,12 @@ def _install_driver_double(monkeypatch: pytest.MonkeyPatch) -> None:
 def _activity(
     store: _AuthorityStore,
     *,
+    admission_store: _AdmissionStore | None = None,
     policy: TemporalActivityPolicy | None = None,
 ) -> TemporalActivationActivity:
     return TemporalActivationActivity(
         authority_store=store,
-        admission_store=_AdmissionStore(),
+        admission_store=_AdmissionStore() if admission_store is None else admission_store,
         run_sink=object(),  # type: ignore[arg-type]
         loop_factory=lambda command, runtime: (command, runtime),  # type: ignore[arg-type,return-value]
         policy=policy or TemporalActivityPolicy(
@@ -383,6 +387,73 @@ def test_competing_writer_lease_returns_retryable_public_error() -> None:
     assert raised.value.non_retryable is False
     assert "competing-owner" not in str(raised.value)
     assert store.release_count == 0
+
+
+def test_activation_binding_writer_fence_returns_retryable_lease_loss() -> None:
+    class FencedAdmissionStore(_AdmissionStore):
+        def bind_activation(
+            self,
+            command: AdmittedCommand,
+            *,
+            writer_token: WriterToken,
+        ) -> object:
+            del command, writer_token
+            raise ActivationBindingWriterFenced("private fenced writer detail")
+
+    store = _AuthorityStore()
+    with pytest.raises(ApplicationError) as raised:
+        ActivityEnvironment().run(
+            _activity(store, admission_store=FencedAdmissionStore()).run,
+            _command().to_json(),
+        )
+
+    assert raised.value.type == "monoid.activation_lease_lost"
+    assert raised.value.non_retryable is False
+    assert "private fenced writer detail" not in str(raised.value)
+    assert store.release_count == 1
+
+
+def test_durable_activation_binding_conflict_remains_nonretryable() -> None:
+    class ConflictingAdmissionStore(_AdmissionStore):
+        def bind_activation(
+            self,
+            command: AdmittedCommand,
+            *,
+            writer_token: WriterToken,
+        ) -> object:
+            del command, writer_token
+            raise ActivationBindingConflict("private durable identity conflict")
+
+    with pytest.raises(ApplicationError) as raised:
+        ActivityEnvironment().run(
+            _activity(
+                _AuthorityStore(),
+                admission_store=ConflictingAdmissionStore(),
+            ).run,
+            _command().to_json(),
+        )
+
+    assert raised.value.type == "monoid.activation_config_conflict"
+    assert raised.value.non_retryable is True
+    assert "private durable identity conflict" not in str(raised.value)
+
+
+def test_loop_wiring_failure_is_a_nonretryable_configuration_error() -> None:
+    private_text = "private loop wiring detail"
+
+    def fail(kwargs: dict[str, Any]) -> object:
+        del kwargs
+        raise ActivationLoopConfigurationError(private_text)
+
+    store = _AuthorityStore()
+    _DriverDouble.behavior = fail
+    with pytest.raises(ApplicationError) as raised:
+        ActivityEnvironment().run(_activity(store).run, _command().to_json())
+
+    assert raised.value.type == "monoid.activation_config_conflict"
+    assert raised.value.non_retryable is True
+    assert private_text not in str(raised.value)
+    assert store.release_count == 1
 
 
 def test_activity_error_taxonomy_never_serializes_private_exception_text() -> None:

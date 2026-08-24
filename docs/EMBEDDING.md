@@ -308,6 +308,8 @@ the PostgreSQL lease, sends empty heartbeats, and propagates Activity cancellati
 shutdown through the exact `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation
 authority. A heartbeat or renewal ambiguity revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+A writer fence observed during activation binding is retryable lease loss. A deterministic loop
+wiring violation is a non-retryable configuration conflict.
 
 Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. The Activity policy
 requires the writer lease TTL to cover at least two renewal intervals. Give
