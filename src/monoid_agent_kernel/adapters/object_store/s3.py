@@ -73,8 +73,8 @@ def _error_details(exc: BaseException) -> tuple[int | None, str]:
 
 
 def _is_missing(exc: BaseException) -> bool:
-    status, code = _error_details(exc)
-    return status == 404 or code in {"404", "NoSuchKey", "NotFound"}
+    _, code = _error_details(exc)
+    return code in {"404", "NoSuchKey", "NotFound"}
 
 
 def _is_precondition(exc: BaseException) -> bool:

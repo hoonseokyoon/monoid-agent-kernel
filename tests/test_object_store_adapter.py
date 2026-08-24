@@ -157,6 +157,16 @@ class _SecretFailureS3(_FakeS3):
         raise RuntimeError("credential=must-never-reach-public-error")
 
 
+class _MissingBucketS3(_FakeS3):
+    def head_object(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise _S3Error(404, "NoSuchBucket")
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        raise _S3Error(404, "NoSuchBucket")
+
+
 def _config(**changes: Any) -> S3ObjectStoreConfig:
     values = {
         "bucket": "monoid-object-test",
@@ -272,6 +282,17 @@ def test_adapter_failure_is_typed_and_does_not_chain_raw_sdk_text() -> None:
     assert "credential" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.operation == "put_object"
+
+
+def test_bucket_level_404_remains_an_adapter_failure() -> None:
+    store, _ = _store(_MissingBucketS3())
+    sha256 = hashlib.sha256(b"missing bucket").hexdigest()
+
+    for operation in (store.stat, store.get_checked):
+        with pytest.raises(S3ObjectStoreFailure) as raised:
+            operation(sha256)
+        assert raised.value.http_status == 404
+        assert raised.value.error_code == "NoSuchBucket"
 
 
 def test_multipart_put_checks_parts_restarts_409_and_reconciles_response_loss() -> None:
