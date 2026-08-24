@@ -951,8 +951,10 @@ class ActivationDriver:
             raise RuntimeError("activation loop must bind the exact write authority")
         if loop.run_sink is not runtime.run_sink or loop.writer_token != runtime.writer_token:
             raise RuntimeError("activation loop must bind the exact run sink and writer token")
-        if not any(sink is runtime.event_sink for sink in loop.authoritative_event_sinks):
-            raise RuntimeError("activation loop must bind the durable event sink as authoritative")
+        if sum(sink is runtime.event_sink for sink in loop.authoritative_event_sinks) != 1:
+            raise RuntimeError(
+                "activation loop must bind the durable event sink exactly once as authoritative"
+            )
         if any(sink is runtime.event_sink for sink in loop.event_sinks):
             raise RuntimeError("activation loop cannot duplicate the durable event sink")
         if loop.event_sequence_seed != runtime.event_sequence_seed:
@@ -971,7 +973,7 @@ class ActivationDriver:
     ) -> Suspension:
         suspension = loop.run_until_suspended(None if user_input is None else user_input.parts)
         deadline = time.monotonic() + self.local_task_wait_s
-        while suspension.reason == "awaiting_tasks" and not suspension.has_external:
+        while suspension.reason == "awaiting_tasks" and not loop.at_quiescent_park():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("local task did not reach a durable activation boundary")

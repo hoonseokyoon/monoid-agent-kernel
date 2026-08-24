@@ -26,6 +26,7 @@ from monoid_agent_kernel.core.content import TextPart
 from monoid_agent_kernel.core.events import EVENT_SCHEMA_VERSION, AgentEvent
 from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.outcome import RetryEligibility, TerminalOutcome
+from monoid_agent_kernel.core.result import Suspension
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import ModelAdapterError, NativeAgentError
 from monoid_agent_kernel.hosting import CommitResult, WriterToken
@@ -135,6 +136,35 @@ class _CaptureEventSink:
 
     def close(self) -> None:
         return None
+
+
+class _MixedTaskBoundaryLoop:
+    """Minimal loop double for a park containing local and external resume tasks."""
+
+    def __init__(self) -> None:
+        self.pump_calls = 0
+        self.wait_calls = 0
+        self._committed_boundary = False
+
+    def run_until_suspended(self, user_input: object = None) -> Suspension:
+        assert user_input is None
+        self.pump_calls += 1
+        if self.pump_calls == 2:
+            self._committed_boundary = True
+        return Suspension(
+            reason="awaiting_tasks",
+            status="completed",
+            awaiting_task_ids=("external-task",),
+            has_external=True,
+        )
+
+    def at_quiescent_park(self) -> bool:
+        return self._committed_boundary
+
+    def wait_for_pending_tasks(self, timeout_s: float) -> bool:
+        assert timeout_s > 0
+        self.wait_calls += 1
+        return True
 
 
 def _workspace(path: Path) -> Path:
@@ -947,6 +977,58 @@ def test_activation_driver_rejects_loop_without_exact_host_bindings(tmp_path: Pa
             writer_token=token,
             loop_factory=unbound_factory,
         ).drive(command)
+
+
+def test_activation_driver_rejects_duplicate_authoritative_event_sink(tmp_path: Path) -> None:
+    harness, token, checkpoint, spec = _seed_checkpoint(
+        tmp_path,
+        run_id="activation-duplicate-event-sink",
+    )
+    command = _command(checkpoint)
+
+    def duplicate_factory(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
+        return AgentLoop(
+            spec=AgentRunSpec(
+                run_id=command.run_id,
+                workspace_root=spec.workspace_root,
+                run_root=tmp_path / "duplicate-event-runs",
+            ),
+            model_adapter=_ForbiddenAdapter(),
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            run_sink=runtime.run_sink,
+            writer_token=runtime.writer_token,
+            write_authority=runtime.write_authority,
+            authoritative_event_sinks=(runtime.event_sink, runtime.event_sink),
+            event_sequence_seed=runtime.event_sequence_seed,
+            status_file=False,
+        )
+
+    with pytest.raises(RuntimeError, match="exactly once as authoritative"):
+        ActivationDriver(
+            sink=harness.sink,
+            writer_token=token,
+            loop_factory=duplicate_factory,
+        ).drive(command)
+
+
+def test_activation_driver_waits_for_committed_mixed_task_boundary() -> None:
+    harness = DeterministicFencedRunHarness()
+    token = harness.claim_writer("mixed-task-boundary", "owner-a")
+    driver = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=lambda command, runtime: (_ for _ in ()).throw(
+            AssertionError((command, runtime))
+        ),
+    )
+    loop = _MixedTaskBoundaryLoop()
+
+    suspension = driver._drive_to_durable_boundary(loop, None)  # type: ignore[arg-type]
+
+    assert suspension.reason == "awaiting_tasks"
+    assert suspension.has_external is True
+    assert loop.wait_calls == 1
+    assert loop.pump_calls == 2
 
 
 def test_activation_driver_rejects_legacy_delta_channel(tmp_path: Path) -> None:
