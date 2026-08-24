@@ -43,8 +43,9 @@ class S3ObjectStoreConfig:
     multipart_threshold_bytes: int = 8 * 1024 * 1024
     multipart_part_bytes: int = 8 * 1024 * 1024
     max_object_bytes: int = 5 * 1024 * 1024 * 1024
-    # `if_match` requires server-side DeleteObject If-Match enforcement. `version_id` requires
-    # bucket versioning and deletes only the exact version captured by admin inventory.
+    # `if_match` requires an unversioned bucket and server-side DeleteObject If-Match
+    # enforcement. `version_id` requires bucket versioning and deletes only the exact version
+    # captured by admin inventory.
     admin_delete_mode: Literal["if_match", "version_id"] = "if_match"
     expected_bucket_owner: str | None = None
     server_side_encryption: Literal["AES256", "aws:kms"] | None = None

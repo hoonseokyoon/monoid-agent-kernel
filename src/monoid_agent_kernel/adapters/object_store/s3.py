@@ -502,7 +502,8 @@ class S3ContentAddressedBlobStore(_S3Client):
 class S3ObjectStoreAdmin(_S3Client):
     """Privileged bounded inventory, safe deletion, and multipart cleanup surface.
 
-    The ``if_match`` mode combines a HEAD preflight with server-side DeleteObject If-Match.
+    The ``if_match`` mode combines a HEAD preflight with server-side DeleteObject If-Match
+    for unversioned buckets.
     The ``version_id`` mode requires bucket versioning and targets the exact inventoried version;
     use it for compatible services that do not enforce conditional delete headers.
     """
@@ -658,6 +659,12 @@ class S3ObjectStoreAdmin(_S3Client):
         version_id = response.get("VersionId") if isinstance(response, Mapping) else None
         if type(token) is not str or not token:
             raise BlobCorrupt("S3 conditional delete metadata has no ETag")
+        if version_id is not None and type(version_id) is not str:
+            raise BlobCorrupt("S3 conditional delete metadata has malformed VersionId")
+        if self.config.admin_delete_mode == "if_match" and type(version_id) is str:
+            raise BlobCorrupt(
+                "S3 versioned delete requires admin_delete_mode='version_id'"
+            )
         if self.config.admin_delete_mode == "version_id" and (
             type(version_id) is not str or not version_id or version_id == "null"
         ):
@@ -708,7 +715,7 @@ class S3ObjectStoreAdmin(_S3Client):
             if expected_version is not None:
                 if not self._version_exists(sha256, expected_version):
                     return ObjectDeleteResult(status="deleted")
-                return ObjectDeleteResult(status="precondition_failed")
+                self._raise_failure("delete_object", exc)
             current = self._current_delete_identity(sha256)
             if current is None:
                 return ObjectDeleteResult(status="deleted")

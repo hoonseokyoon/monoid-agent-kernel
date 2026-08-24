@@ -456,6 +456,16 @@ def test_s3_admin_inventory_conditional_delete_and_response_loss_on_pinned_minio
         Bucket=bucket,
         VersioningConfiguration={"Status": "Enabled"},
     )
+    if_match_admin = _admin(client, bucket, prefix="admin-version-mode-required")
+    if_match_runtime = _store(client, bucket, prefix="admin-version-mode-required")
+    if_match_data = b"versioned bucket requires version delete mode"
+    if_match_sha256 = hashlib.sha256(if_match_data).hexdigest()
+    if_match_runtime.put_if_absent(if_match_sha256, if_match_data)
+    if_match_entry = if_match_admin.inventory_page(limit=1).entries[0]
+    with pytest.raises(BlobCorrupt, match="admin_delete_mode='version_id'"):
+        if_match_admin.delete_if_match(if_match_sha256, if_match_entry.delete_token)
+    assert if_match_runtime.stat(if_match_sha256) is not None
+
     admin = _admin(client, bucket, prefix="admin-delete", admin_delete_mode="version_id")
     runtime = _store(client, bucket, prefix="admin-delete")
     values = (b"admin object one", b"admin object two")

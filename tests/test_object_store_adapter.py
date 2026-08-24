@@ -37,7 +37,8 @@ class _S3Error(Exception):
 
 
 class _FakeS3:
-    def __init__(self) -> None:
+    def __init__(self, *, versioned: bool = False) -> None:
+        self.versioned = versioned
         self.objects: dict[tuple[str, str], dict[str, Any]] = {}
         self.uploads: dict[str, dict[str, Any]] = {}
         self.put_faults: list[str] = []
@@ -49,6 +50,7 @@ class _FakeS3:
         self.abort_calls = 0
         self.list_calls = 0
         self.multipart_list_calls = 0
+        self.delete_faults: list[str] = []
         self.last_body: BytesIO | None = None
 
     @staticmethod
@@ -96,13 +98,15 @@ class _FakeS3:
         data = kwargs["Body"]
         checksum = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
         assert kwargs["ChecksumSHA256"] == checksum
-        self.objects[location] = {
+        stored = {
             "data": data,
             "metadata": dict(kwargs["Metadata"]),
             "checksum": checksum,
             "checksum_type": "FULL_OBJECT",
-            "version_id": f"version-{self.put_calls}",
         }
+        if self.versioned:
+            stored["version_id"] = f"version-{self.put_calls}"
+        self.objects[location] = stored
         if fault == "response_lost":
             raise ConnectionError("simulated response loss")
         return {"ChecksumSHA256": checksum}
@@ -148,13 +152,15 @@ class _FakeS3:
             base64.b64encode(hashlib.sha256(b"".join(part_digests)).digest()).decode("ascii")
             + f"-{len(part_digests)}"
         )
-        self.objects[location] = {
+        stored = {
             "data": data,
             "metadata": upload["metadata"],
             "checksum": checksum,
             "checksum_type": "COMPOSITE",
-            "version_id": f"multipart-version-{self.complete_calls}",
         }
+        if self.versioned:
+            stored["version_id"] = f"multipart-version-{self.complete_calls}"
+        self.objects[location] = stored
         self.uploads.pop(kwargs["UploadId"], None)
         if fault == "response_lost":
             raise ConnectionError("simulated completion response loss")
@@ -202,6 +208,9 @@ class _FakeS3:
         }
 
     def delete_object(self, **kwargs: Any) -> dict[str, Any]:
+        fault = self.delete_faults.pop(0) if self.delete_faults else ""
+        if fault == "before_request":
+            raise ConnectionError("simulated delete failure before request")
         location = self._location(kwargs)
         value = self.objects.get(location)
         if value is None:
@@ -212,6 +221,8 @@ class _FakeS3:
         if kwargs.get("IfMatch") != etag:
             raise _S3Error(412, "PreconditionFailed")
         del self.objects[location]
+        if fault == "response_lost":
+            raise ConnectionError("simulated delete response loss")
         return {"ResponseMetadata": {"HTTPStatusCode": 204}}
 
     def list_multipart_uploads(self, **kwargs: Any) -> dict[str, Any]:
@@ -285,7 +296,7 @@ def _admin(
     client: _FakeS3 | None = None,
     **changes: Any,
 ) -> tuple[S3ObjectStoreAdmin, _FakeS3]:
-    client = client or _FakeS3()
+    client = client or _FakeS3(versioned=changes.get("admin_delete_mode") == "version_id")
     return S3ObjectStoreAdmin(_config(**changes), client=client), client
 
 
@@ -560,3 +571,31 @@ def test_admin_version_id_mode_rejects_a_recreated_current_version() -> None:
     assert admin.delete_if_match(sha256, entry.delete_token).status == "precondition_failed"
     current = admin.inventory_page(limit=1).entries[0]
     assert admin.delete_if_match(sha256, current.delete_token).status == "deleted"
+
+
+def test_admin_if_match_mode_rejects_versioned_bucket() -> None:
+    client = _FakeS3(versioned=True)
+    admin, _ = _admin(client, admin_delete_mode="if_match")
+    runtime = S3ContentAddressedBlobStore(admin.config, client=client)
+    data = b"versioned if-match deletion"
+    sha256 = hashlib.sha256(data).hexdigest()
+    runtime.put_if_absent(sha256, data)
+    entry = admin.inventory_page(limit=1).entries[0]
+
+    with pytest.raises(BlobCorrupt, match="admin_delete_mode='version_id'"):
+        admin.delete_if_match(sha256, entry.delete_token)
+
+
+def test_admin_version_delete_propagates_failure_while_target_still_exists() -> None:
+    admin, client = _admin(admin_delete_mode="version_id")
+    runtime = S3ContentAddressedBlobStore(admin.config, client=client)
+    data = b"retryable version delete failure"
+    sha256 = hashlib.sha256(data).hexdigest()
+    runtime.put_if_absent(sha256, data)
+    entry = admin.inventory_page(limit=1).entries[0]
+    client.delete_faults.append("before_request")
+
+    with pytest.raises(S3ObjectStoreFailure, match="delete_object"):
+        admin.delete_if_match(sha256, entry.delete_token)
+    assert runtime.stat(sha256) is not None
+    assert admin.delete_if_match(sha256, entry.delete_token).status == "deleted"
