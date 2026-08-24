@@ -28,6 +28,18 @@ from .contracts import (
     StorageCapabilities,
     WriterToken,
 )
+from .object_store_admin import (
+    IncompleteMultipartPage,
+    IncompleteMultipartUpload,
+    MultipartAbortResult,
+    ObjectDeleteResult,
+    ObjectGcCandidate,
+    ObjectGcPlan,
+    ObjectGcReceipt,
+    ObjectInventoryEntry,
+    ObjectInventoryPage,
+    ObjectStoreAdmin,
+)
 
 __all__ = [
     "WriterAuthority",
@@ -46,6 +58,16 @@ __all__ = [
     "BlobTooLarge",
     "ContentAddressedBlobStore",
     "is_content_sha256",
+    "ObjectInventoryEntry",
+    "ObjectInventoryPage",
+    "ObjectDeleteResult",
+    "IncompleteMultipartUpload",
+    "IncompleteMultipartPage",
+    "MultipartAbortResult",
+    "ObjectStoreAdmin",
+    "ObjectGcCandidate",
+    "ObjectGcPlan",
+    "ObjectGcReceipt",
     "WriterToken",
     "CommitResult",
     "ModelInvocationRecord",
