@@ -14,6 +14,7 @@ from monoid_agent_kernel.adapters.postgres import (
     PostgresDatabaseClosed,
     bundled_migrations,
 )
+from monoid_agent_kernel.adapters.postgres.admission import _duration_microseconds
 
 
 class _FakeCursor:
@@ -67,6 +68,12 @@ class _FakePool:
     def connection(self, *, timeout: float) -> Iterator[_FakeConnection]:
         self.borrow_timeouts.append(timeout)
         yield self.connection_value
+
+
+def test_admission_durations_are_time_only_microseconds() -> None:
+    assert _duration_microseconds(0) == 0
+    assert _duration_microseconds(0.0000001) == 1
+    assert _duration_microseconds(86_400) == 86_400_000_000
 
 
 def test_postgres_config_hides_dsn_and_validates_schema_and_pool() -> None:

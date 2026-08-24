@@ -259,6 +259,17 @@ def test_admission_receipt_states_bind_exact_activation_identity() -> None:
         replace(receipts[2], activation_command=replace(activation, command_id="other"))
     with pytest.raises(ValueError, match="completion is inconsistent"):
         replace(receipts[3], activation_receipt=replace(completion, command_id="other"))
+    for field_name, invalid_value in (
+        ("checkpoint_seq", activation.source_checkpoint_seq),
+        ("checkpoint_ref", "checkpoint:run-1/999"),
+        ("applied_input_ref", "input:run-1/other"),
+    ):
+        invalid = receipts[3].to_json()
+        raw_completion = invalid["activation_receipt"]
+        assert isinstance(raw_completion, dict)
+        raw_completion[field_name] = invalid_value
+        with pytest.raises(ValueError, match="completion is inconsistent"):
+            AdmissionReceipt.from_json(invalid)
 
 
 @pytest.mark.parametrize(

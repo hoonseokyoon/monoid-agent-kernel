@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Literal
 
-from monoid_agent_kernel.adapters.postgres.authority import PostgresWriterAuthorityStore
+from monoid_agent_kernel.adapters.postgres.authority import (
+    _ELAPSED_TTL_INTERVAL,
+    PostgresWriterAuthorityStore,
+)
 from monoid_agent_kernel.adapters.postgres.migrations import (
     MigrationStatus,
     PostgresMigrations,
@@ -57,6 +59,12 @@ def _is_ambiguous_database_error(exc: Exception) -> bool:
 
 def _content_digest(payload: dict[str, object]) -> str:
     return canonical_sha256(payload)
+
+
+def _duration_microseconds(seconds: float) -> int:
+    """Encode an elapsed duration without PostgreSQL calendar-day normalization."""
+
+    return math.ceil(seconds * 1_000_000)
 
 
 @dataclass(frozen=True)
@@ -562,7 +570,9 @@ class PostgresCommandAdmissionStore:
                             "UPDATE {} AS dispatch SET delivery_state = 'leased', "
                             "attempt_count = dispatch.attempt_count + 1, claim_owner = %s, "
                             "claim_id = %s, claim_generation = dispatch.claim_generation + 1, "
-                            "leased_until = pg_catalog.clock_timestamp() + %s, "
+                            "leased_until = pg_catalog.clock_timestamp() + "
+                            + _ELAPSED_TTL_INTERVAL
+                            + ", "
                             "last_error_code = '', updated_at = pg_catalog.clock_timestamp() "
                             "FROM candidate WHERE dispatch.run_id = candidate.run_id "
                             "AND dispatch.command_id = candidate.command_id "
@@ -574,7 +584,7 @@ class PostgresCommandAdmissionStore:
                             self._table("activation_admission_record"),
                             self._table("activation_dispatch_outbox"),
                         ),
-                        (owner_id, claim_id, timedelta(seconds=float(lease_s))),
+                        (owner_id, claim_id, _duration_microseconds(float(lease_s))),
                     )
                     selected = cursor.fetchone()
                     if selected is None:
@@ -710,14 +720,16 @@ class PostgresCommandAdmissionStore:
                         cursor.execute(
                             sql.SQL(
                                 "UPDATE {} SET delivery_state = %s, leased_until = NULL, "
-                                "available_at = pg_catalog.clock_timestamp() + %s, "
+                                "available_at = pg_catalog.clock_timestamp() + "
+                                + _ELAPSED_TTL_INTERVAL
+                                + ", "
                                 "dispatch_ref = '', delivered_at = NULL, last_error_code = %s, "
                                 "updated_at = pg_catalog.clock_timestamp() "
                                 "WHERE run_id = %s AND command_id = %s"
                             ).format(self._table("activation_dispatch_outbox")),
                             (
                                 delivery_state,
-                                timedelta(seconds=float(delay_s)),
+                                _duration_microseconds(float(delay_s)),
                                 error_code,
                                 token.run_id,
                                 token.command_id,

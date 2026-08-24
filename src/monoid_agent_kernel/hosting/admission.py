@@ -341,6 +341,12 @@ class AdmissionReceipt:
                 or receipt.command_id != activation.command_id
                 or receipt.command_sequence != activation.command_sequence
                 or receipt.command_identity_sha256 != activation.identity_sha256
+                or receipt.checkpoint_seq <= activation.source_checkpoint_seq
+                or receipt.checkpoint_ref
+                != f"checkpoint:{activation.run_id}/{receipt.checkpoint_seq}"
+                or receipt.applied_input_ref != activation.applied_input_ref
+                or receipt.terminal_ref
+                != (f"terminal:{activation.run_id}" if receipt.terminal else "")
             ):
                 raise ValueError("admission receipt completion is inconsistent")
         if self.state == "prepared" and (
