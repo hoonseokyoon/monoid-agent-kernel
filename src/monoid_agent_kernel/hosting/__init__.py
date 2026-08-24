@@ -9,6 +9,17 @@ from .authority import (
     WriterLeaseUnavailable,
     renew_writer_lease,
 )
+from .blobs import (
+    BlobCorrupt,
+    BlobNotFound,
+    BlobPutResult,
+    BlobStat,
+    BlobStoreConflict,
+    BlobStoreError,
+    BlobTooLarge,
+    ContentAddressedBlobStore,
+    is_content_sha256,
+)
 from .contracts import (
     CommitResult,
     FencedCheckpointStore,
@@ -26,6 +37,15 @@ __all__ = [
     "WriterLeaseUnavailable",
     "WriterAuthorityStore",
     "renew_writer_lease",
+    "BlobStat",
+    "BlobPutResult",
+    "BlobStoreError",
+    "BlobNotFound",
+    "BlobCorrupt",
+    "BlobStoreConflict",
+    "BlobTooLarge",
+    "ContentAddressedBlobStore",
+    "is_content_sha256",
     "WriterToken",
     "CommitResult",
     "ModelInvocationRecord",

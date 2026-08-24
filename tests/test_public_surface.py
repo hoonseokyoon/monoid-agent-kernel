@@ -416,6 +416,15 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "WriterLeaseUnavailable",
         "WriterAuthorityStore",
         "renew_writer_lease",
+        "BlobStat",
+        "BlobPutResult",
+        "BlobStoreError",
+        "BlobNotFound",
+        "BlobCorrupt",
+        "BlobStoreConflict",
+        "BlobTooLarge",
+        "ContentAddressedBlobStore",
+        "is_content_sha256",
         "WriterToken",
         "CommitResult",
         "ModelInvocationRecord",
@@ -751,7 +760,13 @@ assert postgres.__all__ == [
     'PostgresFencedRunSink',
 ]
 assert all(hasattr(postgres, name) for name in postgres.__all__)
-assert object_store.__all__ == []
+assert object_store.__all__ == [
+    'S3ObjectStoreConfig',
+    'S3DependencyMissing',
+    'S3ObjectStoreFailure',
+    'S3ContentAddressedBlobStore',
+]
+assert all(hasattr(object_store, name) for name in object_store.__all__)
 assert temporal.__all__ == []
 blocked = [
     name for name in sys.modules

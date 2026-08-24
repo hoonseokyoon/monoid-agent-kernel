@@ -31,7 +31,11 @@ REQUIRED_MEMBERS = {
     "monoid_agent_kernel/adapters/postgres/sql/0002_checkpoint_invocation.sql",
     "monoid_agent_kernel/adapters/postgres/sql/0003_event_terminal_evidence_outbox.sql",
     "monoid_agent_kernel/adapters/object_store/__init__.py",
+    "monoid_agent_kernel/adapters/object_store/config.py",
+    "monoid_agent_kernel/adapters/object_store/s3.py",
     "monoid_agent_kernel/adapters/temporal/__init__.py",
+    "monoid_agent_kernel/hosting/blobs.py",
+    "monoid_agent_kernel/conformance/blob_store.py",
     "monoid_agent_kernel/conformance/fixtures/compatibility-v1.json",
 }
 FORBIDDEN_VENDORED_PACKAGES = {
