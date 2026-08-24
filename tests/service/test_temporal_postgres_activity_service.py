@@ -500,6 +500,90 @@ def test_activity_bounds_an_actual_postgres_authority_row_lock(
     assert harness.authority.release(locker.writer_token).status == "released"
 
 
+def test_activity_bounds_an_actual_postgres_activation_binding_row_lock(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    run_id = f"binding-lock-{uuid.uuid4().hex}"
+    seed_lease, _ = harness.seed(tmp_path, run_id)
+    admitted = harness.admission.admit(_request(run_id)).command
+    assert harness.authority.release(seed_lease.writer_token).status == "released"
+    binding_started = threading.Event()
+    binding_finished = threading.Event()
+
+    @dataclass
+    class ObservedAdmission:
+        inner: PostgresCommandAdmissionStore
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+        def bind_activation(
+            self,
+            command: Any,
+            *,
+            writer_token: WriterToken,
+        ) -> ActivationCommand:
+            binding_started.set()
+            try:
+                return self.inner.bind_activation(command, writer_token=writer_token)
+            finally:
+                binding_finished.set()
+
+    def unreachable_loop_factory(
+        command: ActivationCommand,
+        runtime: ActivationRuntime,
+    ) -> AgentLoop:
+        del command, runtime
+        raise AssertionError("binding timeout must prevent activation construction")
+
+    activation = TemporalActivationActivity(
+        authority_store=harness.authority,
+        admission_store=ObservedAdmission(harness.admission),  # type: ignore[arg-type]
+        run_sink=harness.sink,
+        loop_factory=unreachable_loop_factory,
+        policy=TemporalActivityPolicy(
+            writer_lease_ttl_s=2,
+            writer_lease_renew_interval_s=0.4,
+            heartbeat_interval_s=0.05,
+            authority_call_timeout_s=0.1,
+            supervisor_join_timeout_s=0.2,
+            local_task_wait_s=1,
+        ),
+    )
+    with harness.database.connection() as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT run_id FROM {} WHERE run_id = %s AND command_id = %s FOR UPDATE"
+                    ).format(
+                        sql.Identifier(
+                            harness.database.config.schema,
+                            "activation_dispatch_outbox",
+                        )
+                    ),
+                    (run_id, admitted.command_id),
+                )
+                assert cursor.fetchone() == (run_id,)
+            started = time.monotonic()
+            with pytest.raises(ApplicationError) as raised:
+                ActivityEnvironment().run(activation.run, admitted.to_json())
+            elapsed = time.monotonic() - started
+            assert raised.value.type == "monoid.activation_lease_lost"
+            assert raised.value.non_retryable is False
+            assert binding_started.is_set()
+            assert elapsed < 0.5
+
+    assert binding_finished.wait(2)
+    deadline = time.monotonic() + 2
+    authority = harness.authority.read(run_id)
+    while authority is not None and not authority.revoked and time.monotonic() < deadline:
+        time.sleep(0.01)
+        authority = harness.authority.read(run_id)
+    assert authority is not None and authority.revoked is True and authority.active is False
+
+
 def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
     harness: _Harness,
     tmp_path: Path,

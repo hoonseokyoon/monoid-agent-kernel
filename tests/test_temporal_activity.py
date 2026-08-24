@@ -30,6 +30,7 @@ from monoid_agent_kernel.core.interruption import InterruptionCause  # noqa: E40
 from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationBindingConflict,
     ActivationBindingWriterFenced,
+    ActivationCommand,
     ActivationLoopConfigurationError,
     AdmissionRequest,
     AdmittedCommand,
@@ -128,9 +129,23 @@ class _AdmissionStore:
     def __init__(self) -> None:
         self.bound_tokens: list[WriterToken] = []
 
-    def bind_activation(self, command: AdmittedCommand, *, writer_token: WriterToken) -> object:
+    def bind_activation(
+        self,
+        command: AdmittedCommand,
+        *,
+        writer_token: WriterToken,
+    ) -> ActivationCommand:
         self.bound_tokens.append(writer_token)
-        return SimpleNamespace(command=command)
+        return ActivationCommand(
+            run_id=command.run_id,
+            command_id=command.command_id,
+            command_sequence=command.command_sequence,
+            kind=command.kind,
+            source_checkpoint_seq=1,
+            source_checkpoint_sha256="2" * 64,
+            request_digest=command.request_digest,
+            payload_ref=command.payload_ref,
+        )
 
 
 class _DriverDouble:
@@ -381,6 +396,57 @@ def test_writer_claim_timeout_returns_the_activity_executor_and_releases_late_au
         allow_claim.set()
         claim_timer.cancel()
         claim_timer.join()
+        assert store.released.wait(1)
+    assert store.release_count == 1
+
+
+def test_activation_binding_timeout_returns_the_activity_executor_and_releases_authority() -> None:
+    binding_started = threading.Event()
+    allow_binding = threading.Event()
+
+    class StuckAdmissionStore(_AdmissionStore):
+        def bind_activation(
+            self,
+            command: AdmittedCommand,
+            *,
+            writer_token: WriterToken,
+        ) -> ActivationCommand:
+            binding_started.set()
+            assert allow_binding.wait(1)
+            return super().bind_activation(command, writer_token=writer_token)
+
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=0.05,
+        supervisor_join_timeout_s=0.1,
+        local_task_wait_s=1,
+    )
+    store = _AuthorityStore()
+    binding_timer = threading.Timer(0.4, allow_binding.set)
+    binding_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            ActivityEnvironment().run(
+                _activity(
+                    store,
+                    admission_store=StuckAdmissionStore(),
+                    policy=policy,
+                ).run,
+                _command().to_json(),
+            )
+        elapsed = time.monotonic() - started
+        assert raised.value.type == "monoid.activation_lease_lost"
+        assert raised.value.non_retryable is False
+        assert binding_started.is_set()
+        assert _DriverDouble.constructed == []
+        assert elapsed < 0.25
+    finally:
+        allow_binding.set()
+        binding_timer.cancel()
+        binding_timer.join()
         assert store.released.wait(1)
     assert store.release_count == 1
 
@@ -721,6 +787,7 @@ def test_activation_binding_writer_fence_returns_retryable_lease_loss() -> None:
     assert raised.value.type == "monoid.activation_lease_lost"
     assert raised.value.non_retryable is False
     assert "private fenced writer detail" not in str(raised.value)
+    assert store.released.wait(1)
     assert store.release_count == 1
 
 
@@ -735,10 +802,11 @@ def test_durable_activation_binding_conflict_remains_nonretryable() -> None:
             del command, writer_token
             raise ActivationBindingConflict("private durable identity conflict")
 
+    store = _AuthorityStore()
     with pytest.raises(ApplicationError) as raised:
         ActivityEnvironment().run(
             _activity(
-                _AuthorityStore(),
+                store,
                 admission_store=ConflictingAdmissionStore(),
             ).run,
             _command().to_json(),
@@ -747,6 +815,8 @@ def test_durable_activation_binding_conflict_remains_nonretryable() -> None:
     assert raised.value.type == "monoid.activation_config_conflict"
     assert raised.value.non_retryable is True
     assert "private durable identity conflict" not in str(raised.value)
+    assert store.released.wait(1)
+    assert store.release_count == 1
 
 
 def test_loop_wiring_failure_is_a_nonretryable_configuration_error() -> None:

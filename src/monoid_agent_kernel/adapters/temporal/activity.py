@@ -18,6 +18,7 @@ from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAu
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.hosting.activation import (
+    ActivationCommand,
     ActivationDriver,
     ActivationInputResolver,
     ActivationLoopFactory,
@@ -151,9 +152,10 @@ class _SupervisorUnhealthy(RuntimeError):
 
 
 @dataclass(frozen=True, kw_only=True)
-class _LeaseAcquisition:
+class _ActivationBootstrap:
     lease: WriterLease
     observed_monotonic: float
+    activation: ActivationCommand
 
 
 class _TemporalLeaseSupervisor:
@@ -222,13 +224,18 @@ class _TemporalLeaseSupervisor:
         self._renewal_thread.start()
         self._control_wake.set()
 
-    def acquire(self, run_id: str, owner_id: str) -> _LeaseAcquisition:
+    def bootstrap(
+        self,
+        command: AdmittedCommand,
+        owner_id: str,
+        admission_store: CommandAdmissionStore,
+    ) -> _ActivationBootstrap:
         completed = threading.Event()
         abandoned = threading.Event()
         state_lock = threading.Lock()
-        outcome: list[_LeaseAcquisition | BaseException] = []
+        outcome: list[_ActivationBootstrap | BaseException] = []
 
-        def publish(result: _LeaseAcquisition | BaseException) -> bool:
+        def publish(result: _ActivationBootstrap | BaseException) -> bool:
             with state_lock:
                 if abandoned.is_set():
                     return False
@@ -242,12 +249,12 @@ class _TemporalLeaseSupervisor:
             except BaseException:
                 return
 
-        def run_acquisition() -> None:
+        def run_bootstrap() -> None:
             lease: WriterLease | None = None
             try:
                 lease = claim_writer_lease(
                     self._store,
-                    run_id,
+                    command.run_id,
                     owner_id,
                     self._policy.writer_lease_ttl,
                 )
@@ -264,23 +271,30 @@ class _TemporalLeaseSupervisor:
                 if renewed.status != "renewed" or renewed.lease is None:
                     raise WriteAuthorityRevoked()
                 lease = renewed.lease
-                acquired = _LeaseAcquisition(
+                activation = admission_store.bind_activation(
+                    command,
+                    writer_token=lease.writer_token,
+                )
+                bootstrap = _ActivationBootstrap(
                     lease=lease,
                     observed_monotonic=renew_started,
+                    activation=activation,
                 )
-                if not publish(acquired):
+                if not publish(bootstrap):
                     release_abandoned(lease)
             except BaseException as exc:
                 publish(exc)
+                if lease is not None:
+                    release_abandoned(lease)
             finally:
                 completed.set()
 
-        acquisition_thread = threading.Thread(
-            target=run_acquisition,
-            name="monoid-temporal-authority-acquisition",
+        bootstrap_thread = threading.Thread(
+            target=run_bootstrap,
+            name="monoid-temporal-activation-bootstrap",
             daemon=True,
         )
-        acquisition_thread.start()
+        bootstrap_thread.start()
         deadline = time.monotonic() + float(self._policy.authority_call_timeout_s)
         while True:
             remaining = deadline - time.monotonic()
@@ -293,20 +307,22 @@ class _TemporalLeaseSupervisor:
                     abandoned.set()
                 self._fail()
                 raise _SupervisorUnhealthy(
-                    "Temporal activation authority acquisition timed out or lost control"
+                    "Temporal activation bootstrap timed out or lost control"
                 )
-        acquisition_thread.join()
         if len(outcome) != 1:
             self._fail()
             raise _SupervisorUnhealthy(
-                "Temporal activation authority acquisition produced no result"
+                "Temporal activation bootstrap produced no result"
             )
         result = outcome[0]
         if isinstance(result, BaseException):
             if isinstance(result, Exception):
                 raise result
             self._fail()
-            raise _SupervisorUnhealthy("Temporal activation authority acquisition failed")
+            raise _SupervisorUnhealthy("Temporal activation bootstrap failed")
+        if not isinstance(result.activation, ActivationCommand):
+            self._fail()
+            raise TypeError("activation bootstrap returned an invalid activation")
         return result
 
     def cleanup(self, lease: WriterLease | None) -> ReleaseResult | None:
@@ -560,16 +576,17 @@ class TemporalActivationActivity:
             owner_id = _activity_owner_id(info.task_token)
             activity.heartbeat()
             supervisor.start()
-            acquired = supervisor.acquire(
-                command.run_id,
+            bootstrap = supervisor.bootstrap(
+                command,
                 owner_id,
+                self.admission_store,
             )
-            lease = acquired.lease
+            lease = bootstrap.lease
             supervisor.assert_healthy()
             write_authority.assert_active()
             supervisor.install_lease(
                 lease,
-                observed_monotonic=acquired.observed_monotonic,
+                observed_monotonic=bootstrap.observed_monotonic,
             )
             supervisor.assert_healthy()
             write_authority.assert_active()
@@ -577,10 +594,6 @@ class TemporalActivationActivity:
                 cancellation_token.cancel(InterruptionCause.USER_CANCEL)
             if activity.is_worker_shutdown():
                 cancellation_token.cancel(self.policy.worker_shutdown_cause)
-            activation = self.admission_store.bind_activation(
-                command,
-                writer_token=lease.writer_token,
-            )
             receipt = ActivationDriver(
                 sink=self.run_sink,
                 writer_token=lease.writer_token,
@@ -589,7 +602,7 @@ class TemporalActivationActivity:
                 write_authority=write_authority,
                 cancellation_token=cancellation_token,
                 local_task_wait_s=float(self.policy.local_task_wait_s),
-            ).drive(activation)
+            ).drive(bootstrap.activation)
             supervisor.assert_healthy()
             write_authority.assert_active()
             result = TemporalActivationResult.from_command(

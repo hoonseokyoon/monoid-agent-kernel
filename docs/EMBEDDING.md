@@ -307,10 +307,11 @@ The Activity derives a content-free owner ID from the Temporal task token, claim
 PostgreSQL writer generation, and starts a copied-context control supervisor before the potentially
 blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
 worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
-evidence. Claim plus initial exact-token renewal run in a bounded daemon acquisition worker, so a
-stuck database lock cannot retain the Temporal Activity executor slot. An independent renewal thread
-performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or deadline
-enforcement. Control propagation uses the exact
+evidence. Claim, initial exact-token renewal, and durable activation binding run in one bounded
+daemon bootstrap worker, so a stuck database lock cannot retain the Temporal Activity executor
+slot. A timed-out bootstrap cannot enter the driver and releases a late exact token. An independent
+renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
+deadline enforcement. Control propagation uses the exact
 `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
 renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
