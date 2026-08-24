@@ -191,8 +191,10 @@ terminal commit.
 After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
 `bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.
 This allows several commands to be admitted before an earlier command advances the checkpoint.
-Replacement workers receive the same stored `ActivationCommand`; stale writers are fenced before
-readback.
+The store requires every preceding command sequence to have its canonical checkpoint receipt before
+binding the next command. Concurrent or out-of-order Activity delivery therefore cannot create two
+bindings from the same source checkpoint. Replacement workers receive the same stored
+`ActivationCommand`; stale writers are fenced before readback.
 
 Use `monoid_agent_kernel.hosting.ActivationDriver` when an external scheduler, workflow engine, or
 queue worker owns process replacement. The host admits one stable `ActivationCommand`, claims a

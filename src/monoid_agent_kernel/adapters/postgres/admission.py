@@ -945,6 +945,38 @@ class PostgresCommandAdmissionStore:
             )
         return decoded.value
 
+    def _require_prior_activations_completed(
+        self,
+        cursor: object,
+        command: AdmittedCommand,
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        from psycopg import sql
+
+        if command.command_sequence == 1:
+            return
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "SELECT command_id FROM {} WHERE run_id = %s AND command_sequence = %s"
+            ).format(self._table("activation_admission_record")),
+            (command.run_id, command.command_sequence - 1),
+        )
+        row = cursor.fetchone()  # type: ignore[attr-defined]
+        if row is None:
+            raise PostgresAdmissionCorrupt("preceding activation admission is missing")
+        prior = self._stored(cursor, command.run_id, str(row[0]))
+        if prior is None:
+            raise PostgresAdmissionCorrupt("preceding activation admission is missing")
+        activation = prior.activation
+        if activation is None or activation.checkpoint_marker not in checkpoint.applied_input_ids:
+            raise ActivationBindingConflict(
+                "activation binding requires every preceding command to complete"
+            )
+        try:
+            ActivationReceipt.from_checkpoint(activation, checkpoint)
+        except NativeAgentError as exc:
+            raise PostgresAdmissionCorrupt("preceding activation receipt is invalid") from exc
+
     def _read_bound_activation(
         self,
         command: AdmittedCommand,
@@ -1009,6 +1041,7 @@ class PostgresCommandAdmissionStore:
                         raise AdmissionRunTerminal(
                             "terminal checkpoint cannot bind another activation"
                         )
+                    self._require_prior_activations_completed(cursor, command, checkpoint)
                     activation = ActivationCommand(
                         run_id=command.run_id,
                         command_id=command.command_id,

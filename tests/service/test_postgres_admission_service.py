@@ -782,7 +782,11 @@ def test_queued_commands_bind_checkpoint_only_when_activated(
     assert dispatcher.dispatch_once() is not None
     assert dispatcher.dispatch_once() is not None
 
+    with pytest.raises(ActivationBindingConflict, match="preceding command"):
+        harness.admission.bind_activation(second, writer_token=token)
     first_activation = harness.admission.bind_activation(first, writer_token=token)
+    with pytest.raises(ActivationBindingConflict, match="preceding command"):
+        harness.admission.bind_activation(second, writer_token=token)
     first_receipt = ActivationDriver(
         sink=harness.sink,
         writer_token=token,
@@ -803,3 +807,32 @@ def test_queued_commands_bind_checkpoint_only_when_activated(
     with pytest.raises(ActivationBindingConflict):
         harness.admission.bind_activation(second, writer_token=token)
     assert harness.admission.bind_activation(second, writer_token=replacement) == second_activation
+
+
+def test_concurrent_activation_binding_allows_only_the_first_sequence(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    token, _ = harness.seed(tmp_path, "activation-binding-race")
+    first = harness.admission.admit(_request(token.run_id, "command-1")).command
+    second = harness.admission.admit(_request(token.run_id, "command-2")).command
+    dispatcher = _dispatcher(harness, _accept_all, iter(("claim-1", "claim-2")))
+    assert dispatcher.dispatch_once() is not None
+    assert dispatcher.dispatch_once() is not None
+    barrier = threading.Barrier(2)
+
+    def bind(command: AdmittedCommand) -> tuple[str, ActivationCommand | None]:
+        barrier.wait(timeout=5)
+        try:
+            return "bound", harness.admission.bind_activation(command, writer_token=token)
+        except ActivationBindingConflict:
+            return "blocked", None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(bind, (first, second)))
+
+    assert results[0][0] == "bound"
+    assert results[0][1] is not None and results[0][1].command_id == first.command_id
+    assert results[1] == ("blocked", None)
+    with pytest.raises(ActivationBindingConflict, match="preceding command"):
+        harness.admission.bind_activation(second, writer_token=token)
