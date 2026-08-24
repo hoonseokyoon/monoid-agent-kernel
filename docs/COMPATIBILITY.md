@@ -105,7 +105,9 @@ dispatch state, the immutable activation binding, and canonical completion. Thes
 opaque IDs, digests, addresses, counters, and public-safe taxonomy. Private command content and raw
 transport errors remain outside the wire records. The `run_terminal` receipt state closes an
 unapplied command when its run has already selected a canonical terminal winner; it may have zero
-dispatch attempts and carries the `run_terminal` error taxonomy.
+dispatch attempts and carries the `run_terminal` error taxonomy. PostgreSQL projects admission,
+activation binding, and terminal evidence from one statement snapshot, so a concurrent bind and
+terminal commit cannot make a later receipt regress to an earlier lifecycle state.
 
 `monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
 or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded

@@ -172,12 +172,14 @@ class PostgresCommandAdmissionStore:
                 "dispatch.dispatch_ref, dispatch.last_error_code, "
                 "COALESCE(dispatch.claim_owner, ''), COALESCE(dispatch.claim_id, ''), "
                 "dispatch.claim_generation, dispatch.leased_until, "
-                "dispatch.retry_delay_microseconds "
+                "dispatch.retry_delay_microseconds, pg_catalog.clock_timestamp(), "
+                "EXISTS (SELECT 1 FROM {} WHERE run_id = admission.run_id) "
                 "FROM {} AS admission JOIN {} AS dispatch "
                 "ON dispatch.run_id = admission.run_id "
                 "AND dispatch.command_id = admission.command_id "
                 "WHERE admission.run_id = %s AND admission.command_id = %s"
             ).format(
+                self._table("terminal_record"),
                 self._table("activation_admission_record"),
                 self._table("activation_dispatch_outbox"),
             )
@@ -187,19 +189,23 @@ class PostgresCommandAdmissionStore:
         row = cursor.fetchone()  # type: ignore[attr-defined]
         if row is None:
             return None
-        # PostgreSQL may evaluate a SELECT target-list clock expression before FOR UPDATE finishes
-        # waiting. Sample the DB clock in a second statement, after this transaction owns the row
-        # lock, so a settlement cannot use authority that expired during lock contention.
-        cursor.execute(  # type: ignore[attr-defined]
-            sql.SQL(
-                "SELECT pg_catalog.clock_timestamp(), "
-                "EXISTS (SELECT 1 FROM {} WHERE run_id = %s)"
-            ).format(self._table("terminal_record")),
-            (run_id,),
-        )
-        clock_row = cursor.fetchone()  # type: ignore[attr-defined]
-        if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
-            raise RuntimeError("PostgreSQL dispatch clock query returned no row")
+        if for_update:
+            # PostgreSQL may evaluate target-list expressions before FOR UPDATE finishes waiting.
+            # Locked settlement paths therefore resample the clock and terminal evidence after
+            # owning the outbox row. Unlocked receipt paths retain both values from the row
+            # statement so activation and terminal projection share one READ COMMITTED snapshot.
+            cursor.execute(  # type: ignore[attr-defined]
+                sql.SQL(
+                    "SELECT pg_catalog.clock_timestamp(), "
+                    "EXISTS (SELECT 1 FROM {} WHERE run_id = %s)"
+                ).format(self._table("terminal_record")),
+                (run_id,),
+            )
+            clock_row = cursor.fetchone()  # type: ignore[attr-defined]
+            if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
+                raise RuntimeError("PostgreSQL dispatch clock query returned no row")
+        else:
+            clock_row = row[22:24]
         leased_until = row[20]
         try:
             lease_active = leased_until is not None and leased_until > clock_row[0]

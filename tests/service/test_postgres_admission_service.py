@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -528,6 +529,89 @@ def test_dispatch_claim_readback_waits_for_an_uncommitted_terminal_winner(
             original.token,
             DispatchResult(status="accepted", dispatch_ref="temporal:too-late"),
         )
+
+
+def test_receipt_keeps_activation_and_terminal_evidence_in_one_snapshot(
+    harness: _Harness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, _ = harness.seed(tmp_path, "receipt-snapshot")
+    command = harness.admission.admit(_request(token.run_id, "command-1")).command
+    assert _dispatcher(harness, _accept_all, iter(("claim-1",))).dispatch_once() is not None
+    row_read = threading.Event()
+    resume_reader = threading.Event()
+    reader_thread_id: int | None = None
+    original_cursor = harness.database.cursor
+
+    class _PausingCursor:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+            self.pause_after_fetch = False
+
+        def execute(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+            result = self.inner.execute(query, *args, **kwargs)
+            rendered = query.as_string(self.inner) if hasattr(query, "as_string") else str(query)
+            self.pause_after_fetch = (
+                "activation_admission_record" in rendered
+                and "activation_dispatch_outbox" in rendered
+            )
+            return result
+
+        def fetchone(self) -> Any:
+            row = self.inner.fetchone()
+            if self.pause_after_fetch:
+                self.pause_after_fetch = False
+                row_read.set()
+                if not resume_reader.wait(timeout=5):
+                    raise AssertionError("receipt snapshot reader was not released")
+            return row
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    @contextmanager
+    def cursor(connection: Any) -> Iterator[Any]:
+        with original_cursor(connection) as inner:
+            if threading.get_ident() == reader_thread_id:
+                yield _PausingCursor(inner)
+            else:
+                yield inner
+
+    monkeypatch.setattr(harness.database, "cursor", cursor)
+
+    def read_receipt():
+        nonlocal reader_thread_id
+        reader_thread_id = threading.get_ident()
+        return harness.admission.receipt(token.run_id, command.command_id)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(read_receipt)
+        assert row_read.wait(timeout=5)
+        activation = harness.admission.bind_activation(command, writer_token=token)
+        assert (
+            harness.sink.settle_terminal(
+                TerminalOutcome(
+                    run_id=token.run_id,
+                    kind="cancelled",
+                    retry_eligibility=RetryEligibility.FORBIDDEN,
+                    error_code="cancelled",
+                ),
+                writer_token=token,
+            ).status
+            == "committed"
+        )
+        resume_reader.set()
+        snapshot = future.result(timeout=5)
+    finally:
+        resume_reader.set()
+        executor.shutdown(wait=True)
+
+    assert snapshot is not None and snapshot.state == "dispatched"
+    current = harness.admission.receipt(token.run_id, command.command_id)
+    assert current is not None and current.state == "activation_claimed"
+    assert current.activation_command == activation
 
 
 def test_concurrent_admission_converges_and_assigns_one_sequence_per_run(

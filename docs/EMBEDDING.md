@@ -186,7 +186,9 @@ resolves the lane. A canonical terminal winner excludes that run from new claims
 leased, or delivered commands converge to `run_terminal` without another transport call. Active
 claim finalization and settlement share the run-authority lock with terminal selection, so commit
 order decides the winner and no claim, acknowledge, retry, or reject mutation can follow the
-terminal commit.
+terminal commit. `receipt()` reads admission, activation, and terminal evidence from one PostgreSQL
+statement snapshot, preserving monotonic state projection across concurrent binding and terminal
+commits.
 
 After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
 `bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.
