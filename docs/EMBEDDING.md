@@ -645,6 +645,9 @@ The durable observer derives its store address with `durable_model_stream_id(run
 leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
 call reuses and seals its prior generation; the first delta from an admitted replacement dispatch
 lazily resets every prior open or sealed kernel lane before persisting bytes.
+On a completed close, the observer compares the output lane's byte length and SHA-256 with the
+settled `final_text`. A mismatch means recovery found an unflushed/truncated prefix; the observer
+rebuilds output in a new generation from that authoritative final text before sealing it.
 
 Persist reconnect state as `(generation, cursor)`. Call `read_after()` only with cursor values
 returned by a prior read. `ok` returns complete UTF-8 chunks and `next_cursor`; `reset` tells the

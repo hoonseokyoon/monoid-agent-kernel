@@ -574,6 +574,63 @@ def test_model_observer_resets_abandoned_open_lanes_after_takeover(
     assert harness.streams.read_after(output, generation=1, cursor=0).status == "reset"
     assert harness.streams.read_after(reasoning, generation=1, cursor=0).status == "reset"
 
+    recovered_run = f"run-stream-recovered-output-{uuid.uuid4().hex}"
+    recovered_stale = harness.claim(recovered_run, "recovered-output-worker")
+    recovered_context = ModelStreamContext(
+        run_id=recovered_run,
+        root_run_id=recovered_run,
+        turn_id="turn-recovered-output",
+        stream_id="execution-local-recovered-output",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    recovered_output = DurableStreamIdentity(
+        run_id=recovered_run,
+        stream_id=durable_model_stream_id(recovered_run, recovered_context.turn_id),
+        logical_call_id=logical_model_call_id(
+            recovered_run,
+            recovered_context.turn_id,
+        ),
+        channel="output",
+    )
+    assert harness.streams.open(
+        recovered_output,
+        writer_token=recovered_stale,
+    ).status == "opened"
+    assert harness.streams.append(
+        recovered_output,
+        generation=1,
+        start_offset=0,
+        data=b"truncated ",
+        writer_token=recovered_stale,
+    ).status == "committed"
+    assert harness.authority.release(recovered_stale).status == "released"
+    recovered_current = harness.claim(recovered_run, "recovered-output-replacement")
+    recovered_writer = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=recovered_current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=8,
+        flush_interval_s=10,
+    ).open(recovered_context)
+    recovered_writer.close(
+        ModelStreamOutcome(
+            status="completed",
+            final_text="authoritative 세계 output",
+        )
+    )
+    recovered_read = harness.streams.read_after(
+        recovered_output,
+        generation=2,
+        cursor=0,
+    )
+    assert b"".join(chunk.data for chunk in recovered_read.chunks).decode() == (
+        "authoritative 세계 output"
+    )
+    assert recovered_read.head is not None and recovered_read.head.state == "sealed"
+
 
 def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) -> None:
     counting = _CountingPutStore(harness.streams.object_store)

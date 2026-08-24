@@ -547,6 +547,42 @@ def test_model_stream_observer_preserves_open_lanes_when_recovery_emits_no_delta
     assert b"".join(chunk.data for chunk in store.chunks[(output, 1)]) == b"recovered"
 
 
+def test_model_stream_observer_rebuilds_truncated_recovered_output_from_final_text() -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(run_id=context.run_id, owner_id="worker-1", generation=1)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=durable_model_stream_id(context.run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(context.run_id, context.turn_id),
+        channel="output",
+    )
+    assert store.open(output, writer_token=token).status == "opened"
+    assert store.append(
+        output,
+        generation=1,
+        start_offset=0,
+        data=b"truncated ",
+        writer_token=token,
+    ).status == "committed"
+
+    recovered = _observer(store, authority, chunk_bytes=8).open(context)
+    recovered.close(
+        ModelStreamOutcome(
+            status="completed",
+            final_text="authoritative 세계 output",
+        )
+    )
+
+    final_bytes = b"".join(chunk.data for chunk in store.chunks[(output, 2)])
+    assert final_bytes.decode() == "authoritative 세계 output"
+    assert all(chunk.chunk.size_bytes <= 8 for chunk in store.chunks[(output, 2)])
+    assert store.heads[output].generation == 2
+    assert store.heads[output].state == "sealed"
+    assert store.heads[output].final_sha256 == hashlib.sha256(final_bytes).hexdigest()
+
+
 def test_model_stream_observer_rehydrates_and_idempotently_recloses_a_sealed_lane() -> None:
     store = _MemoryStreamStore()
     authority = ActivationWriteAuthority()

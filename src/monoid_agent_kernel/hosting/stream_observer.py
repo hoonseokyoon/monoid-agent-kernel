@@ -418,6 +418,29 @@ class _DurableModelStreamWriter:
                 self._failure = exc
                 self._condition.notify_all()
 
+    def _reconcile_completed_output(self, outcome: ModelStreamOutcome) -> None:
+        if outcome.status != "completed" or outcome.final_text is None:
+            return
+        lane = self._lanes["output"]
+        authoritative = outcome.final_text.encode("utf-8")
+        if (
+            lane.head.cursor_bytes == len(authoritative)
+            and lane.digest.hexdigest() == hashlib.sha256(authoritative).hexdigest()  # type: ignore[attr-defined]
+        ):
+            return
+        # Recovery can publish the durable model result before the observer's buffered suffix is
+        # flushed. Rebuild from the settled output rather than sealing a truncated open prefix.
+        self._reset_lane_locked(lane)
+        pending = bytearray(authoritative)
+        while pending:
+            size = _utf8_prefix_size(
+                pending,
+                min(len(pending), self._observer.chunk_bytes),
+            )
+            data = bytes(pending[:size])
+            del pending[:size]
+            self._append(lane, data)
+
     def close(self, outcome: ModelStreamOutcome) -> None:
         if not isinstance(outcome, ModelStreamOutcome):
             raise TypeError("durable model stream close requires ModelStreamOutcome")
@@ -433,6 +456,7 @@ class _DurableModelStreamWriter:
             )
         with self._condition:
             self._raise_failure_locked()
+            self._reconcile_completed_output(outcome)
         for channel in sorted(self._lanes):
             lane = self._lanes[channel]
             final_sha256 = lane.digest.hexdigest()  # type: ignore[attr-defined]
