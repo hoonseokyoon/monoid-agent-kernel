@@ -82,6 +82,7 @@ def _utf8_prefix_size(buffer: bytearray, maximum: int) -> int:
 class _Lane:
     identity: DurableStreamIdentity
     head: DurableStreamHead
+    reset_before_append: bool = False
     digest: object = field(default_factory=hashlib.sha256)
     buffer: bytearray = field(default_factory=bytearray)
     flush_at: float | None = None
@@ -162,7 +163,12 @@ class _DurableModelStreamWriter:
         self._closed = False
         self._channel_cursor = 0
         self._worker_context = contextvars.copy_context()
-        self._ensure_lane("output")
+        output = self._ensure_lane("output")
+        if output.reset_before_append:
+            # Output exists for every observer execution and therefore detects a replacement.
+            # Load the other kernel-owned private lane now so the first replacement delta can
+            # reset stale reasoning too, even when the replacement emits no reasoning bytes.
+            self._ensure_lane("reasoning")
         self._worker = threading.Thread(
             target=lambda: self._worker_context.run(self._run),
             name=f"monoid-stream-{context.stream_id[:32]}",
@@ -213,7 +219,11 @@ class _DurableModelStreamWriter:
             )
             if result.status not in {"opened", "already_open", "sealed"} or result.head is None:
                 self._reject("open", result.status)
-            lane = _Lane(identity=identity, head=result.head)
+            lane = _Lane(
+                identity=identity,
+                head=result.head,
+                reset_before_append=result.status in {"already_open", "sealed"},
+            )
             cursor = 0
             while cursor < lane.head.cursor_bytes:
                 replay = self._observer.write_authority.guard_external_call(
@@ -241,7 +251,7 @@ class _DurableModelStreamWriter:
     def _buffered_bytes_locked(self) -> int:
         return sum(len(lane.buffer) for lane in self._lanes.values())
 
-    def _reset_sealed_lane_locked(self, lane: _Lane) -> None:
+    def _reset_lane_locked(self, lane: _Lane) -> None:
         previous = lane.head
         result = self._observer.write_authority.guard_external_call(
             lambda: self._store.reset(
@@ -266,6 +276,7 @@ class _DurableModelStreamWriter:
             raise DurableStreamWriteError("durable stream reset evidence disagrees with lane")
         lane.head = result.head
         lane.digest = hashlib.sha256()
+        lane.reset_before_append = False
 
     def push(self, delta: ModelStreamDelta) -> None:
         if not isinstance(delta, ModelStreamDelta):
@@ -278,11 +289,16 @@ class _DurableModelStreamWriter:
         with self._condition:
             if self._closing or self._closed:
                 raise DurableStreamWriteError("durable model stream writer is closed")
-            if lane.head.state == "sealed":
-                # A recovered successful call emits no deltas and therefore preserves its seal.
-                # The first delta proves that the durable lifecycle admitted a new dispatch for
-                # this logical call; start a fresh generation before recording replacement bytes.
-                self._reset_sealed_lane_locked(lane)
+            if any(value.reset_before_append for value in self._lanes.values()):
+                # A recovered successful call emits no deltas and preserves its open/sealed bytes.
+                # The first new delta proves that the lifecycle admitted a replacement dispatch;
+                # reset every pre-existing kernel lane before recording any replacement content.
+                for value in sorted(
+                    self._lanes.values(),
+                    key=lambda candidate: candidate.identity.channel,
+                ):
+                    if value.reset_before_append:
+                        self._reset_lane_locked(value)
             while position < len(data):
                 self._raise_failure_locked()
                 while self._buffered_bytes_locked() >= self._observer.max_buffer_bytes:

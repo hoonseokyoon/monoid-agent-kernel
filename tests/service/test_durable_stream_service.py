@@ -516,6 +516,65 @@ def test_actual_stream_store_fences_takeover_and_model_observer_persists(
     assert output.head is not None and output.head.state == "sealed"
 
 
+def test_model_observer_resets_abandoned_open_lanes_after_takeover(
+    harness: _Harness,
+) -> None:
+    run_id = f"run-stream-abandoned-{uuid.uuid4().hex}"
+    stale = harness.claim(run_id, "abandoned-worker")
+    context = ModelStreamContext(
+        run_id=run_id,
+        root_run_id=run_id,
+        turn_id="turn-abandoned",
+        stream_id="execution-local-abandoned",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    output = DurableStreamIdentity(
+        run_id=run_id,
+        stream_id=durable_model_stream_id(run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(run_id, context.turn_id),
+        channel="output",
+    )
+    reasoning = DurableStreamIdentity(
+        run_id=run_id,
+        stream_id=output.stream_id,
+        logical_call_id=output.logical_call_id,
+        channel="reasoning",
+    )
+    for identity, data in ((output, b"stale output"), (reasoning, b"stale reasoning")):
+        assert harness.streams.open(identity, writer_token=stale).status == "opened"
+        assert harness.streams.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=stale,
+        ).status == "committed"
+
+    assert harness.authority.release(stale).status == "released"
+    current = harness.claim(run_id, "replacement-worker")
+    replacement = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=16,
+        flush_interval_s=10,
+    ).open(context)
+    replacement.push(ModelStreamDelta(channel="output", text="fresh"))
+    replacement.close(ModelStreamOutcome(status="completed", final_text="fresh"))
+
+    output_read = harness.streams.read_after(output, generation=2, cursor=0)
+    reasoning_read = harness.streams.read_after(reasoning, generation=2, cursor=0)
+    assert b"".join(chunk.data for chunk in output_read.chunks) == b"fresh"
+    assert output_read.head is not None and output_read.head.state == "sealed"
+    assert reasoning_read.chunks == ()
+    assert reasoning_read.head is not None and reasoning_read.head.state == "sealed"
+    assert harness.streams.read_after(output, generation=1, cursor=0).status == "reset"
+    assert harness.streams.read_after(reasoning, generation=1, cursor=0).status == "reset"
+
+
 def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) -> None:
     counting = _CountingPutStore(harness.streams.object_store)
     streams = PostgresObjectStoreDurableStreamStore(

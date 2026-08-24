@@ -634,15 +634,17 @@ loop = make_loop(
 )
 ```
 
-The observer opens one `output` lane and opens `reasoning` when that channel first emits content.
-Host-defined private lanes use the same `DurableStreamIdentity` contract directly. Byte and time
-thresholds bound coalescing; a copied-context daemon performs ordered flushes. Observer failures
-retain the existing model-stream rule: they do not replace a paid provider result. A `fenced`
-store result revokes the shared activation authority, so later kernel publication fails closed.
+The observer opens one `output` lane and normally opens `reasoning` when that channel first emits
+content. A replacement that finds prior output also hydrates reasoning so the first new delta can
+reset every pre-existing kernel lane together. Host-defined private lanes use the same
+`DurableStreamIdentity` contract directly. Byte and time thresholds bound coalescing; a
+copied-context daemon performs ordered flushes. Observer failures retain the existing model-stream
+rule: they do not replace a paid provider result. A `fenced` store result revokes the shared
+activation authority, so later kernel publication fails closed.
 The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
 leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
-call reuses its sealed generation; the first delta from an admitted replacement dispatch lazily
-resets that lane to a new generation before persisting bytes.
+call reuses and seals its prior generation; the first delta from an admitted replacement dispatch
+lazily resets every prior open or sealed kernel lane before persisting bytes.
 
 Persist reconnect state as `(generation, cursor)`. Call `read_after()` only with cursor values
 returned by a prior read. `ok` returns complete UTF-8 chunks and `next_cursor`; `reset` tells the

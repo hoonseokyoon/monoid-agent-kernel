@@ -9,6 +9,7 @@ import pytest
 
 from monoid_agent_kernel.conformance import run_durable_stream_store_contract
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority
+from monoid_agent_kernel.core.model_invocation import logical_model_call_id
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
@@ -472,6 +473,78 @@ def test_model_stream_observer_late_channel_cannot_open_after_close() -> None:
     with pytest.raises(DurableStreamWriteError, match="closed"):
         writer.push(ModelStreamDelta(channel="reasoning", text="late"))
     assert {identity.channel for identity in store.heads} == {"output"}
+
+
+def test_model_stream_observer_resets_abandoned_open_lanes_before_replacement() -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(
+        run_id=context.run_id,
+        owner_id="worker-1",
+        generation=1,
+    )
+    stream_id = durable_model_stream_id(context.run_id, context.turn_id)
+    logical_call_id = logical_model_call_id(context.run_id, context.turn_id)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=stream_id,
+        logical_call_id=logical_call_id,
+        channel="output",
+    )
+    reasoning = replace(output, channel="reasoning")
+    for identity, data in ((output, b"stale output"), (reasoning, b"stale reasoning")):
+        assert store.open(identity, writer_token=token).status == "opened"
+        assert store.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=token,
+        ).status == "committed"
+
+    replacement = _observer(
+        store,
+        authority,
+        chunk_bytes=16,
+        flush_interval_s=10,
+    ).open(context)
+    replacement.push(ModelStreamDelta(channel="output", text="fresh"))
+    replacement.close(ModelStreamOutcome(status="completed", final_text="fresh"))
+
+    assert store.heads[output].generation == 2
+    assert store.heads[reasoning].generation == 2
+    assert b"".join(chunk.data for chunk in store.chunks[(output, 2)]) == b"fresh"
+    assert store.chunks.get((reasoning, 2), []) == []
+    assert store.heads[reasoning].state == "sealed"
+
+
+def test_model_stream_observer_preserves_open_lanes_when_recovery_emits_no_delta() -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(run_id=context.run_id, owner_id="worker-1", generation=1)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=durable_model_stream_id(context.run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(context.run_id, context.turn_id),
+        channel="output",
+    )
+    assert store.open(output, writer_token=token).status == "opened"
+    assert store.append(
+        output,
+        generation=1,
+        start_offset=0,
+        data=b"recovered",
+        writer_token=token,
+    ).status == "committed"
+
+    recovered = _observer(store, authority).open(context)
+    recovered.close(ModelStreamOutcome(status="completed", final_text="recovered"))
+
+    assert store.heads[output].generation == 1
+    assert store.heads[output].state == "sealed"
+    assert b"".join(chunk.data for chunk in store.chunks[(output, 1)]) == b"recovered"
 
 
 def test_model_stream_observer_rehydrates_and_idempotently_recloses_a_sealed_lane() -> None:
