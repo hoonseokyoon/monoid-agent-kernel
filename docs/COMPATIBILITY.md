@@ -50,6 +50,10 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `admission-receipt` | wire | `monoid.admission-receipt.v1` | strict | `monoid.admission-receipt.v1`<br>`native-agent-runner.admission-receipt.v1` |
 | `activation-command` | wire | `monoid.activation-command.v1` | strict | `monoid.activation-command.v1`<br>`native-agent-runner.activation-command.v1` |
 | `activation-receipt` | wire | `monoid.activation-receipt.v1` | strict | `monoid.activation-receipt.v1`<br>`native-agent-runner.activation-receipt.v1` |
+| `temporal-run-policy` | wire | `monoid.temporal-run-policy.v1` | strict | `monoid.temporal-run-policy.v1`<br>`native-agent-runner.temporal-run-policy.v1` |
+| `temporal-run-state` | durable | `monoid.temporal-run-state.v1` | strict | `monoid.temporal-run-state.v1`<br>`native-agent-runner.temporal-run-state.v1` |
+| `temporal-activation-result` | wire | `monoid.temporal-activation-result.v1` | strict | `monoid.temporal-activation-result.v1`<br>`native-agent-runner.temporal-activation-result.v1` |
+| `temporal-run-status` | wire | `monoid.temporal-run-status.v1` | strict | `monoid.temporal-run-status.v1`<br>`native-agent-runner.temporal-run-status.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
@@ -125,6 +129,18 @@ cursors, terminal reference, and portable outcome taxonomy. Hosts reconstruct it
 state after response loss; later checkpoint heads retain the original per-command boundary
 identity. The boundary digest blanks its own nested digest field before hashing to avoid a
 self-reference. Model output and raw exceptions never enter the receipt.
+
+The four Temporal v1 records keep long-lived orchestration content-free and replayable.
+`monoid.temporal-run-policy.v1` records the Activity queue, bounded timeout/retry controls, and
+optional deterministic qualification rollover threshold. `monoid.temporal-run-state.v1` carries
+the Workflow build, next PostgreSQL command sequence, ordered pending command refs, latest receipt
+ref, and bounded operational observations across Continue-As-New. It is transferred only at a safe
+point with no in-flight Activity. `monoid.temporal-activation-result.v1` binds one finite Activity
+result to the exact admitted-command identity and exposes only a canonical receipt ref plus the
+terminal flag. `monoid.temporal-run-status.v1` is a Query and terminal-result projection; it has no
+write or terminal authority. All four strict readers accept the retained namespace alias and reject
+unknown fields. Private model content, checkpoint bytes, credentials, and raw errors remain in the
+PostgreSQL/ObjectStore channels referenced by these records.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The

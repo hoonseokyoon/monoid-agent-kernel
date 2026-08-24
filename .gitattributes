@@ -19,3 +19,6 @@ src/monoid_agent_kernel/reference/studio/web/dist/assets/*.js whitespace=-traili
 # inline-only today, so nothing is broken yet; pinning the tree closes it before the first
 # offloaded fixture rather than after someone spends a day on it.
 tests/fixtures/** -text
+# Temporal history manifests are semantic JSON. Keep them reviewable and cross-platform while
+# leaving any future content-addressed payload chunks under the binary fixture rule above.
+tests/fixtures/temporal_replay_v1/*.json text eol=lf

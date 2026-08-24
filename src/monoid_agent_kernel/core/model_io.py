@@ -68,10 +68,14 @@ from monoid_agent_kernel.core.wire_validation import (
 
 REDACTION_PLACEHOLDER = "[redacted]"
 
-# Keys ``RedactionPolicy.digest``. Minted once per process and never exported: a receipt consumer is
-# meant to compare digests, not reproduce them. See ``RedactionPolicy.digest`` for why an unkeyed
-# digest over a policy is a guessing oracle for that policy's ``literals``.
-_DIGEST_KEY = secrets.token_bytes(32)
+
+# Keys ``RedactionPolicy.digest``. Minted once per process on first use and never exported: a
+# receipt consumer is meant to compare digests, not reproduce them. Lazy creation keeps importing
+# pure record validators deterministic inside Temporal's Workflow sandbox.
+@lru_cache(maxsize=1)
+def _digest_key() -> bytes:
+    return secrets.token_bytes(32)
+
 
 # Substrings that mark a *key* as naming a secret. Matching is on the lowercased key with hyphens
 # folded to underscores, and it is a substring test, so "x_api_key" and "X-Api-Key" both match
@@ -324,7 +328,7 @@ class RedactionPolicy:
         values is a guessing oracle for those values. A deployment that needs cross-process joins
         needs a shared key, which is a deployment-time secret rather than a kernel default.
         """
-        return canonical_hmac_sha256(self.to_json(), _DIGEST_KEY)
+        return canonical_hmac_sha256(self.to_json(), _digest_key())
 
     def names_a_secret(self, key: str) -> bool:
         """Whether `key` names a secret under this policy.
@@ -578,7 +582,7 @@ def destination_digest(value: str) -> str:
     default, and choosing that is deliberately left to whoever first persists these receipts.
     """
 
-    return canonical_hmac_sha256({"destination": value}, _DIGEST_KEY) if value else ""
+    return canonical_hmac_sha256({"destination": value}, _digest_key()) if value else ""
 
 
 def _validated_status(value: Any, key: str, allowed: tuple[str, ...]) -> str:
