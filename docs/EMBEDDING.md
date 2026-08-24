@@ -781,6 +781,18 @@ Publish portable metrics for:
 - approval age and callback completion latency;
 - drain, shutdown, recovery, and terminal projection outcomes.
 
+The v0.23 PostgreSQL production adapter exposes `PostgresOperations.check_ready()` and
+`snapshot()` for exact, aggregate-only operational collection. Route a snapshot through
+`record_operational_snapshot()` to a host-owned sink. `OtelOperationalMetricSink` provides an
+optional observable-gauge bridge under the `[otel]` extra. Keep collection cadence, exporter
+failure handling, resource attributes, and alert thresholds in the host.
+
+Use `PostgresMigrations.doctor()` for database/schema readiness and
+`S3ObjectStoreAdmin.doctor()` for read-only bucket reachability/versioning readiness. Keep
+run-scoped authority reads and destructive admin operations on private operator routes. The full
+startup, rolling migration, drain, GC, backup/restore, and corruption procedures are in
+[Production adapter operations](PRODUCTION_OPERATIONS.md).
+
 The Reference inbox assembly additionally reports lease age, stale claims, watchdog recovery, and
 command claim age. A DBOS evaluation reports workflow, queue, executor-slot, and application-version
 state as operational diagnostics.

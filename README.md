@@ -269,6 +269,8 @@ public/private split.
 
 The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,
 live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)**.
+PostgreSQL/ObjectStore/Temporal startup, migration, metrics, drain, GC, backup/restore, and incident
+procedures are documented in **[docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md)**.
 
 ## Defaults
 
