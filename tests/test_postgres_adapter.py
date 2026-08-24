@@ -171,6 +171,7 @@ def test_bundled_migration_metadata_hashes_exact_wheel_resource() -> None:
     assert tuple(item.migration_id for item in migrations) == (
         "0001_authority",
         "0002_checkpoint_invocation",
+        "0003_event_terminal_evidence_outbox",
     )
     root = files("monoid_agent_kernel.adapters.postgres").joinpath("sql")
     for migration in migrations:
