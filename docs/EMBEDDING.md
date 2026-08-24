@@ -239,6 +239,70 @@ Treat `ActivationReceipt` as an operational copy. Reconstruct it from the canoni
 terminal readback after a response loss. Store model output and raw provider errors only in the
 private checkpoint/blob channels referenced by the receipt.
 
+### Temporal run orchestration
+
+Install `monoid-agent-kernel[temporal]` and register the versioned per-run Workflow explicitly:
+
+```python
+from temporalio.worker import Worker
+
+from monoid_agent_kernel.adapters.temporal import (
+    TemporalRunPolicy,
+    TemporalSignalWithStartTransport,
+)
+from monoid_agent_kernel.adapters.temporal.workflow import TemporalRunWorkflow
+
+policy = TemporalRunPolicy(activity_task_queue="monoid-activation-v1")
+transport = TemporalSignalWithStartTransport(
+    client=temporal_client,
+    event_loop=temporal_client_loop,
+    workflow_task_queue="monoid-run-v1",
+    run_policy=policy,
+)
+
+workflow_worker = Worker(
+    temporal_client,
+    task_queue="monoid-run-v1",
+    workflows=[TemporalRunWorkflow],
+)
+activity_worker = Worker(
+    temporal_client,
+    task_queue="monoid-activation-v1",
+    activities=[drive_activation],
+)
+```
+
+Register `drive_activation` under the exported
+`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name. It accepts an `AdmittedCommand.to_json()` payload and
+returns `TemporalActivationResult.to_json()`. The result binds the exact command identity to a
+canonical receipt ref and terminal flag. Database access, private payload resolution, provider and
+tool calls, checkpoint restore, and terminal settlement remain inside this finite Activity.
+
+The Temporal client is asynchronous. Keep its owner event loop running and call the synchronous
+`transport.dispatch()` from the PostgreSQL outbox polling thread. Async code already executing on
+the owner loop calls `await transport.dispatch_async(command)`. The synchronous method rejects an
+owner-loop call because waiting there would deadlock the client. Both methods return after Temporal
+server acceptance; the PostgreSQL admission receipt remains the client-facing canonical handle.
+
+Signal-With-Start uses a deterministic digest-derived Workflow ID and targets an existing running
+Workflow when present. A lost response can produce another Signal. The Workflow compares the
+PostgreSQL sequence and immutable admitted-command identity, buffers future sequences, and schedules
+one Activity for each sequence. A closed Workflow ID rejects another start, allowing the outbox lane
+to enter an operator-visible terminal/dead-letter disposition.
+
+The Workflow checks Temporal's Continue-As-New suggestion after every completed Activity. It waits
+for Signal handlers, transfers no in-flight Activity, and carries ordered pending commands, the next
+sequence, latest receipt ref, policy, build, and operational counters into the new Run ID. Keep
+`history_rollover_command_limit=0` in production to follow the service suggestion. A small positive
+value is a deterministic qualification hook.
+
+Temporal history and Query status contain opaque IDs, digests, refs, sequence counters, bounded
+policy values, and public-safe taxonomies. Store prompt, response, reasoning, model result,
+workspace bytes, checkpoint bytes, credentials, and raw exception text in private storage. Replay
+`tests/fixtures/temporal_replay_v1/run-workflow-v1.json` with Temporal `Replayer` before changing the
+Workflow command sequence or Activity options. Use Temporal patching or Worker Versioning for a
+change that would produce different commands for an existing history.
+
 ## Golden path B: hosted/multi-tenant product
 
 The hosted example creates two `RunnerBackend` instances over one SQLite database. This diagram is

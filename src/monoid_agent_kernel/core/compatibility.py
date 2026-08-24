@@ -204,6 +204,38 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
             "and terminal winner."
         ),
     ),
+    _monoid_artifact(
+        "temporal-run-policy.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunPolicy.from_json",),
+        legacy_reader=True,
+        notes="Recorded finite-Activity timeout, retry, task-queue, and rollover policy.",
+    ),
+    _monoid_artifact(
+        "temporal-run-state.v1",
+        kind="durable",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunState.from_json",),
+        legacy_reader=True,
+        notes="Content-free safe-point state transferred by Continue-As-New.",
+    ),
+    _monoid_artifact(
+        "temporal-activation-result.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalActivationResult.from_json",),
+        legacy_reader=True,
+        notes="Identity-bound Activity result containing only a receipt ref and terminal flag.",
+    ),
+    _monoid_artifact(
+        "temporal-run-status.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunStatus.from_json",),
+        legacy_reader=True,
+        notes="Operational Query and terminal-result projection without canonical authority.",
+    ),
     CompatibilityArtifact(
         key="model-stream-live",
         kind="wire",

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 
+import monoid_agent_kernel.core.model_io as model_io_module
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.model_io import (
     DEFAULT_SECRET_KEY_PARTS,
@@ -14,6 +18,7 @@ from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     DefaultRedactor,
     RedactionPolicy,
+    destination_digest,
     redacted_or_none,
 )
 from monoid_agent_kernel.core.wire_validation import WireValidationError
@@ -250,6 +255,39 @@ def test_digest_identifies_the_rules_without_disclosing_them() -> None:
     assert policy.digest == RedactionPolicy(literals=("hunter2",)).digest
     assert policy.digest != RedactionPolicy(literals=("hunter3",)).digest
     assert policy.digest != RedactionPolicy(literals=("hunter2",), replacement="***").digest
+
+
+def test_digest_key_first_use_is_serialized_across_worker_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workers = 16
+    gate = threading.Barrier(workers)
+    call_lock = threading.Lock()
+    token_bytes_calls = 0
+
+    def token_bytes(size: int) -> bytes:
+        nonlocal token_bytes_calls
+        with call_lock:
+            token_bytes_calls += 1
+            ordinal = token_bytes_calls
+        time.sleep(0.05)
+        return bytes([ordinal]) * size
+
+    monkeypatch.setattr(model_io_module, "_DIGEST_KEY", None)
+    monkeypatch.setattr(model_io_module.secrets, "token_bytes", token_bytes)
+
+    def compute(index: int) -> tuple[str, str]:
+        gate.wait(timeout=5)
+        if index % 2:
+            return "policy", RedactionPolicy(literals=("shared",)).digest
+        return "destination", destination_digest("model-endpoint")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(compute, range(workers)))
+
+    assert token_bytes_calls == 1
+    for kind in {kind for kind, _digest in results}:
+        assert len({digest for result_kind, digest in results if result_kind == kind}) == 1
 
 
 def test_digest_does_not_let_a_holder_confirm_a_guess_at_a_literal() -> None:

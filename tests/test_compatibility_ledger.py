@@ -96,6 +96,12 @@ from monoid_agent_kernel.hosting.admission import (
     ADMISSION_REQUEST_SCHEMA_VERSION,
     ADMITTED_COMMAND_SCHEMA_VERSION,
 )
+from monoid_agent_kernel.adapters.temporal import (
+    TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSION,
+    TEMPORAL_RUN_POLICY_SCHEMA_VERSION,
+    TEMPORAL_RUN_STATE_SCHEMA_VERSION,
+    TEMPORAL_RUN_STATUS_SCHEMA_VERSION,
+)
 from monoid_agent_kernel.workspace.local import WORKSPACE_BASE_SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,7 +111,7 @@ LEDGER = ROOT / "docs" / "COMPATIBILITY.md"
 def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
     artifacts = PUBLIC_ARTIFACT_COMPATIBILITY
 
-    assert len(artifacts) == 50
+    assert len(artifacts) == 54
     assert len({artifact.key for artifact in artifacts}) == len(artifacts)
     assert len({artifact.current_writer for artifact in artifacts}) == len(artifacts)
     json.dumps(compatibility_registry(), sort_keys=True)
@@ -143,6 +149,10 @@ def test_registry_matches_source_owned_version_constants() -> None:
         "admission-receipt": ADMISSION_RECEIPT_SCHEMA_VERSION,
         "activation-command": ACTIVATION_COMMAND_SCHEMA_VERSION,
         "activation-receipt": ACTIVATION_RECEIPT_SCHEMA_VERSION,
+        "temporal-run-policy": TEMPORAL_RUN_POLICY_SCHEMA_VERSION,
+        "temporal-run-state": TEMPORAL_RUN_STATE_SCHEMA_VERSION,
+        "temporal-activation-result": TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSION,
+        "temporal-run-status": TEMPORAL_RUN_STATUS_SCHEMA_VERSION,
         "model-stream-live": MODEL_STREAM_LIVE_SCHEMA_VERSION,
         "checkpoint": CHECKPOINT_SCHEMA_VERSION,
         "model-invocation": MODEL_INVOCATION_SCHEMA_VERSION,

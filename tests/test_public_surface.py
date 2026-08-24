@@ -829,7 +829,36 @@ assert object_store.__all__ == [
     'S3ObjectStoreAdmin',
 ]
 assert all(hasattr(object_store, name) for name in object_store.__all__)
-assert temporal.__all__ == []
+assert temporal.__all__ == [
+    'TemporalDependencyMissing',
+    'TEMPORAL_RUN_WORKFLOW_TYPE',
+    'TEMPORAL_COMMAND_SIGNAL',
+    'TEMPORAL_STATUS_QUERY',
+    'TEMPORAL_DRIVE_ACTIVATION_ACTIVITY',
+    'TEMPORAL_WORKFLOW_BUILD',
+    'DEFAULT_TEMPORAL_WORKFLOW_ID_PREFIX',
+    'TEMPORAL_RUN_POLICY_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_POLICY_SCHEMA_VERSIONS',
+    'TEMPORAL_RUN_STATE_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_STATE_SCHEMA_VERSIONS',
+    'TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSIONS',
+    'TEMPORAL_RUN_STATUS_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_STATUS_SCHEMA_VERSIONS',
+    'MAX_ACTIVITY_TIMEOUT_S',
+    'MAX_ACTIVITY_ATTEMPTS',
+    'MAX_HISTORY_ROLLOVER_COMMANDS',
+    'MAX_TEMPORAL_RPC_TIMEOUT_S',
+    'TemporalRunPhase',
+    'TemporalRunPolicy',
+    'TemporalRunState',
+    'TemporalActivationResult',
+    'TemporalRunStatus',
+    'temporal_workflow_id',
+    'temporal_dispatch_ref',
+    'TemporalSignalWithStartTransport',
+]
+assert all(hasattr(temporal, name) for name in temporal.__all__)
 blocked = [
     name for name in sys.modules
     if name in {'psycopg', 'psycopg2', 'boto3', 'botocore', 'temporalio'}
