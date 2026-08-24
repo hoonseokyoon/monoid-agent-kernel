@@ -314,10 +314,10 @@ PostgreSQL writer generation, and starts a copied-context control supervisor bef
 blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
 worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
 evidence. Claim, initial exact-token renewal, and durable activation binding run in one bounded
-daemon bootstrap worker, so a stuck database lock cannot retain the Temporal Activity executor
-slot. The configured authority timeout is capped by the current Activity attempt's remaining
-start-to-close budget with cleanup reserve. A timed-out bootstrap cannot enter the driver and
-releases a late exact token. An independent
+copied-context daemon bootstrap worker, so a stuck database lock cannot retain the Temporal
+Activity executor slot. The configured authority timeout is capped by the current Activity
+attempt's remaining start-to-close budget with cleanup reserve. A timed-out bootstrap cannot enter
+the driver and releases a late exact token. An independent
 renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
 deadline enforcement. Its first renewal is scheduled from the installed lease's remaining
 monotonic budget and runs immediately when bootstrap consumed the normal safety margin. Control

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -335,6 +336,49 @@ def test_threaded_activity_renews_heartbeats_and_releases_content_free_owner() -
     ).hexdigest()
     assert store.claimed_owner == expected_owner
     assert b"raw-temporal-task-token".decode() not in store.claimed_owner
+
+
+def test_bootstrap_preserves_the_activity_context_for_every_store_call() -> None:
+    tenant_context: ContextVar[str] = ContextVar("test_temporal_bootstrap_tenant")
+    observed: list[tuple[str, str | None]] = []
+
+    class ContextAuthorityStore(_AuthorityStore):
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            observed.append(("claim", tenant_context.get(None)))
+            return super().claim(run_id, owner_id, ttl)
+
+        def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
+            observed.append(("renew", tenant_context.get(None)))
+            return super().renew(writer_token, ttl)
+
+    class ContextAdmissionStore(_AdmissionStore):
+        def bind_activation(
+            self,
+            command: AdmittedCommand,
+            *,
+            writer_token: WriterToken,
+        ) -> ActivationCommand:
+            observed.append(("bind", tenant_context.get(None)))
+            return super().bind_activation(command, writer_token=writer_token)
+
+    token = tenant_context.set("tenant-context-a")
+    try:
+        result = ActivityEnvironment().run(
+            _activity(
+                ContextAuthorityStore(),
+                admission_store=ContextAdmissionStore(),
+            ).run,
+            _command().to_json(),
+        )
+    finally:
+        tenant_context.reset(token)
+
+    assert result["run_id"] == "temporal-activity-run"
+    assert observed[:3] == [
+        ("claim", "tenant-context-a"),
+        ("renew", "tenant-context-a"),
+        ("bind", "tenant-context-a"),
+    ]
 
 
 def test_activity_reconciles_a_lost_claim_response_with_the_same_owner() -> None:

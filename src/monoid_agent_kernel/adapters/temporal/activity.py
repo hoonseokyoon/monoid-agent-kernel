@@ -300,8 +300,10 @@ class _TemporalLeaseSupervisor:
             finally:
                 completed.set()
 
+        bootstrap_context = contextvars.copy_context()
         bootstrap_thread = threading.Thread(
-            target=run_bootstrap,
+            target=bootstrap_context.run,
+            args=(run_bootstrap,),
             name="monoid-temporal-activation-bootstrap",
             daemon=True,
         )
