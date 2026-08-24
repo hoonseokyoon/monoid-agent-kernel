@@ -74,10 +74,11 @@ class PostgresOperations:
             isolation_level="repeatable_read",
         ) as connection:
             try:
+                with self.database.cursor(connection) as cursor:
+                    collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
                 status = PostgresMigrations(self.database)._require_reader_compatible(connection)
                 schema_version = status.current_version
                 with self.database.cursor(connection) as cursor:
-                    collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
                     authority = self._one(
                         cursor,
                         sql.SQL(

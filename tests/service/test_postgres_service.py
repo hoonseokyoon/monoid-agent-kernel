@@ -524,6 +524,7 @@ def test_operations_snapshot_keeps_schema_and_aggregates_point_in_time(
     operations.check_ready()
     inspection_started = threading.Event()
     mutation_committed = threading.Event()
+    mutation_observed_at: list[datetime] = []
     original_inspect = PostgresMigrations._inspect
 
     def inspect_then_pause(
@@ -566,11 +567,14 @@ def test_operations_snapshot_keeps_schema_and_aggregates_point_in_time(
                         ),
                         ("snapshot-new-run", "snapshot-new-owner"),
                     )
+                    cursor.execute("SELECT pg_catalog.clock_timestamp()")
+                    mutation_observed_at.append(cursor.fetchone()[0])
         finally:
             mutation_committed.set()
         snapshot = future.result(timeout=5)
 
     metrics = {(metric.name, metric.attributes): metric.value for metric in snapshot.metrics}
+    assert snapshot.collected_at < mutation_observed_at[0]
     assert metrics[("monoid.postgres.schema.version", ())] == 6
     assert metrics[("monoid.postgres.authority.count", (("state", "total"),))] == 0
     assert migrations.status().current_version == 7
