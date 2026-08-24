@@ -439,17 +439,39 @@ class PostgresObjectStoreDurableStreamStore:
             )
         return chunk
 
-    def _precheck_append(
+    def append(
         self,
         identity: DurableStreamIdentity,
         *,
         generation: int,
         start_offset: int,
-        end_offset: int,
-        sha256: str,
+        data: bytes,
         writer_token: WriterToken,
-    ) -> DurableStreamAppendResult | None:
-        """Reject without uploading, then release database locks before ObjectStore I/O."""
+    ) -> DurableStreamAppendResult:
+        self._require_ready()
+        generation = _portable_positive(generation, "durable stream append generation")
+        start_offset = _portable_non_negative(
+            start_offset,
+            "durable stream append start_offset",
+        )
+        if type(data) is not bytes or not data or len(data) > MAX_STREAM_CHUNK_BYTES:
+            raise ValueError(
+                "durable stream append data must be non-empty bytes within MAX_STREAM_CHUNK_BYTES"
+            )
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("durable stream append data must be complete UTF-8") from exc
+        end_offset = _portable_positive(
+            start_offset + len(data),
+            "durable stream append end_offset",
+        )
+        checked = self._validate_identity_and_token(identity, writer_token)
+        if checked is None:
+            return DurableStreamAppendResult(status="fenced")
+        identity, writer_token = checked
+        sha256 = hashlib.sha256(data).hexdigest()
+        from psycopg import sql
 
         with self.database.transaction() as connection:
             with self.database.cursor(connection) as cursor:
@@ -489,86 +511,11 @@ class PostgresObjectStoreDurableStreamStore:
                         status="gap" if start_offset > current.cursor_bytes else "conflict",
                         head=current,
                     )
-        return None
-
-    def append(
-        self,
-        identity: DurableStreamIdentity,
-        *,
-        generation: int,
-        start_offset: int,
-        data: bytes,
-        writer_token: WriterToken,
-    ) -> DurableStreamAppendResult:
-        self._require_ready()
-        generation = _portable_positive(generation, "durable stream append generation")
-        start_offset = _portable_non_negative(
-            start_offset,
-            "durable stream append start_offset",
-        )
-        if type(data) is not bytes or not data or len(data) > MAX_STREAM_CHUNK_BYTES:
-            raise ValueError(
-                "durable stream append data must be non-empty bytes within MAX_STREAM_CHUNK_BYTES"
-            )
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("durable stream append data must be complete UTF-8") from exc
-        end_offset = _portable_positive(
-            start_offset + len(data),
-            "durable stream append end_offset",
-        )
-        checked = self._validate_identity_and_token(identity, writer_token)
-        if checked is None:
-            return DurableStreamAppendResult(status="fenced")
-        identity, writer_token = checked
-        sha256 = hashlib.sha256(data).hexdigest()
-        prechecked = self._precheck_append(
-            identity,
-            generation=generation,
-            start_offset=start_offset,
-            end_offset=end_offset,
-            sha256=sha256,
-            writer_token=writer_token,
-        )
-        if prechecked is not None:
-            return prechecked
-        stat = self._put_checked(data)
-        from psycopg import sql
-
-        with self.database.transaction() as connection:
-            with self.database.cursor(connection) as cursor:
-                if not self._current_writer_locked(cursor, writer_token):
-                    return DurableStreamAppendResult(status="fenced")
-                current = self._head_locked(cursor, identity)
-                if current is None:
-                    return DurableStreamAppendResult(status="conflict")
-                if not _identity_matches(current.identity, identity):
-                    return DurableStreamAppendResult(status="conflict", head=current)
-                if generation != current.generation:
-                    return DurableStreamAppendResult(status="old_generation", head=current)
-                existing = self._chunk_at(cursor, identity, generation, start_offset)
-                if existing is not None:
-                    if existing.end_offset != end_offset or existing.sha256 != stat.sha256:
-                        return DurableStreamAppendResult(status="conflict", head=current)
-                    if not self._stat_matches(self.object_store.stat(stat.sha256), stat):
-                        raise PostgresDurableStreamCorrupt(
-                            "idempotent stream chunk no longer has its checked object"
-                        )
-                    return DurableStreamAppendResult(
-                        status="already_committed",
-                        head=current,
-                        chunk=existing,
-                    )
-                if current.state == "sealed":
-                    return DurableStreamAppendResult(status="sealed", head=current)
-                if self._run_is_terminal(cursor, identity.run_id):
-                    return DurableStreamAppendResult(status="run_terminal", head=current)
-                if start_offset != current.cursor_bytes:
-                    return DurableStreamAppendResult(
-                        status="gap" if start_offset > current.cursor_bytes else "conflict",
-                        head=current,
-                    )
+                # One append is a bounded (<= MAX_STREAM_CHUNK_BYTES) mutation. Keep the run
+                # authority and stream head locked through its physical put so terminal, reset,
+                # and takeover linearize strictly before or after the object+metadata commit.
+                # Seal releases these locks before its unbounded multi-chunk checked-read pass.
+                stat = self._put_checked(data)
                 self._record_object(cursor, identity.run_id, stat)
                 sequence = current.next_chunk_sequence
                 cursor.execute(

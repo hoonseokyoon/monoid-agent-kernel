@@ -161,6 +161,26 @@ class _CountingPutStore:
         return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
 
 
+class _BlockingPutStore:
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.puts = 0
+
+    def put_if_absent(self, sha256: str, data: bytes) -> object:
+        self.puts += 1
+        self.entered.set()
+        assert self.release.wait(10)
+        return self.delegate.put_if_absent(sha256, data)  # type: ignore[attr-defined,no-any-return]
+
+    def stat(self, sha256: str) -> object:
+        return self.delegate.stat(sha256)  # type: ignore[attr-defined,no-any-return]
+
+    def get_checked(self, sha256: str) -> bytes:
+        return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
+
+
 class _BlockingStatStore:
     def __init__(self, delegate: object) -> None:
         self.delegate = delegate
@@ -592,6 +612,62 @@ def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) ->
         writer_token=stale,
     ).status == "fenced"
     assert counting.puts == 1
+
+
+def test_terminal_settlement_linearizes_after_inflight_chunk_upload(
+    harness: _Harness,
+) -> None:
+    blocking = _BlockingPutStore(harness.streams.object_store)
+    streams = PostgresObjectStoreDurableStreamStore(
+        harness.database,
+        blocking,  # type: ignore[arg-type]
+    )
+    streams.check_ready()
+    run_id = f"run-stream-upload-fence-{uuid.uuid4().hex}"
+    token = harness.claim(run_id, "upload-fence-worker")
+    identity = _identity(run_id, suffix="upload-fence")
+    assert streams.open(identity, writer_token=token).status == "opened"
+    terminal = TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+    )
+    terminal_entered = threading.Event()
+
+    def settle_terminal() -> object:
+        terminal_entered.set()
+        return harness.sink.settle_terminal(terminal, writer_token=token)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        append_future = executor.submit(
+            lambda: streams.append(
+                identity,
+                generation=1,
+                start_offset=0,
+                data=b"inflight",
+                writer_token=token,
+            )
+        )
+        assert blocking.entered.wait(10)
+        terminal_future = executor.submit(settle_terminal)
+        assert terminal_entered.wait(10)
+        try:
+            with pytest.raises(TimeoutError):
+                terminal_future.result(timeout=0.2)
+        finally:
+            blocking.release.set()
+        assert append_future.result(timeout=20).status == "committed"
+        assert terminal_future.result(timeout=20).status == "committed"
+
+    assert blocking.puts == 1
+    assert streams.append(
+        identity,
+        generation=1,
+        start_offset=len(b"inflight"),
+        data=b"late",
+        writer_token=token,
+    ).status == "run_terminal"
+    assert blocking.puts == 1
 
 
 def test_gc_delete_between_put_check_and_digest_lock_cannot_publish_chunk(

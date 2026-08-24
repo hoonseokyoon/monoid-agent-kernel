@@ -652,6 +652,12 @@ final byte length and SHA-256 after checked ObjectStore reads. PostgreSQL serial
 seal, and terminal settlement through the run authority row. An append committed before terminal
 remains readable; a new append ordered after terminal returns `run_terminal`.
 
+Each append holds the run-authority and stream-head locks through one bounded ObjectStore put;
+terminal settlement, reset, takeover, and renewal then linearize after that chunk commit. Configure
+ObjectStore request timeouts, lease TTL/renewal margin, and `supervisor_join_timeout_s` as one
+operational budget. Seal releases those locks before its multi-chunk checked-read pass and validates
+the captured head again before publication.
+
 Stream metadata contains opaque IDs, channel taxonomy, offsets, sizes, and digests. It contains no
 model text. `read_after()` returns private bytes and performs no tenant authorization; expose it
 only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
