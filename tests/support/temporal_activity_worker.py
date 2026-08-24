@@ -129,6 +129,8 @@ async def _run(args: argparse.Namespace) -> None:
             min_pool_size=1,
             max_pool_size=8,
             pool_timeout_s=10,
+            lock_timeout_s=5,
+            statement_timeout_s=15,
             application_name="monoid-pr10-crash-worker",
         )
     )
@@ -155,6 +157,7 @@ async def _run(args: argparse.Namespace) -> None:
             writer_lease_renew_interval_s=0.4,
             heartbeat_interval_s=0.2,
             authority_call_timeout_s=2,
+            driver_call_timeout_s=20,
             supervisor_join_timeout_s=2,
             local_task_wait_s=5,
         ),

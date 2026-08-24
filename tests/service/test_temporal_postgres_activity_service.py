@@ -58,6 +58,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationCommand,
     ActivationRuntime,
     AdmissionRequest,
+    DispatchResult,
     ReleaseResult,
     RenewResult,
     WriterLease,
@@ -197,6 +198,7 @@ class _Harness:
         ).status in {"committed", "already_committed"}
         return lease, spec
 
+
 @pytest.fixture
 def harness() -> Iterator[_Harness]:
     dsn = os.environ.get("MONOID_POSTGRES16_DSN")
@@ -210,6 +212,8 @@ def harness() -> Iterator[_Harness]:
             min_pool_size=1,
             max_pool_size=16,
             pool_timeout_s=10,
+            lock_timeout_s=5,
+            statement_timeout_s=15,
             application_name="monoid-pr10-combined-test",
         )
     )
@@ -393,6 +397,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                     writer_lease_renew_interval_s=0.5,
                     heartbeat_interval_s=0.1,
                     authority_call_timeout_s=4,
+                    driver_call_timeout_s=20,
                     supervisor_join_timeout_s=4,
                     local_task_wait_s=5,
                 ),
@@ -473,6 +478,7 @@ def test_activity_bounds_an_actual_postgres_authority_row_lock(
             writer_lease_renew_interval_s=0.4,
             heartbeat_interval_s=0.05,
             authority_call_timeout_s=0.1,
+            driver_call_timeout_s=1,
             supervisor_join_timeout_s=0.2,
             local_task_wait_s=1,
         ),
@@ -547,6 +553,7 @@ def test_activity_bounds_an_actual_postgres_activation_binding_row_lock(
             writer_lease_renew_interval_s=0.4,
             heartbeat_interval_s=0.05,
             authority_call_timeout_s=0.1,
+            driver_call_timeout_s=1,
             supervisor_join_timeout_s=0.2,
             local_task_wait_s=1,
         ),
@@ -582,6 +589,121 @@ def test_activity_bounds_an_actual_postgres_activation_binding_row_lock(
         time.sleep(0.01)
         authority = harness.authority.read(run_id)
     assert authority is not None and authority.revoked is True and authority.active is False
+
+
+def test_activity_bounds_an_actual_postgres_row_lock_after_bootstrap(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    run_id = f"driver-lock-{uuid.uuid4().hex}"
+    seed_lease, spec = harness.seed(tmp_path, run_id)
+    admitted = harness.admission.admit(_request(run_id)).command
+    dispatch_claim = harness.admission.claim_dispatch(
+        "driver-lock-dispatcher",
+        "driver-lock-claim",
+        lease_s=30,
+    )
+    assert dispatch_claim is not None and dispatch_claim.command == admitted
+    harness.admission.acknowledge_dispatch(
+        dispatch_claim.token,
+        DispatchResult(status="accepted", dispatch_ref="temporal:driver-lock"),
+    )
+    assert harness.authority.release(seed_lease.writer_token).status == "released"
+    driver_ready = threading.Event()
+    allow_driver = threading.Event()
+    adapter = _SlowCountingAdapter(delay_s=0)
+    build_loop = _loop_factory(tmp_path, spec, adapter)
+
+    def gated_loop_factory(
+        command: ActivationCommand,
+        runtime: ActivationRuntime,
+    ) -> AgentLoop:
+        driver_ready.set()
+        assert allow_driver.wait(2)
+        return build_loop(command, runtime)
+
+    timed_database = PostgresDatabase(
+        PostgresConfig(
+            dsn=harness.database.config.dsn,
+            schema=harness.database.config.schema,
+            min_pool_size=0,
+            max_pool_size=4,
+            pool_timeout_s=1,
+            lock_timeout_s=0.05,
+            statement_timeout_s=1,
+            application_name="monoid-pr10-bounded-driver-test",
+        )
+    )
+    timed_database.open()
+    timed_sink = PostgresFencedRunSink(timed_database)
+    timed_sink.check_ready()
+    activation = TemporalActivationActivity(
+        authority_store=harness.authority,
+        admission_store=harness.admission,
+        run_sink=timed_sink,
+        loop_factory=gated_loop_factory,
+        policy=TemporalActivityPolicy(
+            writer_lease_ttl_s=2,
+            writer_lease_renew_interval_s=0.4,
+            heartbeat_interval_s=0.05,
+            authority_call_timeout_s=1,
+            driver_call_timeout_s=2,
+            supervisor_join_timeout_s=0.2,
+            local_task_wait_s=1,
+        ),
+    )
+    outcome: list[object] = []
+
+    def run_activity() -> None:
+        try:
+            environment = ActivityEnvironment()
+            environment.info = environment.info.__class__(
+                **{
+                    **environment.info.__dict__,
+                    "start_to_close_timeout": timedelta(seconds=5),
+                }
+            )
+            outcome.append(environment.run(activation.run, admitted.to_json()))
+        except BaseException as exc:
+            outcome.append(exc)
+
+    activity_thread = threading.Thread(target=run_activity)
+    activity_thread.start()
+    try:
+        assert driver_ready.wait(2)
+        with harness.database.connection() as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        sql.SQL("SELECT run_id FROM {} WHERE run_id = %s FOR UPDATE").format(
+                            sql.Identifier(harness.database.config.schema, "run_authority")
+                        ),
+                        (run_id,),
+                    )
+                    assert cursor.fetchone() == (run_id,)
+                started = time.monotonic()
+                allow_driver.set()
+                activity_thread.join(0.7)
+                elapsed = time.monotonic() - started
+                assert not activity_thread.is_alive()
+                assert elapsed < 0.7
+                assert len(outcome) == 1
+                assert isinstance(outcome[0], ApplicationError)
+                assert outcome[0].type == "monoid.activation_lease_lost"
+                assert outcome[0].non_retryable is False
+    finally:
+        allow_driver.set()
+        activity_thread.join(2)
+        timed_database.close()
+
+    deadline = time.monotonic() + 2
+    authority = harness.authority.read(run_id)
+    while authority is not None and not authority.revoked and time.monotonic() < deadline:
+        time.sleep(0.01)
+        authority = harness.authority.read(run_id)
+    assert authority is not None and authority.revoked is True and authority.active is False
+    loaded = harness.sink.latest_checked(run_id)
+    assert loaded.value is not None and loaded.value.checkpoint.seq == 1
 
 
 def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
@@ -688,6 +810,7 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
                         writer_lease_renew_interval_s=0.4,
                         heartbeat_interval_s=0.2,
                         authority_call_timeout_s=2,
+                        driver_call_timeout_s=20,
                         supervisor_join_timeout_s=2,
                         local_task_wait_s=5,
                     ),
@@ -774,6 +897,7 @@ def test_worker_shutdown_during_paid_call_commits_reconciliation_receipt(
                     writer_lease_renew_interval_s=0.4,
                     heartbeat_interval_s=0.2,
                     authority_call_timeout_s=2,
+                    driver_call_timeout_s=20,
                     supervisor_join_timeout_s=2,
                     local_task_wait_s=5,
                 ),
@@ -885,6 +1009,7 @@ def test_worker_shutdown_before_provider_entry_commits_graceful_drain_receipt(
                     writer_lease_renew_interval_s=0.4,
                     heartbeat_interval_s=0.2,
                     authority_call_timeout_s=2,
+                    driver_call_timeout_s=20,
                     supervisor_join_timeout_s=2,
                     local_task_wait_s=5,
                 ),

@@ -155,6 +155,11 @@ and its dispatch outbox row in a single transaction. The caller supplies a stabl
 request digest, and opaque private payload address. An exact retry returns the current receipt;
 reusing the ID for a different request raises `AdmissionConflict`.
 
+`PostgresConfig.lock_timeout_s` and `statement_timeout_s` apply transaction-local PostgreSQL
+limits to every adapter operation. Their defaults are 30 and 300 seconds. Set both below the host's
+outer operation timeout so a database lock or statement aborts before it can retain a worker slot.
+`pool_timeout_s` independently bounds connection-pool acquisition.
+
 ```python
 from monoid_agent_kernel.adapters.postgres import PostgresCommandAdmissionStore
 from monoid_agent_kernel.hosting import AdmissionRequest, CommandOutboxDispatcher
@@ -278,6 +283,7 @@ activation = TemporalActivationActivity(
         writer_lease_renew_interval_s=10,
         heartbeat_interval_s=5,
         authority_call_timeout_s=30,
+        driver_call_timeout_s=3300,
         supervisor_join_timeout_s=30,
         local_task_wait_s=300,
     ),
@@ -317,19 +323,27 @@ propagation uses the exact
 `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
 renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
-The control supervisor keeps heartbeating while one bounded cleanup task joins renewal and releases
-the exact writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry returns
-retryable lease loss and leaves any uncooperative cleanup thread daemonized under revoked local
-authority.
+The `ActivationDriver` runs in a copied-context daemon worker. `driver_call_timeout_s` bounds that
+worker and is further capped by the current Activity attempt's remaining start-to-close budget,
+with time reserved for cleanup. Timeout or supervisor loss revokes local write authority, cancels
+the exact activation token, ignores a late driver result, and returns the Temporal Activity
+executor slot. Configure PostgreSQL lock and statement timeouts below this driver bound so an
+in-flight fenced mutation aborts inside the database first. The control supervisor keeps
+heartbeating while one bounded cleanup task joins driver and renewal work and releases the exact
+writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry returns retryable
+lease loss and leaves any uncooperative cleanup thread daemonized under revoked local authority.
 A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
 an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
 observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.
 A writer fence observed during activation binding is retryable lease loss. A deterministic loop
 wiring violation is a non-retryable configuration conflict.
 
-Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`, and keep
-`authority_call_timeout_s` below its `activity_start_to_close_timeout_s`. The Activity policy
-requires the writer lease TTL to cover at least two renewal intervals. Give
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. Keep
+`authority_call_timeout_s`, `driver_call_timeout_s`, and the cleanup reserve within its
+`activity_start_to_close_timeout_s`; runtime caps the driver to the actual remaining attempt
+budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and `statement_timeout_s` below the
+relevant Activity bound. The Activity policy requires the writer lease TTL to cover at least two
+renewal intervals. Give
 `graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
 composition requires this timeout to cover the configured heartbeat interval, authority call
 timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set

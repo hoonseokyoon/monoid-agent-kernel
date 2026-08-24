@@ -60,6 +60,9 @@ default must be changed for production.
       `--auto-grant-capabilities` is **not** used in production.
 - [ ] Each run selects exactly one activation authority and proves fencing, per-run input ordering,
       idempotent receipts, admission limits, and credential-free durable records.
+- [ ] PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and `statement_timeout_s` are below the
+      corresponding host or Temporal Activity operation bound. Temporal driver work leaves a
+      cleanup reserve inside `activity_start_to_close_timeout_s`.
 - [ ] Deployments derived from the Reference inbox assembly share durable checkpoint and lease
       stores plus one transactional command store across instances, enable owner watchdogs, set
       queue limits, isolate run roots and database access by tenant, and monitor persisted command

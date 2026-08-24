@@ -10,6 +10,7 @@ import hashlib
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -112,6 +113,7 @@ class TemporalActivityPolicy:
     writer_lease_renew_interval_s: float = 10.0
     heartbeat_interval_s: float = 5.0
     authority_call_timeout_s: float = 30.0
+    driver_call_timeout_s: float = 3_300.0
     supervisor_join_timeout_s: float = 30.0
     local_task_wait_s: float = 300.0
     worker_shutdown_cause: InterruptionCause = InterruptionCause.GRACEFUL_DRAIN
@@ -124,6 +126,7 @@ class TemporalActivityPolicy:
         )
         _require_duration(self.heartbeat_interval_s, "Temporal heartbeat interval")
         _require_duration(self.authority_call_timeout_s, "writer authority call timeout")
+        _require_duration(self.driver_call_timeout_s, "activation driver call timeout")
         _require_duration(self.supervisor_join_timeout_s, "lease supervisor join timeout")
         _require_duration(self.local_task_wait_s, "activation local task wait")
         if renew * 2 > ttl:
@@ -180,6 +183,7 @@ class _TemporalLeaseSupervisor:
         self._failure = threading.Event()
         self._control_thread: threading.Thread | None = None
         self._renewal_thread: threading.Thread | None = None
+        self._driver_thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._control_thread is not None:
@@ -325,6 +329,64 @@ class _TemporalLeaseSupervisor:
             raise TypeError("activation bootstrap returned an invalid activation")
         return result
 
+    def drive(self, operation: Callable[[], Any], *, timeout_s: float) -> Any:
+        if not callable(operation):
+            raise TypeError("lease supervisor driver operation must be callable")
+        timeout = _require_duration(timeout_s, "activation driver attempt timeout")
+        if self._driver_thread is not None:
+            raise RuntimeError("lease supervisor can drive only one activation")
+        completed = threading.Event()
+        abandoned = threading.Event()
+        state_lock = threading.Lock()
+        outcome: list[Any | BaseException] = []
+
+        def publish(result: Any | BaseException) -> bool:
+            with state_lock:
+                if abandoned.is_set():
+                    return False
+                outcome.append(result)
+                completed.set()
+                return True
+
+        def run_driver() -> None:
+            try:
+                publish(operation())
+            except BaseException as exc:
+                publish(exc)
+            finally:
+                completed.set()
+
+        driver_context = contextvars.copy_context()
+        self._driver_thread = threading.Thread(
+            target=driver_context.run,
+            args=(run_driver,),
+            name="monoid-temporal-activation-driver",
+            daemon=True,
+        )
+        self._driver_thread.start()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if completed.wait(max(0.0, min(0.05, remaining))):
+                break
+            if self._failure.is_set() or remaining <= 0:
+                with state_lock:
+                    if completed.is_set():
+                        continue
+                    abandoned.set()
+                self._fail()
+                raise _SupervisorUnhealthy("Temporal activation driver timed out or lost control")
+        if len(outcome) != 1:
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation driver produced no result")
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            if isinstance(result, Exception):
+                raise result
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation driver failed")
+        return result
+
     def cleanup(self, lease: WriterLease | None) -> ReleaseResult | None:
         if lease is not None and not isinstance(lease, WriterLease):
             raise TypeError("lease supervisor cleanup requires WriterLease or None")
@@ -334,6 +396,9 @@ class _TemporalLeaseSupervisor:
         def run_cleanup() -> None:
             try:
                 self._renewal_stop.set()
+                driver_thread = self._driver_thread
+                if driver_thread is not None:
+                    driver_thread.join()
                 renewal_thread = self._renewal_thread
                 if renewal_thread is not None:
                     renewal_thread.join()
@@ -480,6 +545,33 @@ class _TemporalLeaseSupervisor:
             self._fail()
 
 
+def _driver_attempt_timeout(
+    info: Any,
+    *,
+    attempt_started_monotonic: float,
+    policy: TemporalActivityPolicy,
+) -> float:
+    """Cap driver work below this Activity attempt's remaining start-to-close budget."""
+
+    configured = float(policy.driver_call_timeout_s)
+    start_to_close = getattr(info, "start_to_close_timeout", None)
+    if start_to_close is None:
+        return configured
+    if not isinstance(start_to_close, timedelta):
+        raise _SupervisorUnhealthy("Temporal Activity start-to-close timeout is invalid")
+    remaining = start_to_close.total_seconds() - (time.monotonic() - attempt_started_monotonic)
+    if remaining <= 0.002:
+        raise _SupervisorUnhealthy("Temporal Activity has no driver execution budget")
+    cleanup_reserve = min(
+        float(policy.supervisor_join_timeout_s),
+        remaining / 2,
+    )
+    timeout = min(configured, remaining - cleanup_reserve)
+    if timeout < 0.001:
+        raise _SupervisorUnhealthy("Temporal Activity has no bounded driver execution budget")
+    return timeout
+
+
 def _application_error(exc: Exception) -> ApplicationError:
     if isinstance(exc, WriterLeaseUnavailable):
         retry_delay_s = min(
@@ -557,6 +649,7 @@ class TemporalActivationActivity:
         no_thread_cancel_exception=True,
     )
     def run(self, payload: dict[str, Any]) -> dict[str, object]:
+        attempt_started_monotonic = time.monotonic()
         try:
             command = AdmittedCommand.from_json(payload)
         except (TypeError, ValueError, OverflowError, RecursionError):
@@ -602,7 +695,7 @@ class TemporalActivationActivity:
                 cancellation_token.cancel(InterruptionCause.USER_CANCEL)
             if activity.is_worker_shutdown():
                 cancellation_token.cancel(self.policy.worker_shutdown_cause)
-            receipt = ActivationDriver(
+            driver = ActivationDriver(
                 sink=self.run_sink,
                 writer_token=lease.writer_token,
                 loop_factory=self.loop_factory,
@@ -610,7 +703,15 @@ class TemporalActivationActivity:
                 write_authority=write_authority,
                 cancellation_token=cancellation_token,
                 local_task_wait_s=float(self.policy.local_task_wait_s),
-            ).drive(bootstrap.activation)
+            )
+            receipt = supervisor.drive(
+                lambda: driver.drive(bootstrap.activation),
+                timeout_s=_driver_attempt_timeout(
+                    info,
+                    attempt_started_monotonic=attempt_started_monotonic,
+                    policy=self.policy,
+                ),
+            )
             supervisor.assert_healthy()
             write_authority.assert_active()
             result = TemporalActivationResult.from_command(

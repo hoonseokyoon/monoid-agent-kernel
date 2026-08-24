@@ -190,6 +190,7 @@ def _activity(
             writer_lease_renew_interval_s=0.02,
             heartbeat_interval_s=0.01,
             authority_call_timeout_s=1,
+            driver_call_timeout_s=1,
             supervisor_join_timeout_s=1,
             local_task_wait_s=1,
         ),
@@ -198,11 +199,13 @@ def _activity(
 
 def test_temporal_activity_policy_has_fail_safe_bounds() -> None:
     assert TemporalActivityPolicy().writer_lease_ttl == timedelta(seconds=30)
+    assert TemporalActivityPolicy().driver_call_timeout_s == 3_300
     for changes in (
         {"writer_lease_ttl_s": 0.5},
         {"writer_lease_ttl_s": 10, "writer_lease_renew_interval_s": 6},
         {"heartbeat_interval_s": 0},
         {"authority_call_timeout_s": 0},
+        {"driver_call_timeout_s": 0},
         {"supervisor_join_timeout_s": float("nan")},
         {"local_task_wait_s": MAX_TEMPORAL_ACTIVITY_LOCAL_DURATION_S + 1},
         {"writer_lease_ttl_s": True},
@@ -210,6 +213,28 @@ def test_temporal_activity_policy_has_fail_safe_bounds() -> None:
     ):
         with pytest.raises(ValueError):
             TemporalActivityPolicy(**changes)  # type: ignore[arg-type]
+
+
+def test_driver_attempt_timeout_reserves_cleanup_inside_temporal_deadline() -> None:
+    policy = TemporalActivityPolicy(
+        driver_call_timeout_s=20,
+        supervisor_join_timeout_s=2,
+    )
+    timeout = activity_module._driver_attempt_timeout(
+        SimpleNamespace(start_to_close_timeout=timedelta(seconds=10)),
+        attempt_started_monotonic=time.monotonic() - 3,
+        policy=policy,
+    )
+
+    assert 4.9 < timeout < 5.1
+    assert (
+        activity_module._driver_attempt_timeout(
+            SimpleNamespace(start_to_close_timeout=None),
+            attempt_started_monotonic=time.monotonic(),
+            policy=policy,
+        )
+        == 20
+    )
 
 
 def test_temporal_activity_repr_excludes_host_dependencies() -> None:
@@ -447,6 +472,52 @@ def test_activation_binding_timeout_returns_the_activity_executor_and_releases_a
         allow_binding.set()
         binding_timer.cancel()
         binding_timer.join()
+        assert store.released.wait(1)
+    assert store.release_count == 1
+
+
+def test_driver_timeout_returns_the_activity_executor_and_releases_late_authority() -> None:
+    driver_started = threading.Event()
+    allow_driver = threading.Event()
+
+    def block_driver(kwargs: dict[str, Any]) -> object:
+        driver_started.set()
+        assert allow_driver.wait(1)
+        assert kwargs["write_authority"].revoked is True
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    _DriverDouble.behavior = block_driver
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=1,
+        driver_call_timeout_s=0.05,
+        supervisor_join_timeout_s=0.1,
+        local_task_wait_s=1,
+    )
+    store = _AuthorityStore()
+    driver_timer = threading.Timer(0.4, allow_driver.set)
+    driver_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            ActivityEnvironment().run(
+                _activity(store, policy=policy).run,
+                _command().to_json(),
+            )
+        elapsed = time.monotonic() - started
+        assert raised.value.type == "monoid.activation_lease_lost"
+        assert raised.value.non_retryable is False
+        assert driver_started.is_set()
+        assert elapsed < 0.3
+    finally:
+        allow_driver.set()
+        driver_timer.cancel()
+        driver_timer.join()
         assert store.released.wait(1)
     assert store.release_count == 1
 
