@@ -428,7 +428,15 @@ class _TemporalLeaseSupervisor:
 
     def _run_renewal(self) -> None:
         renew_interval = float(self._policy.writer_lease_renew_interval_s)
-        next_renew = time.monotonic() + renew_interval
+        _, installed_deadline = self._lease_snapshot()
+        if installed_deadline is None:
+            self._fail()
+            return
+        now = time.monotonic()
+        next_renew = max(
+            now,
+            min(now + renew_interval, installed_deadline - renew_interval),
+        )
         try:
             while True:
                 if self._renewal_stop.wait(max(0.0, next_renew - time.monotonic())):

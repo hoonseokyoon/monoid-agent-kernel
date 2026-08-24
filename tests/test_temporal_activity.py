@@ -451,6 +451,53 @@ def test_activation_binding_timeout_returns_the_activity_executor_and_releases_a
     assert store.release_count == 1
 
 
+def test_slow_activation_binding_renews_from_the_remaining_lease_deadline() -> None:
+    class SlowAdmissionStore(_AdmissionStore):
+        def bind_activation(
+            self,
+            command: AdmittedCommand,
+            *,
+            writer_token: WriterToken,
+        ) -> ActivationCommand:
+            time.sleep(0.07)
+            return super().bind_activation(command, writer_token=writer_token)
+
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.04,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=1,
+        supervisor_join_timeout_s=1,
+        local_task_wait_s=1,
+    )
+    store = _AuthorityStore(lease_interval_s=0.1)
+
+    def wait_for_immediate_renewal(kwargs: dict[str, Any]) -> object:
+        del kwargs
+        deadline = time.monotonic() + 0.2
+        while store.renew_count < 2 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert store.renew_count >= 2
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    _DriverDouble.behavior = wait_for_immediate_renewal
+    raw = ActivityEnvironment().run(
+        _activity(
+            store,
+            admission_store=SlowAdmissionStore(),
+            policy=policy,
+        ).run,
+        _command().to_json(),
+    )
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert store.renew_count >= 2
+    assert store.release_count == 1
+
+
 def test_activity_heartbeats_while_writer_renewal_is_blocked() -> None:
     renewal_blocked = threading.Event()
     heartbeat_during_renewal = threading.Event()

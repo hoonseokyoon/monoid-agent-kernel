@@ -311,7 +311,9 @@ evidence. Claim, initial exact-token renewal, and durable activation binding run
 daemon bootstrap worker, so a stuck database lock cannot retain the Temporal Activity executor
 slot. A timed-out bootstrap cannot enter the driver and releases a late exact token. An independent
 renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
-deadline enforcement. Control propagation uses the exact
+deadline enforcement. Its first renewal is scheduled from the installed lease's remaining
+monotonic budget and runs immediately when bootstrap consumed the normal safety margin. Control
+propagation uses the exact
 `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
 renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
