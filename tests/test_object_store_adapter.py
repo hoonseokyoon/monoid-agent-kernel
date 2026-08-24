@@ -45,13 +45,13 @@ class _FakeS3:
         self.upload_part_calls = 0
         self.complete_calls = 0
         self.abort_calls = 0
+        self.last_body: BytesIO | None = None
 
     @staticmethod
     def _location(kwargs: dict[str, Any]) -> tuple[str, str]:
         return kwargs["Bucket"], kwargs["Key"]
 
-    @staticmethod
-    def _response(value: dict[str, Any], *, body: bool = False) -> dict[str, Any]:
+    def _response(self, value: dict[str, Any], *, body: bool = False) -> dict[str, Any]:
         response = {
             "ContentLength": len(value["data"]),
             "Metadata": dict(value["metadata"]),
@@ -59,7 +59,8 @@ class _FakeS3:
             "ChecksumType": value["checksum_type"],
         }
         if body:
-            response["Body"] = BytesIO(value["data"])
+            self.last_body = BytesIO(value["data"])
+            response["Body"] = self.last_body
         return response
 
     def head_object(self, **kwargs: Any) -> dict[str, Any]:
@@ -343,6 +344,9 @@ def test_checked_read_classifies_missing_metadata_size_checksum_and_body_corrupt
     client.objects[location]["metadata"]["monoid-size"] = "999"
     with pytest.raises(BlobCorrupt, match="metadata"):
         store.stat(sha256)
+    with pytest.raises(BlobCorrupt, match="metadata"):
+        store.get_checked(sha256)
+    assert client.last_body is not None and client.last_body.closed
     client.objects[location]["metadata"]["monoid-size"] = str(len(data))
 
     client.objects[location]["checksum"] = "wrong"

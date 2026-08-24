@@ -263,14 +263,17 @@ class S3ContentAddressedBlobStore:
             if _is_missing(exc):
                 raise BlobNotFound("S3 content address was not found") from None
             self._raise_failure("get_object", exc)
-        stat = self._stat_from_response(sha256, response)
         body = response.get("Body") if isinstance(response, Mapping) else None
-        if body is None or not callable(getattr(body, "read", None)):
+        if body is None:
             raise BlobCorrupt("S3 checked read response has no byte stream")
         try:
-            data = body.read(self.config.max_object_bytes + 1)
-        except Exception as exc:
-            self._raise_failure("get_object body read", exc)
+            if not callable(getattr(body, "read", None)):
+                raise BlobCorrupt("S3 checked read response has no byte stream")
+            stat = self._stat_from_response(sha256, response)
+            try:
+                data = body.read(self.config.max_object_bytes + 1)
+            except Exception as exc:
+                self._raise_failure("get_object body read", exc)
         finally:
             close = getattr(body, "close", None)
             if callable(close):
