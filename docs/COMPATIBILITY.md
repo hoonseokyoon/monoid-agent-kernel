@@ -111,6 +111,9 @@ terminal commit cannot make a later receipt regress to an earlier lifecycle stat
 `MAX_COMMAND_RETRY_DELAY_S` defines the portable store range at 86,400 seconds. The finite
 dispatcher clamps larger retry-policy values before durable settlement, and dispatch-store adapters
 accept every finite delay in the inclusive range from zero through that maximum.
+`MAX_COMMAND_DISPATCH_LEASE_S` defines the matching portable lease maximum. Dispatchers validate
+their lease once at construction, and stores accept every finite lease in the interval
+`(0, MAX_COMMAND_DISPATCH_LEASE_S]`.
 
 `monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
 or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded

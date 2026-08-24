@@ -40,6 +40,7 @@ ADMITTED_COMMAND_SCHEMA_VERSION = namespaced_id("admitted-command.v1")
 ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS = accepted_namespaced_ids("admitted-command.v1")
 ADMISSION_RECEIPT_SCHEMA_VERSION = namespaced_id("admission-receipt.v1")
 ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS = accepted_namespaced_ids("admission-receipt.v1")
+MAX_COMMAND_DISPATCH_LEASE_S = 86_400.0
 MAX_COMMAND_RETRY_DELAY_S = 86_400.0
 
 AdmissionState = Literal[
@@ -69,6 +70,17 @@ def _bounded_retry_delay_s(value: object) -> float:
             )
         return min(value, MAX_COMMAND_RETRY_DELAY_S)
     raise ValueError("command dispatcher retry delay must be a non-negative finite number")
+
+
+def _validated_dispatch_lease_s(value: object) -> float:
+    valid = False
+    if type(value) is int:
+        valid = 0 < value <= MAX_COMMAND_DISPATCH_LEASE_S
+    elif type(value) is float:
+        valid = math.isfinite(value) and 0 < value <= MAX_COMMAND_DISPATCH_LEASE_S
+    if not valid:
+        raise ValueError("command dispatcher lease_s must be in the range (0, 86400]")
+    return float(value)
 
 _REQUEST_FIELDS = frozenset(
     {
@@ -531,7 +543,7 @@ class CommandAdmissionStore(Protocol):
 
 @runtime_checkable
 class CommandDispatchStore(Protocol):
-    """Durable dispatch store accepting retry delays through the portable maximum."""
+    """Durable store accepting portable dispatch leases and retry delays."""
 
     def claim_dispatch(
         self,
@@ -585,8 +597,7 @@ class CommandOutboxDispatcher:
             raise TypeError("command dispatcher transport does not satisfy CommandTransport")
         if not is_safe_opaque_id(self.owner_id):
             raise ValueError("command dispatcher owner_id must be a bounded opaque id")
-        if not math.isfinite(self.lease_s) or self.lease_s <= 0:
-            raise ValueError("command dispatcher lease_s must be positive")
+        self.lease_s = _validated_dispatch_lease_s(self.lease_s)
         if not callable(self.retry_delay_s) or not callable(self.claim_id_factory):
             raise TypeError("command dispatcher factories must be callable")
 
@@ -626,6 +637,7 @@ __all__ = [
     "ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS",
     "ADMISSION_RECEIPT_SCHEMA_VERSION",
     "ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS",
+    "MAX_COMMAND_DISPATCH_LEASE_S",
     "MAX_COMMAND_RETRY_DELAY_S",
     "AdmissionState",
     "DispatchStatus",

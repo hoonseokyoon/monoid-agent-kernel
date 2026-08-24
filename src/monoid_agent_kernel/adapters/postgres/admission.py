@@ -37,6 +37,7 @@ from monoid_agent_kernel.hosting.admission import (
     DispatchClaimLost,
     DispatchResult,
     DispatchToken,
+    MAX_COMMAND_DISPATCH_LEASE_S,
     MAX_COMMAND_RETRY_DELAY_S,
 )
 from monoid_agent_kernel.hosting.contracts import WriterToken
@@ -626,7 +627,7 @@ class PostgresCommandAdmissionStore:
             type(lease_s) not in {int, float}
             or isinstance(lease_s, bool)
             or not math.isfinite(float(lease_s))
-            or not 0 < float(lease_s) <= 86_400
+            or not 0 < float(lease_s) <= MAX_COMMAND_DISPATCH_LEASE_S
         ):
             raise ValueError("dispatch lease_s must be in the range (0, 86400]")
         from psycopg import sql

@@ -21,6 +21,7 @@ from monoid_agent_kernel.hosting.admission import (
     DispatchClaim,
     DispatchResult,
     DispatchToken,
+    MAX_COMMAND_DISPATCH_LEASE_S,
     MAX_COMMAND_RETRY_DELAY_S,
 )
 from monoid_agent_kernel.hosting.contracts import WriterToken
@@ -348,6 +349,49 @@ def test_dispatcher_caps_retry_delay_before_store_settlement(delay_s: float | in
     operation, payload = store.operations[-1]
     assert operation == "retry"
     assert isinstance(payload, tuple) and payload[2] == MAX_COMMAND_RETRY_DELAY_S
+
+
+def test_dispatcher_accepts_the_portable_maximum_lease() -> None:
+    command = _command()
+    store = _FakeDispatchStore(command, claim_available=False)
+    dispatcher = CommandOutboxDispatcher(
+        store=store,
+        transport=_FakeTransport(
+            DispatchResult(status="accepted", dispatch_ref="temporal:workflow-1")
+        ),
+        owner_id="worker-1",
+        lease_s=MAX_COMMAND_DISPATCH_LEASE_S,
+        claim_id_factory=lambda: "claim-1",
+    )
+
+    assert dispatcher.dispatch_once() is None
+    assert store.operations == [
+        (
+            "claim",
+            ("worker-1", "claim-1", MAX_COMMAND_DISPATCH_LEASE_S),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "lease_s",
+    (0, MAX_COMMAND_DISPATCH_LEASE_S + 1, True, float("nan"), 10**1000, "30"),
+)
+def test_dispatcher_rejects_lease_outside_the_portable_range(lease_s: object) -> None:
+    store = _FakeDispatchStore(_command())
+
+    with pytest.raises(ValueError, match="lease_s"):
+        CommandOutboxDispatcher(
+            store=store,
+            transport=_FakeTransport(
+                DispatchResult(status="accepted", dispatch_ref="temporal:workflow-1")
+            ),
+            owner_id="worker-1",
+            lease_s=lease_s,  # type: ignore[arg-type]
+            claim_id_factory=lambda: "claim-1",
+        )
+
+    assert store.operations == []
 
 
 def test_dispatcher_sanitizes_transport_exception_and_invalid_result() -> None:

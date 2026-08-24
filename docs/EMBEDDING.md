@@ -160,6 +160,7 @@ from monoid_agent_kernel.adapters.postgres import PostgresCommandAdmissionStore
 from monoid_agent_kernel.hosting import AdmissionRequest, CommandOutboxDispatcher
 
 admission = PostgresCommandAdmissionStore(postgres_database)
+admission.check_ready()
 receipt = admission.admit(
     AdmissionRequest(
         run_id=run_id,
@@ -181,9 +182,10 @@ dispatcher.dispatch_once()
 shutdown, credentials, and health reporting. Dispatch uses database-clock leases and preserves
 per-run command order across competing workers. Delivery is at least once: the transport deduplicates
 `AdmittedCommand.identity_sha256`, and the activation path applies the immutable command identity
-once. Retry policies return a finite non-negative delay; the dispatcher caps it at the portable
-`MAX_COMMAND_RETRY_DELAY_S` value of 86,400 seconds before store settlement. A rejected command
-enters `dead_letter` and blocks later commands in that run until an operator
+once. `lease_s` must be in the portable `(0, MAX_COMMAND_DISPATCH_LEASE_S]` range, whose maximum is
+86,400 seconds. Retry policies return a finite non-negative delay; the dispatcher caps it at the
+portable `MAX_COMMAND_RETRY_DELAY_S` value of 86,400 seconds before store settlement. A rejected
+command enters `dead_letter` and blocks later commands in that run until an operator
 resolves the lane. A canonical terminal winner excludes that run from new claims. Unbound pending,
 leased, or delivered commands converge to `run_terminal` without another transport call. Active
 claim finalization and settlement share the run-authority lock with terminal selection, so commit

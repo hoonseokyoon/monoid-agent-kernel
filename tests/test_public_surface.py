@@ -439,6 +439,7 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS",
         "ADMISSION_RECEIPT_SCHEMA_VERSION",
         "ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS",
+        "MAX_COMMAND_DISPATCH_LEASE_S",
         "MAX_COMMAND_RETRY_DELAY_S",
         "AdmissionState",
         "DispatchStatus",

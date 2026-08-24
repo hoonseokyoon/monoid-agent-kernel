@@ -54,6 +54,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     CommandOutboxDispatcher,
     DispatchClaimLost,
     DispatchResult,
+    MAX_COMMAND_DISPATCH_LEASE_S,
     MAX_COMMAND_RETRY_DELAY_S,
     WriterToken,
 )
@@ -714,6 +715,7 @@ def test_dispatcher_caps_retry_delay_before_postgres_settlement(
             lambda admitted: DispatchResult(status="retry", error_code="transport_busy")
         ),
         owner_id="dispatcher-1",
+        lease_s=MAX_COMMAND_DISPATCH_LEASE_S,
         retry_delay_s=lambda attempt: MAX_COMMAND_RETRY_DELAY_S + 10_000,
         claim_id_factory=lambda: "claim-1",
     )
