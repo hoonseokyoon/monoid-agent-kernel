@@ -35,6 +35,13 @@ def test_campaign_lock_and_tracked_service_artifacts_are_consistent() -> None:
     assert temporal_archive["embedded_server"] == "1.31.2"
     assert len(temporal_archive["sha256"]) == 64
     assert temporal_archive["filename"].endswith(".tar.gz")
+    qualification = module.validate_qualification_manifest()
+    assert set(qualification["categories"]) == module._QUALIFICATION_CATEGORIES
+    assert (
+        "tests/service/test_temporal_postgres_activity_service.py::"
+        "test_actual_temporal_postgres_objectstore_stream_path_is_content_private"
+        in qualification["categories"]["operations_privacy_combined"]
+    )
 
 
 def test_temporal_cli_preparation_rejects_a_corrupt_cached_archive(tmp_path: Path) -> None:
@@ -240,6 +247,9 @@ def test_ci_helper_writes_public_safe_evidence(tmp_path: Path) -> None:
     evidence = json.loads(output.read_text(encoding="utf-8"))
     assert evidence["head_sha"] == "a" * 40
     assert evidence["merge_sha"] == "b" * 40
+    assert evidence["qualification"]["path"] == "tests/service/qualification-v023.json"
+    assert len(evidence["qualification"]["sha256"]) == 64
+    assert evidence["qualification"]["required_tests"]["paid_call_crash_matrix"]
     serialized = output.read_text(encoding="utf-8").lower()
     assert "password" not in serialized
     assert "secret" not in serialized

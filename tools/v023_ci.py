@@ -19,6 +19,7 @@ from typing import Any, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "tests/service/campaign-lock.json"
+QUALIFICATION_PATH = ROOT / "tests/service/qualification-v023.json"
 COMPOSE_PATH = ROOT / "tests/service/compose.yml"
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 ALLOWED_PROFILES = frozenset({"core", "postgres", "objectstore", "temporal", "combined"})
@@ -36,6 +37,18 @@ SDK_IMPORT_MODULES = {
     "temporalio": "temporalio",
 }
 MAX_TEMPORAL_ARCHIVE_BYTES = 256 * 1024 * 1024
+_QUALIFICATION_CATEGORIES = frozenset(
+    {
+        "migration_rolling",
+        "postgres_authority_sink",
+        "objectstore_gc",
+        "temporal_workflow",
+        "worker_crash_drain",
+        "paid_call_crash_matrix",
+        "durable_stream",
+        "operations_privacy_combined",
+    }
+)
 
 
 def _load_lock() -> dict[str, Any]:
@@ -48,6 +61,41 @@ def _load_lock() -> dict[str, Any]:
 def _lock_digest(lock: dict[str, Any]) -> str:
     canonical = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_qualification_manifest() -> dict[str, Any]:
+    """Bind release claims to concrete tests selected by the full L2 workflows."""
+
+    loaded = json.loads(QUALIFICATION_PATH.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("qualification manifest root must be an object")
+    if loaded.get("schema_version") != 1 or loaded.get("campaign") != "v0.23":
+        raise ValueError("qualification manifest identity is invalid")
+    categories = loaded.get("categories")
+    if not isinstance(categories, dict) or set(categories) != _QUALIFICATION_CATEGORIES:
+        raise ValueError("qualification manifest category set is invalid")
+    seen: set[str] = set()
+    for category, node_ids in categories.items():
+        if not isinstance(node_ids, list) or not node_ids:
+            raise ValueError(f"qualification category is empty: {category}")
+        for node_id in node_ids:
+            if not isinstance(node_id, str) or node_id.count("::") != 1:
+                raise ValueError(f"qualification node id is invalid: {node_id!r}")
+            if node_id in seen:
+                raise ValueError(f"qualification node id is duplicated: {node_id}")
+            seen.add(node_id)
+            relative_path, test_name = node_id.split("::", 1)
+            path = ROOT / relative_path
+            if (
+                not path.is_relative_to(ROOT / "tests")
+                or not path.is_file()
+                or re.fullmatch(r"test_[A-Za-z0-9_]+", test_name) is None
+            ):
+                raise ValueError(f"qualification node target is invalid: {node_id}")
+            source = path.read_text(encoding="utf-8")
+            if re.search(rf"^def {re.escape(test_name)}\(", source, re.MULTILINE) is None:
+                raise ValueError(f"qualification test function is missing: {node_id}")
+    return loaded
 
 
 def validate_lock() -> dict[str, Any]:
@@ -121,6 +169,7 @@ def validate_lock() -> dict[str, Any]:
         raise ValueError("PR profile matrix must cover PR 01 through PR 13")
     if any(profile not in ALLOWED_PROFILES for profile in profiles.values()):
         raise ValueError("PR profile matrix contains an unknown profile")
+    validate_qualification_manifest()
     return lock
 
 
@@ -432,6 +481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(values, sort_keys=True))
         return 0
     if arguments.command == "write-evidence":
+        qualification = validate_qualification_manifest()
         evidence = {
             "schema_version": 1,
             "campaign": "v0.23",
@@ -443,6 +493,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 name: entry["exact"] for name, entry in lock["python_dependencies"].items()
             },
             "services": lock["services"],
+            "qualification": {
+                "path": QUALIFICATION_PATH.relative_to(ROOT).as_posix(),
+                "sha256": _sha256_file(QUALIFICATION_PATH),
+                "required_tests": qualification["categories"],
+            },
         }
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(

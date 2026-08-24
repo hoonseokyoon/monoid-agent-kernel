@@ -23,17 +23,27 @@ pytestmark = [pytest.mark.integration, pytest.mark.serial, pytest.mark.service, 
 if os.environ.get("MONOID_SERVICE_PROFILE") != "combined":
     pytest.skip("combined PostgreSQL and Temporal profile is not selected", allow_module_level=True)
 
+import boto3  # noqa: E402
+from botocore import config as botocore_config  # noqa: E402
 from psycopg import sql  # noqa: E402
 from temporalio.exceptions import ApplicationError  # noqa: E402
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
+from monoid_agent_kernel.adapters.object_store import (  # noqa: E402
+    S3ContentAddressedBlobStore,
+    S3ObjectStoreConfig,
+    S3ObjectStoreAdmin,
+)
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresCommandAdmissionStore,
     PostgresConfig,
     PostgresDatabase,
     PostgresFencedRunSink,
     PostgresMigrations,
+    PostgresObjectStoreDurableStreamStore,
+    PostgresObjectStoreFencedRunSink,
+    PostgresOperations,
     PostgresWriterAuthorityStore,
 )
 from monoid_agent_kernel.adapters.temporal import (  # noqa: E402
@@ -59,13 +69,20 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationRuntime,
     AdmissionRequest,
     DispatchResult,
+    DurableModelStreamObserver,
+    DurableStreamIdentity,
     ReleaseResult,
     RenewResult,
     WriterLease,
     WriterToken,
 )
 from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers.base import (  # noqa: E402
+    ModelRequest,
+    ModelTurn,
+    TextDelta,
+    TurnComplete,
+)
 from support.runtime import runtime_config, runtime_provider  # noqa: E402
 
 
@@ -118,6 +135,24 @@ class _BlockingAdapter:
         self.started.set()
         assert self.release.wait(30)
         return ModelTurn(final_text="private result released after worker drain")
+
+
+@dataclass
+class _StreamingCountingAdapter:
+    calls: int = 0
+    one_shot_calls: int = 0
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+        del request
+        self.calls += 1
+        yield TextDelta("private combined ")
+        yield TextDelta("streamed result")
+        yield TurnComplete(response_id="combined-stream-response", stop_reason="stop")
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        del request
+        self.one_shot_calls += 1
+        return ModelTurn(final_text="one-shot path must stay unused")
 
 
 @dataclass
@@ -265,6 +300,26 @@ def _prepare_temporal_cli() -> tuple[str, str]:
     return str(artifact["executable"]), str(artifact["embedded_server"])
 
 
+def _s3_client() -> object:
+    endpoint = os.environ.get("MONOID_MINIO_ENDPOINT")
+    if not endpoint:
+        pytest.fail("MONOID_MINIO_ENDPOINT is required for the combined profile")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.environ.get("MONOID_MINIO_ACCESS_KEY"),
+        aws_secret_access_key=os.environ.get("MONOID_MINIO_SECRET_KEY"),
+        region_name="us-east-1",
+        config=botocore_config.Config(
+            signature_version="s3v4",
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 5, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
+    )
+
+
 def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -298,8 +353,27 @@ def _request(run_id: str) -> AdmissionRequest:
     )
 
 
-def _loop_factory(tmp_path: Path, spec: AgentRunSpec, adapter: object):
+def _loop_factory(
+    tmp_path: Path,
+    spec: AgentRunSpec,
+    adapter: object,
+    *,
+    durable_stream_store: object | None = None,
+):
     def build(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
+        observer_factories = ()
+        if durable_stream_store is not None:
+            observer_factories = (
+                lambda: DurableModelStreamObserver(
+                    durable_stream_store,  # type: ignore[arg-type]
+                    writer_token=runtime.writer_token,
+                    write_authority=runtime.write_authority,
+                    chunk_bytes=8,
+                    flush_interval_s=0.01,
+                    max_buffer_bytes=1024,
+                    supervisor_join_timeout_s=5,
+                ),
+            )
         return AgentLoop(
             spec=AgentRunSpec(
                 run_id=command.run_id,
@@ -312,6 +386,7 @@ def _loop_factory(tmp_path: Path, spec: AgentRunSpec, adapter: object):
             writer_token=runtime.writer_token,
             write_authority=runtime.write_authority,
             cancellation_token=runtime.cancellation_token,
+            model_stream_observer_factories=observer_factories,
             authoritative_event_sinks=(runtime.event_sink,),
             event_sequence_seed=runtime.event_sequence_seed,
             async_model_cancel_grace_s=0.1,
@@ -435,6 +510,174 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert authority is not None and authority.revoked is True and authority.active is False
     assert expected_server
     assert "private production activity completion" not in str(receipt.to_json())
+
+
+def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    executable, _ = _prepare_temporal_cli()
+    client = _s3_client()
+    bucket = f"monoid-v023-combined-{uuid.uuid4().hex}"
+    client.create_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    client.put_bucket_versioning(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    config = S3ObjectStoreConfig(
+        bucket=bucket,
+        prefix="combined-stream",
+        endpoint_url=os.environ["MONOID_MINIO_ENDPOINT"],
+        addressing_style="path",
+        max_object_bytes=8 * 1024 * 1024,
+    )
+    object_store = S3ContentAddressedBlobStore(config, client=client)
+    run_sink = PostgresObjectStoreFencedRunSink(harness.database, object_store)
+    streams = PostgresObjectStoreDurableStreamStore(harness.database, object_store)
+    assert run_sink.check_ready().current is True
+    assert streams.check_ready().current is True
+    assert S3ObjectStoreAdmin(config, client=client).doctor().ok is True
+
+    run_id = f"combined-stream-{uuid.uuid4().hex}"
+    seed_lease, spec = harness.seed(tmp_path, run_id)
+    admitted = harness.admission.admit(_request(run_id)).command
+    dispatch_claim = harness.admission.claim_dispatch(
+        "combined-stream-dispatcher",
+        "combined-stream-claim",
+        lease_s=30,
+    )
+    assert dispatch_claim is not None and dispatch_claim.command == admitted
+    assert harness.authority.release(seed_lease.writer_token).status == "released"
+    adapter = _StreamingCountingAdapter()
+
+    async def run() -> tuple[TemporalRunStatus, Any, str]:
+        async with await WorkflowEnvironment.start_local(
+            dev_server_existing_path=executable,
+            dev_server_log_level="warn",
+        ) as environment:
+            workflow_queue = f"workflow-{uuid.uuid4().hex}"
+            activity_queue = f"activity-{uuid.uuid4().hex}"
+            transport = TemporalSignalWithStartTransport(
+                client=environment.client,
+                event_loop=asyncio.get_running_loop(),
+                workflow_task_queue=workflow_queue,
+                run_policy=TemporalRunPolicy(
+                    activity_task_queue=activity_queue,
+                    activity_start_to_close_timeout_s=30,
+                    activity_heartbeat_timeout_s=1,
+                    activity_max_attempts=3,
+                ),
+            )
+            activation = TemporalActivationActivity(
+                authority_store=harness.authority,
+                admission_store=harness.admission,
+                run_sink=run_sink,
+                loop_factory=_loop_factory(
+                    tmp_path,
+                    spec,
+                    adapter,
+                    durable_stream_store=streams,
+                ),
+                policy=TemporalActivityPolicy(
+                    writer_lease_ttl_s=5,
+                    writer_lease_renew_interval_s=0.5,
+                    heartbeat_interval_s=0.2,
+                    authority_call_timeout_s=2,
+                    driver_call_timeout_s=20,
+                    supervisor_join_timeout_s=2,
+                    local_task_wait_s=5,
+                ),
+            )
+            async with TemporalWorkerGroup(
+                client=environment.client,
+                workflow_task_queue=workflow_queue,
+                activity_task_queue=activity_queue,
+                activation_activity=activation,
+                max_concurrent_activities=2,
+                graceful_shutdown_timeout_s=5,
+            ):
+                accepted = await transport.dispatch_async(admitted)
+                assert accepted.status == "accepted"
+                await asyncio.to_thread(
+                    harness.admission.acknowledge_dispatch,
+                    dispatch_claim.token,
+                    accepted,
+                )
+                status, receipt = await _wait_for_completion(environment, harness, run_id)
+                handle = environment.client.get_workflow_handle(temporal_workflow_id(run_id))
+                history_json = (await handle.fetch_history()).to_json()
+                await handle.cancel()
+                return status, receipt, history_json
+
+    try:
+        status, receipt, history_json = asyncio.run(run())
+        private_content = "private combined streamed result"
+        assert status.phase == "waiting"
+        assert receipt.activation_receipt is not None
+        assert adapter.calls == 1
+        assert adapter.one_shot_calls == 0
+        assert private_content not in history_json
+        assert private_content not in json.dumps(receipt.to_json(), sort_keys=True)
+
+        with harness.database.transaction(read_only=True) as connection:
+            with harness.database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT stream_id, logical_call_id, channel, generation, "
+                        "cursor_bytes, state FROM {}.{} WHERE run_id = %s ORDER BY channel"
+                    ).format(
+                        sql.Identifier(harness.database.config.schema),
+                        sql.Identifier("durable_stream_head"),
+                    ),
+                    (run_id,),
+                )
+                rows = tuple(cursor.fetchall())
+        assert len(rows) == 1
+        stream_id, logical_call_id, channel, generation, cursor_bytes, state = rows[0]
+        assert channel == "output"
+        assert state == "sealed"
+        assert cursor_bytes == len(private_content.encode())
+        identity = DurableStreamIdentity(
+            run_id=run_id,
+            stream_id=str(stream_id),
+            logical_call_id=str(logical_call_id),
+            channel=str(channel),
+        )
+        replay = streams.read_after(identity, generation=int(generation), cursor=0)
+        assert replay.status == "ok"
+        assert b"".join(chunk.data for chunk in replay.chunks).decode() == private_content
+
+        operations = PostgresOperations(harness.database)
+        operations.check_ready()
+        snapshot = operations.snapshot()
+        operational_values = {
+            (metric.name, metric.attributes): metric.value for metric in snapshot.metrics
+        }
+        assert operational_values[
+            (
+                "monoid.postgres.outbox.count",
+                (("queue", "activation"), ("state", "delivered")),
+            )
+        ] >= 1
+        assert operational_values[
+            ("monoid.postgres.invocation.count", (("state", "settled"),))
+        ] >= 1
+        assert operational_values[
+            ("monoid.postgres.outbox.max_attempts", (("queue", "activation"),))
+        ] == 0
+        public_snapshot = json.dumps(snapshot.to_json(), sort_keys=True)
+        assert private_content not in public_snapshot
+        assert run_id not in public_snapshot
+        assert bucket not in public_snapshot
+    finally:
+        versions = client.list_object_versions(Bucket=bucket)  # type: ignore[attr-defined]
+        for value in (*versions.get("Versions", []), *versions.get("DeleteMarkers", [])):
+            client.delete_object(  # type: ignore[attr-defined]
+                Bucket=bucket,
+                Key=value["Key"],
+                VersionId=value["VersionId"],
+            )
+        client.delete_bucket(Bucket=bucket)  # type: ignore[attr-defined]
 
 
 def test_activity_bounds_an_actual_postgres_authority_row_lock(
