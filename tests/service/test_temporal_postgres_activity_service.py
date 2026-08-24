@@ -24,7 +24,8 @@ if os.environ.get("MONOID_SERVICE_PROFILE") != "combined":
     pytest.skip("combined PostgreSQL and Temporal profile is not selected", allow_module_level=True)
 
 from psycopg import sql  # noqa: E402
-from temporalio.testing import WorkflowEnvironment  # noqa: E402
+from temporalio.exceptions import ApplicationError  # noqa: E402
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
 from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
@@ -391,6 +392,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                     writer_lease_ttl_s=5,
                     writer_lease_renew_interval_s=0.5,
                     heartbeat_interval_s=0.1,
+                    authority_call_timeout_s=4,
                     supervisor_join_timeout_s=4,
                     local_task_wait_s=5,
                 ),
@@ -428,6 +430,74 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert authority is not None and authority.revoked is True and authority.active is False
     assert expected_server
     assert "private production activity completion" not in str(receipt.to_json())
+
+
+def test_activity_bounds_an_actual_postgres_authority_row_lock(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    run_id = f"authority-lock-{uuid.uuid4().hex}"
+    locker, _ = harness.seed(tmp_path, run_id)
+    admitted = harness.admission.admit(_request(run_id)).command
+    claim_started = threading.Event()
+    claim_finished = threading.Event()
+
+    @dataclass
+    class ObservedAuthority:
+        inner: PostgresWriterAuthorityStore
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+        def claim(self, claimed_run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            claim_started.set()
+            try:
+                return self.inner.claim(claimed_run_id, owner_id, ttl)
+            finally:
+                claim_finished.set()
+
+    def unreachable_loop_factory(
+        command: ActivationCommand,
+        runtime: ActivationRuntime,
+    ) -> AgentLoop:
+        del command, runtime
+        raise AssertionError("authority timeout must prevent activation construction")
+
+    activation = TemporalActivationActivity(
+        authority_store=ObservedAuthority(harness.authority),  # type: ignore[arg-type]
+        admission_store=harness.admission,
+        run_sink=harness.sink,
+        loop_factory=unreachable_loop_factory,
+        policy=TemporalActivityPolicy(
+            writer_lease_ttl_s=2,
+            writer_lease_renew_interval_s=0.4,
+            heartbeat_interval_s=0.05,
+            authority_call_timeout_s=0.1,
+            supervisor_join_timeout_s=0.2,
+            local_task_wait_s=1,
+        ),
+    )
+    with harness.database.connection() as connection:
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL("SELECT run_id FROM {} WHERE run_id = %s FOR UPDATE").format(
+                        sql.Identifier(harness.database.config.schema, "run_authority")
+                    ),
+                    (run_id,),
+                )
+                assert cursor.fetchone() == (run_id,)
+            started = time.monotonic()
+            with pytest.raises(ApplicationError) as raised:
+                ActivityEnvironment().run(activation.run, admitted.to_json())
+            elapsed = time.monotonic() - started
+            assert raised.value.type == "monoid.activation_lease_lost"
+            assert raised.value.non_retryable is False
+            assert claim_started.is_set()
+            assert elapsed < 0.5
+
+    assert claim_finished.wait(2)
+    assert harness.authority.release(locker.writer_token).status == "released"
 
 
 def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
@@ -533,6 +603,7 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
                         writer_lease_ttl_s=2,
                         writer_lease_renew_interval_s=0.4,
                         heartbeat_interval_s=0.2,
+                        authority_call_timeout_s=2,
                         supervisor_join_timeout_s=2,
                         local_task_wait_s=5,
                     ),
@@ -618,6 +689,7 @@ def test_worker_shutdown_during_paid_call_commits_reconciliation_receipt(
                     writer_lease_ttl_s=4,
                     writer_lease_renew_interval_s=0.4,
                     heartbeat_interval_s=0.2,
+                    authority_call_timeout_s=2,
                     supervisor_join_timeout_s=2,
                     local_task_wait_s=5,
                 ),
@@ -728,6 +800,7 @@ def test_worker_shutdown_before_provider_entry_commits_graceful_drain_receipt(
                     writer_lease_ttl_s=4,
                     writer_lease_renew_interval_s=0.4,
                     heartbeat_interval_s=0.2,
+                    authority_call_timeout_s=2,
                     supervisor_join_timeout_s=2,
                     local_task_wait_s=5,
                 ),

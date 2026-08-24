@@ -110,6 +110,7 @@ class TemporalActivityPolicy:
     writer_lease_ttl_s: float = 30.0
     writer_lease_renew_interval_s: float = 10.0
     heartbeat_interval_s: float = 5.0
+    authority_call_timeout_s: float = 30.0
     supervisor_join_timeout_s: float = 30.0
     local_task_wait_s: float = 300.0
     worker_shutdown_cause: InterruptionCause = InterruptionCause.GRACEFUL_DRAIN
@@ -121,6 +122,7 @@ class TemporalActivityPolicy:
             "writer lease renew interval",
         )
         _require_duration(self.heartbeat_interval_s, "Temporal heartbeat interval")
+        _require_duration(self.authority_call_timeout_s, "writer authority call timeout")
         _require_duration(self.supervisor_join_timeout_s, "lease supervisor join timeout")
         _require_duration(self.local_task_wait_s, "activation local task wait")
         if renew * 2 > ttl:
@@ -146,6 +148,12 @@ def _activity_owner_id(task_token: bytes) -> str:
 
 class _SupervisorUnhealthy(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, kw_only=True)
+class _LeaseAcquisition:
+    lease: WriterLease
+    observed_monotonic: float
 
 
 class _TemporalLeaseSupervisor:
@@ -213,6 +221,93 @@ class _TemporalLeaseSupervisor:
         )
         self._renewal_thread.start()
         self._control_wake.set()
+
+    def acquire(self, run_id: str, owner_id: str) -> _LeaseAcquisition:
+        completed = threading.Event()
+        abandoned = threading.Event()
+        state_lock = threading.Lock()
+        outcome: list[_LeaseAcquisition | BaseException] = []
+
+        def publish(result: _LeaseAcquisition | BaseException) -> bool:
+            with state_lock:
+                if abandoned.is_set():
+                    return False
+                outcome.append(result)
+                completed.set()
+                return True
+
+        def release_abandoned(lease: WriterLease) -> None:
+            try:
+                self._store.release(lease.writer_token)
+            except BaseException:
+                return
+
+        def run_acquisition() -> None:
+            lease: WriterLease | None = None
+            try:
+                lease = claim_writer_lease(
+                    self._store,
+                    run_id,
+                    owner_id,
+                    self._policy.writer_lease_ttl,
+                )
+                if abandoned.is_set():
+                    release_abandoned(lease)
+                    return
+                renew_started = time.monotonic()
+                renewed = renew_writer_lease(
+                    self._store,
+                    lease.writer_token,
+                    self._policy.writer_lease_ttl,
+                    write_authority=self._write_authority,
+                )
+                if renewed.status != "renewed" or renewed.lease is None:
+                    raise WriteAuthorityRevoked()
+                lease = renewed.lease
+                acquired = _LeaseAcquisition(
+                    lease=lease,
+                    observed_monotonic=renew_started,
+                )
+                if not publish(acquired):
+                    release_abandoned(lease)
+            except BaseException as exc:
+                publish(exc)
+            finally:
+                completed.set()
+
+        acquisition_thread = threading.Thread(
+            target=run_acquisition,
+            name="monoid-temporal-authority-acquisition",
+            daemon=True,
+        )
+        acquisition_thread.start()
+        deadline = time.monotonic() + float(self._policy.authority_call_timeout_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            if completed.wait(max(0.0, min(0.05, remaining))):
+                break
+            if self._failure.is_set() or remaining <= 0:
+                with state_lock:
+                    if completed.is_set():
+                        continue
+                    abandoned.set()
+                self._fail()
+                raise _SupervisorUnhealthy(
+                    "Temporal activation authority acquisition timed out or lost control"
+                )
+        acquisition_thread.join()
+        if len(outcome) != 1:
+            self._fail()
+            raise _SupervisorUnhealthy(
+                "Temporal activation authority acquisition produced no result"
+            )
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            if isinstance(result, Exception):
+                raise result
+            self._fail()
+            raise _SupervisorUnhealthy("Temporal activation authority acquisition failed")
+        return result
 
     def cleanup(self, lease: WriterLease | None) -> ReleaseResult | None:
         if lease is not None and not isinstance(lease, WriterLease):
@@ -465,27 +560,17 @@ class TemporalActivationActivity:
             owner_id = _activity_owner_id(info.task_token)
             activity.heartbeat()
             supervisor.start()
-            lease = claim_writer_lease(
-                self.authority_store,
+            acquired = supervisor.acquire(
                 command.run_id,
                 owner_id,
-                self.policy.writer_lease_ttl,
             )
+            lease = acquired.lease
             supervisor.assert_healthy()
             write_authority.assert_active()
-            renew_started = time.monotonic()
-            renewed = renew_writer_lease(
-                self.authority_store,
-                lease.writer_token,
-                self.policy.writer_lease_ttl,
-                write_authority=write_authority,
+            supervisor.install_lease(
+                lease,
+                observed_monotonic=acquired.observed_monotonic,
             )
-            if renewed.status != "renewed" or renewed.lease is None:
-                raise WriteAuthorityRevoked()
-            lease = renewed.lease
-            supervisor.assert_healthy()
-            write_authority.assert_active()
-            supervisor.install_lease(lease, observed_monotonic=renew_started)
             supervisor.assert_healthy()
             write_authority.assert_active()
             if activity.is_cancelled():

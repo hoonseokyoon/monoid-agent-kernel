@@ -154,6 +154,7 @@ async def _run(args: argparse.Namespace) -> None:
             writer_lease_ttl_s=2,
             writer_lease_renew_interval_s=0.4,
             heartbeat_interval_s=0.2,
+            authority_call_timeout_s=2,
             supervisor_join_timeout_s=2,
             local_task_wait_s=5,
         ),

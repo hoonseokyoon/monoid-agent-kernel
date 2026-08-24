@@ -72,6 +72,7 @@ class _AuthorityStore:
         self.renew_threads: list[int] = []
         self.release_count = 0
         self.renewed = threading.Event()
+        self.released = threading.Event()
 
     def _lease(self, token: WriterToken) -> WriterLease:
         return WriterLease(
@@ -107,6 +108,7 @@ class _AuthorityStore:
 
     def release(self, writer_token: WriterToken) -> ReleaseResult:
         self.release_count += 1
+        self.released.set()
         if self.release_status == "fenced":
             return ReleaseResult(
                 status="fenced",
@@ -172,6 +174,7 @@ def _activity(
             writer_lease_ttl_s=2,
             writer_lease_renew_interval_s=0.02,
             heartbeat_interval_s=0.01,
+            authority_call_timeout_s=1,
             supervisor_join_timeout_s=1,
             local_task_wait_s=1,
         ),
@@ -184,6 +187,7 @@ def test_temporal_activity_policy_has_fail_safe_bounds() -> None:
         {"writer_lease_ttl_s": 0.5},
         {"writer_lease_ttl_s": 10, "writer_lease_renew_interval_s": 6},
         {"heartbeat_interval_s": 0},
+        {"authority_call_timeout_s": 0},
         {"supervisor_join_timeout_s": float("nan")},
         {"local_task_wait_s": MAX_TEMPORAL_ACTIVITY_LOCAL_DURATION_S + 1},
         {"writer_lease_ttl_s": True},
@@ -335,6 +339,49 @@ def test_heartbeat_failure_during_claim_prevents_activation_drive() -> None:
     assert raised.value.type == "monoid.activation_lease_lost"
     assert raised.value.non_retryable is False
     assert _DriverDouble.constructed == []
+    assert store.released.wait(1)
+    assert store.release_count == 1
+
+
+def test_writer_claim_timeout_returns_the_activity_executor_and_releases_late_authority() -> None:
+    claim_started = threading.Event()
+    allow_claim = threading.Event()
+
+    class StuckClaimStore(_AuthorityStore):
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            claim_started.set()
+            assert allow_claim.wait(1)
+            return super().claim(run_id, owner_id, ttl)
+
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=0.05,
+        supervisor_join_timeout_s=0.1,
+        local_task_wait_s=1,
+    )
+    store = StuckClaimStore()
+    claim_timer = threading.Timer(0.4, allow_claim.set)
+    claim_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            ActivityEnvironment().run(
+                _activity(store, policy=policy).run,
+                _command().to_json(),
+            )
+        elapsed = time.monotonic() - started
+        assert raised.value.type == "monoid.activation_lease_lost"
+        assert raised.value.non_retryable is False
+        assert claim_started.is_set()
+        assert _DriverDouble.constructed == []
+        assert elapsed < 0.25
+    finally:
+        allow_claim.set()
+        claim_timer.cancel()
+        claim_timer.join()
+        assert store.released.wait(1)
     assert store.release_count == 1
 
 
@@ -803,7 +850,7 @@ def test_worker_group_rejects_a_shutdown_window_shorter_than_supervisor_cleanup(
 ) -> None:
     monkeypatch.setattr(worker_module, "Worker", lambda *args, **kwargs: (args, kwargs))
 
-    with pytest.raises(ValueError, match="cover heartbeat and supervisor"):
+    with pytest.raises(ValueError, match="cover Activity local timeout bounds"):
         worker_module.TemporalWorkerGroup(
             client=object(),
             workflow_task_queue="workflow-v1",

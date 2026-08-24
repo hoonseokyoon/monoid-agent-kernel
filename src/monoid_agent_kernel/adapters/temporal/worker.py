@@ -66,11 +66,12 @@ class TemporalWorkerGroup:
                 raise ValueError("activity_executor must be active")
         minimum_graceful_timeout = max(
             float(activation_activity.policy.heartbeat_interval_s),
+            float(activation_activity.policy.authority_call_timeout_s),
             float(activation_activity.policy.supervisor_join_timeout_s),
         )
         if float(graceful_shutdown_timeout_s) < minimum_graceful_timeout:
             raise ValueError(
-                "graceful_shutdown_timeout_s must cover heartbeat and supervisor shutdown"
+                "graceful_shutdown_timeout_s must cover Activity local timeout bounds"
             )
 
         self._owns_executor = activity_executor is None

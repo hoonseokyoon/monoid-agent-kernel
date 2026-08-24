@@ -277,6 +277,7 @@ activation = TemporalActivationActivity(
         writer_lease_ttl_s=30,
         writer_lease_renew_interval_s=10,
         heartbeat_interval_s=5,
+        authority_call_timeout_s=30,
         supervisor_join_timeout_s=30,
         local_task_wait_s=300,
     ),
@@ -306,8 +307,10 @@ The Activity derives a content-free owner ID from the Temporal task token, claim
 PostgreSQL writer generation, and starts a copied-context control supervisor before the potentially
 blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
 worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
-evidence. An independent renewal thread performs the potentially blocking PostgreSQL calls, so pool
-or row-lock waits cannot stop heartbeat or deadline enforcement. Control propagation uses the exact
+evidence. Claim plus initial exact-token renewal run in a bounded daemon acquisition worker, so a
+stuck database lock cannot retain the Temporal Activity executor slot. An independent renewal thread
+performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or deadline
+enforcement. Control propagation uses the exact
 `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
 renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
@@ -321,11 +324,12 @@ observed by PostgreSQL, so short exponential retry backoffs do not exhaust attem
 A writer fence observed during activation binding is retryable lease loss. A deterministic loop
 wiring violation is a non-retryable configuration conflict.
 
-Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. The Activity policy
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`, and keep
+`authority_call_timeout_s` below its `activity_start_to_close_timeout_s`. The Activity policy
 requires the writer lease TTL to cover at least two renewal intervals. Give
 `graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
-composition requires this timeout to cover the configured heartbeat interval and supervisor join
-window. Shutdown maps to `graceful_drain` by default; set
+composition requires this timeout to cover the configured heartbeat interval, authority call
+timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set
 `worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN` when an orderly host termination should
 retain that distinct cause.
 
