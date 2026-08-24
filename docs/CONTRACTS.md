@@ -784,8 +784,9 @@ A writer that implements the optional `ModelStreamDispatchAwareWriter` extension
 `begin_dispatch()` after durable `dispatch_started` publication and immediately before each actual
 adapter entry. Provider-free recovery of an already settled invocation does not receive it. Durable
 observers use this transition to reset a replacement generation even when the response contains
-only tool calls and emits no text delta. `safe_begin_model_stream_dispatch` preserves the same
-observer-failure isolation as `safe_open_model_stream`.
+only tool calls and emits no text delta. Provider-free success and failure recovery preserve their
+committed stream generation. `safe_begin_model_stream_dispatch` preserves the same observer-failure
+isolation as `safe_open_model_stream`.
 
 Factories materialize a fresh observer set for every activation and every in-process subagent.
 This ownership prevents a restored run or child from closing another activation's live channel.

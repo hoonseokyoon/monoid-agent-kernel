@@ -453,14 +453,6 @@ class _DurableModelStreamWriter:
             del pending[:size]
             self._append(lane, data)
 
-    def _reset_abandoned_replacement_lanes(self, outcome: ModelStreamOutcome) -> None:
-        if outcome.status == "completed":
-            return
-        # Matching completed recovery returned above. The remaining paths have no delta that
-        # could clear a prior generation. Reset before sealing so reconnect readers cannot
-        # observe an abandoned prefix as the replacement's result.
-        self._reset_prior_lanes_locked()
-
     def close(self, outcome: ModelStreamOutcome) -> None:
         if not isinstance(outcome, ModelStreamOutcome):
             raise TypeError("durable model stream close requires ModelStreamOutcome")
@@ -476,7 +468,6 @@ class _DurableModelStreamWriter:
             )
         with self._condition:
             self._raise_failure_locked()
-            self._reset_abandoned_replacement_lanes(outcome)
             self._reconcile_completed_output(outcome)
         for channel in sorted(self._lanes):
             lane = self._lanes[channel]

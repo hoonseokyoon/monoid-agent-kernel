@@ -751,6 +751,60 @@ def test_model_observer_resets_abandoned_open_lanes_after_takeover(
         assert b"".join(chunk.data for chunk in settled_read.chunks) == data
         assert settled_read.head is not None and settled_read.head.state == "sealed"
 
+    failed_run = f"run-stream-failed-recovery-{uuid.uuid4().hex}"
+    failed_stale = harness.claim(failed_run, "failed-recovery-worker")
+    failed_context = ModelStreamContext(
+        run_id=failed_run,
+        root_run_id=failed_run,
+        turn_id="turn-failed-recovery",
+        stream_id="execution-local-failed-recovery",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    failed_output = DurableStreamIdentity(
+        run_id=failed_run,
+        stream_id=durable_model_stream_id(failed_run, failed_context.turn_id),
+        logical_call_id=logical_model_call_id(failed_run, failed_context.turn_id),
+        channel="output",
+    )
+    failed_reasoning = DurableStreamIdentity(
+        run_id=failed_run,
+        stream_id=failed_output.stream_id,
+        logical_call_id=failed_output.logical_call_id,
+        channel="reasoning",
+    )
+    failed_prior = (
+        (failed_output, b"partial output"),
+        (failed_reasoning, b"partial reasoning"),
+    )
+    for identity, data in failed_prior:
+        assert harness.streams.open(identity, writer_token=failed_stale).status == "opened"
+        assert harness.streams.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=failed_stale,
+        ).status == "committed"
+
+    assert harness.authority.release(failed_stale).status == "released"
+    failed_current = harness.claim(failed_run, "failed-recovery-replacement")
+    failed_writer = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=failed_current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=8,
+        flush_interval_s=10,
+    ).open(failed_context)
+    failed_writer.close(ModelStreamOutcome(status="failed", error_code="provider_error"))
+
+    for identity, data in failed_prior:
+        failed_read = harness.streams.read_after(identity, generation=1, cursor=0)
+        assert b"".join(chunk.data for chunk in failed_read.chunks) == data
+        assert failed_read.head is not None and failed_read.head.state == "sealed"
+
 
 def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) -> None:
     counting = _CountingPutStore(harness.streams.object_store)

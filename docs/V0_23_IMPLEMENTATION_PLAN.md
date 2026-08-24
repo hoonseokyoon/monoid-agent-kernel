@@ -652,8 +652,8 @@ durable stream은 private high-volume content와 public lifecycle event를 분�
 - terminal 뒤 no-late-delta
 - writer fencing과 process replacement
 - runner의 실제 provider-dispatch 시작 신호와 provider를 호출하지 않는 settled recovery를 구분한다.
-  replacement는 adapter entry 전에 prior generation을 reset하고 recovery는 authoritative final
-  output과 committed generation을 reconcile한다.
+  replacement는 adapter entry 전에 prior generation을 reset한다. provider-free success/failure
+  recovery는 committed generation을 보존하며 success는 authoritative final output도 reconcile한다.
 
 ### 12.3 storage
 

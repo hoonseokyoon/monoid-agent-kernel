@@ -638,9 +638,10 @@ The observer opens one `output` lane and normally opens `reasoning` when that ch
 content. A replacement that finds prior output also hydrates reasoning. `ModelCallRunner` signals
 every actual adapter entry after durable `dispatch_started` publication, and the observer resets
 every pre-existing kernel lane before that provider execution begins. Provider-free settled
-recovery receives no dispatch signal and preserves the committed generation. The first-delta reset
-remains a fallback for direct writer integrations that do not drive the optional dispatch-aware
-extension. Host-defined private lanes use the same
+success or failure recovery receives no dispatch signal and preserves the committed generation.
+Direct `ModelCallRunner` integrations pass a callback that calls
+`safe_begin_model_stream_dispatch()` before a new provider execution. The first-delta reset remains
+a fallback when such an integration streams content. Host-defined private lanes use the same
 `DurableStreamIdentity` contract directly. Byte and time thresholds bound coalescing; a
 copied-context daemon performs ordered flushes. Observer failures retain the existing model-stream
 rule: they do not replace a paid provider result. A `fenced` store result revokes the shared

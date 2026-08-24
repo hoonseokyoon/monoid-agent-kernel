@@ -575,6 +575,8 @@ def test_model_stream_observer_resets_stale_lanes_when_replacement_ends_without_
         ).status == "committed"
 
     replacement = _observer(store, authority).open(context)
+    assert isinstance(replacement, ModelStreamDispatchAwareWriter)
+    replacement.begin_dispatch()
     replacement.close(ModelStreamOutcome(status=status))
 
     for identity in (output, reasoning):
@@ -582,6 +584,41 @@ def test_model_stream_observer_resets_stale_lanes_when_replacement_ends_without_
         assert store.heads[identity].state == "sealed"
         assert store.heads[identity].cursor_bytes == 0
         assert store.chunks.get((identity, 2), []) == []
+
+
+@pytest.mark.parametrize("status", ("failed", "interrupted", "cancelled", "timed_out"))
+def test_model_stream_observer_preserves_partial_failure_recovery_without_new_dispatch(
+    status: ModelStreamStatus,
+) -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(run_id=context.run_id, owner_id="worker-1", generation=1)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=durable_model_stream_id(context.run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(context.run_id, context.turn_id),
+        channel="output",
+    )
+    reasoning = replace(output, channel="reasoning")
+    prior = ((output, b"partial output"), (reasoning, b"partial reasoning"))
+    for identity, data in prior:
+        assert store.open(identity, writer_token=token).status == "opened"
+        assert store.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=token,
+        ).status == "committed"
+
+    recovered = _observer(store, authority).open(context)
+    recovered.close(ModelStreamOutcome(status=status))
+
+    for identity, data in prior:
+        assert store.heads[identity].generation == 1
+        assert store.heads[identity].state == "sealed"
+        assert b"".join(chunk.data for chunk in store.chunks[(identity, 1)]) == data
 
 
 @pytest.mark.parametrize("final_text", (None, ""))
