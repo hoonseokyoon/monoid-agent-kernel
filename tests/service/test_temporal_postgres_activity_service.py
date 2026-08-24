@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import socket
@@ -26,6 +27,7 @@ if os.environ.get("MONOID_SERVICE_PROFILE") != "combined":
 import boto3  # noqa: E402
 from botocore import config as botocore_config  # noqa: E402
 from psycopg import sql  # noqa: E402
+from temporalio.client import WorkflowHistory  # noqa: E402
 from temporalio.exceptions import ApplicationError  # noqa: E402
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
@@ -157,6 +159,26 @@ class _StreamingCountingAdapter:
         del request
         self.one_shot_calls += 1
         return ModelTurn(final_text="one-shot path must stay unused")
+
+
+def _decoded_history_payloads(history: WorkflowHistory) -> list[object]:
+    decoded: list[object] = []
+    pending: list[object] = [json.loads(history.to_json())]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            metadata = value.get("metadata")
+            data = value.get("data")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("encoding") == "anNvbi9wbGFpbg=="
+                and isinstance(data, str)
+            ):
+                decoded.append(json.loads(base64.b64decode(data)))
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return decoded
 
 
 @dataclass
@@ -554,7 +576,7 @@ def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
     assert harness.authority.release(seed_lease.writer_token).status == "released"
     adapter = _StreamingCountingAdapter()
 
-    async def run() -> tuple[TemporalRunStatus, Any, str]:
+    async def run() -> tuple[TemporalRunStatus, Any, WorkflowHistory]:
         async with await WorkflowEnvironment.start_local(
             dev_server_existing_path=executable,
             dev_server_log_level="warn",
@@ -609,20 +631,25 @@ def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
                 )
                 status, receipt = await _wait_for_completion(environment, harness, run_id)
                 handle = environment.client.get_workflow_handle(temporal_workflow_id(run_id))
-                history_json = (await handle.fetch_history()).to_json()
+                history = await handle.fetch_history()
                 await handle.cancel()
-                return status, receipt, history_json
+                return status, receipt, history
 
     try:
-        status, receipt, history_json = asyncio.run(run())
+        status, receipt, history = asyncio.run(run())
         private_content = "".join(adapter.private_chunks)
+        history_json = history.to_json()
+        decoded_history_payloads = _decoded_history_payloads(history)
+        decoded_history_json = json.dumps(decoded_history_payloads, sort_keys=True)
         receipt_json = json.dumps(receipt.to_json(), sort_keys=True)
         assert status.phase == "waiting"
         assert receipt.activation_receipt is not None
         assert adapter.calls == 1
         assert adapter.one_shot_calls == 0
+        assert decoded_history_payloads
         for private_chunk in adapter.private_chunks:
             assert private_chunk not in history_json
+            assert private_chunk not in decoded_history_json
             assert private_chunk not in receipt_json
 
         with harness.database.transaction(read_only=True) as connection:

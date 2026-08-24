@@ -161,13 +161,22 @@ class PostgresOperations:
                         cursor,
                         sql.SQL(
                             "SELECT "
-                            "count(*) FILTER (WHERE state = 'open'), "
-                            "count(*) FILTER (WHERE state = 'sealed'), "
-                            "coalesce(sum(cursor_bytes), 0), "
-                            "coalesce(sum(cursor_bytes) FILTER (WHERE state = 'open'), 0), "
-                            "extract(epoch FROM (%s - min(opened_at) FILTER "
-                            "(WHERE state = 'open'))) FROM {}"
-                        ).format(self._table("durable_stream_head")),
+                            "count(*) FILTER (WHERE head.state = 'open'), "
+                            "count(*) FILTER (WHERE head.state = 'sealed'), "
+                            "coalesce(sum(head.cursor_bytes), 0), "
+                            "coalesce(sum(head.cursor_bytes) FILTER "
+                            "(WHERE head.state = 'open'), 0), "
+                            "extract(epoch FROM (%s - min(coalesce(reset.recorded_at, "
+                            "head.opened_at)) FILTER (WHERE head.state = 'open'))) "
+                            "FROM {} AS head LEFT JOIN {} AS reset "
+                            "ON reset.run_id = head.run_id "
+                            "AND reset.stream_id = head.stream_id "
+                            "AND reset.channel = head.channel "
+                            "AND reset.generation = head.generation"
+                        ).format(
+                            self._table("durable_stream_head"),
+                            self._table("durable_stream_reset_receipt"),
+                        ),
                         (collected_at,),
                     )
                     stream_chunks = self._one(

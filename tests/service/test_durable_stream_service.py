@@ -301,6 +301,31 @@ def test_actual_operations_snapshot_and_s3_doctor_are_public_and_content_free(
         data=private_content,
         writer_token=token,
     ).status == "committed"
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "UPDATE {}.{} SET opened_at = pg_catalog.clock_timestamp() - "
+                    "interval '1 day' WHERE run_id = %s AND stream_id = %s AND channel = %s"
+                ).format(
+                    sql.Identifier(harness.database.config.schema),
+                    sql.Identifier("durable_stream_head"),
+                ),
+                (identity.run_id, identity.stream_id, identity.channel),
+            )
+    assert harness.streams.seal(
+        identity,
+        generation=1,
+        final_size_bytes=len(private_content),
+        final_sha256=hashlib.sha256(private_content).hexdigest(),
+        writer_token=token,
+    ).status == "sealed"
+    assert harness.streams.reset(
+        identity,
+        expected_generation=1,
+        reset_id="operations-current-generation",
+        writer_token=token,
+    ).status == "reset"
 
     operations = PostgresOperations(harness.database)
     assert operations.check_ready().current is True
@@ -315,6 +340,7 @@ def test_actual_operations_snapshot_and_s3_doctor_are_public_and_content_free(
     assert by_identity[("monoid.postgres.stream.head.count", (("state", "open"),))] >= 1
     assert by_identity[("monoid.postgres.stream.chunk.count", ())] >= 1
     assert by_identity[("monoid.postgres.stream.chunk.bytes", ())] >= len(private_content)
+    assert by_identity[("monoid.postgres.stream.oldest_open_age", ())] < 60
     assert by_identity[("monoid.postgres.object.association.count", ())] >= 1
 
     snapshot_json = json.dumps(snapshot.to_json(), sort_keys=True)

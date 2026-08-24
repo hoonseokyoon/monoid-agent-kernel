@@ -81,7 +81,7 @@ and exporter failure policy.
 | `monoid.postgres.invocation.count` | `1` | current head by `reserved|dispatch_started|settled|unknown` |
 | `monoid.postgres.stream.head.count` | `1` | current head by `open|sealed` |
 | `monoid.postgres.stream.current_bytes` | `By` | current head bytes for `all|open` |
-| `monoid.postgres.stream.oldest_open_age` | `s` | oldest open generation age |
+| `monoid.postgres.stream.oldest_open_age` | `s` | oldest current open generation age; reset receipt anchors generation start |
 | `monoid.postgres.stream.chunk.count` | `1` | retained chunk rows across generations |
 | `monoid.postgres.stream.chunk.bytes` | `By` | retained chunk bytes across generations |
 | `monoid.postgres.object.count` | `1` | metadata by `available|deleted` |
