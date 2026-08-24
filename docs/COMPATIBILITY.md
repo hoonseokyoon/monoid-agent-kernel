@@ -102,7 +102,9 @@ stay outside the command, so retry and process replacement preserve the same ide
 `monoid.activation-receipt.v1` is the content-free operational copy of the boundary stored in the
 canonical checkpoint receipt. It carries checkpoint identity, lifecycle state, event/stream
 cursors, terminal reference, and portable outcome taxonomy. Hosts reconstruct it from durable
-state after response loss; model output and raw exceptions never enter the receipt.
+state after response loss; later checkpoint heads retain the original per-command boundary
+identity. The boundary digest blanks its own nested digest field before hashing to avoid a
+self-reference. Model output and raw exceptions never enter the receipt.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The

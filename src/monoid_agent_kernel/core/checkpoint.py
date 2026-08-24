@@ -511,6 +511,7 @@ def _validate_receipts(value: object) -> None:
             raise ValueError(f"checkpoint {field_prefix} activation identity is inconsistent")
         required_activation_fields = {
             "checkpoint_seq",
+            "checkpoint_sha256",
             "state",
             "terminal",
             "suspension",
@@ -525,6 +526,8 @@ def _validate_receipts(value: object) -> None:
         }
         if not required_activation_fields.issubset(receipt):
             raise ValueError(f"checkpoint {field_prefix} activation receipt is incomplete")
+        if not is_recorded_digest(receipt["checkpoint_sha256"]):
+            raise ValueError(f"checkpoint {field_prefix}.checkpoint_sha256 is invalid")
         try:
             SessionState(receipt["state"])
         except (TypeError, ValueError) as exc:

@@ -171,7 +171,10 @@ loads private content and returns `ResolvedActivationInput` whose request digest
 match the admitted command. A `control` command resumes host-prepared checkpoint state without
 injecting another user message. A duplicate command whose marker is already in the canonical
 checkpoint returns the same content-free `ActivationReceipt` without resolving input or opening a
-loop.
+loop. The checkpoint keeps that command's original boundary sequence and digest inside its private
+receipt, so later commands may advance the head without changing an earlier command's returned
+receipt. The digest hashes the boundary checkpoint with that receipt's own digest field blanked,
+which avoids a self-reference while retaining the rest of the exact boundary identity.
 
 The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`, and
 `write_authority`. It also configures

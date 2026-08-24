@@ -129,6 +129,24 @@ def _checkpoint_digest(checkpoint: RunCheckpoint) -> str:
     return canonical_sha256(checkpoint.to_json())
 
 
+def _checkpoint_receipt_digest(checkpoint: RunCheckpoint, marker: str) -> str:
+    """Hash a boundary checkpoint with only the target receipt digest field blanked."""
+
+    payload = checkpoint.to_json()
+    raw_receipts = payload.get("applied_input_receipts")
+    if not isinstance(raw_receipts, Mapping):
+        raise ValueError("activation checkpoint receipts are invalid")
+    receipts = dict(raw_receipts)
+    target = receipts.get(marker)
+    if not isinstance(target, Mapping):
+        raise ValueError("activation checkpoint receipt is missing")
+    target = dict(target)
+    target["checkpoint_sha256"] = ""
+    receipts[marker] = target
+    payload["applied_input_receipts"] = receipts
+    return canonical_sha256(payload)
+
+
 @dataclass(frozen=True, kw_only=True)
 class ActivationCommand:
     """One retry-stable reference to an admitted input or control command."""
@@ -411,14 +429,16 @@ class ActivationReceipt:
                 error_code="invalid_activation_boundary",
             ) from exc
         checkpoint_seq = raw_receipt.get("checkpoint_seq")
+        checkpoint_sha256 = raw_receipt.get("checkpoint_sha256")
         event_cursor = raw_receipt.get("event_cursor", 0)
         stream_cursor = raw_receipt.get("stream_cursor", 0)
         state = state_from_suspension(suspension).value
-        terminal = checkpoint.terminal or suspension.reason == "terminal"
+        terminal = suspension.reason == "terminal"
         if (
             not is_portable_json_integer(checkpoint_seq)
-            or checkpoint_seq != checkpoint.seq
+            or checkpoint_seq > checkpoint.seq
             or checkpoint_seq <= command.source_checkpoint_seq
+            or not is_recorded_digest(checkpoint_sha256)
             or raw_receipt.get("state") != state
             or raw_receipt.get("terminal") is not terminal
             or raw_receipt.get("command_identity_sha256") != command.identity_sha256
@@ -431,10 +451,18 @@ class ActivationReceipt:
                 "activation receipt boundary metadata is invalid",
                 error_code="invalid_activation_receipt",
             )
+        if checkpoint_seq == checkpoint.seq:
+            if checkpoint.terminal is not terminal or checkpoint_sha256 != (
+                _checkpoint_receipt_digest(checkpoint, marker)
+            ):
+                raise NativeAgentError(
+                    "activation receipt checkpoint identity is invalid",
+                    error_code="invalid_activation_receipt",
+                )
         checkpoint_outcome = terminal_outcome_from_suspension(
             suspension,
             run_id=command.run_id,
-            checkpoint_seq=checkpoint.seq,
+            checkpoint_seq=checkpoint_seq,
         )
         expected_interruption_cause = (
             ""
@@ -469,9 +497,9 @@ class ActivationReceipt:
             command_id=command.command_id,
             command_sequence=command.command_sequence,
             command_identity_sha256=command.identity_sha256,
-            checkpoint_seq=checkpoint.seq,
-            checkpoint_sha256=_checkpoint_digest(checkpoint),
-            checkpoint_ref=f"checkpoint:{command.run_id}/{checkpoint.seq}",
+            checkpoint_seq=checkpoint_seq,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_ref=f"checkpoint:{command.run_id}/{checkpoint_seq}",
             state=state,
             boundary_reason=suspension.reason,
             terminal=terminal,
@@ -566,6 +594,7 @@ class _ActivationRunSink:
             }
             receipts[self.command.checkpoint_marker] = {
                 "checkpoint_seq": checkpoint.seq,
+                "checkpoint_sha256": "",
                 "state": state_from_suspension(suspension).value,
                 "terminal": terminal,
                 "suspension": suspension_checkpoint_payload(suspension),
@@ -582,6 +611,9 @@ class _ActivationRunSink:
                 "terminal_outcome_ref": f"terminal:{self.command.run_id}" if terminal else "",
             }
             checkpoint.applied_input_receipts = receipts
+            receipts[self.command.checkpoint_marker]["checkpoint_sha256"] = (
+                _checkpoint_receipt_digest(checkpoint, self.command.checkpoint_marker)
+            )
         return self.inner.commit_checkpoint(
             checkpoint,
             blobs,

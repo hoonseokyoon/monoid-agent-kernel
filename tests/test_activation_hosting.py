@@ -211,12 +211,17 @@ def _seed_settled_checkpoint(
     return harness, token, record.checkpoint, spec
 
 
-def _command(checkpoint: RunCheckpoint, *, command_id: str = "command-1") -> ActivationCommand:
+def _command(
+    checkpoint: RunCheckpoint,
+    *,
+    command_id: str = "command-1",
+    command_sequence: int = 1,
+) -> ActivationCommand:
     request_digest = canonical_sha256({"command_id": command_id})
     return ActivationCommand(
         run_id=checkpoint.run_id,
         command_id=command_id,
-        command_sequence=1,
+        command_sequence=command_sequence,
         kind="control",
         source_checkpoint_seq=checkpoint.seq,
         source_checkpoint_sha256=canonical_sha256(checkpoint.to_json()),
@@ -372,6 +377,67 @@ def test_activation_replacement_returns_same_content_free_receipt(tmp_path: Path
     assert adapter.calls == 1
     assert len(factory_calls) == 1
     assert harness.sink.latest_event_sequence(command.run_id) == first.event_cursor
+
+
+def test_older_command_keeps_exact_receipt_after_later_input(tmp_path: Path) -> None:
+    harness, token, checkpoint, spec = _seed_checkpoint(
+        tmp_path,
+        run_id="activation-historical-receipt",
+    )
+    first_command = _command(checkpoint)
+    first = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=_loop_factory(
+            tmp_path,
+            spec,
+            _CountingFinalAdapter(),
+            [],
+            run_root_name="first-command-runs",
+        ),
+    ).drive(first_command)
+    first_head = harness.sink.latest_checked(first_command.run_id).value
+    assert first_head is not None
+    first_private_receipt = first_head.checkpoint.applied_input_receipts[
+        first_command.checkpoint_marker
+    ]
+    assert first_private_receipt["checkpoint_sha256"] == first.checkpoint_sha256
+
+    second_command = _command(
+        first_head.checkpoint,
+        command_id="command-2",
+        command_sequence=2,
+    )
+    second_command = replace(second_command, kind="input")
+    second = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=_loop_factory(
+            tmp_path,
+            spec,
+            _CountingFinalAdapter(),
+            [],
+            run_root_name="second-command-runs",
+        ),
+        input_resolver=lambda observed: ResolvedActivationInput(
+            request_digest=observed.request_digest,
+            payload_ref=observed.payload_ref,
+            parts=(TextPart("later private input"),),
+        ),
+    ).drive(second_command)
+
+    assert second.checkpoint_seq > first.checkpoint_seq
+    assert second.event_cursor > first.event_cursor
+    duplicate = ActivationDriver(
+        sink=harness.sink,
+        writer_token=token,
+        loop_factory=lambda command, runtime: (_ for _ in ()).throw(
+            AssertionError((command, runtime))
+        ),
+        input_resolver=lambda command: (_ for _ in ()).throw(AssertionError(command)),
+    ).drive(first_command)
+
+    assert duplicate == first
 
 
 def test_input_activation_resolves_private_payload_once(tmp_path: Path) -> None:
@@ -1144,6 +1210,21 @@ def test_receipt_projection_rejects_valid_but_inconsistent_outcome_metadata(
     record = harness.sink.latest_checked(command.run_id).value
     assert record is not None
     payload = record.checkpoint.to_json()
+    original_checkpoint_sha256 = payload["applied_input_receipts"][
+        command.checkpoint_marker
+    ]["checkpoint_sha256"]
+    payload["applied_input_receipts"][command.checkpoint_marker][
+        "checkpoint_sha256"
+    ] = "0" * 64
+    digest_tamper = decode_checkpoint(payload)
+    assert digest_tamper.value is not None
+    with pytest.raises(NativeAgentError) as digest_error:
+        ActivationReceipt.from_checkpoint(command, digest_tamper.value)
+    assert digest_error.value.error_code == "invalid_activation_receipt"
+
+    payload["applied_input_receipts"][command.checkpoint_marker][
+        "checkpoint_sha256"
+    ] = original_checkpoint_sha256
     payload["applied_input_receipts"][command.checkpoint_marker]["retry_eligibility"] = "safe"
     decoded = decode_checkpoint(payload)
     assert decoded.value is not None
