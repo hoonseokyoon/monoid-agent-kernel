@@ -54,6 +54,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     CommandOutboxDispatcher,
     DispatchClaimLost,
     DispatchResult,
+    MAX_COMMAND_RETRY_DELAY_S,
     WriterToken,
 )
 from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
@@ -699,6 +700,43 @@ def test_postgres_dispatch_claims_preserve_order_expiry_and_fencing(
         error_code="unsupported_command",
     )
     assert dead.state == "dead_letter"
+
+
+def test_dispatcher_caps_retry_delay_before_postgres_settlement(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    token, _ = harness.seed(tmp_path, "dispatch-retry-cap")
+    command = harness.admission.admit(_request(token.run_id, "command-1")).command
+    dispatcher = CommandOutboxDispatcher(
+        store=harness.admission,
+        transport=_Transport(
+            lambda admitted: DispatchResult(status="retry", error_code="transport_busy")
+        ),
+        owner_id="dispatcher-1",
+        retry_delay_s=lambda attempt: MAX_COMMAND_RETRY_DELAY_S + 10_000,
+        claim_id_factory=lambda: "claim-1",
+    )
+
+    receipt = dispatcher.dispatch_once()
+
+    assert receipt is not None and receipt.command == command
+    assert receipt.state == "prepared" and receipt.error_code == "transport_busy"
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT retry_delay_microseconds FROM {} "
+                    "WHERE run_id = %s AND command_id = %s"
+                ).format(
+                    sql.Identifier(
+                        harness.database.config.schema,
+                        "activation_dispatch_outbox",
+                    )
+                ),
+                (token.run_id, command.command_id),
+            )
+            assert cursor.fetchone() == (int(MAX_COMMAND_RETRY_DELAY_S * 1_000_000),)
 
 
 @pytest.mark.parametrize("settlement", ("acknowledge", "retry", "reject"))

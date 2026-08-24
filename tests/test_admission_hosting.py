@@ -21,6 +21,7 @@ from monoid_agent_kernel.hosting.admission import (
     DispatchClaim,
     DispatchResult,
     DispatchToken,
+    MAX_COMMAND_RETRY_DELAY_S,
 )
 from monoid_agent_kernel.hosting.contracts import WriterToken
 
@@ -326,6 +327,27 @@ def test_finite_dispatcher_routes_content_free_results(
     assert transport.commands == [command]
     assert [name for name, _ in store.operations] == ["claim", operation]
     assert dispatcher.dispatch_once() is None
+
+
+@pytest.mark.parametrize(
+    "delay_s",
+    (MAX_COMMAND_RETRY_DELAY_S + 1, 10**1000),
+)
+def test_dispatcher_caps_retry_delay_before_store_settlement(delay_s: float | int) -> None:
+    command = _command()
+    store = _FakeDispatchStore(command)
+    receipt = CommandOutboxDispatcher(
+        store=store,
+        transport=_FakeTransport(DispatchResult(status="retry", error_code="transport_busy")),
+        owner_id="worker-1",
+        retry_delay_s=lambda attempt: delay_s,
+        claim_id_factory=lambda: "claim-1",
+    ).dispatch_once()
+
+    assert receipt is not None and receipt.state == "prepared"
+    operation, payload = store.operations[-1]
+    assert operation == "retry"
+    assert isinstance(payload, tuple) and payload[2] == MAX_COMMAND_RETRY_DELAY_S
 
 
 def test_dispatcher_sanitizes_transport_exception_and_invalid_result() -> None:

@@ -108,6 +108,9 @@ unapplied command when its run has already selected a canonical terminal winner;
 dispatch attempts and carries the `run_terminal` error taxonomy. PostgreSQL projects admission,
 activation binding, and terminal evidence from one statement snapshot, so a concurrent bind and
 terminal commit cannot make a later receipt regress to an earlier lifecycle state.
+`MAX_COMMAND_RETRY_DELAY_S` defines the portable store range at 86,400 seconds. The finite
+dispatcher clamps larger retry-policy values before durable settlement, and dispatch-store adapters
+accept every finite delay in the inclusive range from zero through that maximum.
 
 `monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
 or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded

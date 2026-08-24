@@ -40,6 +40,7 @@ ADMITTED_COMMAND_SCHEMA_VERSION = namespaced_id("admitted-command.v1")
 ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS = accepted_namespaced_ids("admitted-command.v1")
 ADMISSION_RECEIPT_SCHEMA_VERSION = namespaced_id("admission-receipt.v1")
 ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS = accepted_namespaced_ids("admission-receipt.v1")
+MAX_COMMAND_RETRY_DELAY_S = 86_400.0
 
 AdmissionState = Literal[
     "prepared",
@@ -50,6 +51,24 @@ AdmissionState = Literal[
     "dead_letter",
 ]
 DispatchStatus = Literal["accepted", "retry", "rejected"]
+
+
+def _bounded_retry_delay_s(value: object) -> float:
+    if type(value) is int:
+        if value < 0:
+            raise ValueError(
+                "command dispatcher retry delay must be a non-negative finite number"
+            )
+        if value > MAX_COMMAND_RETRY_DELAY_S:
+            return MAX_COMMAND_RETRY_DELAY_S
+        return float(value)
+    if type(value) is float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                "command dispatcher retry delay must be a non-negative finite number"
+            )
+        return min(value, MAX_COMMAND_RETRY_DELAY_S)
+    raise ValueError("command dispatcher retry delay must be a non-negative finite number")
 
 _REQUEST_FIELDS = frozenset(
     {
@@ -512,6 +531,8 @@ class CommandAdmissionStore(Protocol):
 
 @runtime_checkable
 class CommandDispatchStore(Protocol):
+    """Durable dispatch store accepting retry delays through the portable maximum."""
+
     def claim_dispatch(
         self,
         owner_id: str,
@@ -590,18 +611,11 @@ class CommandOutboxDispatcher:
             return self.store.acknowledge_dispatch(claim.token, result)
         if result.status == "rejected":
             return self.store.reject_dispatch(claim.token, error_code=result.error_code)
-        delay_s = self.retry_delay_s(claim.attempt)
-        if (
-            type(delay_s) not in {int, float}
-            or isinstance(delay_s, bool)
-            or not math.isfinite(float(delay_s))
-            or delay_s < 0
-        ):
-            raise ValueError("command dispatcher retry delay must be a non-negative finite number")
+        delay_s = _bounded_retry_delay_s(self.retry_delay_s(claim.attempt))
         return self.store.retry_dispatch(
             claim.token,
             error_code=result.error_code,
-            delay_s=float(delay_s),
+            delay_s=delay_s,
         )
 
 
@@ -612,6 +626,7 @@ __all__ = [
     "ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS",
     "ADMISSION_RECEIPT_SCHEMA_VERSION",
     "ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS",
+    "MAX_COMMAND_RETRY_DELAY_S",
     "AdmissionState",
     "DispatchStatus",
     "AdmissionConflict",

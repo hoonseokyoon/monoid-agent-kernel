@@ -181,7 +181,9 @@ dispatcher.dispatch_once()
 shutdown, credentials, and health reporting. Dispatch uses database-clock leases and preserves
 per-run command order across competing workers. Delivery is at least once: the transport deduplicates
 `AdmittedCommand.identity_sha256`, and the activation path applies the immutable command identity
-once. A rejected command enters `dead_letter` and blocks later commands in that run until an operator
+once. Retry policies return a finite non-negative delay; the dispatcher caps it at the portable
+`MAX_COMMAND_RETRY_DELAY_S` value of 86,400 seconds before store settlement. A rejected command
+enters `dead_letter` and blocks later commands in that run until an operator
 resolves the lane. A canonical terminal winner excludes that run from new claims. Unbound pending,
 leased, or delivered commands converge to `run_terminal` without another transport call. Active
 claim finalization and settlement share the run-authority lock with terminal selection, so commit

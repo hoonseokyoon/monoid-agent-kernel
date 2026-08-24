@@ -37,6 +37,7 @@ from monoid_agent_kernel.hosting.admission import (
     DispatchClaimLost,
     DispatchResult,
     DispatchToken,
+    MAX_COMMAND_RETRY_DELAY_S,
 )
 from monoid_agent_kernel.hosting.contracts import WriterToken
 
@@ -829,7 +830,7 @@ class PostgresCommandAdmissionStore:
             type(delay_s) not in {int, float}
             or isinstance(delay_s, bool)
             or not math.isfinite(float(delay_s))
-            or not 0 <= float(delay_s) <= 86_400
+            or not 0 <= float(delay_s) <= MAX_COMMAND_RETRY_DELAY_S
         ):
             raise ValueError("dispatch retry delay must be in the range [0, 86400]")
         from psycopg import sql
