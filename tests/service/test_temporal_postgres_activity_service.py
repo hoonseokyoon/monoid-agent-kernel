@@ -57,7 +57,9 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationCommand,
     ActivationRuntime,
     AdmissionRequest,
+    RenewResult,
     WriterLease,
+    WriterToken,
 )
 from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
 from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
@@ -116,11 +118,13 @@ class _BlockingAdapter:
 
 
 @dataclass
-class _AmbiguousFirstClaim:
+class _DelayedAmbiguousAuthority:
     inner: PostgresWriterAuthorityStore
     first_claim_delay_s: float = 1.5
+    first_periodic_renew_delay_s: float = 1.5
     claim_calls: int = 0
     read_calls: int = 0
+    renew_calls: int = 0
     owner_ids: list[str] = field(default_factory=list)
 
     def __getattr__(self, name: str) -> Any:
@@ -141,6 +145,12 @@ class _AmbiguousFirstClaim:
         if self.read_calls == 1:
             raise ConnectionError("private PostgreSQL reconciliation response was lost")
         return self.inner.read(run_id)
+
+    def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
+        self.renew_calls += 1
+        if self.renew_calls == 2:
+            time.sleep(self.first_periodic_renew_delay_s)
+        return self.inner.renew(writer_token, ttl)
 
 
 @dataclass
@@ -336,7 +346,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert dispatch_claim is not None and dispatch_claim.command == admitted
     assert harness.authority.release(seed_lease.writer_token).status == "released"
     adapter = _SlowCountingAdapter(delay_s=0.7)
-    response_loss_authority = _AmbiguousFirstClaim(harness.authority)
+    response_loss_authority = _DelayedAmbiguousAuthority(harness.authority)
 
     async def run() -> tuple[TemporalRunStatus, Any]:
         async with await WorkflowEnvironment.start_local(
@@ -401,6 +411,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert adapter.calls == 1
     assert response_loss_authority.claim_calls == 4
     assert response_loss_authority.read_calls == 1
+    assert response_loss_authority.renew_calls >= 2
     assert response_loss_authority.owner_ids[0] == response_loss_authority.owner_ids[1]
     assert len(set(response_loss_authority.owner_ids)) == 3
     authority = harness.authority.read(run_id)

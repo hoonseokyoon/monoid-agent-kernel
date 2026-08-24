@@ -303,12 +303,14 @@ receipt ref and terminal flag. Database access, private payload resolution, prov
 checkpoint restore, and terminal settlement remain inside this finite Activity.
 
 The Activity derives a content-free owner ID from the Temporal task token, claims an independent
-PostgreSQL writer generation, and starts a copied-context supervisor thread. The supervisor renews
-the PostgreSQL lease, sends empty heartbeats from before the potentially blocking writer claim, and
-propagates Activity cancellation or worker shutdown through the exact
-`ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat or
-renewal ambiguity revokes `ActivationWriteAuthority`, and every later checkpoint, invocation,
-event, and terminal publication fails closed at the PostgreSQL fence.
+PostgreSQL writer generation, and starts a copied-context control supervisor before the potentially
+blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
+worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
+evidence. An independent renewal thread performs the potentially blocking PostgreSQL calls, so pool
+or row-lock waits cannot stop heartbeat or deadline enforcement. Control propagation uses the exact
+`ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
+renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
+checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
 A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
 an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
 observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.

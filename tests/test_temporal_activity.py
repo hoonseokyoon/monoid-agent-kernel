@@ -25,6 +25,7 @@ from monoid_agent_kernel.adapters.temporal.activity import (  # noqa: E402
     TemporalActivityPolicy,
 )
 from monoid_agent_kernel.adapters.temporal.records import TemporalActivationResult  # noqa: E402
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked  # noqa: E402
 from monoid_agent_kernel.core.interruption import InterruptionCause  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationBindingConflict,
@@ -63,6 +64,7 @@ def _command() -> AdmittedCommand:
 class _AuthorityStore:
     renew_fenced_after: int = 0
     release_status: str = "released"
+    lease_interval_s: float = 30.0
 
     def __post_init__(self) -> None:
         self.claimed_owner = ""
@@ -75,7 +77,7 @@ class _AuthorityStore:
         return WriterLease(
             writer_token=token,
             observed_at=_NOW,
-            leased_until=_NOW + timedelta(seconds=30),
+            leased_until=_NOW + timedelta(seconds=self.lease_interval_s),
         )
 
     def _authority(self, token: WriterToken, *, revoked: bool) -> WriterAuthority:
@@ -333,6 +335,85 @@ def test_heartbeat_failure_during_claim_prevents_activation_drive() -> None:
     assert raised.value.type == "monoid.activation_lease_lost"
     assert raised.value.non_retryable is False
     assert _DriverDouble.constructed == []
+    assert store.release_count == 1
+
+
+def test_activity_heartbeats_while_writer_renewal_is_blocked() -> None:
+    renewal_blocked = threading.Event()
+    heartbeat_during_renewal = threading.Event()
+
+    class BlockingRenewalStore(_AuthorityStore):
+        def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
+            if self.renew_count == 1:
+                renewal_blocked.set()
+                assert heartbeat_during_renewal.wait(1)
+            return super().renew(writer_token, ttl)
+
+    def observe_heartbeat(*details: object) -> None:
+        assert details == ()
+        if renewal_blocked.is_set():
+            heartbeat_during_renewal.set()
+
+    store = BlockingRenewalStore()
+    environment = ActivityEnvironment()
+    environment.on_heartbeat = observe_heartbeat
+
+    def wait_for_periodic_renewal(kwargs: dict[str, Any]) -> object:
+        del kwargs
+        deadline = time.monotonic() + 1
+        while store.renew_count < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert store.renew_count >= 2
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    _DriverDouble.behavior = wait_for_periodic_renewal
+    raw = environment.run(_activity(store).run, _command().to_json())
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert heartbeat_during_renewal.is_set()
+    assert store.release_count == 1
+
+
+def test_blocked_renewal_revokes_authority_at_the_local_lease_deadline() -> None:
+    renewal_blocked = threading.Event()
+    allow_renewal_return = threading.Event()
+    external_call_started = threading.Event()
+
+    class DeadlineStore(_AuthorityStore):
+        def renew(self, writer_token: WriterToken, ttl: timedelta) -> RenewResult:
+            if self.renew_count == 1:
+                renewal_blocked.set()
+                assert allow_renewal_return.wait(1)
+            return super().renew(writer_token, ttl)
+
+    store = DeadlineStore(lease_interval_s=0.08)
+
+    def refuse_external_call_after_deadline(kwargs: dict[str, Any]) -> object:
+        authority = kwargs["write_authority"]
+        assert renewal_blocked.wait(1)
+        deadline = time.monotonic() + 1
+        while not authority.revoked and time.monotonic() < deadline:
+            time.sleep(0.005)
+        try:
+            with pytest.raises(WriteAuthorityRevoked):
+                authority.guard_external_call(external_call_started.set)
+        finally:
+            allow_renewal_return.set()
+        return SimpleNamespace(
+            checkpoint_ref="checkpoint:temporal-activity-run/2",
+            terminal=False,
+        )
+
+    _DriverDouble.behavior = refuse_external_call_after_deadline
+    with pytest.raises(ApplicationError) as raised:
+        ActivityEnvironment().run(_activity(store).run, _command().to_json())
+
+    assert raised.value.type == "monoid.activation_lease_lost"
+    assert raised.value.non_retryable is False
+    assert external_call_started.is_set() is False
     assert store.release_count == 1
 
 

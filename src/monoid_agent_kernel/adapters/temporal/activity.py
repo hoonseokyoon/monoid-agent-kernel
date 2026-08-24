@@ -159,45 +159,72 @@ class _TemporalLeaseSupervisor:
     ) -> None:
         self._store = store
         self._lease: WriterLease | None = None
+        self._lease_deadline: float | None = None
         self._lease_lock = threading.Lock()
         self._policy = policy
         self._write_authority = write_authority
         self._cancellation_token = cancellation_token
         self._stop = threading.Event()
-        self._wake = threading.Event()
+        self._control_wake = threading.Event()
         self._failure = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._control_thread: threading.Thread | None = None
+        self._renewal_thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._control_thread is not None:
             raise RuntimeError("lease supervisor can only be started once")
         activity_context = contextvars.copy_context()
-        self._thread = threading.Thread(
+        self._control_thread = threading.Thread(
             target=activity_context.run,
-            args=(self._run,),
-            name="monoid-temporal-lease-supervisor",
+            args=(self._run_control,),
+            name="monoid-temporal-activity-control",
             daemon=True,
         )
-        self._thread.start()
+        self._control_thread.start()
 
-    def install_lease(self, lease: WriterLease) -> None:
+    def install_lease(self, lease: WriterLease, *, observed_monotonic: float) -> None:
         if not isinstance(lease, WriterLease):
             raise TypeError("lease supervisor requires WriterLease")
+        if (
+            type(observed_monotonic) not in {int, float}
+            or isinstance(observed_monotonic, bool)
+            or not math.isfinite(float(observed_monotonic))
+        ):
+            raise ValueError("lease observation monotonic time must be finite")
         self.assert_healthy()
+        deadline = float(observed_monotonic) + (
+            lease.leased_until - lease.observed_at
+        ).total_seconds()
+        if time.monotonic() >= deadline:
+            self._fail()
+            raise _SupervisorUnhealthy("writer lease expired before local installation")
         with self._lease_lock:
             if self._lease is not None:
                 raise RuntimeError("lease supervisor authority can only be installed once")
             self._lease = lease
-        self._wake.set()
+            self._lease_deadline = deadline
+        renewal_context = contextvars.copy_context()
+        self._renewal_thread = threading.Thread(
+            target=renewal_context.run,
+            args=(self._run_renewal,),
+            name="monoid-temporal-lease-renewal",
+            daemon=True,
+        )
+        self._renewal_thread.start()
+        self._control_wake.set()
 
     def stop_and_join(self) -> bool:
         self._stop.set()
-        self._wake.set()
-        thread = self._thread
-        if thread is None:
-            return True
-        thread.join(float(self._policy.supervisor_join_timeout_s))
-        if thread.is_alive():
+        self._control_wake.set()
+        deadline = time.monotonic() + float(self._policy.supervisor_join_timeout_s)
+        threads = tuple(
+            thread
+            for thread in (self._control_thread, self._renewal_thread)
+            if thread is not None
+        )
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
             self._fail()
             return False
         return True
@@ -208,6 +235,7 @@ class _TemporalLeaseSupervisor:
 
     def _fail(self) -> None:
         self._failure.set()
+        self._control_wake.set()
         self._write_authority.revoke()
         self._cancellation_token._cancel_for_authority_loss()
 
@@ -217,44 +245,78 @@ class _TemporalLeaseSupervisor:
         if activity.is_worker_shutdown():
             self._cancellation_token.cancel(self._policy.worker_shutdown_cause)
 
-    def _run(self) -> None:
+    def _lease_snapshot(self) -> tuple[WriterLease | None, float | None]:
+        with self._lease_lock:
+            return self._lease, self._lease_deadline
+
+    def _run_control(self) -> None:
         heartbeat_interval = float(self._policy.heartbeat_interval_s)
-        renew_interval = float(self._policy.writer_lease_renew_interval_s)
         now = time.monotonic()
         next_heartbeat = now + heartbeat_interval
-        next_renew: float | None = None
         try:
             while True:
                 self._observe_control()
-                if self._stop.is_set():
+                if self._stop.is_set() or self._failure.is_set():
                     return
                 now = time.monotonic()
+                _, lease_deadline = self._lease_snapshot()
+                if lease_deadline is not None and now >= lease_deadline:
+                    self._fail()
+                    return
                 if now >= next_heartbeat:
                     activity.heartbeat()
                     next_heartbeat = now + heartbeat_interval
-                with self._lease_lock:
-                    lease = self._lease
-                if lease is not None and next_renew is None:
-                    next_renew = now + renew_interval
-                if lease is not None and next_renew is not None and now >= next_renew:
-                    renewed = renew_writer_lease(
-                        self._store,
-                        lease.writer_token,
-                        self._policy.writer_lease_ttl,
-                        write_authority=self._write_authority,
-                    )
-                    if renewed.status != "renewed" or renewed.lease is None:
-                        self._fail()
-                        return
-                    with self._lease_lock:
-                        self._lease = renewed.lease
-                    next_renew = now + renew_interval
                 deadlines = [next_heartbeat]
-                if next_renew is not None:
-                    deadlines.append(next_renew)
+                if lease_deadline is not None:
+                    deadlines.append(lease_deadline)
                 wait_s = max(0.0, min(deadlines) - time.monotonic())
-                self._wake.wait(wait_s)
-                self._wake.clear()
+                self._control_wake.wait(wait_s)
+                self._control_wake.clear()
+        except BaseException:  # the public Activity exposes only a stable failure taxonomy
+            self._fail()
+
+    def _run_renewal(self) -> None:
+        renew_interval = float(self._policy.writer_lease_renew_interval_s)
+        next_renew = time.monotonic() + renew_interval
+        try:
+            while True:
+                if self._stop.wait(max(0.0, next_renew - time.monotonic())):
+                    return
+                if self._failure.is_set():
+                    return
+                lease, lease_deadline = self._lease_snapshot()
+                if lease is None or lease_deadline is None:
+                    raise RuntimeError("lease renewal started without installed authority")
+                renew_started = time.monotonic()
+                if renew_started >= lease_deadline:
+                    self._fail()
+                    return
+                renewed = renew_writer_lease(
+                    self._store,
+                    lease.writer_token,
+                    self._policy.writer_lease_ttl,
+                    write_authority=self._write_authority,
+                )
+                if renewed.status != "renewed" or renewed.lease is None:
+                    self._fail()
+                    return
+                renewed_deadline = renew_started + (
+                    renewed.lease.leased_until - renewed.lease.observed_at
+                ).total_seconds()
+                now = time.monotonic()
+                if self._failure.is_set() or now >= renewed_deadline:
+                    self._fail()
+                    return
+                with self._lease_lock:
+                    if self._stop.is_set() or self._failure.is_set():
+                        return
+                    self._lease = renewed.lease
+                    self._lease_deadline = renewed_deadline
+                self._control_wake.set()
+                next_renew = max(
+                    now,
+                    min(now + renew_interval, renewed_deadline - renew_interval),
+                )
         except BaseException:  # the public Activity exposes only a stable failure taxonomy
             self._fail()
 
@@ -371,6 +433,7 @@ class TemporalActivationActivity:
             )
             supervisor.assert_healthy()
             write_authority.assert_active()
+            renew_started = time.monotonic()
             renewed = renew_writer_lease(
                 self.authority_store,
                 lease.writer_token,
@@ -382,7 +445,7 @@ class TemporalActivationActivity:
             lease = renewed.lease
             supervisor.assert_healthy()
             write_authority.assert_active()
-            supervisor.install_lease(lease)
+            supervisor.install_lease(lease, observed_monotonic=renew_started)
             supervisor.assert_healthy()
             write_authority.assert_active()
             if activity.is_cancelled():
