@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from monoid_agent_kernel.adapters.postgres.config import PostgresConfig
 
@@ -161,19 +161,33 @@ class PostgresDatabase:
             yield cursor
 
     @contextmanager
-    def transaction(self, *, read_only: bool = False) -> Iterator[Any]:
-        """Start the adapter's READ COMMITTED transaction with a trusted local search path."""
+    def transaction(
+        self,
+        *,
+        read_only: bool = False,
+        isolation_level: Literal["read_committed", "repeatable_read"] = "read_committed",
+    ) -> Iterator[Any]:
+        """Start a bounded adapter transaction with a trusted local search path."""
 
         if type(read_only) is not bool:
             raise TypeError("PostgreSQL transaction read_only must be a boolean")
+        if type(isolation_level) is not str:
+            raise TypeError("PostgreSQL transaction isolation_level must be a string")
+        isolation_sql = {
+            "read_committed": "READ COMMITTED",
+            "repeatable_read": "REPEATABLE READ",
+        }.get(isolation_level)
+        if isolation_sql is None:
+            raise ValueError("PostgreSQL transaction isolation_level is unsupported")
 
         with self.connection() as connection:
             with connection.transaction():
                 with self.cursor(connection) as cursor:
-                    # This is deliberately the first statement. Adapter linearization may wait on
-                    # row, unique-index, or advisory locks and then needs a new statement snapshot.
+                    # This is deliberately the first statement. READ COMMITTED mutation paths may
+                    # wait on row, unique-index, or advisory locks and then need a new statement
+                    # snapshot. Aggregate operations select REPEATABLE READ explicitly.
                     cursor.execute(
-                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                        f"SET TRANSACTION ISOLATION LEVEL {isolation_sql}"
                         + (", READ ONLY" if read_only else "")
                     )
                     # Caller-provided pooled sessions may carry an untrusted search_path. Adapter

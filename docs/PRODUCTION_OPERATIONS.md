@@ -46,7 +46,7 @@ inventory, and version-delete semantics belong in pre-production service qualifi
 
 ## Operational snapshots and metrics
 
-`PostgresOperations.snapshot()` opens a `READ COMMITTED, READ ONLY` transaction and uses the
+`PostgresOperations.snapshot()` opens a `REPEATABLE READ, READ ONLY` transaction and uses the
 database clock for one aggregate snapshot. It emits fixed metric names and low-cardinality
 `queue`/`state` attributes. It never emits a run ID, owner ID, schema, locator, digest, payload,
 checkpoint, prompt, output, reasoning text, or credential.

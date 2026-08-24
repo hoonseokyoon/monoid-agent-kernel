@@ -77,7 +77,10 @@ class PostgresOperations:
             self._ready = False
             raise
         self._schema_version = status.current_version
-        with self.database.transaction(read_only=True) as connection:
+        with self.database.transaction(
+            read_only=True,
+            isolation_level="repeatable_read",
+        ) as connection:
             with self.database.cursor(connection) as cursor:
                 collected_at = self._one(cursor, "SELECT pg_catalog.clock_timestamp()")[0]
                 authority = self._one(

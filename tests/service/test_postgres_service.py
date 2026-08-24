@@ -287,6 +287,17 @@ def test_operations_snapshot_is_read_only_and_aggregate_only(
     assert postgres_database.config.schema not in public
     assert postgres_database.config.dsn not in public
 
+    with postgres_database.transaction(
+        read_only=True,
+        isolation_level="repeatable_read",
+    ) as connection:
+        with postgres_database.cursor(connection) as cursor:
+            cursor.execute(
+                "SELECT pg_catalog.current_setting('transaction_isolation'), "
+                "pg_catalog.current_setting('transaction_read_only')"
+            )
+            assert cursor.fetchone() == ("repeatable read", "on")
+
     with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
         with postgres_database.transaction(read_only=True) as connection:
             with postgres_database.cursor(connection) as cursor:
@@ -302,6 +313,9 @@ def test_operations_snapshot_is_read_only_and_aggregate_only(
                         sql.Identifier("run_authority"),
                     )
                 )
+    with pytest.raises(ValueError, match="isolation_level"):
+        with postgres_database.transaction(isolation_level="serializable"):  # type: ignore[arg-type]
+            pass
 
 
 def test_forward_schema_uses_declared_reader_and_writer_floors(
