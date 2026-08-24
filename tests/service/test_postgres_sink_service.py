@@ -2014,6 +2014,59 @@ def test_external_object_profile_passes_full_fenced_sink_contract(
     assert not failed, failed
 
 
+def test_external_sink_preserves_historical_bytea_records_and_references(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    base_sink = PostgresFencedRunSink(external_sink_harness.database)
+    base_sink.check_ready()
+    checkpoint_run = "run-bytea-before-external-checkpoint"
+    checkpoint_token = external_sink_harness.claim(checkpoint_run)
+    checkpoint_sha, checkpoint_blobs = _blob(b"historical bytea checkpoint")
+    assert base_sink.commit_checkpoint(
+        _checkpoint_with_blob(checkpoint_run, 1, checkpoint_sha, "before-external"),
+        checkpoint_blobs,
+        writer_token=checkpoint_token,
+    ).status == "committed"
+
+    loaded_historical = external_sink_harness.sink.latest_checked(checkpoint_run)
+    assert loaded_historical.value is not None
+    assert loaded_historical.value.blob(checkpoint_sha) == checkpoint_blobs[checkpoint_sha]
+    assert external_sink_harness.sink.commit_checkpoint(
+        _checkpoint_with_blob(checkpoint_run, 2, checkpoint_sha, "after-external"),
+        {},
+        writer_token=checkpoint_token,
+    ).status == "committed"
+    loaded_continuation = external_sink_harness.sink.latest_checked(checkpoint_run)
+    assert loaded_continuation.value is not None
+    assert loaded_continuation.value.blob(checkpoint_sha) == checkpoint_blobs[checkpoint_sha]
+
+    invocation_run = "run-bytea-before-external-invocation"
+    invocation_token = external_sink_harness.claim(invocation_run)
+    result_sha, result_blobs = _blob(b"historical bytea invocation")
+    invocation_history = (
+        _invocation(invocation_run, 1, "reserved"),
+        _invocation(invocation_run, 2, "dispatch_started"),
+        _invocation(invocation_run, 3, "settled", succeeded_blob=result_sha),
+    )
+    for invocation in invocation_history[:-1]:
+        assert base_sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=invocation_token,
+        ).status == "committed"
+    assert base_sink.commit_invocation(
+        invocation_history[-1],
+        result_blobs,
+        writer_token=invocation_token,
+    ).status == "committed"
+    loaded_invocation = external_sink_harness.sink.load_invocation(invocation_run, "call-1")
+    assert loaded_invocation.value is not None
+    assert loaded_invocation.value.blob(result_sha) == result_blobs[result_sha]
+
+    assert _table_count(external_sink_harness, "run_object_blob", checkpoint_run) == 0
+    assert _table_count(external_sink_harness, "run_object_blob", invocation_run) == 0
+
+
 def test_external_object_association_is_run_scoped_and_survives_reopen(
     external_sink_harness: _ExternalSinkHarness,
 ) -> None:

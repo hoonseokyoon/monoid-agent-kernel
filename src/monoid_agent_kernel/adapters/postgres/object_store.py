@@ -193,6 +193,22 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
         )
         return self._stat_matches(self.object_store.stat(sha256), expected)
 
+    def _has_object_association(self, cursor: object, run_id: str, sha256: str) -> bool:
+        from psycopg import sql
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL("SELECT 1 FROM {} WHERE run_id = %s AND sha256 = %s").format(
+                self._table("run_object_blob")
+            ),
+            (run_id, sha256),
+        )
+        return cursor.fetchone() is not None  # type: ignore[attr-defined]
+
+    def _reference_is_valid(self, cursor: object, run_id: str, sha256: str) -> bool:
+        if self._has_object_association(cursor, run_id, sha256):
+            return self._associated_blob_is_valid(cursor, run_id, sha256)
+        return super()._associated_blob_is_valid(cursor, run_id, sha256)
+
     def _references_resolve(
         self,
         cursor: object,
@@ -214,7 +230,7 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
             ):
                 return False
         return all(
-            sha256 in blobs or self._associated_blob_is_valid(cursor, run_id, sha256)
+            sha256 in blobs or self._reference_is_valid(cursor, run_id, sha256)
             for sha256 in references
         )
 
@@ -347,7 +363,7 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
                 )
                 row = cursor.fetchone()
         if row is None:
-            raise KeyError(sha256)
+            return super()._read_blob(run_id, sha256)
         if str(row[2]) != "available":
             raise PostgresObjectAssociationCorrupt(
                 "run association references an unavailable physical object"
