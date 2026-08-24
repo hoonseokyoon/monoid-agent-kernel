@@ -40,6 +40,10 @@ class _PreparedObjectBlobs(dict[str, bytes]):
         self.stats = dict(stats)
 
 
+class _PreparedInlineBlobs(dict[str, bytes]):
+    """Validated fallback bytes selected for the PostgreSQL bytea backend."""
+
+
 def _supports(value: object, names: tuple[str, ...]) -> bool:
     return all(callable(getattr(value, name, None)) for name in names)
 
@@ -110,25 +114,32 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
             raise TypeError("external fenced sink object_store must satisfy ContentAddressedBlobStore")
         self.object_store = object_store
 
-    def _prepare_blobs(self, blobs: object) -> _PreparedObjectBlobs | None:
+    def _prepare_blobs(
+        self,
+        blobs: object,
+    ) -> _PreparedObjectBlobs | _PreparedInlineBlobs | None:
         checked = _validate_external_blobs(blobs)
         if checked is None:
             return None
         stats: dict[str, BlobStat] = {}
-        for sha256 in sorted(checked):
-            result = self.object_store.put_if_absent(sha256, checked[sha256])
-            stat = result.stat
-            if (
-                stat.sha256 != sha256
-                or stat.size_bytes != len(checked[sha256])
-                or not stat.locator
-            ):
-                raise BlobCorrupt("object-store put result disagrees with caller bytes")
-            stats[sha256] = stat
+        try:
+            for sha256 in sorted(checked):
+                result = self.object_store.put_if_absent(sha256, checked[sha256])
+                stat = result.stat
+                if (
+                    stat.sha256 != sha256
+                    or stat.size_bytes != len(checked[sha256])
+                    or not stat.locator
+                ):
+                    raise BlobCorrupt("object-store put result disagrees with caller bytes")
+                stats[sha256] = stat
+        except BlobTooLarge:
+            inline = super()._validated_blobs(checked)
+            return _PreparedInlineBlobs(inline) if inline is not None else None
         return _PreparedObjectBlobs(checked, stats)
 
     def _validated_blobs(self, blobs: object) -> dict[str, bytes] | None:
-        if not isinstance(blobs, _PreparedObjectBlobs):
+        if not isinstance(blobs, (_PreparedObjectBlobs, _PreparedInlineBlobs)):
             return None
         return blobs
 
@@ -137,7 +148,8 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
         cursor: object,
         blobs: Mapping[str, bytes],
     ) -> bool:
-        del cursor
+        if isinstance(blobs, _PreparedInlineBlobs):
+            return super()._submitted_blobs_preserve_backing(cursor, blobs)
         return isinstance(blobs, _PreparedObjectBlobs) and set(blobs) == set(blobs.stats)
 
     def _object_metadata(
@@ -216,6 +228,11 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
         references: set[str],
         blobs: Mapping[str, bytes],
     ) -> bool:
+        if isinstance(blobs, _PreparedInlineBlobs):
+            return all(
+                sha256 in blobs or self._reference_is_valid(cursor, run_id, sha256)
+                for sha256 in references
+            )
         if not isinstance(blobs, _PreparedObjectBlobs):
             return False
         for sha256 in sorted(references | set(blobs)):
@@ -240,6 +257,9 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
         run_id: str,
         blobs: Mapping[str, bytes],
     ) -> None:
+        if isinstance(blobs, _PreparedInlineBlobs):
+            super()._persist_blobs(cursor, run_id, blobs)
+            return
         if not isinstance(blobs, _PreparedObjectBlobs):
             raise RuntimeError("external object metadata requires prepared blob stats")
         from psycopg import sql
@@ -297,10 +317,7 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
             raise TypeError("PostgreSQL checkpoint commit requires WriterToken")
         if getattr(checkpoint, "run_id", None) != writer_token.run_id:
             return CommitResult(status="fenced")
-        try:
-            prepared = self._prepare_blobs(blobs)
-        except BlobTooLarge:
-            prepared = None
+        prepared = self._prepare_blobs(blobs)
         if prepared is None:
             return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
         return super().commit_checkpoint(checkpoint, prepared, writer_token=writer_token)
@@ -325,10 +342,7 @@ class PostgresObjectStoreFencedRunSink(PostgresFencedRunSink):
                     else None
                 ),
             )
-        try:
-            prepared = self._prepare_blobs(blobs)
-        except BlobTooLarge:
-            prepared = None
+        prepared = self._prepare_blobs(blobs)
         if prepared is None:
             return super().commit_invocation(
                 invocation,

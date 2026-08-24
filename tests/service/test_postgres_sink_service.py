@@ -55,7 +55,12 @@ from monoid_agent_kernel.core.outcome import (  # noqa: E402
     TerminalOutcome,
 )
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
-from monoid_agent_kernel.hosting import BlobNotFound, CommitResult, WriterToken  # noqa: E402
+from monoid_agent_kernel.hosting import (  # noqa: E402
+    BlobNotFound,
+    BlobTooLarge,
+    CommitResult,
+    WriterToken,
+)
 from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
 
@@ -2065,6 +2070,88 @@ def test_external_sink_preserves_historical_bytea_records_and_references(
 
     assert _table_count(external_sink_harness, "run_object_blob", checkpoint_run) == 0
     assert _table_count(external_sink_harness, "run_object_blob", invocation_run) == 0
+
+
+def test_external_sink_uses_inline_backing_when_object_limit_is_lower(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    class LowerLimitStore:
+        def __init__(self, delegate: object, max_bytes: int) -> None:
+            self.delegate = delegate
+            self.max_bytes = max_bytes
+
+        def put_if_absent(self, sha256: str, data: bytes) -> object:
+            if len(data) > self.max_bytes:
+                raise BlobTooLarge("injected object-store size boundary")
+            return self.delegate.put_if_absent(sha256, data)  # type: ignore[attr-defined]
+
+        def stat(self, sha256: str) -> object:
+            return self.delegate.stat(sha256)  # type: ignore[attr-defined]
+
+        def get_checked(self, sha256: str) -> bytes:
+            return self.delegate.get_checked(sha256)  # type: ignore[attr-defined,no-any-return]
+
+    limited_store = LowerLimitStore(external_sink_harness.object_store, max_bytes=8)
+    sink = PostgresObjectStoreFencedRunSink(
+        external_sink_harness.database,
+        limited_store,  # type: ignore[arg-type]
+    )
+    sink.check_ready()
+
+    checkpoint_run = "run-object-limit-inline-checkpoint"
+    checkpoint_token = external_sink_harness.claim(checkpoint_run)
+    checkpoint_sha, checkpoint_blobs = _blob(b"inline checkpoint after object size limit")
+    assert sink.commit_checkpoint(
+        _checkpoint_with_blob(checkpoint_run, 1, checkpoint_sha, "inline-fallback"),
+        checkpoint_blobs,
+        writer_token=checkpoint_token,
+    ).status == "committed"
+    loaded_checkpoint = sink.latest_checked(checkpoint_run)
+    assert loaded_checkpoint.value is not None
+    assert loaded_checkpoint.value.blob(checkpoint_sha) == checkpoint_blobs[checkpoint_sha]
+
+    invocation_run = "run-object-limit-inline-invocation"
+    invocation_token = external_sink_harness.claim(invocation_run)
+    result_sha, result_blobs = _blob(b"inline invocation after object size limit")
+    invocation_history = (
+        _invocation(invocation_run, 1, "reserved"),
+        _invocation(invocation_run, 2, "dispatch_started"),
+        _invocation(invocation_run, 3, "settled", succeeded_blob=result_sha),
+    )
+    for invocation in invocation_history[:-1]:
+        assert sink.commit_invocation(
+            invocation,
+            {},
+            writer_token=invocation_token,
+        ).status == "committed"
+    assert sink.commit_invocation(
+        invocation_history[-1],
+        result_blobs,
+        writer_token=invocation_token,
+    ).status == "committed"
+    loaded_invocation = sink.load_invocation(invocation_run, "call-1")
+    assert loaded_invocation.value is not None
+    assert loaded_invocation.value.blob(result_sha) == result_blobs[result_sha]
+
+    assert _table_count(external_sink_harness, "run_blob", checkpoint_run) == 1
+    assert _table_count(external_sink_harness, "run_blob", invocation_run) == 1
+    assert _table_count(external_sink_harness, "run_object_blob", checkpoint_run) == 0
+    assert _table_count(external_sink_harness, "run_object_blob", invocation_run) == 0
+    assert external_sink_harness.object_store.stat(checkpoint_sha) is None  # type: ignore[attr-defined]
+    assert external_sink_harness.object_store.stat(result_sha) is None  # type: ignore[attr-defined]
+
+    rejected_run = "run-object-and-inline-limits"
+    rejected_token = external_sink_harness.claim(rejected_run)
+    rejected_data = b"x" * (external_sink_harness.database.config.max_bytea_blob_bytes + 1)
+    rejected_sha, rejected_blobs = _blob(rejected_data)
+    assert sink.commit_checkpoint(
+        _checkpoint_with_blob(rejected_run, 1, rejected_sha, "outside-both-limits"),
+        rejected_blobs,
+        writer_token=rejected_token,
+    ).status == "conflict"
+    assert _table_count(external_sink_harness, "checkpoint_record", rejected_run) == 0
+    assert _table_count(external_sink_harness, "run_blob", rejected_run) == 0
+    assert _table_count(external_sink_harness, "run_object_blob", rejected_run) == 0
 
 
 def test_external_object_association_is_run_scoped_and_survives_reopen(
