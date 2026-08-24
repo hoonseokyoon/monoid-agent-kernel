@@ -150,6 +150,46 @@ an actionable failure for corrupt or unsupported state.
 
 ### Finite activation hosting
 
+Use `PostgresCommandAdmissionStore` at the product ingress to create one immutable admitted command
+and its dispatch outbox row in a single transaction. The caller supplies a stable command ID,
+request digest, and opaque private payload address. An exact retry returns the current receipt;
+reusing the ID for a different request raises `AdmissionConflict`.
+
+```python
+from monoid_agent_kernel.adapters.postgres import PostgresCommandAdmissionStore
+from monoid_agent_kernel.hosting import AdmissionRequest, CommandOutboxDispatcher
+
+admission = PostgresCommandAdmissionStore(postgres_database)
+receipt = admission.admit(
+    AdmissionRequest(
+        run_id=run_id,
+        command_id=command_id,
+        kind="input",
+        request_digest=request_digest,
+        payload_ref=private_payload_ref,
+    )
+)
+dispatcher = CommandOutboxDispatcher(
+    store=admission,
+    transport=orchestrator_transport,
+    owner_id=dispatcher_id,
+)
+dispatcher.dispatch_once()
+```
+
+`dispatch_once()` performs one finite claim/send/settle attempt. The host owns polling, threads,
+shutdown, credentials, and health reporting. Dispatch uses database-clock leases and preserves
+per-run command order across competing workers. Delivery is at least once: the transport deduplicates
+`AdmittedCommand.identity_sha256`, and the activation path applies the immutable command identity
+once. A rejected command enters `dead_letter` and blocks later commands in that run until an operator
+resolves the lane.
+
+After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
+`bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.
+This allows several commands to be admitted before an earlier command advances the checkpoint.
+Replacement workers receive the same stored `ActivationCommand`; stale writers are fenced before
+readback.
+
 Use `monoid_agent_kernel.hosting.ActivationDriver` when an external scheduler, workflow engine, or
 queue worker owns process replacement. The host admits one stable `ActivationCommand`, claims a
 `WriterToken`, and drives the restored loop to one durable suspension boundary:

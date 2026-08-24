@@ -45,6 +45,9 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
 | `terminal-outcome` | wire | `monoid.terminal-outcome.v1` | strict | `monoid.terminal-outcome.v1`<br>`native-agent-runner.terminal-outcome.v1` |
+| `admission-request` | wire | `monoid.admission-request.v1` | strict | `monoid.admission-request.v1`<br>`native-agent-runner.admission-request.v1` |
+| `admitted-command` | wire | `monoid.admitted-command.v1` | strict | `monoid.admitted-command.v1`<br>`native-agent-runner.admitted-command.v1` |
+| `admission-receipt` | wire | `monoid.admission-receipt.v1` | strict | `monoid.admission-receipt.v1`<br>`native-agent-runner.admission-receipt.v1` |
 | `activation-command` | wire | `monoid.activation-command.v1` | strict | `monoid.activation-command.v1`<br>`native-agent-runner.activation-command.v1` |
 | `activation-receipt` | wire | `monoid.activation-receipt.v1` | strict | `monoid.activation-receipt.v1`<br>`native-agent-runner.activation-receipt.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
@@ -94,6 +97,13 @@ so an ambiguous paid call cannot be classified for automatic retry.
 The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
 limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
 contract window, so deploy the current strict reader before a writer that can emit it.
+
+`monoid.admission-request.v1` binds a caller-selected command identity to a request digest and an
+opaque payload address. `monoid.admitted-command.v1` adds the PostgreSQL-assigned per-run sequence
+used for ordered, at-least-once delivery to an orchestrator. `monoid.admission-receipt.v1` projects
+dispatch state, the immutable activation binding, and canonical completion. These records carry
+opaque IDs, digests, addresses, counters, and public-safe taxonomy. Private command content and raw
+transport errors remain outside the wire records.
 
 `monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
 or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded
