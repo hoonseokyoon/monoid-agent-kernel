@@ -15,7 +15,7 @@ from monoid_agent_kernel.adapters.postgres.pool import (
 from monoid_agent_kernel.core.json_ingress import portable_type_name
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _METADATA_TABLE = "monoid_schema_migrations"
 _MIGRATION_LOCK_NAMESPACE = "monoid-agent-kernel:migrations"
 _SCHEMA_TOKEN = "__MONOID_SCHEMA__"
@@ -102,6 +102,7 @@ def _sources() -> tuple[_MigrationSource, ...]:
     definitions = (
         ("0001_authority", 1, 1, 1),
         ("0002_checkpoint_invocation", 2, 1, 1),
+        ("0003_event_terminal_evidence_outbox", 3, 1, 1),
     )
     root = files("monoid_agent_kernel.adapters.postgres").joinpath("sql")
     loaded: list[_MigrationSource] = []

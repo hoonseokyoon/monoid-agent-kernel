@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Literal
 
 import pytest
 
@@ -42,12 +42,17 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
 )
 from monoid_agent_kernel.core._util import canonical_sha256  # noqa: E402
 from monoid_agent_kernel.core.checkpoint import RunCheckpoint  # noqa: E402
+from monoid_agent_kernel.core.events import AgentEvent, make_agent_event  # noqa: E402
 from monoid_agent_kernel.core.model_invocation import (  # noqa: E402
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
 )
-from monoid_agent_kernel.errors import DurableModelCallError  # noqa: E402
-from monoid_agent_kernel.hosting import WriterToken  # noqa: E402
+from monoid_agent_kernel.core.outcome import (  # noqa: E402
+    RetryEligibility,
+    TerminalOutcome,
+)
+from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
+from monoid_agent_kernel.hosting import CommitResult, WriterToken  # noqa: E402
 from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
 
@@ -95,11 +100,179 @@ class _SinkHarness:
             timedelta(seconds=30),
         ).writer_token
 
+    def set_current_writer(self, writer_token: WriterToken) -> None:
+        """Install an exact contract token while retaining PostgreSQL as authority."""
+
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "WITH sampled AS (SELECT pg_catalog.clock_timestamp() AS db_now) "
+                        "INSERT INTO {} "
+                        "(run_id, owner_id, generation, leased_until, revoked, updated_at) "
+                        "SELECT %s, %s, %s, db_now + interval '5 minutes', false, db_now "
+                        "FROM sampled ON CONFLICT (run_id) DO UPDATE SET "
+                        "owner_id = EXCLUDED.owner_id, generation = EXCLUDED.generation, "
+                        "leased_until = EXCLUDED.leased_until, revoked = false, "
+                        "updated_at = EXCLUDED.updated_at"
+                    ).format(sql.Identifier(self.database.config.schema, "run_authority")),
+                    (
+                        writer_token.run_id,
+                        writer_token.owner_id,
+                        writer_token.generation,
+                    ),
+                )
+
+    def reopen(self) -> _SinkHarness:
+        sink = PostgresFencedRunSink(self.database)
+        sink.check_ready()
+        authority = PostgresWriterAuthorityStore(self.database)
+        authority.check_ready()
+        return _SinkHarness(database=self.database, authority=authority, sink=sink)
+
+    def inject_authoritative_load_fault(
+        self,
+        record_family: Literal["checkpoint", "invocation"],
+        run_id: str,
+        status: Literal["corrupt", "unsupported_version"],
+        *,
+        logical_call_id: str = "",
+    ) -> None:
+        if record_family == "checkpoint":
+            table = "checkpoint_record"
+            identity_sql = "run_id = %s AND sequence = (SELECT sequence FROM {} WHERE run_id = %s)"
+            head_table = "checkpoint_head"
+            parameters = (run_id, run_id)
+            future_schema = "monoid.checkpoint.v999"
+        elif record_family == "invocation":
+            table = "invocation_record"
+            identity_sql = (
+                "run_id = %s AND logical_call_id = %s AND revision = "
+                "(SELECT revision FROM {} WHERE run_id = %s AND logical_call_id = %s)"
+            )
+            head_table = "invocation_head"
+            parameters = (run_id, logical_call_id, run_id, logical_call_id)
+            future_schema = "monoid.model-invocation.v999"
+        else:  # pragma: no cover - conformance protocol constrains this value
+            raise ValueError("unknown PostgreSQL fault family")
+        rendered_identity = sql.SQL(identity_sql).format(
+            sql.Identifier(self.database.config.schema, head_table)
+        )
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                if status == "corrupt":
+                    cursor.execute(
+                        sql.SQL("UPDATE {} SET content_digest = %s WHERE ").format(
+                            sql.Identifier(self.database.config.schema, table)
+                        )
+                        + rendered_identity,
+                        ("0" * 64, *parameters),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("load fault requires an authoritative record")
+                    return
+                cursor.execute(
+                    sql.SQL("SELECT payload, submitted_blobs FROM {} WHERE ").format(
+                        sql.Identifier(self.database.config.schema, table)
+                    )
+                    + rendered_identity,
+                    parameters,
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("load fault requires an authoritative record")
+                payload = {**dict(row[0]), "schema_version": future_schema}
+                content_digest = canonical_sha256({"record": payload, "blobs": row[1]})
+                cursor.execute(
+                    sql.SQL(
+                        "UPDATE {} SET payload = %s, schema_version = %s, "
+                        "content_digest = %s WHERE "
+                    ).format(sql.Identifier(self.database.config.schema, table))
+                    + rendered_identity,
+                    (Json(payload), future_schema, content_digest, *parameters),
+                )
+
+    def read_event(self, run_id: str, seq: int) -> AgentEvent | None:
+        return self.sink.read_event(run_id, seq)
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        return self.sink.read_terminal(run_id)
+
+    def close(self) -> None:
+        """The pytest fixture owns the shared database and pool lifecycle."""
+
+    def race_conflicting_writes(
+        self,
+        mutation: str,
+        writer_token: WriterToken,
+        left: Callable[[PostgresFencedRunSink], CommitResult],
+        right: Callable[[PostgresFencedRunSink], CommitResult],
+    ) -> tuple[CommitResult, CommitResult]:
+        del mutation, writer_token
+        barrier = threading.Barrier(3)
+        left_sink = self.reopen().sink
+        right_sink = self.reopen().sink
+
+        def invoke(
+            operation: Callable[[PostgresFencedRunSink], CommitResult],
+            sink: PostgresFencedRunSink,
+        ) -> CommitResult:
+            barrier.wait(timeout=10)
+            return operation(sink)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            left_future = executor.submit(invoke, left, left_sink)
+            right_future = executor.submit(invoke, right, right_sink)
+            barrier.wait(timeout=10)
+            return left_future.result(timeout=20), right_future.result(timeout=20)
+
+    def race_writer_handoff(
+        self,
+        mutation: str,
+        stale_token: WriterToken,
+        current_token: WriterToken,
+        write: Callable[[PostgresFencedRunSink, WriterToken], CommitResult],
+    ) -> tuple[CommitResult, CommitResult, bool]:
+        del mutation
+        schema = self.database.config.schema
+        stale_sink = self.reopen().sink
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with self.database.connection() as blocker:
+                with blocker.transaction():
+                    with blocker.cursor() as cursor:
+                        cursor.execute(
+                            sql.SQL("SELECT run_id FROM {} WHERE run_id = %s FOR UPDATE").format(
+                                sql.Identifier(schema, "run_authority")
+                            ),
+                            (stale_token.run_id,),
+                        )
+                        future = executor.submit(write, stale_sink, stale_token)
+                        _wait_for_lock(
+                            self.database,
+                            self.database.config.application_name,
+                        )
+                        cursor.execute(
+                            sql.SQL(
+                                "UPDATE {} SET owner_id = %s, generation = %s, "
+                                "leased_until = pg_catalog.clock_timestamp() + "
+                                "interval '5 minutes', revoked = false, "
+                                "updated_at = pg_catalog.clock_timestamp() WHERE run_id = %s"
+                            ).format(sql.Identifier(schema, "run_authority")),
+                            (
+                                current_token.owner_id,
+                                current_token.generation,
+                                current_token.run_id,
+                            ),
+                        )
+                stale_result = future.result(timeout=20)
+        current_result = write(self.reopen().sink, current_token)
+        return stale_result, current_result, True
+
 
 @pytest.fixture
 def sink_harness(postgres_target: tuple[str, int]) -> Iterator[_SinkHarness]:
     dsn, _ = postgres_target
-    schema = f"monoid_pr03_{uuid.uuid4().hex}"
+    schema = f"monoid_pr04_{uuid.uuid4().hex}"
     database = PostgresDatabase(
         PostgresConfig(
             dsn=dsn,
@@ -107,7 +280,7 @@ def sink_harness(postgres_target: tuple[str, int]) -> Iterator[_SinkHarness]:
             min_pool_size=1,
             max_pool_size=8,
             pool_timeout_s=10,
-            application_name="monoid-pr03-service-test",
+            application_name="monoid-pr04-service-test",
             max_bytea_blob_bytes=64,
         )
     )
@@ -454,6 +627,87 @@ def test_deleting_run_authority_cascades_records_and_heads(
         assert _table_count(sink_harness, table, run_id) == 0
 
 
+def test_deleting_run_authority_cascades_complete_sink_records(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-complete-sink-cascade"
+    token = sink_harness.claim(run_id)
+    event = make_agent_event(run_id=run_id, seq=1, event_type="run.finished")
+    terminal = TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+    )
+    assert sink_harness.sink.append_event(event, writer_token=token).status == "committed"
+    assert sink_harness.sink.settle_terminal(terminal, writer_token=token).status == "committed"
+
+    required = tuple(
+        _invocation(
+            run_id,
+            revision,
+            state,
+            logical_call_id="call-required-cascade",
+            dispatch_id="dispatch-required-cascade",
+            evidence_policy="required",
+        )
+        for revision, state in ((1, "reserved"), (2, "dispatch_started"), (3, "settled"))
+    )
+    for item in required:
+        assert sink_harness.sink.commit_invocation(item, {}, writer_token=token).status == (
+            "committed"
+        )
+    assert (
+        sink_harness.sink.commit_model_evidence(required[-1], writer_token=token).status
+        == "committed"
+    )
+
+    outbox = tuple(
+        _invocation(
+            run_id,
+            revision,
+            state,
+            logical_call_id="call-outbox-cascade",
+            dispatch_id="dispatch-outbox-cascade",
+            evidence_policy="outbox",
+        )
+        for revision, state in ((1, "reserved"), (2, "dispatch_started"), (3, "settled"))
+    )
+    for item in outbox[:-1]:
+        assert sink_harness.sink.commit_invocation(item, {}, writer_token=token).status == (
+            "committed"
+        )
+    assert (
+        sink_harness.sink.commit_invocation(
+            outbox[-1],
+            {},
+            writer_token=token,
+            stage_evidence=True,
+        ).status
+        == "committed"
+    )
+
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("DELETE FROM {} WHERE run_id = %s").format(
+                    sql.Identifier(sink_harness.database.config.schema, "run_authority")
+                ),
+                (run_id,),
+            )
+
+    for table in (
+        "run_authority",
+        "event_record",
+        "event_head",
+        "terminal_record",
+        "invocation_record",
+        "invocation_head",
+        "model_evidence_record",
+        "model_evidence_outbox",
+    ):
+        assert _table_count(sink_harness, table, run_id) == 0
+
+
 def test_corrupt_records_cannot_acknowledge_idempotent_retries(
     sink_harness: _SinkHarness,
 ) -> None:
@@ -486,15 +740,50 @@ def test_corrupt_records_cannot_acknowledge_idempotent_retries(
     )
 
     assert (
-        sink_harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token).status
-        == "conflict"
+        sink_harness.sink.commit_checkpoint(checkpoint, {}, writer_token=token).status == "conflict"
     )
     assert (
-        sink_harness.sink.commit_invocation(invocation, {}, writer_token=token).status
-        == "conflict"
+        sink_harness.sink.commit_invocation(invocation, {}, writer_token=token).status == "conflict"
     )
     assert sink_harness.sink.latest_checked(run_id).status == "corrupt"
     assert sink_harness.sink.load_invocation(run_id, "call-1").status == "corrupt"
+
+
+def test_corrupt_event_and_terminal_cannot_acknowledge_retries(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-corrupt-event-terminal"
+    token = sink_harness.claim(run_id)
+    event = make_agent_event(run_id=run_id, seq=1, event_type="run.finished")
+    terminal = TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+    )
+    assert sink_harness.sink.append_event(event, writer_token=token).status == "committed"
+    assert sink_harness.sink.settle_terminal(terminal, writer_token=token).status == "committed"
+
+    _rewrite_payload_without_digest(
+        sink_harness,
+        "event_record",
+        "run_id = %s AND sequence = %s",
+        (run_id, 1),
+        lambda payload: {**payload, "level": "warning"},
+    )
+    _rewrite_payload_without_digest(
+        sink_harness,
+        "terminal_record",
+        "run_id = %s",
+        (run_id,),
+        lambda payload: {**payload, "error_code": "corrupt"},
+    )
+
+    assert sink_harness.sink.append_event(event, writer_token=token).status == "conflict"
+    assert sink_harness.sink.settle_terminal(terminal, writer_token=token).status == "conflict"
+    with pytest.raises(RuntimeError, match="event record is corrupt"):
+        sink_harness.sink.read_event(run_id, 1)
+    with pytest.raises(RuntimeError, match="terminal record is corrupt"):
+        sink_harness.sink.read_terminal(run_id)
 
 
 def test_blob_bounds_fencing_and_cross_run_authorization(
@@ -708,6 +997,15 @@ def test_invocation_lifecycle_result_blob_and_retry_rules(
     assert tuple(
         sink_harness.sink.commit_invocation(item, {}, writer_token=token).status for item in history
     ) == ("committed", "committed", "committed")
+    assert (
+        sink_harness.sink.commit_invocation(
+            history[-1],
+            {},
+            writer_token=token,
+            stage_evidence=True,
+        ).status
+        == "conflict"
+    )
     retry = _invocation(
         run_id,
         4,
@@ -826,11 +1124,11 @@ def test_invocation_transition_rejects_a_corrupt_prior_digest(
 
 
 @pytest.mark.parametrize("evidence_policy", ["required", "outbox"])
-def test_invocation_unsupported_evidence_policy_is_rejected_before_insert(
+def test_invocation_evidence_policies_are_persisted_from_reservation(
     sink_harness: _SinkHarness,
     evidence_policy: str,
 ) -> None:
-    run_id = f"run-evidence-{evidence_policy}-unsupported"
+    run_id = f"run-evidence-{evidence_policy}-reservation"
     token = sink_harness.claim(run_id)
 
     result = sink_harness.sink.commit_invocation(
@@ -839,14 +1137,17 @@ def test_invocation_unsupported_evidence_policy_is_rejected_before_insert(
         writer_token=token,
     )
 
-    assert result.status == "conflict"
-    assert _table_count(sink_harness, "invocation_record", run_id) == 0
+    assert result.status == "committed"
+    loaded = sink_harness.sink.load_invocation(run_id, "call-1")
+    assert loaded.status == "loaded"
+    assert loaded.value is not None
+    assert loaded.value.invocation.evidence_policy == evidence_policy
 
 
-def test_required_evidence_lifecycle_is_rejected_before_dispatch_reservation(
+def test_required_evidence_lifecycle_reserves_before_dispatch(
     sink_harness: _SinkHarness,
 ) -> None:
-    run_id = "run-required-lifecycle-unsupported"
+    run_id = "run-required-lifecycle"
     token = sink_harness.claim(run_id)
     lifecycle = FencedModelCallLifecycle(
         sink=sink_harness.sink,  # type: ignore[arg-type]
@@ -862,11 +1163,249 @@ def test_required_evidence_lifecycle_is_rejected_before_dispatch_reservation(
         idempotency_key=f"key-{hashlib.sha256(run_id.encode()).hexdigest()}",
     )
 
-    with pytest.raises(DurableModelCallError) as raised:
-        lifecycle.reserve(reservation)
+    lifecycle.reserve(reservation)
 
-    assert raised.value.error_code == "durable_invocation_conflict"
-    assert _table_count(sink_harness, "invocation_record", run_id) == 0
+    assert _table_count(sink_harness, "invocation_record", run_id) == 1
+    loaded = sink_harness.sink.load_invocation(run_id, "call-required")
+    assert loaded.value is not None
+    assert loaded.value.invocation.evidence_policy == "required"
+
+
+def test_event_and_terminal_records_are_immutable_and_restart_safe(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-event-terminal"
+    token = sink_harness.claim(run_id)
+    event = make_agent_event(
+        run_id=run_id,
+        seq=1,
+        event_type="checkpoint.committed",
+        data={"checkpoint_seq": 1, "text": "before\x00after", "offset": -0.0},
+    )
+    terminal = TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+        checkpoint_seq=1,
+        final_output_ref="blob:final-output",
+    )
+
+    event_commit = sink_harness.sink.append_event(event, writer_token=token)
+    terminal_commit = sink_harness.sink.settle_terminal(terminal, writer_token=token)
+
+    assert event_commit.status == "committed"
+    assert terminal_commit.status == "committed"
+    reopened = sink_harness.reopen()
+    assert reopened.read_event(run_id, 1) == event
+    assert reopened.read_terminal(run_id) == terminal
+    assert reopened.sink.append_event(event, writer_token=token).status == "already_committed"
+    assert reopened.sink.settle_terminal(terminal, writer_token=token).status == (
+        "already_committed"
+    )
+    assert (
+        reopened.sink.append_event(replace(event, level="warning"), writer_token=token).status
+        == "conflict"
+    )
+    assert (
+        reopened.sink.settle_terminal(
+            replace(
+                terminal,
+                kind="failed_terminal",
+                retry_eligibility=RetryEligibility.FORBIDDEN,
+            ),
+            writer_token=token,
+        ).status
+        == "conflict"
+    )
+    assert sink_harness.sink.capabilities.durable_events is True
+    assert sink_harness.sink.capabilities.terminal_first_writer_wins is True
+
+
+def test_required_evidence_binds_exact_current_settled_invocation(
+    sink_harness: _SinkHarness,
+) -> None:
+    run_id = "run-required-evidence"
+    token = sink_harness.claim(run_id)
+    history = (
+        _invocation(run_id, 1, "reserved", evidence_policy="required"),
+        _invocation(run_id, 2, "dispatch_started", evidence_policy="required"),
+        _invocation(
+            run_id,
+            3,
+            "settled",
+            evidence_policy="required",
+            duration_ms=1,
+        ),
+    )
+    assert tuple(
+        sink_harness.sink.commit_invocation(item, {}, writer_token=token).status for item in history
+    ) == ("committed", "committed", "committed")
+
+    mismatched = replace(
+        history[-1],
+        receipt={**dict(history[-1].receipt or {}), "duration_ms": 1.0},
+    )
+    assert mismatched == history[-1]
+    assert canonical_sha256(mismatched.to_json()) != canonical_sha256(history[-1].to_json())
+    assert (
+        sink_harness.sink.commit_model_evidence(mismatched, writer_token=token).status == "conflict"
+    )
+    assert _table_count(sink_harness, "model_evidence_record", run_id) == 0
+
+    committed = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
+    repeated = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
+
+    assert committed.status == "committed"
+    assert repeated.status == "already_committed"
+    assert _table_count(sink_harness, "model_evidence_record", run_id) == 1
+
+    sink_harness.authority.release(token)
+    current = sink_harness.claim(run_id, "worker-b")
+    assert (
+        sink_harness.sink.commit_model_evidence(history[-1], writer_token=token).status == "fenced"
+    )
+    assert (
+        sink_harness.sink.commit_model_evidence(history[-1], writer_token=current).status
+        == "already_committed"
+    )
+
+
+def test_outbox_settlement_and_staging_are_one_transaction(
+    sink_harness: _SinkHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "run-outbox-atomic"
+    token = sink_harness.claim(run_id)
+    history = (
+        _invocation(run_id, 1, "reserved", evidence_policy="outbox"),
+        _invocation(run_id, 2, "dispatch_started", evidence_policy="outbox"),
+    )
+    assert (
+        sink_harness.sink.commit_invocation(
+            history[0],
+            {},
+            writer_token=token,
+            stage_evidence=True,
+        ).status
+        == "conflict"
+    )
+    assert tuple(
+        sink_harness.sink.commit_invocation(item, {}, writer_token=token).status for item in history
+    ) == ("committed", "committed")
+    settled = _invocation(run_id, 3, "settled", evidence_policy="outbox")
+
+    assert sink_harness.sink.commit_invocation(settled, {}, writer_token=token).status == "conflict"
+    committed = sink_harness.sink.commit_invocation(
+        settled,
+        {},
+        writer_token=token,
+        stage_evidence=True,
+    )
+    assert committed.status == "committed"
+    assert _table_count(sink_harness, "invocation_record", run_id) == 3
+    assert _table_count(sink_harness, "model_evidence_outbox", run_id) == 1
+    assert (
+        sink_harness.sink.commit_invocation(
+            settled,
+            {},
+            writer_token=token,
+            stage_evidence=True,
+        ).status
+        == "already_committed"
+    )
+    with sink_harness.database.transaction() as connection:
+        with sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "DELETE FROM {} WHERE run_id = %s AND logical_call_id = %s AND revision = %s"
+                ).format(
+                    sql.Identifier(
+                        sink_harness.database.config.schema,
+                        "model_evidence_outbox",
+                    )
+                ),
+                (run_id, "call-1", 3),
+            )
+    assert (
+        sink_harness.sink.commit_invocation(
+            settled,
+            {},
+            writer_token=token,
+            stage_evidence=True,
+        ).status
+        == "conflict"
+    )
+    assert sink_harness.sink.load_invocation(run_id, "call-1").sequence == 3
+
+    rollback_run = "run-outbox-rollback"
+    rollback_token = sink_harness.claim(rollback_run)
+    for invocation in (
+        _invocation(rollback_run, 1, "reserved", evidence_policy="outbox"),
+        _invocation(rollback_run, 2, "dispatch_started", evidence_policy="outbox"),
+    ):
+        assert (
+            sink_harness.sink.commit_invocation(
+                invocation,
+                {},
+                writer_token=rollback_token,
+            ).status
+            == "committed"
+        )
+
+    def reject_stage(
+        _cursor: object,
+        invocation: object,
+        *,
+        outbox: bool,
+    ) -> tuple[CommitResult, str, dict[str, object] | None]:
+        del outbox
+        return (
+            CommitResult(
+                status="conflict",
+                sequence=getattr(invocation, "revision", None),
+            ),
+            "",
+            None,
+        )
+
+    monkeypatch.setattr(sink_harness.sink, "_commit_evidence_locked", reject_stage)
+    rejected = sink_harness.sink.commit_invocation(
+        _invocation(rollback_run, 3, "settled", evidence_policy="outbox"),
+        {},
+        writer_token=rollback_token,
+        stage_evidence=True,
+    )
+    assert rejected.status == "conflict"
+    assert sink_harness.sink.load_invocation(rollback_run, "call-1").sequence == 2
+    assert _table_count(sink_harness, "invocation_record", rollback_run) == 2
+    assert _table_count(sink_harness, "model_evidence_outbox", rollback_run) == 0
+    assert sink_harness.sink.capabilities.transactional_outbox is True
+
+
+def test_actual_postgres_satisfies_full_fenced_run_sink_contract(
+    sink_harness: _SinkHarness,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(sink_harness.reopen)
+    failures = {
+        outcome.rule_id: tuple(
+            (item.observation_id, item.expected, item.actual)
+            for item in outcome.observations
+            if not item.passed
+        )
+        for outcome in outcomes
+        if not outcome.passed
+    }
+
+    assert tuple(outcome.rule_id for outcome in outcomes) == (
+        "FENCED-00-CAPABILITY-DECLARATION",
+        "FENCED-01-CHECKPOINT-CONTENT-IDENTITY",
+        "FENCED-02-FENCE-PRECEDES-IDEMPOTENCY",
+        "FENCED-03-EVENT-AND-TERMINAL-WINNERS",
+        "FENCED-04-INVOCATION-LIFECYCLE",
+        "FENCED-05-INVOCATION-REFUSES-ILLEGAL-TRANSITIONS",
+        "FENCED-06-WRITER-TOKEN-RUN-BINDING",
+    )
+    assert failures == {}
 
 
 def test_competing_checkpoint_and_invocation_coordinates_have_one_winner(
@@ -1013,7 +1552,7 @@ def test_authority_rotation_linearizes_before_stale_blob_publication(
     assert _table_count(sink_harness, "run_blob", run_id) == 0
 
 
-def test_ambiguous_checkpoint_and_invocation_commit_use_canonical_readback(
+def test_all_sink_mutations_use_canonical_readback_after_ambiguous_commit(
     sink_harness: _SinkHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1047,6 +1586,95 @@ def test_ambiguous_checkpoint_and_invocation_commit_use_canonical_readback(
     result = sink_harness.sink.commit_invocation(invocation, {}, writer_token=token)
     assert result.status == "already_committed"
     assert sink_harness.sink.load_invocation(run_id, "call-1").value.invocation == invocation  # type: ignore[union-attr]
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
+    install_one_ambiguous_commit()
+    event = make_agent_event(
+        run_id=run_id,
+        seq=1,
+        event_type="checkpoint.committed",
+    )
+    assert sink_harness.sink.append_event(event, writer_token=token).status == ("already_committed")
+    assert sink_harness.sink.read_event(run_id, 1) == event
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
+    install_one_ambiguous_commit()
+    terminal = TerminalOutcome(
+        run_id=run_id,
+        kind="completed",
+        retry_eligibility=RetryEligibility.NOT_APPLICABLE,
+    )
+    assert sink_harness.sink.settle_terminal(terminal, writer_token=token).status == (
+        "already_committed"
+    )
+    assert sink_harness.sink.read_terminal(run_id) == terminal
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
+    evidence_run = "run-ambiguous-evidence"
+    evidence_token = sink_harness.claim(evidence_run)
+    required_history = (
+        _invocation(evidence_run, 1, "reserved", evidence_policy="required"),
+        _invocation(evidence_run, 2, "dispatch_started", evidence_policy="required"),
+        _invocation(
+            evidence_run,
+            3,
+            "settled",
+            evidence_policy="required",
+            duration_ms=1,
+        ),
+    )
+    for item in required_history:
+        assert (
+            sink_harness.sink.commit_invocation(item, {}, writer_token=evidence_token).status
+            == "committed"
+        )
+    equal_but_canonically_distinct = replace(
+        required_history[-1],
+        receipt={**dict(required_history[-1].receipt or {}), "duration_ms": 1.0},
+    )
+    assert equal_but_canonically_distinct == required_history[-1]
+    install_one_ambiguous_commit()
+    assert (
+        sink_harness.sink.commit_model_evidence(
+            equal_but_canonically_distinct,
+            writer_token=evidence_token,
+        ).status
+        == "conflict"
+    )
+    assert _table_count(sink_harness, "model_evidence_record", evidence_run) == 0
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
+    install_one_ambiguous_commit()
+    assert (
+        sink_harness.sink.commit_model_evidence(
+            required_history[-1], writer_token=evidence_token
+        ).status
+        == "already_committed"
+    )
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
+    outbox_run = "run-ambiguous-outbox"
+    outbox_token = sink_harness.claim(outbox_run)
+    for revision, state in ((1, "reserved"), (2, "dispatch_started")):
+        assert (
+            sink_harness.sink.commit_invocation(
+                _invocation(outbox_run, revision, state, evidence_policy="outbox"),
+                {},
+                writer_token=outbox_token,
+            ).status
+            == "committed"
+        )
+    install_one_ambiguous_commit()
+    assert (
+        sink_harness.sink.commit_invocation(
+            _invocation(outbox_run, 3, "settled", evidence_policy="outbox"),
+            {},
+            writer_token=outbox_token,
+            stage_evidence=True,
+        ).status
+        == "already_committed"
+    )
+    assert _table_count(sink_harness, "model_evidence_outbox", outbox_run) == 1
 
 
 def _rewrite_record(
@@ -1180,7 +1808,7 @@ def test_sink_readiness_requires_reader_and_writer_compatibility(
                         "monoid_schema_migrations",
                     )
                 ),
-                ("0003_reader_incompatible", 3, "f" * 64, 3, 2),
+                ("0004_reader_incompatible", 4, "f" * 64, 4, 3),
             )
 
     sink = sink_harness.sink
@@ -1229,7 +1857,7 @@ def test_sink_requires_explicit_migration_readiness(postgres_target: tuple[str, 
     database = PostgresDatabase(
         PostgresConfig(
             dsn=dsn,
-            schema=f"monoid_pr03_unready_{uuid.uuid4().hex}",
+            schema=f"monoid_pr04_unready_{uuid.uuid4().hex}",
             min_pool_size=0,
             max_pool_size=2,
         )

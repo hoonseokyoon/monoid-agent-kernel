@@ -1,11 +1,12 @@
-"""PostgreSQL-fenced checkpoint and model-invocation journal."""
+"""PostgreSQL-fenced authoritative run journal."""
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Callable
+from datetime import datetime
+from typing import Any, Callable, get_args
 
 from monoid_agent_kernel.adapters.postgres.authority import PostgresWriterAuthorityStore
 from monoid_agent_kernel.adapters.postgres.migrations import (
@@ -26,13 +27,24 @@ from monoid_agent_kernel.core.checkpoint import (
     decode_checkpoint,
 )
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
+from monoid_agent_kernel.core.events import (
+    EVENT_SCHEMA_VERSION,
+    AgentEvent,
+    AgentEventLevel,
+    AgentEventType,
+)
+from monoid_agent_kernel.core.json_ingress import (
+    is_portable_json_integer,
+    normalize_json_ingress,
+)
 from monoid_agent_kernel.core.model_invocation import (
     MODEL_INVOCATION_CODEC,
     DurableModelInvocation,
     decode_model_invocation,
 )
 from monoid_agent_kernel.core.model_io import is_recorded_digest
-from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
+from monoid_agent_kernel.core.outcome import TerminalOutcome
+from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id, is_safe_utc_timestamp
 from monoid_agent_kernel.hosting import CommitResult, ModelInvocationRecord, WriterToken
 
 
@@ -41,7 +53,10 @@ _CAPABILITIES = StorageCapabilities(
     compare_and_set=True,
     lease_fencing=True,
     durable_checkpoints=True,
+    durable_events=True,
     durable_invocations=True,
+    terminal_first_writer_wins=True,
+    transactional_outbox=True,
 )
 _STABLE_INVOCATION_FIELDS = (
     "logical_call_id",
@@ -67,6 +82,29 @@ _INVOCATION_TYPED_FIELDS = (
     "result_ref",
     "failure_code",
 )
+_EVENT_TYPED_FIELDS = (
+    "run_id",
+    "seq",
+    "event_id",
+    "schema_version",
+    "type",
+    "level",
+)
+_TERMINAL_TYPED_FIELDS = (
+    "run_id",
+    "schema_version",
+    "kind",
+    "retry_eligibility",
+    "checkpoint_seq",
+    "error_code",
+)
+_EVIDENCE_TYPED_FIELDS = (
+    "run_id",
+    "logical_call_id",
+    "revision",
+    "schema_version",
+    "evidence_policy",
+)
 
 
 class PostgresBlobCorrupt(RuntimeError):
@@ -77,12 +115,20 @@ class _BlobRaceConflict(Exception):
     """Roll back blobs inserted before a concurrent global digest collision was observed."""
 
 
+class _EvidenceStageConflict(Exception):
+    """Roll back an invocation whose required outbox entry could not be staged."""
+
+
 def _blob_projection(blobs: Mapping[str, bytes]) -> dict[str, str]:
     return {key: hashlib.sha256(value).hexdigest() for key, value in sorted(blobs.items())}
 
 
 def _record_digest(payload: dict[str, Any], blobs: Mapping[str, bytes]) -> str:
     return canonical_sha256({"record": payload, "blobs": _blob_projection(blobs)})
+
+
+def _record_only_digest(payload: dict[str, Any]) -> str:
+    return _record_digest(payload, {})
 
 
 def _stored_projection_is_valid(value: object) -> bool:
@@ -113,9 +159,9 @@ def _payload_matches_typed_values(
     fields: tuple[str, ...],
     typed_values: tuple[object, ...],
 ) -> bool:
-    return isinstance(payload, dict) and tuple(
-        payload.get(field) for field in fields
-    ) == typed_values
+    return (
+        isinstance(payload, dict) and tuple(payload.get(field) for field in fields) == typed_values
+    )
 
 
 def _is_ambiguous_database_error(exc: Exception) -> bool:
@@ -129,9 +175,8 @@ def _is_ambiguous_database_error(exc: Exception) -> bool:
 class PostgresFencedRunSink:
     """Run-fenced durable journal backed by PostgreSQL and bounded bytea blobs.
 
-    v0.23 PR3 implements checkpoint and invocation persistence on this stable facade. Event,
-    terminal, evidence, and outbox mutations are added by PR4; their capabilities remain false
-    until those mutations pass the full reusable sink conformance profile.
+    Checkpoints, invocations, events, terminal outcomes, required evidence, and transactional
+    evidence outbox entries share one run-bound authority and canonical readback model.
     """
 
     def __init__(self, database: PostgresDatabase) -> None:
@@ -284,13 +329,18 @@ class PostgresFencedRunSink:
         row: object,
         content_digest: str,
         *,
-        sequence: int,
+        sequence: int | None,
         typed_fields: tuple[str, ...],
         expected_typed_values: tuple[object, ...],
     ) -> CommitResult | None:
         if row is None:
             return None
-        winner_digest = str(row[0])  # type: ignore[index]
+        raw_winner_digest = row[0]  # type: ignore[index]
+        winner_digest = (
+            raw_winner_digest
+            if type(raw_winner_digest) is str and is_recorded_digest(raw_winner_digest)
+            else ""
+        )
         stored_payload = row[1]  # type: ignore[index]
         stored_typed_values = tuple(row[3:])  # type: ignore[index]
         if (
@@ -484,6 +534,340 @@ class PostgresFencedRunSink:
                 raise
             return reconciled
 
+    @staticmethod
+    def _event_payload(event: object) -> dict[str, Any] | None:
+        if not isinstance(event, AgentEvent):
+            return None
+        if (
+            event.schema_version != EVENT_SCHEMA_VERSION
+            or not is_safe_opaque_id(event.event_id)
+            or not is_safe_opaque_id(event.run_id)
+            or not is_portable_json_integer(event.seq)
+            or not 1 <= event.seq <= _POSTGRES_BIGINT_MAX
+            or not is_safe_utc_timestamp(event.timestamp)
+            or type(event.type) is not str
+            or event.type not in get_args(AgentEventType)
+            or type(event.level) is not str
+            or event.level not in get_args(AgentEventLevel)
+            or (event.turn_id is not None and not is_safe_opaque_id(event.turn_id))
+            or (event.parent_id is not None and not is_safe_opaque_id(event.parent_id))
+            or not isinstance(event.data, dict)
+        ):
+            return None
+        try:
+            payload = normalize_json_ingress(
+                event.to_json(),
+                substitute_nonfinite=False,
+            )
+            digest = canonical_sha256(payload)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return None
+        if not isinstance(payload, dict) or not is_recorded_digest(digest):
+            return None
+        return payload
+
+    def _event_coordinate(
+        self,
+        cursor: object,
+        event: AgentEvent,
+        payload: dict[str, Any],
+        content_digest: str,
+    ) -> CommitResult | None:
+        from psycopg import sql
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "SELECT content_digest, payload, '{{}}'::jsonb, run_id, sequence, event_id, "
+                "schema_version, event_type, event_level, event_timestamp "
+                "FROM {} WHERE run_id = %s AND sequence = %s"
+            ).format(self._table("event_record")),
+            (event.run_id, event.seq),
+        )
+        row = cursor.fetchone()  # type: ignore[attr-defined]
+        if row is None:
+            return None
+        try:
+            timestamp_matches = row[9] == datetime.fromisoformat(
+                payload["timestamp"][:-1] + "+00:00"
+            )
+        except (TypeError, ValueError):
+            timestamp_matches = False
+        if not timestamp_matches:
+            return CommitResult(
+                status="conflict",
+                sequence=event.seq,
+                content_digest=content_digest,
+                winner_digest=(
+                    row[0] if type(row[0]) is str and is_recorded_digest(row[0]) else ""
+                ),
+            )
+        return self._stored_result(
+            row[:9],
+            content_digest,
+            sequence=event.seq,
+            typed_fields=_EVENT_TYPED_FIELDS,
+            expected_typed_values=tuple(payload[field] for field in _EVENT_TYPED_FIELDS),
+        )
+
+    def _event_id_winner(
+        self,
+        cursor: object,
+        event: AgentEvent,
+        content_digest: str,
+    ) -> CommitResult | None:
+        from psycopg import sql
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL("SELECT content_digest FROM {} WHERE run_id = %s AND event_id = %s").format(
+                self._table("event_record")
+            ),
+            (event.run_id, event.event_id),
+        )
+        row = cursor.fetchone()  # type: ignore[attr-defined]
+        if row is None:
+            return None
+        winner_digest = row[0] if type(row[0]) is str and is_recorded_digest(row[0]) else ""
+        return CommitResult(
+            status="conflict",
+            sequence=event.seq,
+            content_digest=content_digest,
+            winner_digest=winner_digest,
+        )
+
+    def _commit_event_locked(
+        self,
+        cursor: object,
+        event: object,
+    ) -> tuple[CommitResult, str, dict[str, Any] | None]:
+        sequence = getattr(event, "seq", None)
+        evidence_sequence = (
+            sequence if is_portable_json_integer(sequence) and sequence >= 0 else None
+        )
+        payload = self._event_payload(event)
+        if payload is None or not isinstance(event, AgentEvent):
+            return CommitResult(status="conflict", sequence=evidence_sequence), "", None
+        content_digest = _record_only_digest(payload)
+        stored = self._event_coordinate(cursor, event, payload, content_digest)
+        if stored is not None:
+            return stored, content_digest, payload
+        duplicate_id = self._event_id_winner(cursor, event, content_digest)
+        if duplicate_id is not None:
+            return duplicate_id, content_digest, payload
+
+        from psycopg import sql
+        from psycopg.types.json import Json
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "INSERT INTO {} (run_id, sequence, event_id, schema_version, event_timestamp, "
+                "event_type, event_level, content_digest, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            ).format(self._table("event_record")),
+            (
+                event.run_id,
+                event.seq,
+                event.event_id,
+                payload["schema_version"],
+                event.timestamp,
+                event.type,
+                event.level,
+                content_digest,
+                Json(payload),
+            ),
+        )
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "INSERT INTO {} AS head (run_id, sequence) VALUES (%s, %s) "
+                "ON CONFLICT (run_id) DO UPDATE SET sequence = EXCLUDED.sequence, "
+                "updated_at = pg_catalog.clock_timestamp() "
+                "WHERE EXCLUDED.sequence > head.sequence"
+            ).format(self._table("event_head")),
+            (event.run_id, event.seq),
+        )
+        return (
+            CommitResult(
+                status="committed",
+                sequence=event.seq,
+                content_digest=content_digest,
+            ),
+            content_digest,
+            payload,
+        )
+
+    def _reconcile_event(
+        self,
+        event: AgentEvent,
+        writer_token: WriterToken,
+        payload: dict[str, Any],
+        content_digest: str,
+    ) -> CommitResult | None:
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                if not self._current_writer_locked(cursor, writer_token):
+                    return CommitResult(status="fenced")
+                return self._event_coordinate(cursor, event, payload, content_digest)
+
+    def append_event(
+        self,
+        event: AgentEvent,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        self._require_ready()
+        if not isinstance(writer_token, WriterToken):
+            raise TypeError("PostgreSQL event append requires WriterToken")
+        if getattr(event, "run_id", None) != writer_token.run_id:
+            return CommitResult(status="fenced")
+        result: CommitResult | None = None
+        content_digest = ""
+        payload: dict[str, Any] | None = None
+        try:
+            with self.database.transaction() as connection:
+                with self.database.cursor(connection) as cursor:
+                    if not self._current_writer_locked(cursor, writer_token):
+                        return CommitResult(status="fenced")
+                    result, content_digest, payload = self._commit_event_locked(cursor, event)
+            if result is None:  # pragma: no cover - transaction body always assigns a result
+                raise RuntimeError("PostgreSQL event transaction returned no result")
+            return result
+        except Exception as exc:
+            if not content_digest or payload is None or not _is_ambiguous_database_error(exc):
+                raise
+            try:
+                reconciled = self._reconcile_event(
+                    event,
+                    writer_token,
+                    payload,
+                    content_digest,
+                )
+            except Exception:
+                raise exc
+            if reconciled is None:
+                raise
+            return reconciled
+
+    def _terminal_coordinate(
+        self,
+        cursor: object,
+        outcome: TerminalOutcome,
+        payload: dict[str, Any],
+        content_digest: str,
+    ) -> CommitResult | None:
+        from psycopg import sql
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "SELECT content_digest, payload, '{{}}'::jsonb, run_id, schema_version, "
+                "outcome_kind, retry_eligibility, checkpoint_sequence, error_code "
+                "FROM {} WHERE run_id = %s"
+            ).format(self._table("terminal_record")),
+            (outcome.run_id,),
+        )
+        return self._stored_result(
+            cursor.fetchone(),  # type: ignore[attr-defined]
+            content_digest,
+            sequence=None,
+            typed_fields=_TERMINAL_TYPED_FIELDS,
+            expected_typed_values=tuple(payload[field] for field in _TERMINAL_TYPED_FIELDS),
+        )
+
+    def _commit_terminal_locked(
+        self,
+        cursor: object,
+        outcome: object,
+    ) -> tuple[CommitResult, str, dict[str, Any] | None]:
+        if not isinstance(outcome, TerminalOutcome):
+            return CommitResult(status="conflict"), "", None
+        try:
+            payload = TerminalOutcome.from_json(outcome.to_json()).to_json()
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return CommitResult(status="conflict"), "", None
+        checkpoint_sequence = payload["checkpoint_seq"]
+        if checkpoint_sequence is not None and checkpoint_sequence > _POSTGRES_BIGINT_MAX:
+            return CommitResult(status="conflict"), "", None
+        content_digest = _record_only_digest(payload)
+        stored = self._terminal_coordinate(cursor, outcome, payload, content_digest)
+        if stored is not None:
+            return stored, content_digest, payload
+
+        from psycopg import sql
+        from psycopg.types.json import Json
+
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "INSERT INTO {} (run_id, schema_version, outcome_kind, retry_eligibility, "
+                "checkpoint_sequence, error_code, content_digest, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+            ).format(self._table("terminal_record")),
+            (
+                outcome.run_id,
+                payload["schema_version"],
+                payload["kind"],
+                payload["retry_eligibility"],
+                checkpoint_sequence,
+                payload["error_code"],
+                content_digest,
+                Json(payload),
+            ),
+        )
+        return (
+            CommitResult(status="committed", content_digest=content_digest),
+            content_digest,
+            payload,
+        )
+
+    def _reconcile_terminal(
+        self,
+        outcome: TerminalOutcome,
+        writer_token: WriterToken,
+        payload: dict[str, Any],
+        content_digest: str,
+    ) -> CommitResult | None:
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                if not self._current_writer_locked(cursor, writer_token):
+                    return CommitResult(status="fenced")
+                return self._terminal_coordinate(cursor, outcome, payload, content_digest)
+
+    def settle_terminal(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        self._require_ready()
+        if not isinstance(writer_token, WriterToken):
+            raise TypeError("PostgreSQL terminal settlement requires WriterToken")
+        if getattr(outcome, "run_id", None) != writer_token.run_id:
+            return CommitResult(status="fenced")
+        result: CommitResult | None = None
+        content_digest = ""
+        payload: dict[str, Any] | None = None
+        try:
+            with self.database.transaction() as connection:
+                with self.database.cursor(connection) as cursor:
+                    if not self._current_writer_locked(cursor, writer_token):
+                        return CommitResult(status="fenced")
+                    result, content_digest, payload = self._commit_terminal_locked(cursor, outcome)
+            if result is None:  # pragma: no cover - transaction body always assigns a result
+                raise RuntimeError("PostgreSQL terminal transaction returned no result")
+            return result
+        except Exception as exc:
+            if not content_digest or payload is None or not _is_ambiguous_database_error(exc):
+                raise
+            try:
+                reconciled = self._reconcile_terminal(
+                    outcome,
+                    writer_token,
+                    payload,
+                    content_digest,
+                )
+            except Exception:
+                raise exc
+            if reconciled is None:
+                raise
+            return reconciled
+
     def _invocation_coordinate(
         self,
         cursor: object,
@@ -530,6 +914,144 @@ class PostgresFencedRunSink:
             (run_id, logical_call_id),
         )
         return cursor.fetchone()  # type: ignore[attr-defined]
+
+    def _checked_invocation_head(
+        self,
+        cursor: object,
+        run_id: str,
+        logical_call_id: str,
+    ) -> tuple[DurableModelInvocation, str] | None:
+        row = self._invocation_head(cursor, run_id, logical_call_id)
+        if row is None or row[0] is None or row[1] is None or not isinstance(row[2], dict):
+            return None
+        revision = int(row[0])
+        stored_typed_values = tuple(row[4:])
+        content_digest = _checked_stored_digest(row[2], row[3], row[1])
+        if (
+            content_digest is None
+            or stored_typed_values[:3] != (run_id, logical_call_id, revision)
+            or not _payload_matches_typed_values(
+                row[2],
+                _INVOCATION_TYPED_FIELDS,
+                stored_typed_values,
+            )
+        ):
+            return None
+        decoded = decode_model_invocation(row[2])
+        if not decoded.ok or decoded.value is None:
+            return None
+        invocation = decoded.value
+        if (
+            invocation.run_id != run_id
+            or invocation.logical_call_id != logical_call_id
+            or invocation.revision != revision
+        ):
+            return None
+        return invocation, _record_only_digest(row[2])
+
+    def _evidence_coordinate(
+        self,
+        cursor: object,
+        invocation: DurableModelInvocation,
+        payload: dict[str, Any],
+        content_digest: str,
+        *,
+        outbox: bool,
+    ) -> CommitResult | None:
+        from psycopg import sql
+
+        table = "model_evidence_outbox" if outbox else "model_evidence_record"
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "SELECT content_digest, payload, '{{}}'::jsonb, run_id, logical_call_id, "
+                "revision, schema_version, evidence_policy FROM {} "
+                "WHERE run_id = %s AND logical_call_id = %s AND revision = %s"
+            ).format(self._table(table)),
+            (invocation.run_id, invocation.logical_call_id, invocation.revision),
+        )
+        return self._stored_result(
+            cursor.fetchone(),  # type: ignore[attr-defined]
+            content_digest,
+            sequence=invocation.revision,
+            typed_fields=_EVIDENCE_TYPED_FIELDS,
+            expected_typed_values=tuple(payload[field] for field in _EVIDENCE_TYPED_FIELDS),
+        )
+
+    def _commit_evidence_locked(
+        self,
+        cursor: object,
+        invocation: object,
+        *,
+        outbox: bool,
+    ) -> tuple[CommitResult, str, dict[str, Any] | None]:
+        revision = getattr(invocation, "revision", None)
+        sequence = revision if is_portable_json_integer(revision) and revision >= 0 else None
+        if (
+            not isinstance(invocation, DurableModelInvocation)
+            or invocation.dispatch_state != "settled"
+            or invocation.receipt is None
+            or (outbox and invocation.evidence_policy != "outbox")
+        ):
+            return CommitResult(status="conflict", sequence=sequence), "", None
+        try:
+            payload = invocation.to_json()
+            content_digest = _record_only_digest(payload)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return CommitResult(status="conflict", sequence=sequence), "", None
+        authoritative = self._checked_invocation_head(
+            cursor,
+            invocation.run_id,
+            invocation.logical_call_id,
+        )
+        if authoritative is None or authoritative[1] != content_digest:
+            return (
+                CommitResult(
+                    status="conflict",
+                    sequence=invocation.revision,
+                    content_digest=content_digest,
+                ),
+                content_digest,
+                payload,
+            )
+        stored = self._evidence_coordinate(
+            cursor,
+            invocation,
+            payload,
+            content_digest,
+            outbox=outbox,
+        )
+        if stored is not None:
+            return stored, content_digest, payload
+
+        from psycopg import sql
+        from psycopg.types.json import Json
+
+        table = "model_evidence_outbox" if outbox else "model_evidence_record"
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "INSERT INTO {} (run_id, logical_call_id, revision, schema_version, "
+                "evidence_policy, content_digest, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            ).format(self._table(table)),
+            (
+                invocation.run_id,
+                invocation.logical_call_id,
+                invocation.revision,
+                payload["schema_version"],
+                invocation.evidence_policy,
+                content_digest,
+                Json(payload),
+            ),
+        )
+        return (
+            CommitResult(
+                status="committed",
+                sequence=invocation.revision,
+                content_digest=content_digest,
+            ),
+            content_digest,
+            payload,
+        )
 
     def _invocation_transition_winner(
         self,
@@ -624,13 +1146,12 @@ class PostgresFencedRunSink:
         )
         for row in cursor:  # type: ignore[operator]
             stored_typed_values = tuple(row[3:])
-            if (
-                _checked_stored_digest(row[1], row[2], row[0]) is None
-                or not _payload_matches_typed_values(
-                    row[1],
-                    _INVOCATION_TYPED_FIELDS,
-                    stored_typed_values,
-                )
+            if _checked_stored_digest(
+                row[1], row[2], row[0]
+            ) is None or not _payload_matches_typed_values(
+                row[1],
+                _INVOCATION_TYPED_FIELDS,
+                stored_typed_values,
             ):
                 return True
             decoded = decode_model_invocation(row[1])
@@ -656,8 +1177,19 @@ class PostgresFencedRunSink:
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         if (
             type(stage_evidence) is not bool
-            or stage_evidence
-            or invocation.evidence_policy != "passive"
+            or (
+                stage_evidence
+                and not (
+                    invocation.evidence_policy == "outbox"
+                    and invocation.dispatch_state == "settled"
+                    and invocation.receipt is not None
+                )
+            )
+            or (
+                not stage_evidence
+                and invocation.evidence_policy == "outbox"
+                and invocation.dispatch_state == "settled"
+            )
         ):
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         submitted = self._validated_blobs(blobs)
@@ -679,6 +1211,24 @@ class PostgresFencedRunSink:
         content_digest = _record_digest(payload, submitted)
         stored = self._invocation_coordinate(cursor, invocation, payload, content_digest)
         if stored is not None:
+            if stage_evidence and stored.status == "already_committed":
+                evidence_digest = _record_only_digest(payload)
+                staged = self._evidence_coordinate(
+                    cursor,
+                    invocation,
+                    payload,
+                    evidence_digest,
+                    outbox=True,
+                )
+                if staged is None or staged.status != "already_committed":
+                    return (
+                        CommitResult(
+                            status="conflict",
+                            sequence=invocation.revision,
+                            content_digest=content_digest,
+                        ),
+                        content_digest,
+                    )
             return stored, content_digest
         transition_winner = self._invocation_transition_winner(cursor, invocation)
         if transition_winner is not None:
@@ -714,7 +1264,7 @@ class PostgresFencedRunSink:
                 invocation.dispatch_state,
                 invocation.idempotency_key,
                 invocation.request_digest,
-                invocation.digest_generation,
+                payload["digest_generation"],
                 invocation.evidence_policy,
                 invocation.result_ref,
                 invocation.failure_code,
@@ -731,6 +1281,14 @@ class PostgresFencedRunSink:
             ).format(self._table("invocation_head")),
             (invocation.run_id, invocation.logical_call_id, invocation.revision),
         )
+        if stage_evidence:
+            staged, _, _ = self._commit_evidence_locked(
+                cursor,
+                invocation,
+                outbox=True,
+            )
+            if staged.status != "committed":
+                raise _EvidenceStageConflict
         return (
             CommitResult(
                 status="committed",
@@ -745,16 +1303,39 @@ class PostgresFencedRunSink:
         invocation: DurableModelInvocation,
         writer_token: WriterToken,
         content_digest: str,
+        *,
+        stage_evidence: bool,
     ) -> CommitResult | None:
         with self.database.transaction() as connection:
             with self.database.cursor(connection) as cursor:
                 if not self._current_writer_locked(cursor, writer_token):
                     return CommitResult(status="fenced")
-                return self._invocation_coordinate(
+                result = self._invocation_coordinate(
                     cursor,
                     invocation,
                     invocation.to_json(),
                     content_digest,
+                )
+                if (
+                    not stage_evidence
+                    or result is None
+                    or result.status not in {"committed", "already_committed"}
+                ):
+                    return result
+                payload = invocation.to_json()
+                staged = self._evidence_coordinate(
+                    cursor,
+                    invocation,
+                    payload,
+                    _record_only_digest(payload),
+                    outbox=True,
+                )
+                if staged is not None and staged.status == "already_committed":
+                    return result
+                return CommitResult(
+                    status="conflict",
+                    sequence=invocation.revision,
+                    content_digest=content_digest,
                 )
 
     def commit_invocation(
@@ -786,7 +1367,7 @@ class PostgresFencedRunSink:
             if result is None:  # pragma: no cover - transaction body always assigns a result
                 raise RuntimeError("PostgreSQL invocation transaction returned no result")
             return result
-        except _BlobRaceConflict:
+        except (_BlobRaceConflict, _EvidenceStageConflict):
             return CommitResult(
                 status="conflict",
                 sequence=getattr(invocation, "revision", None),
@@ -799,6 +1380,92 @@ class PostgresFencedRunSink:
                 reconciled = self._reconcile_invocation(
                     invocation,
                     writer_token,
+                    content_digest,
+                    stage_evidence=stage_evidence,
+                )
+            except Exception:
+                raise exc
+            if reconciled is None:
+                raise
+            return reconciled
+
+    def _reconcile_evidence(
+        self,
+        invocation: DurableModelInvocation,
+        writer_token: WriterToken,
+        payload: dict[str, Any],
+        content_digest: str,
+    ) -> CommitResult | None:
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                if not self._current_writer_locked(cursor, writer_token):
+                    return CommitResult(status="fenced", sequence=invocation.revision)
+                authoritative = self._checked_invocation_head(
+                    cursor,
+                    invocation.run_id,
+                    invocation.logical_call_id,
+                )
+                if authoritative is None or authoritative[1] != content_digest:
+                    return CommitResult(
+                        status="conflict",
+                        sequence=invocation.revision,
+                        content_digest=content_digest,
+                    )
+                return self._evidence_coordinate(
+                    cursor,
+                    invocation,
+                    payload,
+                    content_digest,
+                    outbox=False,
+                )
+
+    def commit_model_evidence(
+        self,
+        invocation: DurableModelInvocation,
+        *,
+        writer_token: WriterToken,
+    ) -> CommitResult:
+        self._require_ready()
+        if not isinstance(writer_token, WriterToken):
+            raise TypeError("PostgreSQL model evidence commit requires WriterToken")
+        if getattr(invocation, "run_id", None) != writer_token.run_id:
+            return CommitResult(
+                status="fenced",
+                sequence=(
+                    invocation.revision if isinstance(invocation, DurableModelInvocation) else None
+                ),
+            )
+        result: CommitResult | None = None
+        content_digest = ""
+        payload: dict[str, Any] | None = None
+        try:
+            with self.database.transaction() as connection:
+                with self.database.cursor(connection) as cursor:
+                    if not self._current_writer_locked(cursor, writer_token):
+                        return CommitResult(
+                            status="fenced",
+                            sequence=(
+                                invocation.revision
+                                if isinstance(invocation, DurableModelInvocation)
+                                else None
+                            ),
+                        )
+                    result, content_digest, payload = self._commit_evidence_locked(
+                        cursor,
+                        invocation,
+                        outbox=False,
+                    )
+            if result is None:  # pragma: no cover - transaction body always assigns a result
+                raise RuntimeError("PostgreSQL model evidence transaction returned no result")
+            return result
+        except Exception as exc:
+            if not content_digest or payload is None or not _is_ambiguous_database_error(exc):
+                raise
+            try:
+                reconciled = self._reconcile_evidence(
+                    invocation,
+                    writer_token,
+                    payload,
                     content_digest,
                 )
             except Exception:
@@ -954,6 +1621,92 @@ class PostgresFencedRunSink:
                 _blob_reader=self._blob_reader(run_id),
             )
         )
+
+    def read_event(self, run_id: str, sequence: int) -> AgentEvent | None:
+        """Read and verify one complete event by its authoritative coordinate."""
+
+        self._require_ready()
+        if not is_safe_opaque_id(run_id):
+            raise ValueError("PostgreSQL event run_id must be a bounded opaque id")
+        if (
+            not is_portable_json_integer(sequence)
+            or sequence < 1
+            or sequence > _POSTGRES_BIGINT_MAX
+        ):
+            raise ValueError("PostgreSQL event sequence must fit a positive bigint")
+        from psycopg import sql
+
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT content_digest, payload, run_id, sequence, event_id, "
+                        "schema_version, event_type, event_level, event_timestamp "
+                        "FROM {} WHERE run_id = %s AND sequence = %s"
+                    ).format(self._table("event_record")),
+                    (run_id, sequence),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = row[1]
+        try:
+            event = AgentEvent(**payload)
+        except (TypeError, ValueError):
+            raise RuntimeError("PostgreSQL event payload is corrupt") from None
+        expected_typed_values = tuple(payload[field] for field in _EVENT_TYPED_FIELDS)
+        stored_typed_values = tuple(row[2:8])
+        try:
+            timestamp_matches = row[8] == datetime.fromisoformat(
+                payload["timestamp"][:-1] + "+00:00"
+            )
+        except (TypeError, ValueError):
+            timestamp_matches = False
+        if (
+            _checked_stored_digest(payload, {}, row[0]) is None
+            or stored_typed_values != expected_typed_values
+            or not timestamp_matches
+            or self._event_payload(event) != payload
+        ):
+            raise RuntimeError("PostgreSQL event record is corrupt")
+        return event
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        """Read and verify the first-writer terminal winner for a run."""
+
+        self._require_ready()
+        if not is_safe_opaque_id(run_id):
+            raise ValueError("PostgreSQL terminal run_id must be a bounded opaque id")
+        from psycopg import sql
+
+        with self.database.transaction() as connection:
+            with self.database.cursor(connection) as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT content_digest, payload, '{{}}'::jsonb, run_id, schema_version, "
+                        "outcome_kind, retry_eligibility, checkpoint_sequence, error_code "
+                        "FROM {} WHERE run_id = %s"
+                    ).format(self._table("terminal_record")),
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            outcome = TerminalOutcome.from_json(row[1])
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise RuntimeError("PostgreSQL terminal payload is corrupt") from None
+        payload = outcome.to_json()
+        result = self._stored_result(
+            row,
+            _record_only_digest(payload),
+            sequence=None,
+            typed_fields=_TERMINAL_TYPED_FIELDS,
+            expected_typed_values=tuple(payload[field] for field in _TERMINAL_TYPED_FIELDS),
+        )
+        if result is None or result.status != "already_committed":
+            raise RuntimeError("PostgreSQL terminal record is corrupt")
+        return outcome
 
 
 __all__ = ["PostgresBlobCorrupt", "PostgresFencedRunSink"]
