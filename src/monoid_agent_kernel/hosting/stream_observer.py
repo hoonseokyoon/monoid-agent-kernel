@@ -441,6 +441,21 @@ class _DurableModelStreamWriter:
             del pending[:size]
             self._append(lane, data)
 
+    def _reset_abandoned_replacement_lanes(self, outcome: ModelStreamOutcome) -> None:
+        if outcome.status == "completed":
+            return
+        # A completed recovery can re-close the bytes committed by its interrupted process.
+        # Every other terminal classification belongs to a replacement execution. When that
+        # execution emitted no delta, push() had no opportunity to clear the prior generation;
+        # do it before sealing so reconnect readers cannot observe the abandoned prefix as the
+        # replacement's result.
+        for lane in sorted(
+            self._lanes.values(),
+            key=lambda candidate: candidate.identity.channel,
+        ):
+            if lane.reset_before_append:
+                self._reset_lane_locked(lane)
+
     def close(self, outcome: ModelStreamOutcome) -> None:
         if not isinstance(outcome, ModelStreamOutcome):
             raise TypeError("durable model stream close requires ModelStreamOutcome")
@@ -456,6 +471,7 @@ class _DurableModelStreamWriter:
             )
         with self._condition:
             self._raise_failure_locked()
+            self._reset_abandoned_replacement_lanes(outcome)
             self._reconcile_completed_output(outcome)
         for channel in sorted(self._lanes):
             lane = self._lanes[channel]
