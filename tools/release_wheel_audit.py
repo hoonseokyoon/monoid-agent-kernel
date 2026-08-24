@@ -10,7 +10,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 
-EXPECTED_VERSION = "0.22.0"
+EXPECTED_VERSION = "0.23.0"
 EXPECTED_BASE_DEPENDENCIES = {"click", "jsonschema", "pathspec", "pydantic"}
 REQUIRED_MEMBERS = {
     "monoid_agent_kernel/core/authority.py",
@@ -24,6 +24,7 @@ REQUIRED_MEMBERS = {
     "monoid_agent_kernel/hosting/contracts.py",
     "monoid_agent_kernel/hosting/execution.py",
     "monoid_agent_kernel/hosting/object_store_admin.py",
+    "monoid_agent_kernel/hosting/operations.py",
     "monoid_agent_kernel/hosting/stream_observer.py",
     "monoid_agent_kernel/hosting/streams.py",
     "monoid_agent_kernel/adapters/__init__.py",
@@ -33,6 +34,7 @@ REQUIRED_MEMBERS = {
     "monoid_agent_kernel/adapters/postgres/config.py",
     "monoid_agent_kernel/adapters/postgres/migrations.py",
     "monoid_agent_kernel/adapters/postgres/object_store.py",
+    "monoid_agent_kernel/adapters/postgres/operations.py",
     "monoid_agent_kernel/adapters/postgres/pool.py",
     "monoid_agent_kernel/adapters/postgres/sink.py",
     "monoid_agent_kernel/adapters/postgres/streams.py",
@@ -46,7 +48,15 @@ REQUIRED_MEMBERS = {
     "monoid_agent_kernel/adapters/object_store/config.py",
     "monoid_agent_kernel/adapters/object_store/s3.py",
     "monoid_agent_kernel/adapters/temporal/__init__.py",
+    "monoid_agent_kernel/adapters/temporal/activity.py",
+    "monoid_agent_kernel/adapters/temporal/dependency.py",
+    "monoid_agent_kernel/adapters/temporal/dispatcher.py",
+    "monoid_agent_kernel/adapters/temporal/names.py",
+    "monoid_agent_kernel/adapters/temporal/records.py",
+    "monoid_agent_kernel/adapters/temporal/worker.py",
+    "monoid_agent_kernel/adapters/temporal/workflow.py",
     "monoid_agent_kernel/hosting/blobs.py",
+    "monoid_agent_kernel/observability/operations.py",
     "monoid_agent_kernel/conformance/blob_store.py",
     "monoid_agent_kernel/conformance/durable_stream.py",
     "monoid_agent_kernel/conformance/fixtures/compatibility-v1.json",
@@ -139,6 +149,15 @@ def audit_wheel(wheel_path: Path) -> None:
             "checkpoint-v022-additive-v1",
             "terminal-outcome-current-v1",
             "model-invocation-current-v1",
+            "admission-request-v023-v1",
+            "admitted-command-v023-v1",
+            "admission-receipt-v023-v1",
+            "activation-command-v023-v1",
+            "activation-receipt-v023-v1",
+            "temporal-run-policy-v023-v1",
+            "temporal-run-state-v023-v1",
+            "temporal-activation-result-v023-v1",
+            "temporal-run-status-v023-v1",
         }
         missing_fixtures = sorted(required_fixture_ids - fixture_ids)
         if missing_fixtures:

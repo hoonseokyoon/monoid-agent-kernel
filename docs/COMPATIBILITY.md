@@ -142,6 +142,12 @@ write or terminal authority. All four strict readers accept the retained namespa
 unknown fields. Private model content, checkpoint bytes, credentials, and raw errors remain in the
 PostgreSQL/ObjectStore channels referenced by these records.
 
+The packaged compatibility fixture includes current v0.23 examples for admission request, admitted
+command, admission receipt, activation command, activation receipt, Temporal run policy, Temporal
+run state, Temporal activation result, and Temporal run status. CI round-trips each fixture through
+its strict reader and verifies the canonical writer output byte-for-structure. These fixtures ship
+beside the retained v0.21/v0.22 checkpoint and model-invocation examples.
+
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The
 receipt is normalized metadata; model content, request bodies, endpoints, and raw exceptions are
