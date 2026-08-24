@@ -102,6 +102,13 @@ class ModelStreamWriter(Protocol):
 
 
 @runtime_checkable
+class ModelStreamDispatchAwareWriter(Protocol):
+    """Optional writer extension notified immediately before a real provider dispatch."""
+
+    def begin_dispatch(self) -> None: ...
+
+
+@runtime_checkable
 class ModelStreamObserver(Protocol):
     """Opens an isolated writer for one model call."""
 
@@ -129,6 +136,18 @@ class _FailureShieldedModelStreamWriter:
         self._writer = writer
         self._closed = False
         self._disabled = False
+
+    def begin_dispatch(self) -> None:
+        if self._closed or self._disabled:
+            return
+        begin = getattr(self._writer, "begin_dispatch", None)
+        if not callable(begin):
+            return
+        try:
+            begin()
+        except Exception:  # noqa: BLE001 - observer failure is deliberately isolated
+            self._disabled = True
+            _LOGGER.debug("model stream observer dispatch-start failed", exc_info=True)
 
     def push(self, delta: ModelStreamDelta) -> None:
         if self._closed or self._disabled:
@@ -165,3 +184,15 @@ def safe_open_model_stream(
         _LOGGER.debug("model stream observer open failed", exc_info=True)
         return NOOP_MODEL_STREAM_WRITER
     return _FailureShieldedModelStreamWriter(writer)
+
+
+def safe_begin_model_stream_dispatch(writer: ModelStreamWriter) -> None:
+    """Notify a dispatch-aware writer without letting exporter failures reach the provider."""
+
+    begin = getattr(writer, "begin_dispatch", None)
+    if not callable(begin):
+        return
+    try:
+        begin()
+    except Exception:  # noqa: BLE001 - third-party writers may be unshielded
+        _LOGGER.debug("model stream dispatch-start notification failed", exc_info=True)

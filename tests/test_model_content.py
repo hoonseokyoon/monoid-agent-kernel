@@ -31,6 +31,7 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
     ModelStreamOutcome,
+    safe_begin_model_stream_dispatch,
     safe_open_model_stream,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -844,6 +845,29 @@ def test_observer_failures_are_shielded_and_a_broken_writer_is_disabled() -> Non
     unavailable = safe_open_model_stream(_FailingOpenObserver(), _context())
     unavailable.push(ModelStreamDelta("output", "safe"))
     unavailable.close(ModelStreamOutcome("completed"))
+
+
+def test_dispatch_start_failure_disables_content_push_but_still_closes_writer() -> None:
+    class DispatchFailureWriter(_FailingWriter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dispatch_calls = 0
+
+        def begin_dispatch(self) -> None:
+            self.dispatch_calls += 1
+            raise RuntimeError("dispatch observer unavailable")
+
+    failing = DispatchFailureWriter()
+    writer = safe_open_model_stream(_Observer(failing), _context())
+
+    safe_begin_model_stream_dispatch(writer)
+    safe_begin_model_stream_dispatch(writer)
+    writer.push(ModelStreamDelta("output", "must not publish"))
+    writer.close(ModelStreamOutcome("failed", error_code="provider_error"))
+
+    assert failing.dispatch_calls == 1
+    assert failing.push_calls == 0
+    assert failing.close_calls == 1
 
 
 def test_recorder_sidecar_is_opt_in_and_dual_writes_settled_text(tmp_path: Path) -> None:

@@ -68,6 +68,7 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamOutcome,
     ModelStreamStatus,
     ModelStreamWriter,
+    safe_begin_model_stream_dispatch,
     safe_open_model_stream,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
@@ -2943,6 +2944,7 @@ class AgentLoop:
             or wants_content_stream
         )
         observer_writers: tuple[ModelStreamWriter, ...] = ()
+        before_dispatch: Callable[[], None] | None = None
         output_fragments: list[str] = []
 
         if wants_stream:
@@ -2983,6 +2985,17 @@ class AgentLoop:
                     )
                     writers.append(writer)
                 observer_writers = tuple(writers)
+                if observer_writers:
+
+                    def begin_observer_dispatch() -> None:
+                        self._assert_write_authority()
+                        for writer in observer_writers:
+                            self.write_authority.guard_external_call(
+                                lambda writer=writer: safe_begin_model_stream_dispatch(writer)
+                            )
+                        self._assert_write_authority()
+
+                    before_dispatch = begin_observer_dispatch
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
                 self._assert_write_authority()
@@ -3039,6 +3052,7 @@ class AgentLoop:
                 context=invocation_context,
                 deadline=deadline,
                 delta_consumer=delta_consumer,
+                before_dispatch=before_dispatch,
                 should_abort=should_abort,
                 logical_call_id=(
                     logical_model_call_id(self.spec.run_id, turn_id)

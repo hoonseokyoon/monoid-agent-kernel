@@ -37,6 +37,10 @@ class _RecordingWriter:
     def __init__(self) -> None:
         self.deltas: list[ModelStreamDelta] = []
         self.outcomes: list[ModelStreamOutcome] = []
+        self.dispatches = 0
+
+    def begin_dispatch(self) -> None:
+        self.dispatches += 1
 
     def push(self, delta: ModelStreamDelta) -> None:
         self.deltas.append(delta)
@@ -154,6 +158,7 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
         ModelStreamDelta(channel="output", text="Hel"),
         ModelStreamDelta(channel="output", text="lo"),
     ]
+    assert observer.writers[0].dispatches == 1
     assert observer.writers[0].outcomes == [
         ModelStreamOutcome(
             status="completed",

@@ -780,10 +780,17 @@ turn assembly. A failed outcome's `retryable` flag carries the provider's transi
 used for automatic retry eligibility; `false` does not prevent an explicit user reissue after a
 configuration change.
 
+A writer that implements the optional `ModelStreamDispatchAwareWriter` extension receives
+`begin_dispatch()` after durable `dispatch_started` publication and immediately before each actual
+adapter entry. Provider-free recovery of an already settled invocation does not receive it. Durable
+observers use this transition to reset a replacement generation even when the response contains
+only tool calls and emits no text delta. `safe_begin_model_stream_dispatch` preserves the same
+observer-failure isolation as `safe_open_model_stream`.
+
 Factories materialize a fresh observer set for every activation and every in-process subagent.
 This ownership prevents a restored run or child from closing another activation's live channel.
-Factory, open, push, and close failures are contained; an observer cannot change a paid model
-call's result. `safe_open_model_stream` applies the same failure shield to custom observers.
+Factory, open, dispatch-start, push, and close failures are contained; an observer cannot change a
+paid model call's result. `safe_open_model_stream` applies the failure shield to custom observers.
 
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
 This keeps token-boundary interruption responsive while durable events remain compact.

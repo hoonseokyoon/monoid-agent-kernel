@@ -143,6 +143,9 @@ is the consumer's business; ordering and completeness are this module's.
 ShouldAbort = Callable[[], bool]
 """Polled once per streamed chunk, after it has been delivered. See `ModelCallRunner.acall`."""
 
+BeforeDispatch = Callable[[], None]
+"""Called after durable start publication and immediately before each adapter entry."""
+
 
 @dataclass(frozen=True)
 class SettledModelCall:
@@ -701,6 +704,7 @@ class ModelCallRunner:
         deadline: float | None = None,
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
+        before_dispatch: BeforeDispatch | None = None,
         logical_call_id: str = "",
         abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
@@ -722,6 +726,11 @@ class ModelCallRunner:
         ``logical_call_id`` is required only when ``lifecycle_hook`` is configured. It is the
         caller-owned durable address of this call; standalone anonymous calls cannot invent a
         stable address across process restore.
+
+        ``before_dispatch`` runs once for every actual adapter entry, after a configured durable
+        lifecycle has committed ``dispatch_started``. Durable recovery that returns an already
+        settled result does not call it. This lets presentation/storage observers distinguish a
+        replacement execution from provider-free recovery without inferring from response content.
 
         ``abort_after_recovery_probe`` is the durable-resume seam for an already-started streamed
         step. It polls ``should_abort`` once after authoritative recovery proves there is no
@@ -1048,6 +1057,9 @@ class ModelCallRunner:
                         # The commit sits immediately before adapter entry. A hook failure leaves
                         # attempts_made unchanged, so the receipt does not claim provider work.
                         lifecycle_hook.dispatch_started(reservation)
+                        self._assert_write_authority()
+                    if before_dispatch is not None:
+                        before_dispatch()
                         self._assert_write_authority()
                     attempts_made = next_attempt
                     reports_before = progress.count

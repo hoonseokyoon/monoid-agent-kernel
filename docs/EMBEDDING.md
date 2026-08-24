@@ -635,8 +635,12 @@ loop = make_loop(
 ```
 
 The observer opens one `output` lane and normally opens `reasoning` when that channel first emits
-content. A replacement that finds prior output also hydrates reasoning so the first new delta can
-reset every pre-existing kernel lane together. Host-defined private lanes use the same
+content. A replacement that finds prior output also hydrates reasoning. `ModelCallRunner` signals
+every actual adapter entry after durable `dispatch_started` publication, and the observer resets
+every pre-existing kernel lane before that provider execution begins. Provider-free settled
+recovery receives no dispatch signal and preserves the committed generation. The first-delta reset
+remains a fallback for direct writer integrations that do not drive the optional dispatch-aware
+extension. Host-defined private lanes use the same
 `DurableStreamIdentity` contract directly. Byte and time thresholds bound coalescing; a
 copied-context daemon performs ordered flushes. Observer failures retain the existing model-stream
 rule: they do not replace a paid provider result. A `fenced` store result revokes the shared
@@ -644,7 +648,7 @@ activation authority, so later kernel publication fails closed.
 The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
 leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
 call reuses and seals its prior generation; the first delta from an admitted replacement dispatch
-lazily resets every prior open or sealed kernel lane before persisting bytes.
+cannot mix with the prior generation because reset already committed before adapter entry.
 On a completed close, the observer compares the output lane's byte length and SHA-256 with the
 settled `final_text`. A mismatch means recovery found an unflushed/truncated prefix; the observer
 rebuilds output in a new generation from that authoritative final text before sealing it.

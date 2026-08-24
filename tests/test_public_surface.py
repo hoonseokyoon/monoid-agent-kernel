@@ -95,10 +95,12 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelStreamStatus",
     "ModelStreamContext",
     "ModelStreamDelta",
+    "ModelStreamDispatchAwareWriter",
     "ModelStreamOutcome",
     "ModelStreamWriter",
     "ModelStreamObserver",
     "ModelStreamObserverFactory",
+    "safe_begin_model_stream_dispatch",
     "safe_open_model_stream",
     "ModelCallRunner",
     # Writing a typed ``settled_sink`` needs the argument type, and every other type

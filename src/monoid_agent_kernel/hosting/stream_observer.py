@@ -278,6 +278,23 @@ class _DurableModelStreamWriter:
         lane.digest = hashlib.sha256()
         lane.reset_before_append = False
 
+    def _reset_prior_lanes_locked(self) -> None:
+        for lane in sorted(
+            self._lanes.values(),
+            key=lambda candidate: candidate.identity.channel,
+        ):
+            if lane.reset_before_append:
+                self._reset_lane_locked(lane)
+
+    def begin_dispatch(self) -> None:
+        """Move a replacement provider execution to a fresh generation before adapter entry."""
+
+        with self._condition:
+            self._raise_failure_locked()
+            if self._closing or self._closed:
+                raise DurableStreamWriteError("durable model stream writer is closed")
+            self._reset_prior_lanes_locked()
+
     def push(self, delta: ModelStreamDelta) -> None:
         if not isinstance(delta, ModelStreamDelta):
             raise TypeError("durable model stream push requires ModelStreamDelta")
@@ -293,12 +310,7 @@ class _DurableModelStreamWriter:
                 # A recovered successful call emits no deltas and preserves its open/sealed bytes.
                 # The first new delta proves that the lifecycle admitted a replacement dispatch;
                 # reset every pre-existing kernel lane before recording any replacement content.
-                for value in sorted(
-                    self._lanes.values(),
-                    key=lambda candidate: candidate.identity.channel,
-                ):
-                    if value.reset_before_append:
-                        self._reset_lane_locked(value)
+                self._reset_prior_lanes_locked()
             while position < len(data):
                 self._raise_failure_locked()
                 while self._buffered_bytes_locked() >= self._observer.max_buffer_bytes:
@@ -443,24 +455,11 @@ class _DurableModelStreamWriter:
 
     def _reset_abandoned_replacement_lanes(self, outcome: ModelStreamOutcome) -> None:
         if outcome.status == "completed":
-            # Text completions carry an authoritative value that the reconciliation path can
-            # compare with the hydrated output. A completed tool-call/empty-text turn has no
-            # replacement delta, so non-empty pre-existing private lanes are unverifiable and
-            # must be cleared together. Once cleared, a repeated recovery is idempotent.
-            if outcome.final_text not in {None, ""} or not any(
-                lane.reset_before_append and lane.head.cursor_bytes > 0
-                for lane in self._lanes.values()
-            ):
-                return
+            return
         # Matching completed recovery returned above. The remaining paths have no delta that
         # could clear a prior generation. Reset before sealing so reconnect readers cannot
         # observe an abandoned prefix as the replacement's result.
-        for lane in sorted(
-            self._lanes.values(),
-            key=lambda candidate: candidate.identity.channel,
-        ):
-            if lane.reset_before_append:
-                self._reset_lane_locked(lane)
+        self._reset_prior_lanes_locked()
 
     def close(self, outcome: ModelStreamOutcome) -> None:
         if not isinstance(outcome, ModelStreamOutcome):

@@ -13,6 +13,7 @@ from monoid_agent_kernel.core.model_invocation import logical_model_call_id
 from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
+    ModelStreamDispatchAwareWriter,
     ModelStreamOutcome,
     ModelStreamStatus,
 )
@@ -609,6 +610,8 @@ def test_model_stream_observer_treats_completed_no_text_as_authoritative_empty(
         ).status == "committed"
 
     replacement = _observer(store, authority).open(context)
+    assert isinstance(replacement, ModelStreamDispatchAwareWriter)
+    replacement.begin_dispatch()
     replacement.close(ModelStreamOutcome(status="completed", final_text=final_text))
 
     for identity in (output, reasoning):
@@ -621,6 +624,38 @@ def test_model_stream_observer_treats_completed_no_text_as_authoritative_empty(
     recovered.close(ModelStreamOutcome(status="completed", final_text=final_text))
     assert store.heads[output].generation == 2
     assert store.heads[reasoning].generation == 2
+
+
+def test_model_stream_observer_preserves_tool_call_recovery_without_new_dispatch() -> None:
+    store = _MemoryStreamStore()
+    authority = ActivationWriteAuthority()
+    context = _context()
+    token = WriterToken(run_id=context.run_id, owner_id="worker-1", generation=1)
+    output = DurableStreamIdentity(
+        run_id=context.run_id,
+        stream_id=durable_model_stream_id(context.run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(context.run_id, context.turn_id),
+        channel="output",
+    )
+    reasoning = replace(output, channel="reasoning")
+    assert store.open(output, writer_token=token).status == "opened"
+    assert store.open(reasoning, writer_token=token).status == "opened"
+    assert store.append(
+        reasoning,
+        generation=1,
+        start_offset=0,
+        data=b"recovered reasoning",
+        writer_token=token,
+    ).status == "committed"
+
+    recovered = _observer(store, authority).open(context)
+    recovered.close(ModelStreamOutcome(status="completed", final_text=None))
+
+    assert store.heads[output].generation == 1
+    assert store.heads[reasoning].generation == 1
+    assert store.heads[output].state == "sealed"
+    assert store.heads[reasoning].state == "sealed"
+    assert b"".join(chunk.data for chunk in store.chunks[(reasoning, 1)]) == b"recovered reasoning"
 
 
 def test_model_stream_observer_rebuilds_truncated_recovered_output_from_final_text() -> None:

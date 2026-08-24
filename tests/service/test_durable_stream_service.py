@@ -631,6 +631,126 @@ def test_model_observer_resets_abandoned_open_lanes_after_takeover(
     )
     assert recovered_read.head is not None and recovered_read.head.state == "sealed"
 
+    empty_run = f"run-stream-empty-dispatch-{uuid.uuid4().hex}"
+    empty_stale = harness.claim(empty_run, "empty-dispatch-worker")
+    empty_context = ModelStreamContext(
+        run_id=empty_run,
+        root_run_id=empty_run,
+        turn_id="turn-empty-dispatch",
+        stream_id="execution-local-empty-dispatch",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    empty_output = DurableStreamIdentity(
+        run_id=empty_run,
+        stream_id=durable_model_stream_id(empty_run, empty_context.turn_id),
+        logical_call_id=logical_model_call_id(empty_run, empty_context.turn_id),
+        channel="output",
+    )
+    empty_reasoning = DurableStreamIdentity(
+        run_id=empty_run,
+        stream_id=empty_output.stream_id,
+        logical_call_id=empty_output.logical_call_id,
+        channel="reasoning",
+    )
+    for identity, data in (
+        (empty_output, b"stale output"),
+        (empty_reasoning, b"stale reasoning"),
+    ):
+        assert harness.streams.open(identity, writer_token=empty_stale).status == "opened"
+        assert harness.streams.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=empty_stale,
+        ).status == "committed"
+
+    assert harness.authority.release(empty_stale).status == "released"
+    empty_current = harness.claim(empty_run, "empty-dispatch-replacement")
+    empty_writer = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=empty_current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=8,
+        flush_interval_s=10,
+    ).open(empty_context)
+    empty_writer.begin_dispatch()
+    empty_writer.close(ModelStreamOutcome(status="completed", final_text=None))
+
+    for identity in (empty_output, empty_reasoning):
+        current_read = harness.streams.read_after(identity, generation=2, cursor=0)
+        assert current_read.chunks == ()
+        assert current_read.head is not None and current_read.head.state == "sealed"
+        assert harness.streams.read_after(identity, generation=1, cursor=0).status == "reset"
+
+    settled_run = f"run-stream-settled-recovery-{uuid.uuid4().hex}"
+    settled_stale = harness.claim(settled_run, "settled-recovery-worker")
+    settled_context = ModelStreamContext(
+        run_id=settled_run,
+        root_run_id=settled_run,
+        turn_id="turn-settled-recovery",
+        stream_id="execution-local-settled-recovery",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    settled_output = DurableStreamIdentity(
+        run_id=settled_run,
+        stream_id=durable_model_stream_id(settled_run, settled_context.turn_id),
+        logical_call_id=logical_model_call_id(settled_run, settled_context.turn_id),
+        channel="output",
+    )
+    settled_reasoning = DurableStreamIdentity(
+        run_id=settled_run,
+        stream_id=settled_output.stream_id,
+        logical_call_id=settled_output.logical_call_id,
+        channel="reasoning",
+    )
+    for identity, data in (
+        (settled_output, b"settled answer"),
+        (settled_reasoning, b"settled thought"),
+    ):
+        assert harness.streams.open(identity, writer_token=settled_stale).status == "opened"
+        assert harness.streams.append(
+            identity,
+            generation=1,
+            start_offset=0,
+            data=data,
+            writer_token=settled_stale,
+        ).status == "committed"
+        assert harness.streams.seal(
+            identity,
+            generation=1,
+            final_size_bytes=len(data),
+            final_sha256=hashlib.sha256(data).hexdigest(),
+            writer_token=settled_stale,
+        ).status == "sealed"
+
+    assert harness.authority.release(settled_stale).status == "released"
+    settled_current = harness.claim(settled_run, "settled-recovery-replacement")
+    settled_writer = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=settled_current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=8,
+        flush_interval_s=10,
+    ).open(settled_context)
+    settled_writer.close(
+        ModelStreamOutcome(status="completed", final_text="settled answer")
+    )
+
+    for identity, data in (
+        (settled_output, b"settled answer"),
+        (settled_reasoning, b"settled thought"),
+    ):
+        settled_read = harness.streams.read_after(identity, generation=1, cursor=0)
+        assert b"".join(chunk.data for chunk in settled_read.chunks) == data
+        assert settled_read.head is not None and settled_read.head.state == "sealed"
+
 
 def test_rejected_appends_do_not_upload_unassociated_bytes(harness: _Harness) -> None:
     counting = _CountingPutStore(harness.streams.object_store)
