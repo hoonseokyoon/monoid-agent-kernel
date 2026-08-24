@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -113,6 +113,31 @@ class _BlockingAdapter:
         self.started.set()
         assert self.release.wait(30)
         return ModelTurn(final_text="private result released after worker drain")
+
+
+@dataclass
+class _AmbiguousFirstClaim:
+    inner: PostgresWriterAuthorityStore
+    claim_calls: int = 0
+    read_calls: int = 0
+    owner_ids: list[str] = field(default_factory=list)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+        self.claim_calls += 1
+        self.owner_ids.append(owner_id)
+        lease = self.inner.claim(run_id, owner_id, ttl)
+        if self.claim_calls <= 2:
+            raise ConnectionError("private committed PostgreSQL claim response was lost")
+        return lease
+
+    def read(self, run_id: str):  # noqa: ANN201 - exact store result passthrough
+        self.read_calls += 1
+        if self.read_calls == 1:
+            raise ConnectionError("private PostgreSQL reconciliation response was lost")
+        return self.inner.read(run_id)
 
 
 @dataclass
@@ -308,6 +333,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
     assert dispatch_claim is not None and dispatch_claim.command == admitted
     assert harness.authority.release(seed_lease.writer_token).status == "released"
     adapter = _SlowCountingAdapter(delay_s=0.7)
+    response_loss_authority = _AmbiguousFirstClaim(harness.authority)
 
     async def run() -> tuple[TemporalRunStatus, Any]:
         async with await WorkflowEnvironment.start_local(
@@ -324,7 +350,7 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                     activity_task_queue=activity_queue,
                     activity_start_to_close_timeout_s=30,
                     activity_heartbeat_timeout_s=2,
-                    activity_max_attempts=8,
+                    activity_max_attempts=3,
                 ),
             )
             accepted = await transport.dispatch_async(admitted)
@@ -335,12 +361,12 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
                 accepted,
             )
             activation = TemporalActivationActivity(
-                authority_store=harness.authority,
+                authority_store=response_loss_authority,
                 admission_store=harness.admission,
                 run_sink=harness.sink,
                 loop_factory=_loop_factory(tmp_path, spec, adapter),
                 policy=TemporalActivityPolicy(
-                    writer_lease_ttl_s=4,
+                    writer_lease_ttl_s=2,
                     writer_lease_renew_interval_s=0.25,
                     heartbeat_interval_s=0.1,
                     supervisor_join_timeout_s=2,
@@ -370,6 +396,10 @@ def test_temporal_activity_drives_actual_postgres_boundary_and_releases_lease(
         == receipt.activation_command.identity_sha256
     )
     assert adapter.calls == 1
+    assert response_loss_authority.claim_calls == 4
+    assert response_loss_authority.read_calls == 1
+    assert response_loss_authority.owner_ids[0] == response_loss_authority.owner_ids[1]
+    assert len(set(response_loss_authority.owner_ids)) == 3
     authority = harness.authority.read(run_id)
     assert authority is not None and authority.revoked is True and authority.active is False
     assert expected_server

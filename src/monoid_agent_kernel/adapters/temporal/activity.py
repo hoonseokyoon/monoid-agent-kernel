@@ -33,6 +33,7 @@ from monoid_agent_kernel.hosting.authority import (
     WriterAuthorityStore,
     WriterLease,
     WriterLeaseUnavailable,
+    claim_writer_lease,
     renew_writer_lease,
 )
 from monoid_agent_kernel.hosting.contracts import FencedRunSink
@@ -239,9 +240,17 @@ class _TemporalLeaseSupervisor:
 
 def _application_error(exc: Exception) -> ApplicationError:
     if isinstance(exc, WriterLeaseUnavailable):
+        retry_delay_s = min(
+            MAX_TEMPORAL_ACTIVITY_LOCAL_DURATION_S,
+            max(
+                0.001,
+                (exc.authority.leased_until - exc.authority.observed_at).total_seconds(),
+            ),
+        )
         return ApplicationError(
             "Temporal activation writer lease is temporarily unavailable",
             type="monoid.activation_lease_unavailable",
+            next_retry_delay=timedelta(seconds=retry_delay_s),
         )
     if isinstance(
         exc,
@@ -319,17 +328,12 @@ class TemporalActivationActivity:
             info = activity.info()
             owner_id = _activity_owner_id(info.task_token)
             activity.heartbeat()
-            lease = self.authority_store.claim(
+            lease = claim_writer_lease(
+                self.authority_store,
                 command.run_id,
                 owner_id,
                 self.policy.writer_lease_ttl,
             )
-            if (
-                not isinstance(lease, WriterLease)
-                or lease.writer_token.run_id != command.run_id
-                or lease.writer_token.owner_id != owner_id
-            ):
-                raise TypeError("writer authority store returned an invalid claim")
         except Exception as exc:
             raise _application_error(exc) from None
 

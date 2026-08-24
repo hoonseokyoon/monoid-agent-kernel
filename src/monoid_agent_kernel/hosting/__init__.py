@@ -7,6 +7,7 @@ from .authority import (
     WriterAuthorityStore,
     WriterLease,
     WriterLeaseUnavailable,
+    claim_writer_lease,
     renew_writer_lease,
 )
 from .activation import (
@@ -94,6 +95,7 @@ __all__ = [
     "ReleaseResult",
     "WriterLeaseUnavailable",
     "WriterAuthorityStore",
+    "claim_writer_lease",
     "renew_writer_lease",
     "ActivationCommandKind",
     "ActivationCommand",

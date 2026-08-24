@@ -14,6 +14,7 @@ from monoid_agent_kernel.hosting import (
     WriterLease,
     WriterLeaseUnavailable,
     WriterToken,
+    claim_writer_lease,
     renew_writer_lease,
 )
 
@@ -109,6 +110,82 @@ def test_unavailable_claim_requires_active_evidence() -> None:
     assert error.authority.writer_token == _TOKEN
     with pytest.raises(ValueError, match="must be active"):
         WriterLeaseUnavailable(_authority(expired=True))
+
+
+class _ClaimingStore:
+    def __init__(
+        self,
+        outcomes: list[object],
+        *,
+        observation: WriterAuthority | None = None,
+    ) -> None:
+        self.outcomes = outcomes
+        self.observation = observation
+        self.claim_calls = 0
+        self.read_calls = 0
+
+    def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> object:
+        del run_id, owner_id, ttl
+        self.claim_calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def read(self, run_id: str) -> WriterAuthority | None:
+        del run_id
+        self.read_calls += 1
+        return self.observation
+
+
+def test_claim_helper_reuses_the_same_owner_after_response_loss() -> None:
+    store = _ClaimingStore([ConnectionError("claim response lost"), _lease()])
+
+    claimed = claim_writer_lease(  # type: ignore[arg-type]
+        store,
+        _TOKEN.run_id,
+        _TOKEN.owner_id,
+        timedelta(seconds=30),
+    )
+
+    assert claimed == _lease()
+    assert store.claim_calls == 2
+    assert store.read_calls == 0
+
+
+def test_claim_helper_recovers_the_exact_token_after_two_ambiguous_responses() -> None:
+    store = _ClaimingStore(
+        [ConnectionError("first response lost"), ConnectionError("second response lost")],
+        observation=_authority(),
+    )
+
+    claimed = claim_writer_lease(  # type: ignore[arg-type]
+        store,
+        _TOKEN.run_id,
+        _TOKEN.owner_id,
+        timedelta(seconds=30),
+    )
+
+    assert claimed == _lease()
+    assert store.claim_calls == 2
+    assert store.read_calls == 1
+
+
+def test_claim_helper_does_not_retry_a_definitive_competing_owner() -> None:
+    unavailable = WriterLeaseUnavailable(_authority())
+    store = _ClaimingStore([unavailable])
+
+    with pytest.raises(WriterLeaseUnavailable) as raised:
+        claim_writer_lease(  # type: ignore[arg-type]
+            store,
+            _TOKEN.run_id,
+            "worker-2",
+            timedelta(seconds=30),
+        )
+
+    assert raised.value is unavailable
+    assert store.claim_calls == 1
+    assert store.read_calls == 0
 
 
 class _RenewingStore:

@@ -308,6 +308,9 @@ the PostgreSQL lease, sends empty heartbeats, and propagates Activity cancellati
 shutdown through the exact `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation
 authority. A heartbeat or renewal ambiguity revokes `ActivationWriteAuthority`, and every later
 checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
+an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
+observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.
 A writer fence observed during activation binding is retryable lease loss. A deterministic loop
 wiring violation is a non-retryable configuration conflict.
 

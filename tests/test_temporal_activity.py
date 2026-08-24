@@ -258,6 +258,30 @@ def test_threaded_activity_renews_heartbeats_and_releases_content_free_owner() -
     assert b"raw-temporal-task-token".decode() not in store.claimed_owner
 
 
+def test_activity_reconciles_a_lost_claim_response_with_the_same_owner() -> None:
+    class LoseFirstClaimResponse(_AuthorityStore):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.claim_calls = 0
+            self.owners: list[str] = []
+
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            self.claim_calls += 1
+            self.owners.append(owner_id)
+            lease = super().claim(run_id, owner_id, ttl)
+            if self.claim_calls == 1:
+                raise ConnectionError("private committed claim response was lost")
+            return lease
+
+    store = LoseFirstClaimResponse()
+    raw = ActivityEnvironment().run(_activity(store).run, _command().to_json())
+
+    assert TemporalActivationResult.from_json(raw).matches(_command())
+    assert store.claim_calls == 2
+    assert len(set(store.owners)) == 1
+    assert store.release_count == 1
+
+
 def test_worker_shutdown_policy_can_report_host_shutdown() -> None:
     store = _AuthorityStore()
     environment = ActivityEnvironment()
@@ -385,6 +409,7 @@ def test_competing_writer_lease_returns_retryable_public_error() -> None:
 
     assert raised.value.type == "monoid.activation_lease_unavailable"
     assert raised.value.non_retryable is False
+    assert raised.value.next_retry_delay == timedelta(seconds=30)
     assert "competing-owner" not in str(raised.value)
     assert store.release_count == 0
 
