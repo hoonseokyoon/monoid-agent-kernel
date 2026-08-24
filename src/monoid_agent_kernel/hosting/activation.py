@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from monoid_agent_kernel.core._util import canonical_sha256
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import CheckpointRecord, RunCheckpoint
 from monoid_agent_kernel.core.content import ContentPart
 from monoid_agent_kernel.core.events import AgentEvent
@@ -69,6 +70,13 @@ ActivationCommandKind = Literal["input", "control"]
 ActivationLoopFactory = Callable[["ActivationCommand", "ActivationRuntime"], "AgentLoop"]
 ActivationFaultHook = Callable[[str, "ActivationCommand"], None]
 ActivationInputResolver = Callable[["ActivationCommand"], "ResolvedActivationInput"]
+
+
+class ActivationLoopConfigurationError(RuntimeError):
+    """A host-built loop violates the activation runtime wiring contract."""
+
+    error_code = "activation_loop_config_conflict"
+
 
 _COMMAND_FIELDS = frozenset(
     {
@@ -524,6 +532,7 @@ class ActivationRuntime:
     run_sink: FencedRunSink
     writer_token: WriterToken
     write_authority: ActivationWriteAuthority
+    cancellation_token: CancellationToken
     event_sink: FencedEventSink
     terminal_bridge: FencedTerminalBridge
     event_sequence_seed: int
@@ -533,6 +542,8 @@ class ActivationRuntime:
             raise TypeError("activation runtime requires WriterToken")
         if not isinstance(self.write_authority, ActivationWriteAuthority):
             raise TypeError("activation runtime requires ActivationWriteAuthority")
+        if not isinstance(self.cancellation_token, CancellationToken):
+            raise TypeError("activation runtime requires CancellationToken")
         if self.event_sink.write_authority is not self.write_authority:
             raise ValueError("activation runtime event sink authority mismatch")
         if self.terminal_bridge.write_authority is not self.write_authority:
@@ -682,6 +693,7 @@ class ActivationDriver:
     loop_factory: ActivationLoopFactory
     input_resolver: ActivationInputResolver | None = None
     write_authority: ActivationWriteAuthority = field(default_factory=ActivationWriteAuthority)
+    cancellation_token: CancellationToken = field(default_factory=CancellationToken)
     local_task_wait_s: float = 300.0
     fault_hook: ActivationFaultHook | None = None
 
@@ -690,6 +702,8 @@ class ActivationDriver:
             raise TypeError("activation driver requires WriterToken")
         if not isinstance(self.write_authority, ActivationWriteAuthority):
             raise TypeError("activation driver requires ActivationWriteAuthority")
+        if not isinstance(self.cancellation_token, CancellationToken):
+            raise TypeError("activation driver requires CancellationToken")
         if not callable(self.loop_factory):
             raise TypeError("activation driver loop_factory must be callable")
         if self.input_resolver is not None and not callable(self.input_resolver):
@@ -749,6 +763,7 @@ class ActivationDriver:
             run_sink=run_sink,
             writer_token=self.writer_token,
             write_authority=self.write_authority,
+            cancellation_token=self.cancellation_token,
             event_sink=event_sink,
             terminal_bridge=terminal_bridge,
             event_sequence_seed=event_sequence,
@@ -950,23 +965,41 @@ class ActivationDriver:
                 error_code="loop_run_mismatch",
             )
         if loop.write_authority is not runtime.write_authority:
-            raise RuntimeError("activation loop must bind the exact write authority")
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact write authority"
+            )
+        if loop.cancellation_token is not runtime.cancellation_token:
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact cancellation token"
+            )
         if loop.run_sink is not runtime.run_sink or loop.writer_token != runtime.writer_token:
-            raise RuntimeError("activation loop must bind the exact run sink and writer token")
+            raise ActivationLoopConfigurationError(
+                "activation loop must bind the exact run sink and writer token"
+            )
         if sum(sink is runtime.event_sink for sink in loop.authoritative_event_sinks) != 1:
-            raise RuntimeError(
+            raise ActivationLoopConfigurationError(
                 "activation loop must bind the durable event sink exactly once as authoritative"
             )
         if any(sink is runtime.event_sink for sink in loop.event_sinks):
-            raise RuntimeError("activation loop cannot duplicate the durable event sink")
+            raise ActivationLoopConfigurationError(
+                "activation loop cannot duplicate the durable event sink"
+            )
         if loop.event_sequence_seed != runtime.event_sequence_seed:
-            raise RuntimeError("activation loop must use the authoritative event sequence seed")
+            raise ActivationLoopConfigurationError(
+                "activation loop must use the authoritative event sequence seed"
+            )
         if loop.checkpoint_persist_callback is not None:
-            raise RuntimeError("activation loop cannot install a checkpoint callback")
+            raise ActivationLoopConfigurationError(
+                "activation loop cannot install a checkpoint callback"
+            )
         if loop.emit_output_deltas:
-            raise RuntimeError("activation loop model deltas require the durable stream channel")
+            raise ActivationLoopConfigurationError(
+                "activation loop model deltas require the durable stream channel"
+            )
         if getattr(loop, "_session", None) is not None or getattr(loop, "_finalized", False):
-            raise RuntimeError("activation loop_factory must return an unopened fresh loop")
+            raise ActivationLoopConfigurationError(
+                "activation loop_factory must return an unopened fresh loop"
+            )
 
     def _drive_to_durable_boundary(
         self,
@@ -1002,5 +1035,6 @@ __all__ = [
     "ActivationLoopFactory",
     "ActivationFaultHook",
     "ActivationInputResolver",
+    "ActivationLoopConfigurationError",
     "ActivationDriver",
 ]

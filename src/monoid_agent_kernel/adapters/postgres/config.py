@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -9,6 +10,20 @@ from dataclasses import dataclass, field
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z", re.ASCII)
 _RESERVED_SCHEMA_NAMES = frozenset({"information_schema"})
 _MAX_POSTGRES_BYTEA_BYTES = (1 << 30) - 1
+_MAX_POSTGRES_OPERATION_TIMEOUT_S = 86_400.0
+
+
+def _require_operation_timeout(value: object, field_name: str) -> None:
+    if (
+        type(value) not in {int, float}
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not 0 < float(value) <= _MAX_POSTGRES_OPERATION_TIMEOUT_S
+    ):
+        raise ValueError(
+            f"PostgreSQL {field_name} must be in the range "
+            f"(0, {_MAX_POSTGRES_OPERATION_TIMEOUT_S:g}]"
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -21,6 +36,8 @@ class PostgresConfig:
     max_pool_size: int = 10
     connect_timeout_s: int = 10
     pool_timeout_s: float = 30.0
+    lock_timeout_s: float = 30.0
+    statement_timeout_s: float = 300.0
     application_name: str = "monoid-agent-kernel"
     max_bytea_blob_bytes: int = 8 * 1024 * 1024
 
@@ -54,6 +71,8 @@ class PostgresConfig:
             or not 0 < float(self.pool_timeout_s) <= 3600
         ):
             raise ValueError("PostgreSQL pool_timeout_s must be in the range (0, 3600]")
+        _require_operation_timeout(self.lock_timeout_s, "lock_timeout_s")
+        _require_operation_timeout(self.statement_timeout_s, "statement_timeout_s")
         if (
             type(self.application_name) is not str
             or not self.application_name

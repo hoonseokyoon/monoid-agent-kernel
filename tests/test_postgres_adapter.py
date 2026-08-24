@@ -98,6 +98,13 @@ def test_postgres_config_hides_dsn_and_validates_schema_and_pool() -> None:
     assert PostgresConfig(dsn="postgresql://db/service", schema="public").schema == "public"
     with pytest.raises(ValueError, match="max_pool_size"):
         PostgresConfig(dsn="postgresql://db/service", min_pool_size=2, max_pool_size=1)
+    for field_name in ("lock_timeout_s", "statement_timeout_s"):
+        for invalid_timeout in (True, 0, float("nan"), 86_401):
+            with pytest.raises(ValueError, match=field_name):
+                PostgresConfig(
+                    dsn="postgresql://db/service",
+                    **{field_name: invalid_timeout},
+                )
     assert PostgresConfig(dsn="postgresql://db/service").max_bytea_blob_bytes == 8 * 1024 * 1024
     for invalid_limit in (True, 0, -1, 1 << 30):
         with pytest.raises(ValueError, match="max_bytea_blob_bytes"):
@@ -167,6 +174,11 @@ def test_adapter_transaction_pins_isolation_and_trusted_search_path() -> None:
     assert pool.connection_value.cursor_value.executed == [
         ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", None),
         ("SET LOCAL search_path TO pg_catalog, pg_temp", None),
+        (
+            "SELECT pg_catalog.set_config('lock_timeout', %s, true), "
+            "pg_catalog.set_config('statement_timeout', %s, true)",
+            ("30000ms", "300000ms"),
+        ),
     ]
     assert len(pool.connection_value.row_factories) == 1
     assert getattr(pool.connection_value.row_factories[0], "__name__", "") == "_tuple_row"

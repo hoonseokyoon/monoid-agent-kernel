@@ -155,6 +155,11 @@ and its dispatch outbox row in a single transaction. The caller supplies a stabl
 request digest, and opaque private payload address. An exact retry returns the current receipt;
 reusing the ID for a different request raises `AdmissionConflict`.
 
+`PostgresConfig.lock_timeout_s` and `statement_timeout_s` apply transaction-local PostgreSQL
+limits to every adapter operation. Their defaults are 30 and 300 seconds. Set both below the host's
+outer operation timeout so a database lock or statement aborts before it can retain a worker slot.
+`pool_timeout_s` independently bounds connection-pool acquisition.
+
 ```python
 from monoid_agent_kernel.adapters.postgres import PostgresCommandAdmissionStore
 from monoid_agent_kernel.hosting import AdmissionRequest, CommandOutboxDispatcher
@@ -228,8 +233,8 @@ receipt, so later commands may advance the head without changing an earlier comm
 receipt. The digest hashes the boundary checkpoint with that receipt's own digest field blanked,
 which avoids a self-reference while retaining the rest of the exact boundary identity.
 
-The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`, and
-`write_authority`. It also configures
+The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`,
+`write_authority`, and `cancellation_token`. It also configures
 `authoritative_event_sinks=(runtime.event_sink,)`, seeds `event_sequence_seed` from the runtime, and
 keeps `emit_output_deltas=False` until a durable private stream sink is configured. The resulting
 event order is durable journal first, then local projections. A terminal winner closes new public
@@ -241,16 +246,23 @@ private checkpoint/blob channels referenced by the receipt.
 
 ### Temporal run orchestration
 
-Install `monoid-agent-kernel[temporal]` and register the versioned per-run Workflow explicitly:
+Install `monoid-agent-kernel[durable-host]`, check every storage adapter for readiness, and compose
+the versioned per-run Workflow with the production threaded Activity:
 
 ```python
-from temporalio.worker import Worker
-
 from monoid_agent_kernel.adapters.temporal import (
     TemporalRunPolicy,
     TemporalSignalWithStartTransport,
 )
-from monoid_agent_kernel.adapters.temporal.workflow import TemporalRunWorkflow
+from monoid_agent_kernel.adapters.temporal.activity import (
+    TemporalActivationActivity,
+    TemporalActivityPolicy,
+)
+from monoid_agent_kernel.adapters.temporal.worker import TemporalWorkerGroup
+
+authority_store.check_ready()
+admission_store.check_ready()
+fenced_run_sink.check_ready()
 
 policy = TemporalRunPolicy(activity_task_queue="monoid-activation-v1")
 transport = TemporalSignalWithStartTransport(
@@ -260,23 +272,103 @@ transport = TemporalSignalWithStartTransport(
     run_policy=policy,
 )
 
-workflow_worker = Worker(
-    temporal_client,
-    task_queue="monoid-run-v1",
-    workflows=[TemporalRunWorkflow],
+activation = TemporalActivationActivity(
+    authority_store=authority_store,
+    admission_store=admission_store,
+    run_sink=fenced_run_sink,
+    loop_factory=build_loop,
+    input_resolver=resolve_private_input,
+    policy=TemporalActivityPolicy(
+        writer_lease_ttl_s=30,
+        writer_lease_renew_interval_s=10,
+        heartbeat_interval_s=5,
+        authority_call_timeout_s=30,
+        driver_call_timeout_s=3300,
+        supervisor_join_timeout_s=30,
+        local_task_wait_s=300,
+    ),
 )
-activity_worker = Worker(
-    temporal_client,
-    task_queue="monoid-activation-v1",
-    activities=[drive_activation],
+
+workers = TemporalWorkerGroup(
+    client=temporal_client,
+    workflow_task_queue="monoid-run-v1",
+    activity_task_queue=policy.activity_task_queue,
+    activation_activity=activation,
+    max_concurrent_activities=10,
+    graceful_shutdown_timeout_s=30,
 )
+
+async with workers:
+    await serve_until_shutdown()
 ```
 
-Register `drive_activation` under the exported
-`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name. It accepts an `AdmittedCommand.to_json()` payload and
-returns `TemporalActivationResult.to_json()`. The result binds the exact command identity to a
-canonical receipt ref and terminal flag. Database access, private payload resolution, provider and
-tool calls, checkpoint restore, and terminal settlement remain inside this finite Activity.
+`TemporalActivationActivity.run` is registered as the exported
+`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name with
+`no_thread_cancel_exception=True`. It accepts an `AdmittedCommand.to_json()` payload and returns
+`TemporalActivationResult.to_json()`. The result binds the exact command identity to a canonical
+receipt ref and terminal flag. Database access, private payload resolution, provider and tool calls,
+checkpoint restore, and terminal settlement remain inside this finite Activity.
+
+The Activity derives a content-free owner ID from the Temporal task token, claims an independent
+PostgreSQL writer generation, and starts a copied-context control supervisor before the potentially
+blocking writer claim. The control supervisor sends empty heartbeats, observes cancellation and
+worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
+evidence. Claim, initial exact-token renewal, and durable activation binding run in one bounded
+copied-context daemon bootstrap worker, so a stuck database lock cannot retain the Temporal
+Activity executor slot. The configured authority timeout is capped by the current Activity
+attempt's remaining start-to-close budget with cleanup reserve. A timed-out bootstrap cannot enter
+the driver and releases a late exact token. An independent
+renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
+deadline enforcement. Its first renewal is scheduled from the installed lease's remaining
+monotonic budget and runs immediately when bootstrap consumed the normal safety margin. Control
+propagation uses the exact
+`ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation authority. A heartbeat,
+renewal ambiguity, or local lease deadline revokes `ActivationWriteAuthority`, and every later
+checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+The `ActivationDriver` runs in a copied-context daemon worker. `driver_call_timeout_s` bounds that
+worker and is further capped by the current Activity attempt's remaining start-to-close budget,
+with time reserved for cleanup. Timeout or supervisor loss revokes local write authority, cancels
+the exact activation token, ignores a late driver result, and returns the Temporal Activity
+executor slot. Configure PostgreSQL lock and statement timeouts below this driver bound so an
+in-flight fenced mutation aborts inside the database first. The control supervisor keeps
+heartbeating while one bounded copied-context cleanup task joins driver and renewal work and
+releases the exact writer token. `supervisor_join_timeout_s` bounds that combined cleanup; expiry
+returns retryable lease loss and leaves any uncooperative cleanup thread daemonized under revoked
+local authority.
+A lost claim response is reconciled inside the same Activity attempt with the same unique owner and
+an exact-token read. A competing owner delays the next Temporal attempt by the lease interval
+observed by PostgreSQL, so short exponential retry backoffs do not exhaust attempts before expiry.
+A writer fence observed during activation binding is retryable lease loss. A deterministic loop
+wiring violation is a non-retryable configuration conflict.
+
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`; runtime caps the
+effective interval to half of the actual Activity heartbeat timeout. Keep
+`authority_call_timeout_s`, `driver_call_timeout_s`, and the cleanup reserve within its
+`activity_start_to_close_timeout_s`; runtime caps both bootstrap and driver phases to the actual
+remaining attempt budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and
+`statement_timeout_s` below the relevant Activity bound. The Activity policy requires the writer
+lease TTL to cover at least two renewal intervals. A start-to-close timeout that cannot contain the
+configured cleanup reserve fails as a non-retryable configuration conflict before writer claim.
+Give
+`graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
+composition requires this timeout to cover the configured heartbeat interval, authority call
+timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set
+`worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN` when an orderly host termination should
+retain that distinct cause.
+
+`TemporalWorkerGroup` creates an Activity executor sized to `max_concurrent_activities` by default.
+An externally owned executor must be active and expose at least that many worker threads. Reserve
+that capacity for Activity work; unrelated tasks in a shared pool can still delay the initial
+heartbeat and lease claim. After the Temporal graceful-drain window, an owned executor stops
+accepting work and cancels queued futures without joining a stuck running call. This keeps group
+exit bounded and leaves final process termination to the host supervisor. Externally owned
+executors retain their host-managed lifecycle.
+
+A drain before provider entry commits a resumable `graceful_drain` receipt. A drain after durable
+`dispatch_started` and before trustworthy provider evidence commits `dispatch_unknown` with
+`after_reconciliation` eligibility. This result blocks automatic paid-call replay. A worker crash
+after the settled invocation commit lets the replacement generation reuse the stored result with
+zero additional provider calls.
 
 The Temporal client is asynchronous. Keep its owner event loop running and call the synchronous
 `transport.dispatch()` from the PostgreSQL outbox polling thread. Async code already executing on

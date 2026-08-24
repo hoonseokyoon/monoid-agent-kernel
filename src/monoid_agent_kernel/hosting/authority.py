@@ -150,6 +150,68 @@ class WriterAuthorityStore(Protocol):
     def read(self, run_id: str) -> WriterAuthority | None: ...
 
 
+def _validate_claimed_lease(
+    lease: object,
+    run_id: str,
+    owner_id: str,
+) -> WriterLease:
+    if (
+        not isinstance(lease, WriterLease)
+        or lease.writer_token.run_id != run_id
+        or lease.writer_token.owner_id != owner_id
+    ):
+        raise TypeError("writer authority store returned an invalid claim")
+    return lease
+
+
+def claim_writer_lease(
+    store: WriterAuthorityStore,
+    run_id: str,
+    owner_id: str,
+    ttl: timedelta,
+) -> WriterLease:
+    """Claim once and reconcile an ambiguous response with the same unique owner.
+
+    The second claim is response-loss reconciliation and does not extend an existing lease.
+    A final read can recover the exact token when both claim responses were ambiguous.
+    """
+
+    _require_ttl(ttl)
+    try:
+        claimed = store.claim(run_id, owner_id, ttl)
+    except WriterLeaseUnavailable:
+        raise
+    except (TypeError, ValueError):
+        raise
+    except Exception as first_error:
+        try:
+            claimed = store.claim(run_id, owner_id, ttl)
+        except WriterLeaseUnavailable:
+            raise
+        except (TypeError, ValueError):
+            raise
+        except Exception:
+            try:
+                authority = store.read(run_id)
+            except Exception:
+                raise first_error from None
+            if authority is not None and not isinstance(authority, WriterAuthority):
+                raise TypeError("writer authority store returned an invalid observation")
+            if authority is not None and authority.writer_token.run_id != run_id:
+                raise TypeError("writer authority store observed a different run")
+            if authority is not None and authority.active:
+                if authority.writer_token.owner_id != owner_id:
+                    raise WriterLeaseUnavailable(authority)
+                claimed = WriterLease(
+                    writer_token=authority.writer_token,
+                    observed_at=authority.observed_at,
+                    leased_until=authority.leased_until,
+                )
+            else:
+                raise first_error from None
+    return _validate_claimed_lease(claimed, run_id, owner_id)
+
+
 def renew_writer_lease(
     store: WriterAuthorityStore,
     writer_token: WriterToken,
@@ -187,5 +249,6 @@ __all__ = [
     "ReleaseResult",
     "WriterLeaseUnavailable",
     "WriterAuthorityStore",
+    "claim_writer_lease",
     "renew_writer_lease",
 ]

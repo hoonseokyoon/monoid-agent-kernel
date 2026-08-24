@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ def _tuple_row(_cursor: object) -> type[tuple]:
     """Return positional rows without importing the optional psycopg package."""
 
     return tuple
+
+
+def _timeout_milliseconds(seconds: float) -> str:
+    return f"{max(1, math.ceil(float(seconds) * 1_000))}ms"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -169,6 +174,14 @@ class PostgresDatabase:
                     # relations are schema-qualified; built-ins resolve from pg_catalog, and temp
                     # objects remain reachable only after it. SET LOCAL restores caller state.
                     cursor.execute("SET LOCAL search_path TO pg_catalog, pg_temp")
+                    cursor.execute(
+                        "SELECT pg_catalog.set_config('lock_timeout', %s, true), "
+                        "pg_catalog.set_config('statement_timeout', %s, true)",
+                        (
+                            _timeout_milliseconds(self.config.lock_timeout_s),
+                            _timeout_milliseconds(self.config.statement_timeout_s),
+                        ),
+                    )
                 yield connection
 
     def health(self) -> PostgresHealth:
