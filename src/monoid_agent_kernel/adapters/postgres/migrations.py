@@ -268,7 +268,7 @@ class PostgresMigrations:
         )
 
     def status(self) -> MigrationStatus:
-        with self.database.transaction() as connection:
+        with self.database.transaction(read_only=True) as connection:
             return self._inspect(connection)
 
     def plan(self) -> MigrationPlan:

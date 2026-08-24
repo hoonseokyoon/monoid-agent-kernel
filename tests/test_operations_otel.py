@@ -67,3 +67,6 @@ def test_otel_operational_sink_rejects_unit_drift() -> None:
 
     with pytest.raises(ValueError, match="unit"):
         sink.record(OperationalMetric(name="monoid.postgres.object.bytes", value=1, unit="1"))
+
+    with pytest.raises(ValueError, match="meter_name"):
+        OtelOperationalMetricSink(meter_name="private\nmeter", meter_provider=MeterProvider())

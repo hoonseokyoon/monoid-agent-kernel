@@ -57,6 +57,7 @@ def test_operational_snapshot_is_canonical_public_json_and_records_exactly_once(
     (
         lambda: OperationalMetric(name="tenant.private.value", value=1),
         lambda: OperationalMetric(name="monoid.safe", value=float("nan")),
+        lambda: OperationalMetric(name="monoid.safe", value=10**1000),
         lambda: OperationalMetric(name="monoid.safe", value=1, unit="tokens"),
         lambda: OperationalMetric(
             name="monoid.safe",
@@ -92,6 +93,12 @@ def test_operational_snapshot_rejects_duplicate_or_unsorted_metric_identity() ->
             source="postgres",
             collected_at=datetime.now(UTC),
             metrics=(first, first),
+        )
+    with pytest.raises(ValueError, match="OperationalMetric"):
+        OperationalSnapshot(
+            source="postgres",
+            collected_at=datetime.now(UTC),
+            metrics=(object(),),  # type: ignore[arg-type]
         )
 
 

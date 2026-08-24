@@ -193,7 +193,7 @@ class PostgresDatabase:
     def health(self) -> PostgresHealth:
         """Verify connectivity, supported major version, and database-clock availability."""
 
-        with self.transaction() as connection:
+        with self.transaction(read_only=True) as connection:
             with self.cursor(connection) as cursor:
                 cursor.execute(
                     "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4, "

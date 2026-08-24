@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from threading import RLock
 from typing import Any
 
 from monoid_agent_kernel.hosting.operations import OperationalMetric
+
+
+_METER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,254}\Z", re.ASCII)
 
 
 class OtelOperationalMetricSink:
@@ -21,8 +25,8 @@ class OtelOperationalMetricSink:
         meter_name: str = "monoid_agent_kernel.operations",
         meter_provider: Any = None,
     ) -> None:
-        if type(meter_name) is not str or not meter_name or len(meter_name) > 255:
-            raise ValueError("OTel operational meter_name must be a non-empty bounded string")
+        if type(meter_name) is not str or _METER_NAME.fullmatch(meter_name) is None:
+            raise ValueError("OTel operational meter_name must use the bounded public vocabulary")
         try:
             from opentelemetry import metrics
             from opentelemetry.metrics import Observation

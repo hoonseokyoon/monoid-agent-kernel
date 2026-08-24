@@ -34,9 +34,11 @@ Run startup in this order:
 6. Run `S3ObjectStoreAdmin.doctor()` and require bucket reachability plus enabled versioning.
 7. Start Temporal Workflow workers, then Activity workers, then admission dispatchers.
 
-Adapter construction never applies migrations. A readiness failure blocks traffic. Doctor reports
-carry portable error types and capability booleans. They exclude DSNs, schema names, endpoints,
-bucket names, expected-owner values, credentials, and exception prose.
+Adapter construction never applies migrations. A readiness failure blocks traffic. Doctor errors
+carry portable types and exclude DSNs, endpoints, bucket names, expected-owner values, credentials,
+and exception prose. PostgreSQL migration status names the configured schema, so keep the complete
+PostgreSQL doctor report on a private operator route. The S3 doctor report omits its bucket and
+endpoint.
 
 `S3ObjectStoreAdmin.doctor()` performs read-only bucket head and versioning calls. Its
 `*_supported` fields describe adapter capabilities. Actual conditional-create, checked-read,

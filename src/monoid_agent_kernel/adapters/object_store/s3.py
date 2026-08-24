@@ -73,8 +73,8 @@ class S3ObjectStoreDoctorReport:
     versioning_enabled: bool
     conditional_create_supported: bool = True
     checked_read_supported: bool = True
-    object_inventory_supported: bool = True
-    versioned_delete_supported: bool = True
+    object_inventory_ready: bool = True
+    versioned_delete_ready: bool = True
     multipart_cleanup_supported: bool = True
     encryption_configured: bool = False
     errors: tuple[str, ...] = ()
@@ -553,7 +553,8 @@ class S3ObjectStoreAdmin(_S3Client):
             ok=reachable and versioning_enabled,
             reachable=reachable,
             versioning_enabled=versioning_enabled,
-            versioned_delete_supported=versioning_enabled,
+            object_inventory_ready=versioning_enabled,
+            versioned_delete_ready=versioning_enabled,
             encryption_configured=self.config.server_side_encryption is not None,
             errors=tuple(errors),
         )

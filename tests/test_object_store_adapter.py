@@ -560,8 +560,8 @@ def test_admin_doctor_reports_read_only_capabilities_and_bucket_versioning() -> 
     assert report.versioning_enabled is True
     assert report.conditional_create_supported is True
     assert report.checked_read_supported is True
-    assert report.object_inventory_supported is True
-    assert report.versioned_delete_supported is True
+    assert report.object_inventory_ready is True
+    assert report.versioned_delete_ready is True
     assert report.multipart_cleanup_supported is True
     assert report.encryption_configured is True
     assert report.errors == ()
@@ -576,7 +576,8 @@ def test_admin_doctor_fails_closed_for_unversioned_or_unreachable_bucket() -> No
     assert report.ok is False
     assert report.reachable is True
     assert report.versioning_enabled is False
-    assert report.versioned_delete_supported is False
+    assert report.object_inventory_ready is False
+    assert report.versioned_delete_ready is False
     assert report.errors == ("versioning: disabled",)
 
     unreachable, _ = _admin(_DoctorSecretFailureS3(versioned=True))

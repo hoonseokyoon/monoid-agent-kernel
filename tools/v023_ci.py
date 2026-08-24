@@ -85,9 +85,10 @@ def validate_qualification_manifest() -> dict[str, Any]:
                 raise ValueError(f"qualification node id is duplicated: {node_id}")
             seen.add(node_id)
             relative_path, test_name = node_id.split("::", 1)
-            path = ROOT / relative_path
+            path = (ROOT / relative_path).resolve()
+            tests_root = (ROOT / "tests").resolve()
             if (
-                not path.is_relative_to(ROOT / "tests")
+                not path.is_relative_to(tests_root)
                 or not path.is_file()
                 or re.fullmatch(r"test_[A-Za-z0-9_]+", test_name) is None
             ):

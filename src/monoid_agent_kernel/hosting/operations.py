@@ -23,6 +23,8 @@ _ATTRIBUTE_NAMES = frozenset(
     }
 )
 _UNITS = frozenset({"1", "By", "s"})
+_MIN_OTEL_INTEGER = -(2**63)
+_MAX_OTEL_INTEGER = 2**63 - 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -40,11 +42,11 @@ class OperationalMetric:
     def __post_init__(self) -> None:
         if type(self.name) is not str or _METRIC_NAME.fullmatch(self.name) is None:
             raise ValueError("operational metric name must use the bounded monoid.* vocabulary")
-        if (
-            type(self.value) not in {int, float}
-            or isinstance(self.value, bool)
-            or not math.isfinite(float(self.value))
-        ):
+        if type(self.value) is int:
+            valid_value = _MIN_OTEL_INTEGER <= self.value <= _MAX_OTEL_INTEGER
+        else:
+            valid_value = type(self.value) is float and math.isfinite(self.value)
+        if not valid_value:
             raise ValueError("operational metric value must be a finite number")
         if self.unit not in _UNITS:
             raise ValueError("operational metric unit is outside the supported vocabulary")
@@ -85,10 +87,16 @@ class OperationalSnapshot:
     def __post_init__(self) -> None:
         if type(self.source) is not str or _ATTRIBUTE_VALUE.fullmatch(self.source) is None:
             raise ValueError("operational snapshot source must be a bounded public identity")
-        if not isinstance(self.collected_at, datetime) or self.collected_at.tzinfo is None:
+        if (
+            not isinstance(self.collected_at, datetime)
+            or self.collected_at.tzinfo is None
+            or self.collected_at.utcoffset() is None
+        ):
             raise ValueError("operational snapshot collected_at must be timezone-aware")
         if type(self.metrics) is not tuple or not self.metrics:
             raise ValueError("operational snapshot must contain a non-empty metric tuple")
+        if not all(isinstance(metric, OperationalMetric) for metric in self.metrics):
+            raise ValueError("operational snapshot metrics must be OperationalMetric values")
         identities = tuple((metric.name, metric.attributes) for metric in self.metrics)
         if len(set(identities)) != len(identities):
             raise ValueError("operational snapshot metric identities must be unique")
