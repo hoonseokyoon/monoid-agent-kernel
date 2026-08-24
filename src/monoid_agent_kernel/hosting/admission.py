@@ -46,6 +46,7 @@ AdmissionState = Literal[
     "dispatched",
     "activation_claimed",
     "completed",
+    "run_terminal",
     "dead_letter",
 ]
 DispatchStatus = Literal["accepted", "retry", "rejected"]
@@ -322,7 +323,9 @@ class AdmissionReceipt:
         if type(self.state) is not str or self.state not in get_args(AdmissionState):
             raise ValueError("admission receipt state is outside the portable vocabulary")
         _require_nonnegative_integer(self.attempt_count, "admission receipt attempt count")
-        if self.state != "prepared" and self.attempt_count < 1:
+        if self.state in {"dispatched", "activation_claimed", "completed", "dead_letter"} and (
+            self.attempt_count < 1
+        ):
             raise ValueError("post-claim admission receipt requires a dispatch attempt")
         if self.dispatch_ref and not is_safe_opaque_address(self.dispatch_ref):
             raise ValueError("admission receipt dispatch_ref must be an opaque address")
@@ -378,6 +381,13 @@ class AdmissionReceipt:
             or self.activation_receipt is None
         ):
             raise ValueError("completed admission receipt evidence is inconsistent")
+        if self.state == "run_terminal" and (
+            self.error_code != "run_terminal"
+            or self.dispatch_ref
+            or self.activation_command is not None
+            or self.activation_receipt is not None
+        ):
+            raise ValueError("terminal-run admission receipt evidence is inconsistent")
         if self.state == "dead_letter" and (
             not self.error_code
             or self.dispatch_ref

@@ -244,6 +244,14 @@ def test_admission_receipt_states_bind_exact_activation_identity() -> None:
 
     for receipt in receipts:
         assert AdmissionReceipt.from_json(receipt.to_json()) == receipt
+    for attempt_count in (0, 2):
+        terminal = AdmissionReceipt(
+            command=command,
+            state="run_terminal",
+            attempt_count=attempt_count,
+            error_code="run_terminal",
+        )
+        assert AdmissionReceipt.from_json(terminal.to_json()) == terminal
 
     bad_version = receipts[0].to_json()
     bad_version["schema_version"] = "monoid.admission-receipt.v999"
@@ -284,6 +292,8 @@ def test_admission_receipt_states_bind_exact_activation_identity() -> None:
         invalid["error_code"] = "transport_busy"
         with pytest.raises(ValueError, match="evidence is inconsistent"):
             AdmissionReceipt.from_json(invalid)
+    with pytest.raises(ValueError, match="terminal-run admission receipt"):
+        AdmissionReceipt(command=command, state="run_terminal", error_code="terminal")
 
 
 @pytest.mark.parametrize(

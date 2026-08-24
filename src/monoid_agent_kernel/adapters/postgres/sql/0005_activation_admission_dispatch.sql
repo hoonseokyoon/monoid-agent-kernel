@@ -60,7 +60,7 @@ CREATE TABLE __MONOID_SCHEMA__.activation_dispatch_outbox (
     run_id text NOT NULL,
     command_id text NOT NULL,
     delivery_state text NOT NULL DEFAULT 'pending' CHECK (
-        delivery_state IN ('pending', 'leased', 'delivered', 'dead_letter')
+        delivery_state IN ('pending', 'leased', 'delivered', 'run_terminal', 'dead_letter')
     ),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     available_at timestamp with time zone NOT NULL DEFAULT pg_catalog.clock_timestamp(),
@@ -125,10 +125,13 @@ CREATE TABLE __MONOID_SCHEMA__.activation_dispatch_outbox (
         OR (claim_generation > 0 AND claim_owner IS NOT NULL AND claim_id IS NOT NULL)
     ),
     CHECK (
-        delivery_state = 'pending' OR attempt_count > 0
+        delivery_state IN ('pending', 'run_terminal') OR attempt_count > 0
     ),
     CHECK (
         delivery_state = 'pending' OR retry_delay_microseconds = 0
+    ),
+    CHECK (
+        delivery_state <> 'run_terminal' OR last_error_code = 'run_terminal'
     )
 );
 

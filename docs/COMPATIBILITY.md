@@ -103,7 +103,9 @@ opaque payload address. `monoid.admitted-command.v1` adds the PostgreSQL-assigne
 used for ordered, at-least-once delivery to an orchestrator. `monoid.admission-receipt.v1` projects
 dispatch state, the immutable activation binding, and canonical completion. These records carry
 opaque IDs, digests, addresses, counters, and public-safe taxonomy. Private command content and raw
-transport errors remain outside the wire records.
+transport errors remain outside the wire records. The `run_terminal` receipt state closes an
+unapplied command when its run has already selected a canonical terminal winner; it may have zero
+dispatch attempts and carries the `run_terminal` error taxonomy.
 
 `monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
 or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded

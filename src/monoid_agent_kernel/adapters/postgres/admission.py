@@ -42,7 +42,9 @@ from monoid_agent_kernel.hosting.contracts import WriterToken
 
 
 _POSTGRES_BIGINT_MAX = (1 << 63) - 1
-_DELIVERY_STATES = frozenset({"pending", "leased", "delivered", "dead_letter"})
+_DELIVERY_STATES = frozenset(
+    {"pending", "leased", "delivered", "run_terminal", "dead_letter"}
+)
 
 
 class PostgresAdmissionCorrupt(NativeAgentError):
@@ -79,7 +81,9 @@ def _duration_microseconds(seconds: float) -> int:
 class _StoredAdmission:
     command: AdmittedCommand
     activation: ActivationCommand | None
-    delivery_state: Literal["pending", "leased", "delivered", "dead_letter"]
+    delivery_state: Literal[
+        "pending", "leased", "delivered", "run_terminal", "dead_letter"
+    ]
     attempt_count: int
     dispatch_ref: str
     last_error_code: str
@@ -88,6 +92,7 @@ class _StoredAdmission:
     claim_generation: int
     lease_active: bool
     retry_delay_microseconds: int
+    run_terminal: bool
 
 
 class PostgresCommandAdmissionStore:
@@ -185,7 +190,13 @@ class PostgresCommandAdmissionStore:
         # PostgreSQL may evaluate a SELECT target-list clock expression before FOR UPDATE finishes
         # waiting. Sample the DB clock in a second statement, after this transaction owns the row
         # lock, so a settlement cannot use authority that expired during lock contention.
-        cursor.execute("SELECT pg_catalog.clock_timestamp()")  # type: ignore[attr-defined]
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "SELECT pg_catalog.clock_timestamp(), "
+                "EXISTS (SELECT 1 FROM {} WHERE run_id = %s)"
+            ).format(self._table("terminal_record")),
+            (run_id,),
+        )
         clock_row = cursor.fetchone()  # type: ignore[attr-defined]
         if clock_row is None:  # pragma: no cover - PostgreSQL SELECT always returns one row
             raise RuntimeError("PostgreSQL dispatch clock query returned no row")
@@ -194,7 +205,7 @@ class PostgresCommandAdmissionStore:
             lease_active = leased_until is not None and leased_until > clock_row[0]
         except TypeError as exc:
             raise PostgresAdmissionCorrupt("dispatch lease timestamp is invalid") from exc
-        return (*tuple(row[:20]), lease_active, row[21])
+        return (*tuple(row[:20]), lease_active, row[21], clock_row[1])
 
     @staticmethod
     def _decode_row(row: tuple[object, ...]) -> _StoredAdmission:
@@ -268,6 +279,7 @@ class PostgresCommandAdmissionStore:
             or type(row[20]) is not bool
             or type(row[21]) is not int
             or row[21] < 0
+            or type(row[22]) is not bool
         ):
             raise PostgresAdmissionCorrupt("dispatch outbox metadata is invalid")
         return _StoredAdmission(
@@ -282,6 +294,7 @@ class PostgresCommandAdmissionStore:
             claim_generation=claim_generation,
             lease_active=row[20],
             retry_delay_microseconds=row[21],
+            run_terminal=row[22],
         )
 
     def _stored(
@@ -341,6 +354,15 @@ class PostgresCommandAdmissionStore:
                 state="dead_letter",
                 attempt_count=stored.attempt_count,
                 error_code=stored.last_error_code,
+            )
+        if stored.delivery_state == "run_terminal" or (
+            stored.run_terminal and stored.activation is None
+        ):
+            return AdmissionReceipt(
+                command=stored.command,
+                state="run_terminal",
+                attempt_count=stored.attempt_count,
+                error_code="run_terminal",
             )
         if stored.delivery_state != "delivered":
             if stored.activation is not None:
@@ -510,6 +532,53 @@ class PostgresCommandAdmissionStore:
                     return None
                 return self._stored(cursor, str(row[0]), str(row[1]))
 
+    def _reconcile_one_terminal_dispatch(
+        self,
+        cursor: object,
+        *,
+        run_id: str = "",
+        command_id: str = "",
+    ) -> bool:
+        from psycopg import sql
+
+        target = sql.SQL("")
+        parameters: tuple[object, ...] = ()
+        if run_id or command_id:
+            if not run_id or not command_id:
+                raise ValueError("terminal dispatch reconciliation requires a complete command key")
+            target = sql.SQL("AND dispatch.run_id = %s AND dispatch.command_id = %s ")
+            parameters = (run_id, command_id)
+        cursor.execute(  # type: ignore[attr-defined]
+            sql.SQL(
+                "WITH candidate AS ("
+                "SELECT dispatch.run_id, dispatch.command_id "
+                "FROM {} AS dispatch JOIN {} AS admission "
+                "ON admission.run_id = dispatch.run_id "
+                "AND admission.command_id = dispatch.command_id "
+                "JOIN {} AS terminal ON terminal.run_id = dispatch.run_id "
+                "WHERE dispatch.delivery_state IN ('pending', 'leased', 'delivered') "
+                "AND admission.activation_payload IS NULL "
+            ).format(
+                self._table("activation_dispatch_outbox"),
+                self._table("activation_admission_record"),
+                self._table("terminal_record"),
+            )
+            + target
+            + sql.SQL(
+                "ORDER BY dispatch.created_at, dispatch.run_id, admission.command_sequence "
+                "FOR UPDATE OF dispatch SKIP LOCKED LIMIT 1) "
+                "UPDATE {} AS dispatch SET delivery_state = 'run_terminal', "
+                "leased_until = NULL, dispatch_ref = '', delivered_at = NULL, "
+                "last_error_code = 'run_terminal', retry_delay_microseconds = 0, "
+                "updated_at = pg_catalog.clock_timestamp() FROM candidate "
+                "WHERE dispatch.run_id = candidate.run_id "
+                "AND dispatch.command_id = candidate.command_id "
+                "RETURNING dispatch.run_id"
+            ).format(self._table("activation_dispatch_outbox")),
+            parameters,
+        )
+        return cursor.fetchone() is not None  # type: ignore[attr-defined]
+
     @staticmethod
     def _dispatch_claim(stored: _StoredAdmission, owner_id: str, claim_id: str) -> DispatchClaim:
         if (
@@ -569,9 +638,20 @@ class PostgresCommandAdmissionStore:
                             str(existing_key[1]),
                         )
                         assert existing is not None
+                        if existing.run_terminal:
+                            self._reconcile_one_terminal_dispatch(
+                                cursor,
+                                run_id=existing.command.run_id,
+                                command_id=existing.command.command_id,
+                            )
+                            return None
                         if existing.claim_owner != owner_id:
                             raise AdmissionConflict("dispatch claim ID belongs to another owner")
                         return self._dispatch_claim(existing, owner_id, claim_id)
+                    # Close one terminal-run backlog row on every new claim attempt. The bound
+                    # keeps dispatch_once finite while preventing continuous traffic on other
+                    # runs from starving terminal reconciliation.
+                    self._reconcile_one_terminal_dispatch(cursor)
                     cursor.execute(
                         sql.SQL(
                             "WITH candidate AS ("
@@ -583,6 +663,8 @@ class PostgresCommandAdmissionStore:
                             "AND dispatch.available_at <= pg_catalog.clock_timestamp()) "
                             "OR (dispatch.delivery_state = 'leased' "
                             "AND dispatch.leased_until <= pg_catalog.clock_timestamp())) "
+                            "AND NOT EXISTS (SELECT 1 FROM {} AS terminal "
+                            "WHERE terminal.run_id = dispatch.run_id) "
                             "AND NOT EXISTS (SELECT 1 FROM {} AS prior_dispatch "
                             "JOIN {} AS prior_admission "
                             "ON prior_admission.run_id = prior_dispatch.run_id "
@@ -607,6 +689,7 @@ class PostgresCommandAdmissionStore:
                         ).format(
                             self._table("activation_dispatch_outbox"),
                             self._table("activation_admission_record"),
+                            self._table("terminal_record"),
                             self._table("activation_dispatch_outbox"),
                             self._table("activation_admission_record"),
                             self._table("activation_dispatch_outbox"),

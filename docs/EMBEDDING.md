@@ -182,7 +182,8 @@ shutdown, credentials, and health reporting. Dispatch uses database-clock leases
 per-run command order across competing workers. Delivery is at least once: the transport deduplicates
 `AdmittedCommand.identity_sha256`, and the activation path applies the immutable command identity
 once. A rejected command enters `dead_letter` and blocks later commands in that run until an operator
-resolves the lane.
+resolves the lane. A canonical terminal winner excludes that run from new claims. Unbound pending,
+leased, or delivered commands converge to `run_terminal` without another transport call.
 
 After the orchestrator selects a delivered command, acquire the current `WriterToken` and call
 `bind_activation()`. Binding captures the latest checked checkpoint exactly once at activation time.

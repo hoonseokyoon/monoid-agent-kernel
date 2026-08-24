@@ -289,9 +289,79 @@ def test_postgres_admission_is_atomic_idempotent_and_terminal_aware(
         ).status
         == "committed"
     )
-    assert harness.admission.admit(request) == first
+    terminal_receipt = harness.admission.admit(request)
+    assert terminal_receipt.state == "run_terminal"
+    assert terminal_receipt.command == first.command
+    assert terminal_receipt.attempt_count == 0
+    assert terminal_receipt.error_code == "run_terminal"
+    assert harness.admission.claim_dispatch("owner-a", "terminal-claim", lease_s=1) is None
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT delivery_state FROM {} WHERE run_id = %s AND command_id = %s"
+                ).format(
+                    sql.Identifier(
+                        harness.database.config.schema,
+                        "activation_dispatch_outbox",
+                    )
+                ),
+                (request.run_id, request.command_id),
+            )
+            assert cursor.fetchone() == ("run_terminal",)
     with pytest.raises(AdmissionRunTerminal):
         harness.admission.admit(_request(request.run_id, "command-2"))
+
+
+def test_terminal_run_reconciles_delivered_unbound_commands_without_transport(
+    harness: _Harness,
+    tmp_path: Path,
+) -> None:
+    token, _ = harness.seed(tmp_path, "terminal-dispatch-reconciliation")
+    first = harness.admission.admit(_request(token.run_id, "command-1")).command
+    second = harness.admission.admit(_request(token.run_id, "command-2")).command
+    third = harness.admission.admit(_request(token.run_id, "command-3")).command
+    dispatcher = _dispatcher(harness, _accept_all, iter(("claim-1", "claim-2")))
+    assert dispatcher.dispatch_once() is not None
+    assert dispatcher.dispatch_once() is not None
+    third_claim = harness.admission.claim_dispatch("owner-a", "claim-3", lease_s=10)
+    assert third_claim is not None and third_claim.command == third
+    harness.admission.bind_activation(first, writer_token=token)
+
+    assert (
+        harness.sink.settle_terminal(
+            TerminalOutcome(
+                run_id=token.run_id,
+                kind="cancelled",
+                retry_eligibility=RetryEligibility.FORBIDDEN,
+                error_code="cancelled",
+            ),
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+    forbidden_transport = _dispatcher(
+        harness,
+        lambda command: (_ for _ in ()).throw(AssertionError(command)),
+        iter(("terminal-reconcile",)),
+    )
+    assert forbidden_transport.dispatch_once() is None
+    assert harness.admission.claim_dispatch("owner-a", "terminal-reconcile-2", lease_s=1) is None
+    receipt = harness.admission.receipt(token.run_id, second.command_id)
+    assert receipt is not None
+    assert receipt.state == "run_terminal"
+    assert receipt.command == second
+    assert receipt.attempt_count == 1
+    assert receipt.error_code == "run_terminal"
+    leased_receipt = harness.admission.receipt(token.run_id, third.command_id)
+    assert leased_receipt is not None
+    assert leased_receipt.state == "run_terminal"
+    assert leased_receipt.attempt_count == 1
+    with pytest.raises(DispatchClaimLost):
+        harness.admission.acknowledge_dispatch(
+            third_claim.token,
+            DispatchResult(status="accepted", dispatch_ref="temporal:too-late"),
+        )
 
 
 def test_concurrent_admission_converges_and_assigns_one_sequence_per_run(
