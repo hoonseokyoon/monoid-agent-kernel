@@ -233,7 +233,10 @@ class _TemporalLeaseSupervisor:
         command: AdmittedCommand,
         owner_id: str,
         admission_store: CommandAdmissionStore,
+        *,
+        timeout_s: float,
     ) -> _ActivationBootstrap:
+        timeout = _require_duration(timeout_s, "activation bootstrap attempt timeout")
         completed = threading.Event()
         abandoned = threading.Event()
         state_lock = threading.Lock()
@@ -299,7 +302,7 @@ class _TemporalLeaseSupervisor:
             daemon=True,
         )
         bootstrap_thread.start()
-        deadline = time.monotonic() + float(self._policy.authority_call_timeout_s)
+        deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if completed.wait(max(0.0, min(0.05, remaining))):
@@ -545,15 +548,17 @@ class _TemporalLeaseSupervisor:
             self._fail()
 
 
-def _driver_attempt_timeout(
+def _activity_phase_timeout(
     info: Any,
     *,
     attempt_started_monotonic: float,
-    policy: TemporalActivityPolicy,
+    configured_timeout_s: float,
+    cleanup_timeout_s: float,
+    phase_name: str,
 ) -> float:
-    """Cap driver work below this Activity attempt's remaining start-to-close budget."""
+    """Cap local work below this Activity attempt's remaining start-to-close budget."""
 
-    configured = float(policy.driver_call_timeout_s)
+    configured = _require_duration(configured_timeout_s, f"{phase_name} configured timeout")
     start_to_close = getattr(info, "start_to_close_timeout", None)
     if start_to_close is None:
         return configured
@@ -561,14 +566,16 @@ def _driver_attempt_timeout(
         raise _SupervisorUnhealthy("Temporal Activity start-to-close timeout is invalid")
     remaining = start_to_close.total_seconds() - (time.monotonic() - attempt_started_monotonic)
     if remaining <= 0.002:
-        raise _SupervisorUnhealthy("Temporal Activity has no driver execution budget")
-    cleanup_reserve = min(
-        float(policy.supervisor_join_timeout_s),
-        remaining / 2,
+        raise _SupervisorUnhealthy(f"Temporal Activity has no {phase_name} execution budget")
+    cleanup_reserve = _require_duration(
+        cleanup_timeout_s,
+        "activation cleanup reserve",
     )
     timeout = min(configured, remaining - cleanup_reserve)
     if timeout < 0.001:
-        raise _SupervisorUnhealthy("Temporal Activity has no bounded driver execution budget")
+        raise _SupervisorUnhealthy(
+            f"Temporal Activity has no bounded {phase_name} execution budget"
+        )
     return timeout
 
 
@@ -681,6 +688,13 @@ class TemporalActivationActivity:
                 command,
                 owner_id,
                 self.admission_store,
+                timeout_s=_activity_phase_timeout(
+                    info,
+                    attempt_started_monotonic=attempt_started_monotonic,
+                    configured_timeout_s=float(self.policy.authority_call_timeout_s),
+                    cleanup_timeout_s=float(self.policy.supervisor_join_timeout_s),
+                    phase_name="bootstrap",
+                ),
             )
             lease = bootstrap.lease
             supervisor.assert_healthy()
@@ -706,10 +720,12 @@ class TemporalActivationActivity:
             )
             receipt = supervisor.drive(
                 lambda: driver.drive(bootstrap.activation),
-                timeout_s=_driver_attempt_timeout(
+                timeout_s=_activity_phase_timeout(
                     info,
                     attempt_started_monotonic=attempt_started_monotonic,
-                    policy=self.policy,
+                    configured_timeout_s=float(self.policy.driver_call_timeout_s),
+                    cleanup_timeout_s=float(self.policy.supervisor_join_timeout_s),
+                    phase_name="driver",
                 ),
             )
             supervisor.assert_healthy()

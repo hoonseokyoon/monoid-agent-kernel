@@ -477,9 +477,9 @@ def test_activity_bounds_an_actual_postgres_authority_row_lock(
             writer_lease_ttl_s=2,
             writer_lease_renew_interval_s=0.4,
             heartbeat_interval_s=0.05,
-            authority_call_timeout_s=0.1,
+            authority_call_timeout_s=2,
             driver_call_timeout_s=1,
-            supervisor_join_timeout_s=0.2,
+            supervisor_join_timeout_s=0.05,
             local_task_wait_s=1,
         ),
     )
@@ -495,7 +495,14 @@ def test_activity_bounds_an_actual_postgres_authority_row_lock(
                 assert cursor.fetchone() == (run_id,)
             started = time.monotonic()
             with pytest.raises(ApplicationError) as raised:
-                ActivityEnvironment().run(activation.run, admitted.to_json())
+                environment = ActivityEnvironment()
+                environment.info = environment.info.__class__(
+                    **{
+                        **environment.info.__dict__,
+                        "start_to_close_timeout": timedelta(seconds=0.25),
+                    }
+                )
+                environment.run(activation.run, admitted.to_json())
             elapsed = time.monotonic() - started
             assert raised.value.type == "monoid.activation_lease_lost"
             assert raised.value.non_retryable is False

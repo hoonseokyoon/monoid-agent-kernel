@@ -315,7 +315,9 @@ blocking writer claim. The control supervisor sends empty heartbeats, observes c
 worker shutdown, and enforces a conservative monotonic deadline derived from PostgreSQL lease
 evidence. Claim, initial exact-token renewal, and durable activation binding run in one bounded
 daemon bootstrap worker, so a stuck database lock cannot retain the Temporal Activity executor
-slot. A timed-out bootstrap cannot enter the driver and releases a late exact token. An independent
+slot. The configured authority timeout is capped by the current Activity attempt's remaining
+start-to-close budget with cleanup reserve. A timed-out bootstrap cannot enter the driver and
+releases a late exact token. An independent
 renewal thread performs later PostgreSQL calls, so pool or row-lock waits cannot stop heartbeat or
 deadline enforcement. Its first renewal is scheduled from the installed lease's remaining
 monotonic budget and runs immediately when bootstrap consumed the normal safety margin. Control
@@ -340,10 +342,10 @@ wiring violation is a non-retryable configuration conflict.
 
 Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. Keep
 `authority_call_timeout_s`, `driver_call_timeout_s`, and the cleanup reserve within its
-`activity_start_to_close_timeout_s`; runtime caps the driver to the actual remaining attempt
-budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and `statement_timeout_s` below the
-relevant Activity bound. The Activity policy requires the writer lease TTL to cover at least two
-renewal intervals. Give
+`activity_start_to_close_timeout_s`; runtime caps both bootstrap and driver phases to the actual
+remaining attempt budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and
+`statement_timeout_s` below the relevant Activity bound. The Activity policy requires the writer
+lease TTL to cover at least two renewal intervals. Give
 `graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
 composition requires this timeout to cover the configured heartbeat interval, authority call
 timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set

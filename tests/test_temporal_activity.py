@@ -191,7 +191,7 @@ def _activity(
             heartbeat_interval_s=0.01,
             authority_call_timeout_s=1,
             driver_call_timeout_s=1,
-            supervisor_join_timeout_s=1,
+            supervisor_join_timeout_s=0.1,
             local_task_wait_s=1,
         ),
     )
@@ -215,26 +215,34 @@ def test_temporal_activity_policy_has_fail_safe_bounds() -> None:
             TemporalActivityPolicy(**changes)  # type: ignore[arg-type]
 
 
-def test_driver_attempt_timeout_reserves_cleanup_inside_temporal_deadline() -> None:
-    policy = TemporalActivityPolicy(
-        driver_call_timeout_s=20,
-        supervisor_join_timeout_s=2,
-    )
-    timeout = activity_module._driver_attempt_timeout(
+def test_activity_phase_timeout_reserves_cleanup_inside_temporal_deadline() -> None:
+    timeout = activity_module._activity_phase_timeout(
         SimpleNamespace(start_to_close_timeout=timedelta(seconds=10)),
         attempt_started_monotonic=time.monotonic() - 3,
-        policy=policy,
+        configured_timeout_s=20,
+        cleanup_timeout_s=2,
+        phase_name="driver",
     )
 
     assert 4.9 < timeout < 5.1
     assert (
-        activity_module._driver_attempt_timeout(
+        activity_module._activity_phase_timeout(
             SimpleNamespace(start_to_close_timeout=None),
             attempt_started_monotonic=time.monotonic(),
-            policy=policy,
+            configured_timeout_s=20,
+            cleanup_timeout_s=2,
+            phase_name="bootstrap",
         )
         == 20
     )
+    with pytest.raises(RuntimeError, match="no bounded bootstrap execution budget"):
+        activity_module._activity_phase_timeout(
+            SimpleNamespace(start_to_close_timeout=timedelta(seconds=1)),
+            attempt_started_monotonic=time.monotonic(),
+            configured_timeout_s=20,
+            cleanup_timeout_s=1,
+            phase_name="bootstrap",
+        )
 
 
 def test_temporal_activity_repr_excludes_host_dependencies() -> None:
@@ -425,6 +433,56 @@ def test_writer_claim_timeout_returns_the_activity_executor_and_releases_late_au
     assert store.release_count == 1
 
 
+def test_bootstrap_timeout_is_capped_by_the_temporal_attempt_deadline() -> None:
+    claim_started = threading.Event()
+    allow_claim = threading.Event()
+
+    class StuckClaimStore(_AuthorityStore):
+        def claim(self, run_id: str, owner_id: str, ttl: timedelta) -> WriterLease:
+            claim_started.set()
+            assert allow_claim.wait(1)
+            return super().claim(run_id, owner_id, ttl)
+
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=1,
+        driver_call_timeout_s=1,
+        supervisor_join_timeout_s=0.05,
+        local_task_wait_s=1,
+    )
+    store = StuckClaimStore()
+    environment = ActivityEnvironment()
+    environment.info = environment.info.__class__(
+        **{
+            **environment.info.__dict__,
+            "start_to_close_timeout": timedelta(seconds=0.25),
+        }
+    )
+    claim_timer = threading.Timer(0.5, allow_claim.set)
+    claim_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ApplicationError) as raised:
+            environment.run(
+                _activity(store, policy=policy).run,
+                _command().to_json(),
+            )
+        elapsed = time.monotonic() - started
+        assert raised.value.type == "monoid.activation_lease_lost"
+        assert raised.value.non_retryable is False
+        assert claim_started.is_set()
+        assert _DriverDouble.constructed == []
+        assert elapsed < 0.35
+    finally:
+        allow_claim.set()
+        claim_timer.cancel()
+        claim_timer.join()
+        assert store.released.wait(1)
+    assert store.release_count == 1
+
+
 def test_activation_binding_timeout_returns_the_activity_executor_and_releases_authority() -> None:
     binding_started = threading.Event()
     allow_binding = threading.Event()
@@ -538,7 +596,7 @@ def test_slow_activation_binding_renews_from_the_remaining_lease_deadline() -> N
         writer_lease_renew_interval_s=0.04,
         heartbeat_interval_s=0.01,
         authority_call_timeout_s=1,
-        supervisor_join_timeout_s=1,
+        supervisor_join_timeout_s=0.2,
         local_task_wait_s=1,
     )
     store = _AuthorityStore(lease_interval_s=0.1)
@@ -761,7 +819,7 @@ def test_worker_shutdown_policy_can_report_host_shutdown() -> None:
         writer_lease_ttl_s=2,
         writer_lease_renew_interval_s=0.02,
         heartbeat_interval_s=0.01,
-        supervisor_join_timeout_s=1,
+        supervisor_join_timeout_s=0.2,
         local_task_wait_s=1,
         worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN,
     )
