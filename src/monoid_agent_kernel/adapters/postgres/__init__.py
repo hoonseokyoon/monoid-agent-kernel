@@ -30,6 +30,7 @@ from .object_store import (
     PostgresObjectStoreFencedRunSink,
 )
 from .sink import PostgresBlobCorrupt, PostgresFencedRunSink
+from .streams import PostgresDurableStreamCorrupt, PostgresObjectStoreDurableStreamStore
 
 __all__ = [
     "PostgresConfig",
@@ -58,4 +59,6 @@ __all__ = [
     "PostgresObjectAssociationCorrupt",
     "PostgresObjectStoreFencedRunSink",
     "PostgresObjectGarbageCollector",
+    "PostgresDurableStreamCorrupt",
+    "PostgresObjectStoreDurableStreamStore",
 ]
