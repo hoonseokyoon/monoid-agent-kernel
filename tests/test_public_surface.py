@@ -425,6 +425,16 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
         "BlobTooLarge",
         "ContentAddressedBlobStore",
         "is_content_sha256",
+        "ObjectInventoryEntry",
+        "ObjectInventoryPage",
+        "ObjectDeleteResult",
+        "IncompleteMultipartUpload",
+        "IncompleteMultipartPage",
+        "MultipartAbortResult",
+        "ObjectStoreAdmin",
+        "ObjectGcCandidate",
+        "ObjectGcPlan",
+        "ObjectGcReceipt",
         "WriterToken",
         "CommitResult",
         "ModelInvocationRecord",
@@ -758,6 +768,9 @@ assert postgres.__all__ == [
     'PostgresWriterAuthorityStore',
     'PostgresBlobCorrupt',
     'PostgresFencedRunSink',
+    'PostgresObjectAssociationCorrupt',
+    'PostgresObjectStoreFencedRunSink',
+    'PostgresObjectGarbageCollector',
 ]
 assert all(hasattr(postgres, name) for name in postgres.__all__)
 assert object_store.__all__ == [
@@ -765,6 +778,7 @@ assert object_store.__all__ == [
     'S3DependencyMissing',
     'S3ObjectStoreFailure',
     'S3ContentAddressedBlobStore',
+    'S3ObjectStoreAdmin',
 ]
 assert all(hasattr(object_store, name) for name in object_store.__all__)
 assert temporal.__all__ == []

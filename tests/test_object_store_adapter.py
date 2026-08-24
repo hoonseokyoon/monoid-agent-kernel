@@ -4,6 +4,7 @@ import base64
 import hashlib
 import subprocess
 import sys
+from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 from monoid_agent_kernel.adapters.object_store import (
     S3ContentAddressedBlobStore,
     S3ObjectStoreConfig,
+    S3ObjectStoreAdmin,
     S3ObjectStoreFailure,
 )
 from monoid_agent_kernel.hosting import (
@@ -45,6 +47,8 @@ class _FakeS3:
         self.upload_part_calls = 0
         self.complete_calls = 0
         self.abort_calls = 0
+        self.list_calls = 0
+        self.multipart_list_calls = 0
         self.last_body: BytesIO | None = None
 
     @staticmethod
@@ -57,16 +61,22 @@ class _FakeS3:
             "Metadata": dict(value["metadata"]),
             "ChecksumSHA256": value["checksum"],
             "ChecksumType": value["checksum_type"],
+            "ETag": value.get("etag", f'"{hashlib.md5(value["data"]).hexdigest()}"'),  # noqa: S324
+            "LastModified": datetime(2026, 8, 23, tzinfo=UTC),
         }
         if body:
             self.last_body = BytesIO(value["data"])
             response["Body"] = self.last_body
+        if "version_id" in value:
+            response["VersionId"] = value["version_id"]
         return response
 
     def head_object(self, **kwargs: Any) -> dict[str, Any]:
         value = self.objects.get(self._location(kwargs))
         if value is None:
             raise _S3Error(404, "NoSuchKey")
+        if kwargs.get("VersionId") not in {None, value.get("version_id")}:
+            raise _S3Error(404, "NoSuchVersion")
         return self._response(value)
 
     def get_object(self, **kwargs: Any) -> dict[str, Any]:
@@ -91,6 +101,7 @@ class _FakeS3:
             "metadata": dict(kwargs["Metadata"]),
             "checksum": checksum,
             "checksum_type": "FULL_OBJECT",
+            "version_id": f"version-{self.put_calls}",
         }
         if fault == "response_lost":
             raise ConnectionError("simulated response loss")
@@ -105,6 +116,7 @@ class _FakeS3:
             "location": self._location(kwargs),
             "metadata": dict(kwargs["Metadata"]),
             "parts": {},
+            "initiated": datetime(2026, 8, 24, tzinfo=UTC),
         }
         return {"UploadId": upload_id}
 
@@ -141,6 +153,7 @@ class _FakeS3:
             "metadata": upload["metadata"],
             "checksum": checksum,
             "checksum_type": "COMPOSITE",
+            "version_id": f"multipart-version-{self.complete_calls}",
         }
         self.uploads.pop(kwargs["UploadId"], None)
         if fault == "response_lost":
@@ -149,7 +162,90 @@ class _FakeS3:
 
     def abort_multipart_upload(self, **kwargs: Any) -> None:
         self.abort_calls += 1
-        self.uploads.pop(kwargs["UploadId"], None)
+        if self.uploads.pop(kwargs["UploadId"], None) is None:
+            raise _S3Error(404, "NoSuchUpload")
+
+    def list_parts(self, **kwargs: Any) -> dict[str, Any]:
+        upload = self.uploads.get(kwargs["UploadId"])
+        if upload is None:
+            raise _S3Error(404, "NoSuchUpload")
+        return {"Parts": list(upload["parts"].values())}
+
+    def list_objects_v2(self, **kwargs: Any) -> dict[str, Any]:
+        self.list_calls += 1
+        prefix = kwargs.get("Prefix", "")
+        keys = sorted(key for bucket, key in self.objects if bucket == kwargs["Bucket"])
+        keys = [key for key in keys if key.startswith(prefix)]
+        token = kwargs.get("ContinuationToken")
+        if token is not None:
+            keys = [key for key in keys if key > token]
+        selected = keys[: kwargs["MaxKeys"]]
+        contents = []
+        for key in selected:
+            value = self.objects[(kwargs["Bucket"], key)]
+            contents.append(
+                {
+                    "Key": key,
+                    "Size": len(value["data"]),
+                    "LastModified": datetime(2026, 8, 23, tzinfo=UTC),
+                    "ETag": value.get(
+                        "etag",
+                        f'"{hashlib.md5(value["data"]).hexdigest()}"',  # noqa: S324
+                    ),
+                }
+            )
+        truncated = len(keys) > len(selected)
+        return {
+            "Contents": contents,
+            "IsTruncated": truncated,
+            "NextContinuationToken": selected[-1] if truncated else None,
+        }
+
+    def delete_object(self, **kwargs: Any) -> dict[str, Any]:
+        location = self._location(kwargs)
+        value = self.objects.get(location)
+        if value is None:
+            raise _S3Error(404, "NoSuchKey")
+        if kwargs.get("VersionId") not in {None, value.get("version_id")}:
+            raise _S3Error(404, "NoSuchVersion")
+        etag = value.get("etag", f'"{hashlib.md5(value["data"]).hexdigest()}"')  # noqa: S324
+        if kwargs.get("IfMatch") != etag:
+            raise _S3Error(412, "PreconditionFailed")
+        del self.objects[location]
+        return {"ResponseMetadata": {"HTTPStatusCode": 204}}
+
+    def list_multipart_uploads(self, **kwargs: Any) -> dict[str, Any]:
+        self.multipart_list_calls += 1
+        prefix = kwargs.get("Prefix", "")
+        values = sorted(
+            (
+                upload["location"][1],
+                upload_id,
+                upload,
+            )
+            for upload_id, upload in self.uploads.items()
+            if upload["location"][0] == kwargs["Bucket"]
+            and upload["location"][1].startswith(prefix)
+        )
+        key_marker = kwargs.get("KeyMarker")
+        upload_marker = kwargs.get("UploadIdMarker")
+        if key_marker is not None:
+            values = [
+                value
+                for value in values
+                if (value[0], value[1]) > (key_marker, upload_marker)
+            ]
+        selected = values[: kwargs["MaxUploads"]]
+        truncated = len(values) > len(selected)
+        return {
+            "Uploads": [
+                {"Key": key, "UploadId": upload_id, "Initiated": upload["initiated"]}
+                for key, upload_id, upload in selected
+            ],
+            "IsTruncated": truncated,
+            "NextKeyMarker": selected[-1][0] if truncated else None,
+            "NextUploadIdMarker": selected[-1][1] if truncated else None,
+        }
 
 
 class _SecretFailureS3(_FakeS3):
@@ -185,6 +281,14 @@ def _store(client: _FakeS3 | None = None, **changes: Any) -> tuple[S3ContentAddr
     return S3ContentAddressedBlobStore(_config(**changes), client=client), client
 
 
+def _admin(
+    client: _FakeS3 | None = None,
+    **changes: Any,
+) -> tuple[S3ObjectStoreAdmin, _FakeS3]:
+    client = client or _FakeS3()
+    return S3ObjectStoreAdmin(_config(**changes), client=client), client
+
+
 def test_s3_config_is_bounded_and_hides_sensitive_values() -> None:
     config = _config(
         endpoint_url="https://objects.example.test",
@@ -206,6 +310,8 @@ def test_s3_config_is_bounded_and_hides_sensitive_values() -> None:
         _config(multipart_part_bytes=5 * _MIB, max_object_bytes=50_001 * _MIB)
     with pytest.raises(ValueError, match="requires aws:kms"):
         _config(sse_kms_key_id="key-id")
+    with pytest.raises(ValueError, match="admin_delete_mode"):
+        _config(admin_delete_mode="unsafe")
 
 
 def test_object_store_namespace_import_does_not_load_optional_sdks() -> None:
@@ -240,7 +346,7 @@ def test_single_put_is_conditional_checked_and_idempotent_without_list() -> None
     assert store.get_checked(sha256) == data
     assert first.stat.locator.endswith(f"/sha256/{sha256[:2]}/{sha256}")
     assert client.put_calls == 2
-    assert not hasattr(client, "list_objects_v2")
+    assert client.list_calls == client.multipart_list_calls == 0
 
 
 def test_single_put_retries_409_and_reconciles_response_loss() -> None:
@@ -388,3 +494,69 @@ def test_threshold_at_or_below_part_size_keeps_one_part_values_on_single_put() -
     assert store.put_if_absent(hashlib.sha256(data).hexdigest(), data).status == "stored"
     assert client.put_calls == 1
     assert client.create_calls == 0
+
+
+def test_admin_inventory_is_bounded_parses_only_exact_content_keys_and_conditionally_deletes() -> None:
+    admin, client = _admin()
+    runtime = S3ContentAddressedBlobStore(admin.config, client=client)
+    assert not hasattr(runtime, "inventory_page")
+    assert not hasattr(admin, "put_if_absent")
+    values = (b"admin-left", b"admin-right")
+    digests = tuple(hashlib.sha256(value).hexdigest() for value in values)
+    for sha256, value in zip(digests, values, strict=True):
+        runtime.put_if_absent(sha256, value)
+    client.objects[(admin.config.bucket, f"{admin.config.prefix}/sha256/not-a-digest")] = {
+        "data": b"ignored",
+        "metadata": {},
+        "checksum": "",
+        "checksum_type": "FULL_OBJECT",
+    }
+
+    first = admin.inventory_page(limit=1)
+    second = admin.inventory_page(continuation_token=first.next_token, limit=2)
+    entries = first.entries + second.entries
+
+    assert {entry.sha256 for entry in entries} == set(digests)
+    victim = next(entry for entry in entries if entry.sha256 == digests[0])
+    assert admin.delete_if_match(victim.sha256, '"wrong"').status == "precondition_failed"
+    assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "deleted"
+    assert admin.delete_if_match(victim.sha256, victim.delete_token).status == "already_missing"
+
+
+def test_admin_incomplete_multipart_inventory_token_and_abort_are_explicit() -> None:
+    admin, client = _admin()
+    digests = (
+        hashlib.sha256(b"upload-left").hexdigest(),
+        hashlib.sha256(b"upload-right").hexdigest(),
+    )
+    for sha256 in digests:
+        client.create_multipart_upload(
+            Bucket=admin.config.bucket,
+            Key=admin.config.object_key(sha256),
+            Metadata={},
+            ChecksumAlgorithm="SHA256",
+            ChecksumType="COMPOSITE",
+        )
+
+    first = admin.incomplete_multipart_page(limit=1)
+    second = admin.incomplete_multipart_page(continuation_token=first.next_token, limit=1)
+    uploads = first.uploads + second.uploads
+
+    assert {upload.sha256 for upload in uploads} == set(digests)
+    assert admin.abort_incomplete_multipart(uploads[0]).status == "aborted"
+    assert admin.abort_incomplete_multipart(uploads[0]).status == "already_missing"
+
+
+def test_admin_version_id_mode_rejects_a_recreated_current_version() -> None:
+    admin, client = _admin(admin_delete_mode="version_id")
+    runtime = S3ContentAddressedBlobStore(admin.config, client=client)
+    data = b"versioned conditional deletion"
+    sha256 = hashlib.sha256(data).hexdigest()
+    runtime.put_if_absent(sha256, data)
+    entry = admin.inventory_page(limit=1).entries[0]
+    location = (admin.config.bucket, admin.config.object_key(sha256))
+    client.objects[location]["version_id"] = "replacement-version"
+
+    assert admin.delete_if_match(sha256, entry.delete_token).status == "precondition_failed"
+    current = admin.inventory_page(limit=1).entries[0]
+    assert admin.delete_if_match(sha256, current.delete_token).status == "deleted"

@@ -172,6 +172,7 @@ def test_bundled_migration_metadata_hashes_exact_wheel_resource() -> None:
         "0001_authority",
         "0002_checkpoint_invocation",
         "0003_event_terminal_evidence_outbox",
+        "0004_object_association_gc",
     )
     root = files("monoid_agent_kernel.adapters.postgres").joinpath("sql")
     for migration in migrations:

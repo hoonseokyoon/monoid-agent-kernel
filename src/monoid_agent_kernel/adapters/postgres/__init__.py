@@ -23,6 +23,11 @@ from .pool import (
     PostgresHealth,
     UnsupportedPostgresVersion,
 )
+from .object_store import (
+    PostgresObjectAssociationCorrupt,
+    PostgresObjectGarbageCollector,
+    PostgresObjectStoreFencedRunSink,
+)
 from .sink import PostgresBlobCorrupt, PostgresFencedRunSink
 
 __all__ = [
@@ -47,4 +52,7 @@ __all__ = [
     "PostgresWriterAuthorityStore",
     "PostgresBlobCorrupt",
     "PostgresFencedRunSink",
+    "PostgresObjectAssociationCorrupt",
+    "PostgresObjectStoreFencedRunSink",
+    "PostgresObjectGarbageCollector",
 ]

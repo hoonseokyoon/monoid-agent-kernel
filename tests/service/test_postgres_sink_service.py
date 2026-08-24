@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -37,6 +38,8 @@ from monoid_agent_kernel.adapters.postgres import (  # noqa: E402
     PostgresDatabase,
     PostgresFencedRunSink,
     PostgresMigrations,
+    PostgresObjectGarbageCollector,
+    PostgresObjectStoreFencedRunSink,
     PostgresSchemaIncompatible,
     PostgresWriterAuthorityStore,
 )
@@ -52,7 +55,7 @@ from monoid_agent_kernel.core.outcome import (  # noqa: E402
     TerminalOutcome,
 )
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
-from monoid_agent_kernel.hosting import CommitResult, WriterToken  # noqa: E402
+from monoid_agent_kernel.hosting import BlobNotFound, CommitResult, WriterToken  # noqa: E402
 from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
 
@@ -269,6 +272,25 @@ class _SinkHarness:
         return stale_result, current_result, True
 
 
+@dataclass
+class _ExternalSinkHarness(_SinkHarness):
+    object_store: object
+    object_admin: object
+
+    def reopen(self) -> _ExternalSinkHarness:
+        sink = PostgresObjectStoreFencedRunSink(self.database, self.object_store)  # type: ignore[arg-type]
+        sink.check_ready()
+        authority = PostgresWriterAuthorityStore(self.database)
+        authority.check_ready()
+        return _ExternalSinkHarness(
+            database=self.database,
+            authority=authority,
+            sink=sink,
+            object_store=self.object_store,
+            object_admin=self.object_admin,
+        )
+
+
 @pytest.fixture
 def sink_harness(postgres_target: tuple[str, int]) -> Iterator[_SinkHarness]:
     dsn, _ = postgres_target
@@ -304,6 +326,116 @@ def sink_harness(postgres_target: tuple[str, int]) -> Iterator[_SinkHarness]:
                         )
         finally:
             database.close()
+
+
+@pytest.fixture
+def external_sink_harness(postgres_target: tuple[str, int]) -> Iterator[_ExternalSinkHarness]:
+    if os.environ["MONOID_SERVICE_PROFILE"] not in {"objectstore", "combined"}:
+        pytest.skip("external object association requires the object-store profile")
+    import boto3
+    from botocore import config as botocore_config
+
+    from monoid_agent_kernel.adapters.object_store import (
+        S3ContentAddressedBlobStore,
+        S3ObjectStoreAdmin,
+        S3ObjectStoreConfig,
+    )
+
+    endpoint = os.environ.get("MONOID_MINIO_ENDPOINT")
+    if not endpoint:
+        pytest.fail("MONOID_MINIO_ENDPOINT is required for the selected service profile")
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=os.environ.get("MONOID_MINIO_ACCESS_KEY"),
+        aws_secret_access_key=os.environ.get("MONOID_MINIO_SECRET_KEY"),
+        region_name="us-east-1",
+        config=botocore_config.Config(
+            signature_version="s3v4",
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 5, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
+    )
+    bucket = f"monoid-v023-association-{uuid.uuid4().hex}"
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_versioning(
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    object_config = S3ObjectStoreConfig(
+            bucket=bucket,
+            prefix="external-sink",
+            endpoint_url=endpoint,
+            addressing_style="path",
+            multipart_threshold_bytes=6 * 1024 * 1024,
+            multipart_part_bytes=5 * 1024 * 1024,
+            max_object_bytes=32 * 1024 * 1024,
+            admin_delete_mode="version_id",
+        )
+    object_store = S3ContentAddressedBlobStore(
+        object_config,
+        client=client,
+    )
+    object_admin = S3ObjectStoreAdmin(object_config, client=client)
+    dsn, _ = postgres_target
+    schema = f"monoid_pr06_{uuid.uuid4().hex}"
+    database = PostgresDatabase(
+        PostgresConfig(
+            dsn=dsn,
+            schema=schema,
+            min_pool_size=1,
+            max_pool_size=8,
+            pool_timeout_s=10,
+            application_name="monoid-pr06-service-test",
+        )
+    )
+    database.open()
+    PostgresMigrations(database).apply()
+    authority = PostgresWriterAuthorityStore(database)
+    authority.check_ready()
+    sink = PostgresObjectStoreFencedRunSink(database, object_store)
+    sink.check_ready()
+    harness = _ExternalSinkHarness(
+        database=database,
+        authority=authority,
+        sink=sink,
+        object_store=object_store,
+        object_admin=object_admin,
+    )
+    try:
+        yield harness
+    finally:
+        try:
+            with database.connection() as connection:
+                with connection.transaction():
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                                sql.Identifier(schema)
+                            )
+                        )
+        finally:
+            database.close()
+            uploads = client.list_multipart_uploads(Bucket=bucket).get("Uploads", [])
+            for upload in uploads:
+                client.abort_multipart_upload(
+                    Bucket=bucket,
+                    Key=upload["Key"],
+                    UploadId=upload["UploadId"],
+                )
+            objects = client.list_objects_v2(Bucket=bucket).get("Contents", [])
+            for value in objects:
+                client.delete_object(Bucket=bucket, Key=value["Key"])
+            versions = client.list_object_versions(Bucket=bucket)
+            for value in (*versions.get("Versions", []), *versions.get("DeleteMarkers", [])):
+                client.delete_object(
+                    Bucket=bucket,
+                    Key=value["Key"],
+                    VersionId=value["VersionId"],
+                )
+            client.delete_bucket(Bucket=bucket)
 
 
 def _blob(data: bytes) -> tuple[str, dict[str, bytes]]:
@@ -1808,7 +1940,7 @@ def test_sink_readiness_requires_reader_and_writer_compatibility(
                         "monoid_schema_migrations",
                     )
                 ),
-                ("0004_reader_incompatible", 4, "f" * 64, 4, 3),
+                ("0005_reader_incompatible", 5, "f" * 64, 5, 4),
             )
 
     sink = sink_harness.sink
@@ -1871,3 +2003,303 @@ def test_sink_requires_explicit_migration_readiness(postgres_target: tuple[str, 
             sink.check_ready()
     finally:
         database.close()
+
+
+def test_external_object_profile_passes_full_fenced_sink_contract(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    outcomes = run_fenced_run_sink_contract(external_sink_harness.reopen)
+
+    failed = [outcome.to_json() for outcome in outcomes if not outcome.passed]
+    assert not failed, failed
+
+
+def test_external_object_association_is_run_scoped_and_survives_reopen(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    run_a = "run-object-associated-a"
+    run_b = "run-object-associated-b"
+    run_c = "run-object-associated-c"
+    token_a = external_sink_harness.claim(run_a)
+    token_b = external_sink_harness.claim(run_b)
+    token_c = external_sink_harness.claim(run_c)
+    sha256, blobs = _blob(b"external private checkpoint bytes")
+    checkpoint_a = _checkpoint_with_blob(run_a, 1, sha256, "associated")
+
+    assert external_sink_harness.sink.commit_checkpoint(
+        checkpoint_a,
+        blobs,
+        writer_token=token_a,
+    ).status == "committed"
+    reopened = external_sink_harness.reopen()
+    loaded = reopened.sink.latest_checked(run_a)
+    assert loaded.value is not None
+    assert loaded.value.blob(sha256) == blobs[sha256]
+
+    checkpoint_b = _checkpoint_with_blob(run_b, 1, sha256, "global-dedup")
+    assert reopened.sink.commit_checkpoint(checkpoint_b, blobs, writer_token=token_b).status == (
+        "committed"
+    )
+    class CountingStore:
+        def __init__(self, delegate: object) -> None:
+            self.delegate = delegate
+            self.stat_calls = 0
+            self.get_calls = 0
+
+        def put_if_absent(self, digest: str, data: bytes) -> object:
+            return self.delegate.put_if_absent(digest, data)  # type: ignore[attr-defined]
+
+        def stat(self, digest: str) -> object:
+            self.stat_calls += 1
+            return self.delegate.stat(digest)  # type: ignore[attr-defined]
+
+        def get_checked(self, digest: str) -> bytes:
+            self.get_calls += 1
+            return self.delegate.get_checked(digest)  # type: ignore[attr-defined,no-any-return]
+
+    counted_store = CountingStore(external_sink_harness.object_store)
+    counted_sink = PostgresObjectStoreFencedRunSink(
+        external_sink_harness.database,
+        counted_store,  # type: ignore[arg-type]
+    )
+    counted_sink.check_ready()
+    checkpoint_c = _checkpoint_with_blob(run_c, 1, sha256, "cross-run")
+    assert counted_sink.commit_checkpoint(checkpoint_c, {}, writer_token=token_c).status == (
+        "conflict"
+    )
+    with pytest.raises(KeyError):
+        counted_sink._read_blob(run_c, sha256)
+    assert counted_store.stat_calls == counted_store.get_calls == 0
+
+    with external_sink_harness.database.transaction() as connection:
+        with external_sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("SELECT run_id FROM {} WHERE sha256 = %s ORDER BY run_id").format(
+                    sql.Identifier(
+                        external_sink_harness.database.config.schema,
+                        "run_object_blob",
+                    )
+                ),
+                (sha256,),
+            )
+            assert [str(row[0]) for row in cursor] == [run_a, run_b]
+            cursor.execute(
+                sql.SQL("SELECT count(*) FROM {} WHERE sha256 = %s").format(
+                    sql.Identifier(
+                        external_sink_harness.database.config.schema,
+                        "object_blob",
+                    )
+                ),
+                (sha256,),
+            )
+            assert int(cursor.fetchone()[0]) == 1
+
+
+def test_associated_external_object_missing_is_a_typed_restore_failure(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    run_id = "run-object-missing"
+    token = external_sink_harness.claim(run_id)
+    sha256, blobs = _blob(b"associated object later removed")
+    assert external_sink_harness.sink.commit_checkpoint(
+        _checkpoint_with_blob(run_id, 1, sha256, "missing"),
+        blobs,
+        writer_token=token,
+    ).status == "committed"
+    inventory = external_sink_harness.object_admin.inventory_page(limit=1000)  # type: ignore[attr-defined]
+    entry = next(value for value in inventory.entries if value.sha256 == sha256)
+    assert external_sink_harness.object_admin.delete_if_match(  # type: ignore[attr-defined]
+        sha256,
+        entry.delete_token,
+    ).status == "deleted"
+
+    loaded = external_sink_harness.sink.latest_checked(run_id)
+    assert loaded.value is not None
+    with pytest.raises(BlobNotFound, match="missing"):
+        loaded.value.blob(sha256)
+
+
+def test_external_object_upload_followed_by_postgres_rollback_is_not_canonical(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    class InjectedRollback(Exception):
+        pass
+
+    class RollbackSink(PostgresObjectStoreFencedRunSink):
+        def _persist_blobs(
+            self,
+            cursor: object,
+            run_id: str,
+            blobs: Mapping[str, bytes],
+        ) -> None:
+            super()._persist_blobs(cursor, run_id, blobs)
+            raise InjectedRollback
+
+    run_id = "run-object-postgres-rollback"
+    token = external_sink_harness.claim(run_id)
+    sha256, blobs = _blob(b"object survives PostgreSQL rollback")
+    sink = RollbackSink(
+        external_sink_harness.database,
+        external_sink_harness.object_store,  # type: ignore[arg-type]
+    )
+    sink.check_ready()
+
+    with pytest.raises(InjectedRollback):
+        sink.commit_checkpoint(
+            _checkpoint_with_blob(run_id, 1, sha256, "rollback"),
+            blobs,
+            writer_token=token,
+        )
+
+    assert external_sink_harness.object_store.stat(sha256) is not None  # type: ignore[attr-defined]
+    assert _table_count(external_sink_harness, "checkpoint_record", run_id) == 0
+    assert _table_count(external_sink_harness, "run_object_blob", run_id) == 0
+    with external_sink_harness.database.transaction() as connection:
+        with external_sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("SELECT count(*) FROM {} WHERE sha256 = %s").format(
+                    sql.Identifier(
+                        external_sink_harness.database.config.schema,
+                        "object_blob",
+                    )
+                ),
+                (sha256,),
+            )
+            assert int(cursor.fetchone()[0]) == 0
+
+
+def test_object_first_fence_failure_leaves_only_a_collectable_orphan(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    run_id = "run-object-first-orphan"
+    stale = external_sink_harness.claim(run_id, "worker-a")
+    assert external_sink_harness.authority.release(stale).status == "released"
+    current = external_sink_harness.claim(run_id, "worker-b")
+    sha256, blobs = _blob(b"uploaded before stale writer fence")
+
+    result = external_sink_harness.sink.commit_checkpoint(
+        _checkpoint_with_blob(run_id, 1, sha256, "must-not-commit"),
+        blobs,
+        writer_token=stale,
+    )
+
+    assert result.status == "fenced"
+    assert external_sink_harness.object_store.stat(sha256) is not None  # type: ignore[attr-defined]
+    assert _table_count(external_sink_harness, "checkpoint_record", run_id) == 0
+    assert _table_count(external_sink_harness, "run_object_blob", run_id) == 0
+    collector = PostgresObjectGarbageCollector(
+        external_sink_harness.database,
+        external_sink_harness.object_admin,  # type: ignore[arg-type]
+    )
+    collector.check_ready()
+    plan = collector.plan(grace_period=timedelta(0))
+    candidate = next(value for value in plan.candidates if value.sha256 == sha256)
+    assert candidate.generation == 0
+
+    with pytest.raises(ValueError, match="plan identity"):
+        collector.apply(replace(plan, next_token="tampered"))
+
+    receipts = collector.apply(plan)
+
+    receipt = next(value for value in receipts if value.sha256 == sha256)
+    assert receipt.status == "deleted"
+    assert receipt.candidate_generation == receipt.observed_generation == 0
+    assert external_sink_harness.object_store.stat(sha256) is None  # type: ignore[attr-defined]
+    assert external_sink_harness.sink.commit_checkpoint(
+        _checkpoint_with_blob(run_id, 1, sha256, "revived"),
+        blobs,
+        writer_token=current,
+    ).status == "committed"
+    with external_sink_harness.database.transaction() as connection:
+        with external_sink_harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("SELECT generation, state FROM {} WHERE sha256 = %s").format(
+                    sql.Identifier(
+                        external_sink_harness.database.config.schema,
+                        "object_blob",
+                    )
+                ),
+                (sha256,),
+            )
+            assert cursor.fetchone() == (2, "available")
+    assert collector.apply(plan) == receipts
+    assert external_sink_harness.sink._read_blob(run_id, sha256) == blobs[sha256]
+
+
+def test_gc_grace_and_stale_generation_plan_never_delete_a_recreated_object(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    sha256, blobs = _blob(b"stale GC generation must not delete recreation")
+    external_sink_harness.object_store.put_if_absent(sha256, blobs[sha256])  # type: ignore[attr-defined]
+    collector = PostgresObjectGarbageCollector(
+        external_sink_harness.database,
+        external_sink_harness.object_admin,  # type: ignore[arg-type]
+    )
+    collector.check_ready()
+
+    grace_plan = collector.plan(grace_period=timedelta(days=1))
+    assert all(candidate.sha256 != sha256 for candidate in grace_plan.candidates)
+    assert external_sink_harness.object_store.stat(sha256) is not None  # type: ignore[attr-defined]
+
+    stale_plan = collector.plan(grace_period=timedelta(0))
+    deleting_plan = collector.plan(grace_period=timedelta(0))
+    assert stale_plan.plan_id != deleting_plan.plan_id
+    assert collector.apply(deleting_plan)[0].status == "deleted"
+    external_sink_harness.object_store.put_if_absent(sha256, blobs[sha256])  # type: ignore[attr-defined]
+
+    stale_receipt = collector.apply(stale_plan)[0]
+
+    assert stale_receipt.status == "skipped_generation"
+    assert stale_receipt.candidate_generation == 0
+    assert stale_receipt.observed_generation == 1
+    assert external_sink_harness.object_store.get_checked(sha256) == blobs[sha256]  # type: ignore[attr-defined]
+
+
+def test_gc_and_association_digest_lock_race_has_only_two_safe_outcomes(
+    external_sink_harness: _ExternalSinkHarness,
+) -> None:
+    run_id = "run-object-gc-race"
+    token = external_sink_harness.claim(run_id)
+    sha256, blobs = _blob(b"association versus garbage collection")
+    external_sink_harness.object_store.put_if_absent(sha256, blobs[sha256])  # type: ignore[attr-defined]
+    collector = PostgresObjectGarbageCollector(
+        external_sink_harness.database,
+        external_sink_harness.object_admin,  # type: ignore[arg-type]
+    )
+    collector.check_ready()
+    plan = collector.plan(grace_period=timedelta(0))
+    assert any(candidate.sha256 == sha256 for candidate in plan.candidates)
+    barrier = threading.Barrier(3)
+
+    def associate() -> CommitResult:
+        barrier.wait(timeout=10)
+        return external_sink_harness.reopen().sink.commit_checkpoint(
+            _checkpoint_with_blob(run_id, 1, sha256, "race"),
+            blobs,
+            writer_token=token,
+        )
+
+    def collect() -> tuple[object, ...]:
+        barrier.wait(timeout=10)
+        return collector.apply(plan)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        association_future = executor.submit(associate)
+        collection_future = executor.submit(collect)
+        barrier.wait(timeout=10)
+        association = association_future.result(timeout=30)
+        receipts = collection_future.result(timeout=30)
+
+    receipt = next(value for value in receipts if value.sha256 == sha256)
+    assert (association.status, receipt.status) in {
+        ("committed", "skipped_associated"),
+        ("committed", "deleted"),
+        ("committed", "already_missing"),
+        ("conflict", "deleted"),
+        ("conflict", "already_missing"),
+    }
+    if association.status == "committed":
+        assert external_sink_harness.sink._read_blob(run_id, sha256) == blobs[sha256]
+    else:
+        with pytest.raises(KeyError):
+            external_sink_harness.sink._read_blob(run_id, sha256)

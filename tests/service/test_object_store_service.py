@@ -24,6 +24,7 @@ from botocore import exceptions as botocore_exceptions  # noqa: E402
 from monoid_agent_kernel.adapters.object_store import (  # noqa: E402
     S3ContentAddressedBlobStore,
     S3ObjectStoreConfig,
+    S3ObjectStoreAdmin,
 )
 from monoid_agent_kernel.conformance import (  # noqa: E402
     run_content_addressed_blob_store_contract,
@@ -114,6 +115,13 @@ class _ResponseLossOnceClient(_ClientProxy):
             raise ConnectionError("injected response loss")
         return response
 
+    def delete_object(self, **kwargs: object) -> object:
+        response = self.delegate.delete_object(**kwargs)  # type: ignore[attr-defined]
+        if self.operation == "delete" and not self.injected:
+            self.injected = True
+            raise ConnectionError("injected response loss")
+        return response
+
 
 class _ListDeniedClient(_ClientProxy):
     def list_objects_v2(self, **kwargs: object) -> object:
@@ -163,6 +171,13 @@ def object_store_bucket() -> Iterator[tuple[object, str]]:
         objects = client.list_objects_v2(Bucket=bucket).get("Contents", [])  # type: ignore[attr-defined]
         for value in objects:
             client.delete_object(Bucket=bucket, Key=value["Key"])  # type: ignore[attr-defined]
+        versions = client.list_object_versions(Bucket=bucket)  # type: ignore[attr-defined]
+        for value in (*versions.get("Versions", []), *versions.get("DeleteMarkers", [])):
+            client.delete_object(  # type: ignore[attr-defined]
+                Bucket=bucket,
+                Key=value["Key"],
+                VersionId=value["VersionId"],
+            )
         client.delete_bucket(Bucket=bucket)  # type: ignore[attr-defined]
 
 
@@ -176,6 +191,28 @@ def _store(client: object, bucket: str, *, prefix: str) -> S3ContentAddressedBlo
             multipart_threshold_bytes=6 * _MIB,
             multipart_part_bytes=5 * _MIB,
             max_object_bytes=32 * _MIB,
+        ),
+        client=client,
+    )
+
+
+def _admin(
+    client: object,
+    bucket: str,
+    *,
+    prefix: str,
+    admin_delete_mode: str = "if_match",
+) -> S3ObjectStoreAdmin:
+    return S3ObjectStoreAdmin(
+        S3ObjectStoreConfig(
+            bucket=bucket,
+            prefix=prefix,
+            endpoint_url=os.environ["MONOID_MINIO_ENDPOINT"],
+            addressing_style="path",
+            multipart_threshold_bytes=6 * _MIB,
+            multipart_part_bytes=5 * _MIB,
+            max_object_bytes=32 * _MIB,
+            admin_delete_mode=admin_delete_mode,  # type: ignore[arg-type]
         ),
         client=client,
     )
@@ -409,3 +446,71 @@ def test_s3_adapter_runtime_path_is_list_free_and_detects_forged_content(
     )
     with pytest.raises(BlobCorrupt, match="checksum"):
         store.stat(expected_sha)
+
+
+def test_s3_admin_inventory_conditional_delete_and_response_loss_on_pinned_minio(
+    object_store_bucket: tuple[object, str],
+) -> None:
+    client, bucket = object_store_bucket
+    client.put_bucket_versioning(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        VersioningConfiguration={"Status": "Enabled"},
+    )
+    admin = _admin(client, bucket, prefix="admin-delete", admin_delete_mode="version_id")
+    runtime = _store(client, bucket, prefix="admin-delete")
+    values = (b"admin object one", b"admin object two")
+    digests = tuple(hashlib.sha256(value).hexdigest() for value in values)
+    for sha256, value in zip(digests, values, strict=True):
+        runtime.put_if_absent(sha256, value)
+
+    first = admin.inventory_page(limit=1)
+    second = admin.inventory_page(continuation_token=first.next_token, limit=1)
+    entries = first.entries + second.entries
+    assert {entry.sha256 for entry in entries} == set(digests)
+
+    first_entry = next(entry for entry in entries if entry.sha256 == digests[0])
+    wrong_entry = next(entry for entry in entries if entry.sha256 == digests[1])
+    assert admin.delete_if_match(first_entry.sha256, wrong_entry.delete_token).status == (
+        "precondition_failed"
+    )
+    assert admin.delete_if_match(first_entry.sha256, first_entry.delete_token).status == "deleted"
+    assert runtime.stat(first_entry.sha256) is None
+
+    second_entry = next(entry for entry in entries if entry.sha256 == digests[1])
+    response_loss_admin = _admin(
+        _ResponseLossOnceClient(client, operation="delete"),
+        bucket,
+        prefix="admin-delete",
+        admin_delete_mode="version_id",
+    )
+    assert response_loss_admin.delete_if_match(
+        second_entry.sha256,
+        second_entry.delete_token,
+    ).status == "deleted"
+    assert runtime.stat(second_entry.sha256) is None
+
+
+def test_s3_admin_incomplete_multipart_inventory_and_abort_on_pinned_minio(
+    object_store_bucket: tuple[object, str],
+) -> None:
+    client, bucket = object_store_bucket
+    admin = _admin(client, bucket, prefix="admin-multipart")
+    sha256 = hashlib.sha256(b"incomplete multipart identity").hexdigest()
+    created = client.create_multipart_upload(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        Key=admin.config.object_key(sha256),
+        Metadata={"monoid-sha256": sha256},
+    )
+    client.upload_part(  # type: ignore[attr-defined]
+        Bucket=bucket,
+        Key=admin.config.object_key(sha256),
+        UploadId=created["UploadId"],
+        PartNumber=1,
+        Body=b"x" * (5 * _MIB),
+    )
+
+    page = admin.incomplete_multipart_page(limit=1)
+    assert len(page.uploads) == 1
+    assert page.uploads[0].sha256 == sha256
+    assert admin.abort_incomplete_multipart(page.uploads[0]).status == "aborted"
+    assert admin.incomplete_multipart_page(limit=1).uploads == ()

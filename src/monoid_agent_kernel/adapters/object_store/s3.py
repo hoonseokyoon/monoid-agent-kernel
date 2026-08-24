@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from collections.abc import Mapping
+from datetime import datetime
 
 from monoid_agent_kernel.hosting.blobs import (
     BlobCorrupt,
@@ -15,6 +17,14 @@ from monoid_agent_kernel.hosting.blobs import (
     BlobStoreError,
     BlobTooLarge,
     is_content_sha256,
+)
+from monoid_agent_kernel.hosting.object_store_admin import (
+    IncompleteMultipartPage,
+    IncompleteMultipartUpload,
+    MultipartAbortResult,
+    ObjectDeleteResult,
+    ObjectInventoryEntry,
+    ObjectInventoryPage,
 )
 
 from .config import S3ObjectStoreConfig
@@ -87,12 +97,10 @@ def _is_conditional_conflict(exc: BaseException) -> bool:
     return status == 409 or code in {"ConditionalRequestConflict", "OperationAborted"}
 
 
-class S3ContentAddressedBlobStore:
-    """Write-once SHA-256 objects using S3 conditional single and multipart requests."""
-
+class _S3Client:
     def __init__(self, config: S3ObjectStoreConfig, *, client: object | None = None) -> None:
         if not isinstance(config, S3ObjectStoreConfig):
-            raise TypeError("S3 content-addressed store config must be S3ObjectStoreConfig")
+            raise TypeError("S3 adapter config must be S3ObjectStoreConfig")
         self.config = config
         self._client = client if client is not None else self._build_client()
 
@@ -122,6 +130,24 @@ class S3ContentAddressedBlobStore:
     def _key(self, sha256: str) -> str:
         return self.config.object_key(sha256)
 
+    def _inventory_prefix(self) -> str:
+        return f"{self.config.prefix}/sha256/" if self.config.prefix else "sha256/"
+
+    def _digest_from_key(self, key: object) -> str | None:
+        if type(key) is not str:
+            return None
+        prefix = self._inventory_prefix()
+        if not key.startswith(prefix):
+            return None
+        suffix = key[len(prefix) :]
+        parts = suffix.split("/")
+        if len(parts) != 2:
+            return None
+        shard, sha256 = parts
+        if not is_content_sha256(sha256) or shard != sha256[:2]:
+            return None
+        return sha256
+
     def _locator(self, key: str) -> str:
         return f"s3://{self.config.bucket}/{key}"
 
@@ -130,6 +156,19 @@ class S3ContentAddressedBlobStore:
         if self.config.expected_bucket_owner is not None:
             kwargs["ExpectedBucketOwner"] = self.config.expected_bucket_owner
         return kwargs
+
+    @staticmethod
+    def _raise_failure(operation: str, exc: BaseException) -> None:
+        http_status, error_code = _error_details(exc)
+        raise S3ObjectStoreFailure(
+            operation,
+            http_status=http_status,
+            error_code=error_code,
+        ) from None
+
+
+class S3ContentAddressedBlobStore(_S3Client):
+    """Write-once SHA-256 objects using S3 conditional single and multipart requests."""
 
     def _encryption(self) -> dict[str, object]:
         kwargs: dict[str, object] = {}
@@ -158,15 +197,6 @@ class S3ContentAddressedBlobStore:
         if composite_sha256:
             metadata["monoid-composite-sha256"] = composite_sha256
         return metadata
-
-    @staticmethod
-    def _raise_failure(operation: str, exc: BaseException) -> None:
-        http_status, error_code = _error_details(exc)
-        raise S3ObjectStoreFailure(
-            operation,
-            http_status=http_status,
-            error_code=error_code,
-        ) from None
 
     def _stat_from_response(
         self,
@@ -469,8 +499,374 @@ class S3ContentAddressedBlobStore:
         raise BlobStoreConflict("S3 conditional multipart PUT exhausted its retry budget") from None
 
 
+class S3ObjectStoreAdmin(_S3Client):
+    """Privileged bounded inventory, safe deletion, and multipart cleanup surface.
+
+    The ``if_match`` mode combines a HEAD preflight with server-side DeleteObject If-Match.
+    The ``version_id`` mode requires bucket versioning and targets the exact inventoried version;
+    use it for compatible services that do not enforce conditional delete headers.
+    """
+
+    @staticmethod
+    def _page_limit(limit: object) -> int:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("S3 admin page limit must be between 1 and 1000")
+        return limit
+
+    @staticmethod
+    def _token(value: object, field_name: str) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 8192
+            or not value.isascii()
+            or not all(character.isprintable() for character in value)
+        ):
+            raise ValueError(f"S3 {field_name} must be bounded printable ASCII")
+        return value
+
+    def inventory_page(
+        self,
+        *,
+        continuation_token: str | None = None,
+        limit: int = 1000,
+    ) -> ObjectInventoryPage:
+        checked_limit = self._page_limit(limit)
+        checked_token = self._token(continuation_token, "inventory continuation_token")
+        kwargs: dict[str, object] = {
+            "Bucket": self.config.bucket,
+            "Prefix": self._inventory_prefix(),
+            "MaxKeys": checked_limit,
+        }
+        if checked_token is not None:
+            kwargs["ContinuationToken"] = checked_token
+        if self.config.expected_bucket_owner is not None:
+            kwargs["ExpectedBucketOwner"] = self.config.expected_bucket_owner
+        try:
+            response = self._client.list_objects_v2(**kwargs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._raise_failure("list_objects_v2", exc)
+        if not isinstance(response, Mapping):
+            raise BlobCorrupt("S3 object inventory response is malformed")
+        raw_entries = response.get("Contents", ())
+        if not isinstance(raw_entries, (list, tuple)):
+            raise BlobCorrupt("S3 object inventory contents are malformed")
+        entries: list[ObjectInventoryEntry] = []
+        for raw in raw_entries:
+            if not isinstance(raw, Mapping):
+                raise BlobCorrupt("S3 object inventory entry is malformed")
+            sha256 = self._digest_from_key(raw.get("Key"))
+            if sha256 is None:
+                continue
+            size_bytes = raw.get("Size")
+            last_modified = raw.get("LastModified")
+            delete_token = raw.get("ETag")
+            if (
+                type(size_bytes) is not int
+                or size_bytes < 0
+                or not isinstance(last_modified, datetime)
+                or type(delete_token) is not str
+            ):
+                raise BlobCorrupt("S3 object inventory entry is malformed")
+            if self.config.admin_delete_mode == "version_id":
+                try:
+                    current = self._client.head_object(  # type: ignore[attr-defined]
+                        **self._location(sha256)
+                    )
+                except Exception as exc:
+                    if _is_missing(exc):
+                        continue
+                    self._raise_failure("head_object for versioned inventory", exc)
+                if not isinstance(current, Mapping):
+                    raise BlobCorrupt("S3 versioned inventory metadata is malformed")
+                current_size = current.get("ContentLength")
+                current_modified = current.get("LastModified")
+                current_etag = current.get("ETag")
+                current_version = current.get("VersionId")
+                if (
+                    type(current_size) is not int
+                    or current_size < 0
+                    or not isinstance(current_modified, datetime)
+                    or type(current_etag) is not str
+                    or type(current_version) is not str
+                    or not current_version
+                    or current_version == "null"
+                ):
+                    raise BlobCorrupt("S3 versioned inventory metadata is malformed")
+                size_bytes = current_size
+                last_modified = current_modified
+                delete_token = self._encode_versioned_delete_token(
+                    current_etag,
+                    current_version,
+                )
+            entries.append(
+                ObjectInventoryEntry(
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    locator=self._locator(self._key(sha256)),
+                    last_modified=last_modified,
+                    delete_token=delete_token,
+                )
+            )
+        next_token = response.get("NextContinuationToken")
+        if response.get("IsTruncated") is True:
+            if type(next_token) is not str or not next_token:
+                raise BlobCorrupt("S3 truncated object inventory has no continuation token")
+            checked_next = self._token(next_token, "inventory next_token")
+        else:
+            checked_next = None
+        return ObjectInventoryPage(entries=tuple(entries), next_token=checked_next)
+
+    @staticmethod
+    def _encode_versioned_delete_token(etag: str, version_id: str) -> str:
+        raw = json.dumps(
+            {"etag": etag, "version_id": version_id},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_versioned_delete_token(token: str) -> tuple[str, str]:
+        try:
+            padding = "=" * (-len(token) % 4)
+            value = json.loads(base64.urlsafe_b64decode(token + padding).decode("ascii"))
+        except Exception as exc:
+            raise ValueError("S3 versioned delete_token is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"etag", "version_id"}
+            or type(value["etag"]) is not str
+            or not value["etag"]
+            or type(value["version_id"]) is not str
+            or not value["version_id"]
+        ):
+            raise ValueError("S3 versioned delete_token is invalid")
+        return value["etag"], value["version_id"]
+
+    def _current_delete_identity(self, sha256: str) -> tuple[str, str | None] | None:
+        try:
+            response = self._client.head_object(**self._location(sha256))  # type: ignore[attr-defined]
+        except Exception as exc:
+            if _is_missing(exc):
+                return None
+            self._raise_failure("head_object for conditional delete", exc)
+        token = response.get("ETag") if isinstance(response, Mapping) else None
+        version_id = response.get("VersionId") if isinstance(response, Mapping) else None
+        if type(token) is not str or not token:
+            raise BlobCorrupt("S3 conditional delete metadata has no ETag")
+        if self.config.admin_delete_mode == "version_id" and (
+            type(version_id) is not str or not version_id or version_id == "null"
+        ):
+            raise BlobCorrupt("S3 versioned delete requires bucket versioning evidence")
+        return (
+            token,
+            version_id
+            if self.config.admin_delete_mode == "version_id" and type(version_id) is str
+            else None,
+        )
+
+    def _version_exists(self, sha256: str, version_id: str) -> bool:
+        kwargs = self._location(sha256)
+        kwargs["VersionId"] = version_id
+        try:
+            self._client.head_object(**kwargs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            if _is_missing(exc) or _error_details(exc)[1] == "NoSuchVersion":
+                return False
+            self._raise_failure("head_object for version delete reconciliation", exc)
+        return True
+
+    def delete_if_match(self, sha256: str, delete_token: str) -> ObjectDeleteResult:
+        if not is_content_sha256(sha256):
+            raise ValueError("S3 delete sha256 must be a lowercase SHA-256 digest")
+        checked_token = self._token(delete_token, "delete_token")
+        assert checked_token is not None
+        if self.config.admin_delete_mode == "version_id":
+            expected_etag, expected_version = self._decode_versioned_delete_token(checked_token)
+        else:
+            expected_etag, expected_version = checked_token, None
+        current = self._current_delete_identity(sha256)
+        if current is None:
+            return ObjectDeleteResult(status="already_missing")
+        if current != (expected_etag, expected_version):
+            return ObjectDeleteResult(status="precondition_failed")
+        delete_kwargs = self._location(sha256)
+        delete_kwargs["IfMatch"] = expected_etag
+        if expected_version is not None:
+            delete_kwargs["VersionId"] = expected_version
+        try:
+            self._client.delete_object(**delete_kwargs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            if _is_missing(exc) or _error_details(exc)[1] == "NoSuchVersion":
+                return ObjectDeleteResult(status="already_missing")
+            if _is_precondition(exc):
+                return ObjectDeleteResult(status="precondition_failed")
+            if expected_version is not None:
+                if not self._version_exists(sha256, expected_version):
+                    return ObjectDeleteResult(status="deleted")
+                return ObjectDeleteResult(status="precondition_failed")
+            current = self._current_delete_identity(sha256)
+            if current is None:
+                return ObjectDeleteResult(status="deleted")
+            if current != (expected_etag, expected_version):
+                return ObjectDeleteResult(status="precondition_failed")
+            self._raise_failure("delete_object", exc)
+        return ObjectDeleteResult(status="deleted")
+
+    @staticmethod
+    def _encode_multipart_token(
+        key_marker: str,
+        upload_id_marker: str,
+        *,
+        bucket_scope: bool,
+    ) -> str:
+        raw = json.dumps(
+            {"bucket_scope": bucket_scope, "key": key_marker, "upload": upload_id_marker},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_multipart_token(token: str) -> tuple[str, str, bool]:
+        try:
+            padding = "=" * (-len(token) % 4)
+            value = json.loads(base64.urlsafe_b64decode(token + padding).decode("ascii"))
+        except Exception as exc:
+            raise ValueError("S3 multipart continuation_token is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"bucket_scope", "key", "upload"}
+            or type(value["bucket_scope"]) is not bool
+            or type(value["key"]) is not str
+            or type(value["upload"]) is not str
+            or not value["key"]
+            or not value["upload"]
+        ):
+            raise ValueError("S3 multipart continuation_token is invalid")
+        return value["key"], value["upload"], value["bucket_scope"]
+
+    def incomplete_multipart_page(
+        self,
+        *,
+        continuation_token: str | None = None,
+        limit: int = 1000,
+    ) -> IncompleteMultipartPage:
+        checked_limit = self._page_limit(limit)
+        checked_token = self._token(continuation_token, "multipart continuation_token")
+        kwargs: dict[str, object] = {
+            "Bucket": self.config.bucket,
+            "Prefix": self._inventory_prefix(),
+            "MaxUploads": checked_limit,
+        }
+        bucket_scope = False
+        if checked_token is not None:
+            key_marker, upload_marker, bucket_scope = self._decode_multipart_token(checked_token)
+            kwargs["KeyMarker"] = key_marker
+            kwargs["UploadIdMarker"] = upload_marker
+            if bucket_scope:
+                kwargs.pop("Prefix")
+        if self.config.expected_bucket_owner is not None:
+            kwargs["ExpectedBucketOwner"] = self.config.expected_bucket_owner
+        try:
+            response = self._client.list_multipart_uploads(**kwargs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._raise_failure("list_multipart_uploads", exc)
+        if not isinstance(response, Mapping):
+            raise BlobCorrupt("S3 multipart inventory response is malformed")
+        if (
+            not bucket_scope
+            and checked_token is None
+            and not response.get("Uploads")
+            and response.get("IsTruncated") is not True
+        ):
+            # Some S3-compatible services accept Prefix but return an empty multipart listing.
+            # A bounded bucket-scoped page preserves correctness; exact key parsing below keeps
+            # other namespaces out of the result.
+            bucket_scope = True
+            kwargs.pop("Prefix")
+            try:
+                response = self._client.list_multipart_uploads(  # type: ignore[attr-defined]
+                    **kwargs
+                )
+            except Exception as exc:
+                self._raise_failure("bucket-scoped list_multipart_uploads", exc)
+            if not isinstance(response, Mapping):
+                raise BlobCorrupt("S3 multipart inventory response is malformed")
+        raw_uploads = response.get("Uploads", ())
+        if not isinstance(raw_uploads, (list, tuple)):
+            raise BlobCorrupt("S3 multipart inventory uploads are malformed")
+        uploads: list[IncompleteMultipartUpload] = []
+        for raw in raw_uploads:
+            if not isinstance(raw, Mapping):
+                raise BlobCorrupt("S3 multipart inventory entry is malformed")
+            sha256 = self._digest_from_key(raw.get("Key"))
+            if sha256 is None:
+                continue
+            upload_id = raw.get("UploadId")
+            initiated = raw.get("Initiated")
+            if type(upload_id) is not str or not isinstance(initiated, datetime):
+                raise BlobCorrupt("S3 multipart inventory entry is malformed")
+            uploads.append(
+                IncompleteMultipartUpload(
+                    sha256=sha256,
+                    upload_id=upload_id,
+                    initiated_at=initiated,
+                )
+            )
+        if response.get("IsTruncated") is True:
+            next_key = response.get("NextKeyMarker")
+            next_upload = response.get("NextUploadIdMarker")
+            if type(next_key) is not str or type(next_upload) is not str:
+                raise BlobCorrupt("S3 truncated multipart inventory has no continuation markers")
+            next_token = self._encode_multipart_token(
+                next_key,
+                next_upload,
+                bucket_scope=bucket_scope,
+            )
+        else:
+            next_token = None
+        return IncompleteMultipartPage(uploads=tuple(uploads), next_token=next_token)
+
+    def abort_incomplete_multipart(
+        self,
+        upload: IncompleteMultipartUpload,
+    ) -> MultipartAbortResult:
+        if not isinstance(upload, IncompleteMultipartUpload):
+            raise TypeError("S3 multipart abort requires IncompleteMultipartUpload")
+        for _ in range(self.config.max_conflict_retries + 1):
+            try:
+                self._client.abort_multipart_upload(  # type: ignore[attr-defined]
+                    **self._location(upload.sha256),
+                    UploadId=upload.upload_id,
+                )
+            except Exception as exc:
+                if _is_missing(exc) or _error_details(exc)[1] == "NoSuchUpload":
+                    return MultipartAbortResult(status="already_missing")
+                if _is_precondition(exc):
+                    return MultipartAbortResult(status="precondition_failed")
+                self._raise_failure("abort_multipart_upload", exc)
+            try:
+                self._client.list_parts(  # type: ignore[attr-defined]
+                    **self._location(upload.sha256),
+                    UploadId=upload.upload_id,
+                    MaxParts=1,
+                )
+            except Exception as exc:
+                if _is_missing(exc) or _error_details(exc)[1] == "NoSuchUpload":
+                    return MultipartAbortResult(status="aborted")
+                self._raise_failure("list_parts after abort", exc)
+        raise BlobStoreConflict("S3 multipart abort exhausted its retry budget")
+
+
 __all__ = [
     "S3DependencyMissing",
     "S3ObjectStoreFailure",
     "S3ContentAddressedBlobStore",
+    "S3ObjectStoreAdmin",
 ]
