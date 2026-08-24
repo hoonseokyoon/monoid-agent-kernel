@@ -1229,24 +1229,34 @@ def test_required_evidence_binds_exact_current_settled_invocation(
     history = (
         _invocation(run_id, 1, "reserved", evidence_policy="required"),
         _invocation(run_id, 2, "dispatch_started", evidence_policy="required"),
-        _invocation(run_id, 3, "settled", evidence_policy="required"),
+        _invocation(
+            run_id,
+            3,
+            "settled",
+            evidence_policy="required",
+            duration_ms=1,
+        ),
     )
     assert tuple(
         sink_harness.sink.commit_invocation(item, {}, writer_token=token).status for item in history
     ) == ("committed", "committed", "committed")
 
-    committed = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
-    repeated = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
     mismatched = replace(
         history[-1],
-        receipt={**dict(history[-1].receipt or {}), "provider_request_id": "other-request"},
+        receipt={**dict(history[-1].receipt or {}), "duration_ms": 1.0},
     )
-
-    assert committed.status == "committed"
-    assert repeated.status == "already_committed"
+    assert mismatched == history[-1]
+    assert canonical_sha256(mismatched.to_json()) != canonical_sha256(history[-1].to_json())
     assert (
         sink_harness.sink.commit_model_evidence(mismatched, writer_token=token).status == "conflict"
     )
+    assert _table_count(sink_harness, "model_evidence_record", run_id) == 0
+
+    committed = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
+    repeated = sink_harness.sink.commit_model_evidence(history[-1], writer_token=token)
+
+    assert committed.status == "committed"
+    assert repeated.status == "already_committed"
     assert _table_count(sink_harness, "model_evidence_record", run_id) == 1
 
     sink_harness.authority.release(token)
@@ -1602,20 +1612,38 @@ def test_all_sink_mutations_use_canonical_readback_after_ambiguous_commit(
     monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
     evidence_run = "run-ambiguous-evidence"
     evidence_token = sink_harness.claim(evidence_run)
-    required_history = tuple(
+    required_history = (
+        _invocation(evidence_run, 1, "reserved", evidence_policy="required"),
+        _invocation(evidence_run, 2, "dispatch_started", evidence_policy="required"),
         _invocation(
             evidence_run,
-            revision,
-            state,
+            3,
+            "settled",
             evidence_policy="required",
-        )
-        for revision, state in ((1, "reserved"), (2, "dispatch_started"), (3, "settled"))
+            duration_ms=1,
+        ),
     )
     for item in required_history:
         assert (
             sink_harness.sink.commit_invocation(item, {}, writer_token=evidence_token).status
             == "committed"
         )
+    equal_but_canonically_distinct = replace(
+        required_history[-1],
+        receipt={**dict(required_history[-1].receipt or {}), "duration_ms": 1.0},
+    )
+    assert equal_but_canonically_distinct == required_history[-1]
+    install_one_ambiguous_commit()
+    assert (
+        sink_harness.sink.commit_model_evidence(
+            equal_but_canonically_distinct,
+            writer_token=evidence_token,
+        ).status
+        == "conflict"
+    )
+    assert _table_count(sink_harness, "model_evidence_record", evidence_run) == 0
+
+    monkeypatch.setattr(sink_harness.database, "transaction", original_transaction)
     install_one_ambiguous_commit()
     assert (
         sink_harness.sink.commit_model_evidence(

@@ -947,7 +947,7 @@ class PostgresFencedRunSink:
             or invocation.revision != revision
         ):
             return None
-        return invocation, content_digest
+        return invocation, _record_only_digest(row[2])
 
     def _evidence_coordinate(
         self,
@@ -1003,7 +1003,7 @@ class PostgresFencedRunSink:
             invocation.run_id,
             invocation.logical_call_id,
         )
-        if authoritative is None or authoritative[0] != invocation:
+        if authoritative is None or authoritative[1] != content_digest:
             return (
                 CommitResult(
                     status="conflict",
@@ -1405,7 +1405,7 @@ class PostgresFencedRunSink:
                     invocation.run_id,
                     invocation.logical_call_id,
                 )
-                if authoritative is None or authoritative[0] != invocation:
+                if authoritative is None or authoritative[1] != content_digest:
                     return CommitResult(
                         status="conflict",
                         sequence=invocation.revision,
