@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import re
 import secrets
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -72,9 +73,22 @@ REDACTION_PLACEHOLDER = "[redacted]"
 # Keys ``RedactionPolicy.digest``. Minted once per process on first use and never exported: a
 # receipt consumer is meant to compare digests, not reproduce them. Lazy creation keeps importing
 # pure record validators deterministic inside Temporal's Workflow sandbox.
-@lru_cache(maxsize=1)
+_DIGEST_KEY: bytes | None = None
+_DIGEST_KEY_LOCK = threading.Lock()
+
+
 def _digest_key() -> bytes:
-    return secrets.token_bytes(32)
+    global _DIGEST_KEY
+
+    key = _DIGEST_KEY
+    if key is not None:
+        return key
+    with _DIGEST_KEY_LOCK:
+        key = _DIGEST_KEY
+        if key is None:
+            key = secrets.token_bytes(32)
+            _DIGEST_KEY = key
+        return key
 
 
 # Substrings that mark a *key* as naming a secret. Matching is on the lowercased key with hyphens
