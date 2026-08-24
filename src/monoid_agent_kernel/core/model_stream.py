@@ -103,9 +103,16 @@ class ModelStreamWriter(Protocol):
 
 @runtime_checkable
 class ModelStreamDispatchAwareWriter(Protocol):
-    """Optional writer extension notified immediately before a real provider dispatch."""
+    """Optional fail-closed extension run before a real provider dispatch is published."""
 
     def begin_dispatch(self) -> None: ...
+
+
+@runtime_checkable
+class ModelStreamSettlementAwareWriter(Protocol):
+    """Optional fail-closed extension that durably prepares content for settlement."""
+
+    def prepare_settlement(self) -> None: ...
 
 
 @runtime_checkable
@@ -136,32 +143,75 @@ class _FailureShieldedModelStreamWriter:
         self._writer = writer
         self._closed = False
         self._disabled = False
+        self._preparation_failed = False
+        self._failure: Exception | None = None
 
     def begin_dispatch(self) -> None:
-        if self._closed or self._disabled:
-            return
         begin = getattr(self._writer, "begin_dispatch", None)
         if not callable(begin):
             return
+        if self._closed or self._disabled:
+            self._preparation_failed = True
+            raise RuntimeError(
+                "model stream writer failed before dispatch preparation"
+            ) from self._failure
         try:
             begin()
-        except Exception:  # noqa: BLE001 - observer failure is deliberately isolated
+        except Exception as exc:
             self._disabled = True
-            _LOGGER.debug("model stream observer dispatch-start failed", exc_info=True)
+            self._preparation_failed = True
+            self._failure = exc
+            _LOGGER.debug("model stream observer dispatch preparation failed", exc_info=True)
+            raise
+
+    def prepare_settlement(self) -> None:
+        prepare = getattr(self._writer, "prepare_settlement", None)
+        if not callable(prepare):
+            return
+        if self._closed or self._disabled:
+            self._preparation_failed = True
+            raise RuntimeError(
+                "model stream writer failed before settlement preparation"
+            ) from self._failure
+        try:
+            prepare()
+        except Exception as exc:
+            self._disabled = True
+            self._preparation_failed = True
+            self._failure = exc
+            _LOGGER.debug("model stream observer settlement preparation failed", exc_info=True)
+            raise
 
     def push(self, delta: ModelStreamDelta) -> None:
         if self._closed or self._disabled:
             return
         try:
             self._writer.push(delta)
-        except Exception:  # noqa: BLE001 - observer failure is deliberately isolated
+        except Exception as exc:  # noqa: BLE001 - observer failure is deliberately isolated
             # One broken exporter must not create one log entry per provider token.  Keep close
             # available for best-effort resource release, but disable all later content delivery.
             self._disabled = True
+            self._failure = exc
             _LOGGER.debug("model stream observer push failed", exc_info=True)
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._disabled = True
+        abort = getattr(self._writer, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            abort()
+        except Exception:  # noqa: BLE001 - cleanup cannot replace the preparation failure
+            _LOGGER.debug("model stream observer abort failed", exc_info=True)
 
     def close(self, outcome: ModelStreamOutcome) -> None:
         if self._closed:
+            return
+        if self._preparation_failed:
+            self.abort()
             return
         self._closed = True
         try:
@@ -174,7 +224,7 @@ def safe_open_model_stream(
     observer: ModelStreamObserver | None,
     context: ModelStreamContext,
 ) -> ModelStreamWriter:
-    """Open a writer while keeping all observer failures off the model-call path."""
+    """Open a writer while isolating ordinary observer delivery failures."""
 
     if observer is None:
         return NOOP_MODEL_STREAM_WRITER
@@ -186,13 +236,29 @@ def safe_open_model_stream(
     return _FailureShieldedModelStreamWriter(writer)
 
 
-def safe_begin_model_stream_dispatch(writer: ModelStreamWriter) -> None:
-    """Notify a dispatch-aware writer without letting exporter failures reach the provider."""
+def begin_model_stream_dispatch(writer: ModelStreamWriter) -> None:
+    """Run optional dispatch preparation; participating writer failures propagate."""
 
     begin = getattr(writer, "begin_dispatch", None)
-    if not callable(begin):
+    if callable(begin):
+        begin()
+
+
+def prepare_model_stream_settlement(writer: ModelStreamWriter) -> None:
+    """Flush an optional settlement-aware writer before publishing durable settlement."""
+
+    prepare = getattr(writer, "prepare_settlement", None)
+    if callable(prepare):
+        prepare()
+
+
+def abort_model_stream(writer: ModelStreamWriter) -> None:
+    """Best-effort cleanup that never seals or reconciles failed preparation content."""
+
+    abort = getattr(writer, "abort", None)
+    if not callable(abort):
         return
     try:
-        begin()
-    except Exception:  # noqa: BLE001 - third-party writers may be unshielded
-        _LOGGER.debug("model stream dispatch-start notification failed", exc_info=True)
+        abort()
+    except Exception:  # noqa: BLE001 - cleanup cannot replace the preparation failure
+        _LOGGER.debug("model stream abort failed", exc_info=True)

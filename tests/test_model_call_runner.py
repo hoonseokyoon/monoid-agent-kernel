@@ -5259,12 +5259,14 @@ def _durable_call(
     *,
     request: ModelRequest = REQUEST,
     before_dispatch: Any = None,
+    before_settlement: Any = None,
 ) -> tuple[ModelTurn, Any]:
     return asyncio.run(
         ModelCallRunner(adapter=adapter, lifecycle_hook=lifecycle).acall(
             request,
             logical_call_id="call-durable-1",
             before_dispatch=before_dispatch,
+            before_settlement=before_settlement,
         )
     )
 
@@ -5286,8 +5288,8 @@ def test_durable_runner_requires_an_explicit_logical_call_id_before_dispatch() -
     ("lose_after", "expected_states", "expected_notifications"),
     (
         ("reserve", ["reserved"], []),
-        ("dispatch_started", ["reserved", "dispatch_started"], []),
-        ("before_dispatch", ["reserved", "dispatch_started"], ["dispatch"]),
+        ("before_dispatch", ["reserved"], ["dispatch"]),
+        ("dispatch_started", ["reserved", "dispatch_started"], ["dispatch"]),
     ),
 )
 def test_lease_loss_after_each_pre_dispatch_commit_blocks_provider_entry(
@@ -5495,6 +5497,10 @@ def test_dispatch_start_notification_distinguishes_adapter_entry_from_recovery()
             super().dispatch_started(reservation)
             events.append("durable_start")
 
+        def settled(self, settlement: ModelDispatchSettlement) -> None:
+            super().settled(settlement)
+            events.append("durable_settle")
+
     class RecoveringLifecycle(OrderedLifecycle):
         def recover(self, query: ModelDispatchRecoveryQuery) -> RecoveredModelDispatch | None:
             loaded = self._loaded(query.logical_call_id)
@@ -5528,12 +5534,28 @@ def test_dispatch_start_notification_distinguishes_adapter_entry_from_recovery()
 
     def before_dispatch() -> None:
         head = lifecycle._head("call-durable-1")
-        assert head is not None and head.dispatch_state == "dispatch_started"
+        assert head is not None and head.dispatch_state == "reserved"
         events.append("observer_dispatch")
 
-    _durable_call(adapter, lifecycle, before_dispatch=before_dispatch)
+    def before_settlement() -> None:
+        head = lifecycle._head("call-durable-1")
+        assert head is not None and head.dispatch_state == "dispatch_started"
+        events.append("observer_settlement")
 
-    assert events == ["durable_start", "observer_dispatch", "adapter_entry"]
+    _durable_call(
+        adapter,
+        lifecycle,
+        before_dispatch=before_dispatch,
+        before_settlement=before_settlement,
+    )
+
+    assert events == [
+        "observer_dispatch",
+        "durable_start",
+        "adapter_entry",
+        "observer_settlement",
+        "durable_settle",
+    ]
     assert adapter.calls == 1
 
     events.clear()
@@ -5542,10 +5564,49 @@ def test_dispatch_start_notification_distinguishes_adapter_entry_from_recovery()
         adapter,
         recovered,
         before_dispatch=lambda: events.append("must_not_dispatch"),
+        before_settlement=lambda: events.append("must_not_settle"),
     )
 
     assert events == []
     assert adapter.calls == 1
+
+
+def test_dispatch_preparation_failure_leaves_reserved_call_without_provider_entry() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(OSError, match="stream reset unavailable"):
+        _durable_call(
+            adapter,
+            lifecycle,
+            before_dispatch=lambda: (_ for _ in ()).throw(OSError("stream reset unavailable")),
+        )
+
+    assert adapter.calls == 0
+    assert lifecycle.states == ["reserved"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "reserved"
+
+
+def test_settlement_preparation_failure_marks_paid_dispatch_unknown() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    adapter = _CountingDurableAdapter()
+
+    with pytest.raises(DurableModelCallError) as caught:
+        _durable_call(
+            adapter,
+            lifecycle,
+            before_settlement=lambda: (_ for _ in ()).throw(OSError("stream flush unavailable")),
+        )
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert adapter.calls == 1
+    assert lifecycle.states == ["reserved", "dispatch_started", "unknown"]
+    head = lifecycle._head("call-durable-1")
+    assert head is not None and head.dispatch_state == "unknown"
+    assert head.failure_code == "stream_settlement_uncommitted"
 
 
 def test_lease_loss_at_durable_settlement_blocks_receipt_observers_and_sidecars() -> None:
@@ -5853,12 +5914,14 @@ def test_explicit_retryable_refusal_settles_then_reuses_the_key_on_the_next_disp
     lifecycle = _JournalLifecycle(harness)
     adapter = RefusesThenAnswers()
     dispatches: list[int] = []
+    settlements: list[int] = []
 
     _durable_call(
         adapter,
         lifecycle,
         request=replace(REQUEST, model=_kernel_model()),
         before_dispatch=lambda: dispatches.append(len(dispatches) + 1),
+        before_settlement=lambda: settlements.append(len(settlements) + 1),
     )
 
     assert lifecycle.states == [
@@ -5871,6 +5934,7 @@ def test_explicit_retryable_refusal_settles_then_reuses_the_key_on_the_next_disp
     ]
     assert adapter.calls == 2
     assert dispatches == [1, 2]
+    assert settlements == [1, 2]
     assert len(set(adapter.keys)) == 1
     head = lifecycle._head("call-durable-1")
     assert head is not None

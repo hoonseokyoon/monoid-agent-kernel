@@ -516,6 +516,73 @@ def test_actual_stream_store_fences_takeover_and_model_observer_persists(
     assert output.head is not None and output.head.state == "sealed"
 
 
+def test_actual_model_observer_prepares_both_lanes_before_recovery_seals(
+    harness: _Harness,
+) -> None:
+    run_id = f"run-stream-prepared-recovery-{uuid.uuid4().hex}"
+    stale = harness.claim(run_id, "prepared-worker")
+    context = ModelStreamContext(
+        run_id=run_id,
+        root_run_id=run_id,
+        turn_id="turn-prepared-recovery",
+        stream_id="execution-local-prepared-recovery",
+        step=1,
+        provider="fixture",
+        model="fixture-model",
+        started_at="2026-08-25T00:00:00Z",
+    )
+    writer = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=stale,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=1024,
+        flush_interval_s=10,
+        max_buffer_bytes=4096,
+    ).open(context)
+    writer.begin_dispatch()  # type: ignore[attr-defined]
+    writer.push(ModelStreamDelta(channel="reasoning", text="complete reasoning"))
+    writer.push(ModelStreamDelta(channel="output", text="complete answer"))
+
+    writer.prepare_settlement()  # type: ignore[attr-defined]
+
+    output = DurableStreamIdentity(
+        run_id=run_id,
+        stream_id=durable_model_stream_id(run_id, context.turn_id),
+        logical_call_id=logical_model_call_id(run_id, context.turn_id),
+        channel="output",
+    )
+    reasoning = DurableStreamIdentity(
+        run_id=run_id,
+        stream_id=output.stream_id,
+        logical_call_id=output.logical_call_id,
+        channel="reasoning",
+    )
+    expected = ((output, b"complete answer"), (reasoning, b"complete reasoning"))
+    for identity, data in expected:
+        prepared = harness.streams.read_after(identity, generation=1, cursor=0)
+        assert b"".join(chunk.data for chunk in prepared.chunks) == data
+        assert prepared.head is not None and prepared.head.state == "open"
+
+    # Model invocation settlement can commit here while the stream generation remains open.
+    # A new owner must observe all prepared bytes and seal them without a replacement reset.
+    writer.abort()  # type: ignore[attr-defined]
+    assert harness.authority.release(stale).status == "released"
+    current = harness.claim(run_id, "prepared-recovery-worker")
+    recovered = DurableModelStreamObserver(
+        harness.streams,
+        writer_token=current,
+        write_authority=ActivationWriteAuthority(),
+        chunk_bytes=8,
+        flush_interval_s=10,
+    ).open(context)
+    recovered.close(ModelStreamOutcome(status="completed", final_text="complete answer"))
+
+    for identity, data in expected:
+        sealed = harness.streams.read_after(identity, generation=1, cursor=0)
+        assert b"".join(chunk.data for chunk in sealed.chunks) == data
+        assert sealed.head is not None and sealed.head.state == "sealed"
+
+
 def test_model_observer_resets_abandoned_open_lanes_after_takeover(
     harness: _Harness,
 ) -> None:

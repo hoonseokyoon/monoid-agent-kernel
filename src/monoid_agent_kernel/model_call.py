@@ -144,7 +144,10 @@ ShouldAbort = Callable[[], bool]
 """Polled once per streamed chunk, after it has been delivered. See `ModelCallRunner.acall`."""
 
 BeforeDispatch = Callable[[], None]
-"""Called after durable start publication and immediately before each adapter entry."""
+"""Called before durable start publication and each actual adapter entry."""
+
+BeforeSettlement = Callable[[], None]
+"""Called after provider completion and before a recoverable durable settlement."""
 
 
 @dataclass(frozen=True)
@@ -705,6 +708,7 @@ class ModelCallRunner:
         should_abort: ShouldAbort | None = None,
         delta_consumer: DeltaConsumer | None = None,
         before_dispatch: BeforeDispatch | None = None,
+        before_settlement: BeforeSettlement | None = None,
         logical_call_id: str = "",
         abort_after_recovery_probe: bool = False,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
@@ -727,10 +731,14 @@ class ModelCallRunner:
         caller-owned durable address of this call; standalone anonymous calls cannot invent a
         stable address across process restore.
 
-        ``before_dispatch`` runs once for every actual adapter entry, after a configured durable
-        lifecycle has committed ``dispatch_started``. Durable recovery that returns an already
-        settled result does not call it. This lets presentation/storage observers distinguish a
-        replacement execution from provider-free recovery without inferring from response content.
+        ``before_dispatch`` runs once for every actual adapter entry, before a configured durable
+        lifecycle commits ``dispatch_started``. Durable recovery that returns an already settled
+        result does not call it. This lets storage observers prepare a replacement generation and
+        fail closed before provider entry without inferring from response content.
+
+        ``before_settlement`` runs after an actual provider result/refusal and before the durable
+        lifecycle publishes it as recoverable. A failure enters the same dispatch-unknown boundary
+        as a failed result-blob or settlement write. Provider-free recovery skips this callback.
 
         ``abort_after_recovery_probe`` is the durable-resume seam for an already-started streamed
         step. It polls ``should_abort`` once after authoritative recovery proves there is no
@@ -799,6 +807,29 @@ class ModelCallRunner:
             recovered_failure_receipt: ModelCallReceipt | None = None
             durable_outcome_receipt: ModelCallReceipt | None = None
             elapsed_before_recovery_ms = 0
+
+            def prepare_durable_stream_settlement(
+                reservation: ModelDispatchReservation,
+                usage: Mapping[str, int],
+            ) -> None:
+                if before_settlement is None or lifecycle_hook is None:
+                    return
+                try:
+                    before_settlement()
+                    self._assert_write_authority()
+                except Exception as preparation_error:
+                    # Authority loss outranks observer/storage classification and forbids the
+                    # unknown mutation. With authority intact, a paid result whose required
+                    # stream bytes did not flush cannot become a recoverable settlement.
+                    self._assert_write_authority()
+                    raise_model_dispatch_unknown(
+                        lifecycle_hook,
+                        reservation,
+                        preparation_error,
+                        failure_code="stream_settlement_uncommitted",
+                        usage=usage,
+                    )
+
             try:
                 if lifecycle_hook is not None and not is_safe_opaque_id(logical_call_id):
                     raise DurableModelCallError(
@@ -1054,12 +1085,16 @@ class ModelCallRunner:
                             receipt,
                             idempotency_key=reservation.idempotency_key,
                         )
-                        # The commit sits immediately before adapter entry. A hook failure leaves
-                        # attempts_made unchanged, so the receipt does not claim provider work.
-                        lifecycle_hook.dispatch_started(reservation)
-                        self._assert_write_authority()
                     if before_dispatch is not None:
                         before_dispatch()
+                        self._assert_write_authority()
+                    if lifecycle_hook is not None:
+                        if reservation is None:  # pragma: no cover - reserved in the block above
+                            raise AssertionError("durable model call has no dispatch reservation")
+                        # Dispatch preparation completed before this commit. A failure there keeps
+                        # the invocation reserved and records no provider work; after this commit,
+                        # the next operation is the adapter entry itself.
+                        lifecycle_hook.dispatch_started(reservation)
                         self._assert_write_authority()
                     attempts_made = next_attempt
                     reports_before = progress.count
@@ -1143,6 +1178,10 @@ class ModelCallRunner:
                                     if spent_usage
                                     else current_failure.usage
                                 ),
+                            )
+                            prepare_durable_stream_settlement(
+                                reservation,
+                                durable_failure.usage,
                             )
                             durable_outcome_receipt = durable_failure
                             settle_model_dispatch(
@@ -1388,6 +1427,10 @@ class ModelCallRunner:
                 durable_completed = replace(
                     completed,
                     latency_ms=elapsed_before_recovery_ms + self._ms_since(started),
+                )
+                prepare_durable_stream_settlement(
+                    reservation,
+                    durable_completed.usage,
                 )
                 durable_outcome_receipt = durable_completed
                 try:

@@ -636,16 +636,24 @@ loop = make_loop(
 
 The observer opens one `output` lane and normally opens `reasoning` when that channel first emits
 content. A replacement that finds prior output also hydrates reasoning. `ModelCallRunner` signals
-every actual adapter entry after durable `dispatch_started` publication, and the observer resets
-every pre-existing kernel lane before that provider execution begins. Provider-free settled
-success or failure recovery receives no dispatch signal and preserves the committed generation.
-Direct `ModelCallRunner` integrations pass a callback that calls
-`safe_begin_model_stream_dispatch()` before a new provider execution. The first-delta reset remains
-a fallback when such an integration streams content. Host-defined private lanes use the same
-`DurableStreamIdentity` contract directly. Byte and time thresholds bound coalescing; a
-copied-context daemon performs ordered flushes. Observer failures retain the existing model-stream
-rule: they do not replace a paid provider result. A `fenced` store result revokes the shared
-activation authority, so later kernel publication fails closed.
+every actual adapter entry before durable `dispatch_started` publication. The observer resets every
+pre-existing kernel lane at that boundary. A reset failure leaves the invocation `reserved` and
+prevents provider entry. Provider-free settled success or failure recovery receives no dispatch
+signal and preserves the committed generation. Direct `ModelCallRunner` integrations pass a
+`before_dispatch` callback that calls `begin_model_stream_dispatch()`.
+
+The loop also passes a `before_settlement` callback that calls
+`prepare_model_stream_settlement()`. The durable observer flushes all accepted output and reasoning
+bytes before the lifecycle publishes a recoverable success or refusal. The generation stays open
+until ordinary close seals it. A crash after invocation settlement can therefore recover the full
+generation and seal it without reconstructing reasoning. A preparation failure commits
+`dispatch_unknown`, invokes `abort_model_stream()`, and leaves the generation unsealed for
+diagnosis. The first-delta reset remains a fallback for direct integrations that omit the dispatch
+callback. Host-defined private lanes use the same `DurableStreamIdentity` contract directly. Byte
+and time thresholds bound coalescing; a copied-context daemon performs ordered flushes. Generic
+observer factory, open, push, and close failures stay isolated. Dispatch- and settlement-aware
+extensions opt into fail-closed preparation. A `fenced` store result revokes the shared activation
+authority, so later kernel publication fails closed.
 The durable observer derives its store address with `durable_model_stream_id(run_id, turn_id)` and
 leaves `ModelStreamContext.stream_id` execution-unique for legacy sidecars. A recovered completed
 call reuses and seals its prior generation; the first delta from an admitted replacement dispatch

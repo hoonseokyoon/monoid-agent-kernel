@@ -154,9 +154,11 @@ Evidence: pending.
 | crash point | required result | dispatch count | status |
 |---|---|---:|---|
 | before reserve | retry same command | at most 1 eventual | pending |
-| after reserve, before dispatch | reuse key and continue | 1 | pending |
-| after `dispatch_started`, before provider evidence | `dispatch_unknown` | 1 | pending |
+| after reserve, before stream dispatch preparation | reuse key and continue | 1 eventual | pending |
+| after stream preparation, before `dispatch_started` | reuse key and prepare the next generation | 1 eventual | pending |
+| after `dispatch_started`, before provider evidence | `dispatch_unknown` | 0 or 1 observed; automatic retry 0 | pending |
 | after provider result, before settled commit | `dispatch_unknown` unless durable result exists | 1 | pending |
+| after stream settlement preparation, before settled commit | full open stream + `dispatch_unknown` | 1 | pending |
 | after settled commit, before Activity response | reuse stored result | 1 | pending |
 | after evidence/outbox failure | recover delivery only | 1 | pending |
 
@@ -169,6 +171,10 @@ Evidence: pending.
 - [ ] Reconnect after each committed cursor returns exact ordered bytes.
 - [ ] Generation replacement reports reset/gap with a typed result.
 - [ ] Process kill preserves committed chunks and drops only uncommitted buffer.
+- [ ] Replacement generation reset commits before `dispatch_started`; reset failure enters no provider.
+- [ ] Success/refusal settlement flushes accepted output and reasoning while the generation is open.
+- [ ] Flush failure leaves the generation open, marks invocation unknown, and disables automatic retry.
+- [ ] Crash after invocation settlement recovers the full prepared generation and seals without reset.
 - [ ] Terminal settlement rejects late stream append/seal.
 - [ ] Private channels do not appear in public event, PG notification, or Temporal history.
 

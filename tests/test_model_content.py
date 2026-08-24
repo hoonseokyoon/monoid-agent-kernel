@@ -31,7 +31,9 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamContext,
     ModelStreamDelta,
     ModelStreamOutcome,
-    safe_begin_model_stream_dispatch,
+    abort_model_stream,
+    begin_model_stream_dispatch,
+    prepare_model_stream_settlement,
     safe_open_model_stream,
 )
 from monoid_agent_kernel.recorder import AgentRecorder
@@ -837,6 +839,8 @@ def test_observer_failures_are_shielded_and_a_broken_writer_is_disabled() -> Non
 
     writer.push(ModelStreamDelta("output", "one"))
     writer.push(ModelStreamDelta("output", "two"))
+    # Generic exporters do not opt into the fail-closed durable settlement boundary.
+    prepare_model_stream_settlement(writer)
     writer.close(ModelStreamOutcome("failed", error_code="provider_error"))
     writer.close(ModelStreamOutcome("failed", error_code="provider_error"))
 
@@ -847,27 +851,63 @@ def test_observer_failures_are_shielded_and_a_broken_writer_is_disabled() -> Non
     unavailable.close(ModelStreamOutcome("completed"))
 
 
-def test_dispatch_start_failure_disables_content_push_but_still_closes_writer() -> None:
+def test_dispatch_preparation_failure_propagates_and_aborts_without_close() -> None:
     class DispatchFailureWriter(_FailingWriter):
         def __init__(self) -> None:
             super().__init__()
             self.dispatch_calls = 0
+            self.abort_calls = 0
 
         def begin_dispatch(self) -> None:
             self.dispatch_calls += 1
             raise RuntimeError("dispatch observer unavailable")
 
+        def abort(self) -> None:
+            self.abort_calls += 1
+
     failing = DispatchFailureWriter()
     writer = safe_open_model_stream(_Observer(failing), _context())
 
-    safe_begin_model_stream_dispatch(writer)
-    safe_begin_model_stream_dispatch(writer)
+    with pytest.raises(RuntimeError, match="dispatch observer unavailable"):
+        begin_model_stream_dispatch(writer)
+    abort_model_stream(writer)
     writer.push(ModelStreamDelta("output", "must not publish"))
     writer.close(ModelStreamOutcome("failed", error_code="provider_error"))
 
     assert failing.dispatch_calls == 1
     assert failing.push_calls == 0
-    assert failing.close_calls == 1
+    assert failing.abort_calls == 1
+    assert failing.close_calls == 0
+
+
+def test_settlement_preparation_failure_propagates_and_aborts_without_close() -> None:
+    class SettlementFailureWriter(_FailingWriter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prepare_calls = 0
+            self.abort_calls = 0
+
+        def push(self, delta: ModelStreamDelta) -> None:
+            del delta
+
+        def prepare_settlement(self) -> None:
+            self.prepare_calls += 1
+            raise RuntimeError("settlement observer unavailable")
+
+        def abort(self) -> None:
+            self.abort_calls += 1
+
+    failing = SettlementFailureWriter()
+    writer = safe_open_model_stream(_Observer(failing), _context())
+
+    with pytest.raises(RuntimeError, match="settlement observer unavailable"):
+        prepare_model_stream_settlement(writer)
+    abort_model_stream(writer)
+    writer.close(ModelStreamOutcome("completed", final_text="must not seal"))
+
+    assert failing.prepare_calls == 1
+    assert failing.abort_calls == 1
+    assert failing.close_calls == 0
 
 
 def test_recorder_sidecar_is_opt_in_and_dual_writes_settled_text(tmp_path: Path) -> None:

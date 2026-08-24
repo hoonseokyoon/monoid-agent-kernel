@@ -781,17 +781,27 @@ used for automatic retry eligibility; `false` does not prevent an explicit user 
 configuration change.
 
 A writer that implements the optional `ModelStreamDispatchAwareWriter` extension receives
-`begin_dispatch()` after durable `dispatch_started` publication and immediately before each actual
-adapter entry. Provider-free recovery of an already settled invocation does not receive it. Durable
-observers use this transition to reset a replacement generation even when the response contains
-only tool calls and emits no text delta. Provider-free success and failure recovery preserve their
-committed stream generation. `safe_begin_model_stream_dispatch` preserves the same observer-failure
-isolation as `safe_open_model_stream`.
+`begin_dispatch()` before durable `dispatch_started` publication and each actual adapter entry.
+Provider-free recovery of an already settled invocation skips it. Durable observers use this
+transition to reset a replacement generation even when the response contains only tool calls and
+emits no text delta. Provider-free success and failure recovery preserve their committed stream
+generation. `begin_model_stream_dispatch` propagates an opted-in preparation failure, so the
+invocation remains `reserved` and the provider receives no request.
+
+A writer that implements `ModelStreamSettlementAwareWriter` receives `prepare_settlement()` after
+the provider terminal and before a success or definite refusal becomes recoverable. The durable
+observer flushes every accepted output and reasoning byte while keeping the generation open. A
+failure moves a started invocation to `unknown` and blocks automatic provider retry.
+`abort_model_stream` releases local writer resources without reconciliation or sealing. A process
+replacement can therefore seal a fully prepared open generation after recovering the settled
+model result.
 
 Factories materialize a fresh observer set for every activation and every in-process subagent.
 This ownership prevents a restored run or child from closing another activation's live channel.
-Factory, open, dispatch-start, push, and close failures are contained; an observer cannot change a
-paid model call's result. `safe_open_model_stream` applies the failure shield to custom observers.
+Factory, open, generic push, and close failures are contained. `safe_open_model_stream` applies the
+failure shield to custom observers. Dispatch- and settlement-aware writers opt into the two
+fail-closed preparation boundaries above because their durable bytes participate in paid-call
+recovery correctness.
 
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
 This keeps token-boundary interruption responsive while durable events remain compact.
@@ -2787,9 +2797,13 @@ The synchronous lifecycle sequence is:
 normalize + request digest
   -> reserve effective key
   -> recheck lease authority
+  -> prepare/reset durable stream generation
+  -> recheck lease authority
   -> commit dispatch_started
   -> recheck lease authority
   -> enter adapter
+  -> flush accepted durable output/reasoning bytes
+  -> recheck lease authority
   -> commit settled success/refusal OR commit unknown
   -> recheck lease authority
   -> deliver passive observer/sidecar evidence
@@ -2813,10 +2827,11 @@ private result blob. The body preserves final text, tool calls, reasoning, usage
 provider retry evidence. It excludes `ModelTurn.raw`. An unencodable or oversized result becomes an
 unknown dispatch because provider work has already happened.
 
-Lifecycle writes control execution and their exceptions are not observer failures. Reserve/start
-failure prevents adapter entry. Settle failure attempts an unknown transition and surfaces
-`dispatch_unknown` even when that transition also fails. The next recovery pass interprets a
-remaining `dispatch_started` head as unknown. Python `BaseException` represents a process-stop
+Lifecycle writes and opted-in durable stream preparations control execution. Reserve, stream reset,
+and start failure prevent adapter entry. A stream flush failure after provider completion commits
+`unknown` with `stream_settlement_uncommitted`. Settle failure attempts an unknown transition and
+surfaces `dispatch_unknown` even when that transition also fails. The next recovery pass interprets
+a remaining `dispatch_started` head as unknown. Python `BaseException` represents a process-stop
 failpoint and bypasses in-process compensation, leaving the last committed head for recovery.
 
 The lifecycle value types live in `monoid_agent_kernel.model_lifecycle`. They stay outside the

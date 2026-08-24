@@ -161,6 +161,9 @@ class _DurableModelStreamWriter:
         self._failure: BaseException | None = None
         self._closing = False
         self._closed = False
+        self._aborting = False
+        self._flush_requested = False
+        self._inflight = False
         self._channel_cursor = 0
         self._worker_context = contextvars.copy_context()
         output = self._ensure_lane("output")
@@ -295,6 +298,32 @@ class _DurableModelStreamWriter:
                 raise DurableStreamWriteError("durable model stream writer is closed")
             self._reset_prior_lanes_locked()
 
+    def prepare_settlement(self) -> None:
+        """Flush every delivered delta before invocation settlement becomes recoverable."""
+
+        # Batching may use an injected/frozen clock. The supervisor budget must still expire in
+        # wall-clock time when a store blocks or the worker fails to make progress.
+        deadline = time.monotonic() + self._observer.supervisor_join_timeout_s
+        with self._condition:
+            self._raise_failure_locked()
+            if self._closing or self._closed:
+                raise DurableStreamWriteError("durable model stream writer is closed")
+            self._flush_requested = True
+            self._condition.notify_all()
+            try:
+                while self._inflight or any(lane.buffer for lane in self._lanes.values()):
+                    self._raise_failure_locked()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DurableStreamWriterTimeout(
+                            "durable stream flush exceeded supervisor_join_timeout_s"
+                        )
+                    self._condition.wait(timeout=remaining)
+                self._raise_failure_locked()
+            finally:
+                self._flush_requested = False
+                self._condition.notify_all()
+
     def push(self, delta: ModelStreamDelta) -> None:
         if not isinstance(delta, ModelStreamDelta):
             raise TypeError("durable model stream push requires ModelStreamDelta")
@@ -353,7 +382,7 @@ class _DurableModelStreamWriter:
             lane = self._lanes[channel]
             if not lane.buffer:
                 continue
-            due = lane.flush_at is not None and lane.flush_at <= now
+            due = self._flush_requested or (lane.flush_at is not None and lane.flush_at <= now)
             if not self._closing and len(lane.buffer) < self._observer.chunk_bytes and not due:
                 continue
             maximum = min(len(lane.buffer), self._observer.chunk_bytes)
@@ -413,6 +442,8 @@ class _DurableModelStreamWriter:
         try:
             while True:
                 with self._condition:
+                    if self._aborting:
+                        return
                     batch = self._next_batch_locked()
                     if batch is None:
                         if self._closing and not any(
@@ -421,12 +452,15 @@ class _DurableModelStreamWriter:
                             return
                         self._condition.wait(timeout=self._wait_timeout_locked())
                         continue
+                    self._inflight = True
                 lane, data = batch
                 self._append(lane, data)
                 with self._condition:
+                    self._inflight = False
                     self._condition.notify_all()
         except BaseException as exc:
             with self._condition:
+                self._inflight = False
                 self._failure = exc
                 self._condition.notify_all()
 
@@ -488,6 +522,27 @@ class _DurableModelStreamWriter:
             lane.head = result.head
         with self._condition:
             self._closed = True
+
+    def abort(self) -> None:
+        """Stop the worker without reconciling or sealing an unprepared generation."""
+
+        with self._condition:
+            if self._closed:
+                return
+            self._aborting = True
+            self._closing = True
+            self._condition.notify_all()
+        self._worker.join(timeout=self._observer.supervisor_join_timeout_s)
+        if self._worker.is_alive():
+            raise DurableStreamWriterTimeout(
+                "durable stream abort exceeded supervisor_join_timeout_s"
+            )
+        with self._condition:
+            self._closed = True
+            for lane in self._lanes.values():
+                lane.buffer.clear()
+                lane.flush_at = None
+            self._condition.notify_all()
 
 
 __all__ = [

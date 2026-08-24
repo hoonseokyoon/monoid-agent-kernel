@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamDelta,
     ModelStreamDispatchAwareWriter,
     ModelStreamOutcome,
+    ModelStreamSettlementAwareWriter,
     ModelStreamStatus,
 )
 from monoid_agent_kernel.hosting import (
@@ -425,6 +426,70 @@ def test_model_stream_observer_flushes_on_time_and_copies_context() -> None:
     assert store.appended.wait(2)
     writer.close(ModelStreamOutcome(status="completed", final_text="timed"))
     assert store.append_contexts == ["tenant-a"]
+
+
+def test_settlement_preparation_flushes_both_lanes_before_recovery_seals_them() -> None:
+    store = _MemoryStreamStore()
+    context = _context()
+    writer = _observer(
+        store,
+        ActivationWriteAuthority(),
+        chunk_bytes=1024,
+        flush_interval_s=10,
+        max_buffer_bytes=4096,
+    ).open(context)
+    assert isinstance(writer, ModelStreamSettlementAwareWriter)
+    writer.push(ModelStreamDelta(channel="reasoning", text="complete reasoning"))
+    writer.push(ModelStreamDelta(channel="output", text="complete answer"))
+
+    writer.prepare_settlement()
+
+    identities = {identity.channel: identity for identity in store.heads}
+    expected = {"output": b"complete answer", "reasoning": b"complete reasoning"}
+    for channel, data in expected.items():
+        identity = identities[channel]
+        head = store.heads[identity]
+        assert head.generation == 1
+        assert head.state == "open"
+        assert b"".join(chunk.data for chunk in store.chunks[(identity, 1)]) == data
+
+    # A process can disappear after invocation settlement and before observer close. Recovery
+    # must preserve and seal the fully prepared generation without reconstructing reasoning.
+    writer.abort()  # type: ignore[attr-defined]
+    current = store.replace_writer(context.run_id)
+    recovered = DurableModelStreamObserver(
+        store,
+        writer_token=current,
+        write_authority=ActivationWriteAuthority(),
+    ).open(context)
+    recovered.close(ModelStreamOutcome(status="completed", final_text="complete answer"))
+
+    for channel, data in expected.items():
+        identity = identities[channel]
+        assert store.heads[identity].generation == 1
+        assert store.heads[identity].state == "sealed"
+        assert b"".join(chunk.data for chunk in store.chunks[(identity, 1)]) == data
+
+
+def test_failed_settlement_preparation_aborts_without_sealing_partial_content() -> None:
+    store = _MemoryStreamStore()
+    writer = _observer(
+        store,
+        ActivationWriteAuthority(),
+        chunk_bytes=1024,
+        flush_interval_s=10,
+        max_buffer_bytes=4096,
+    ).open(_context())
+    writer.push(ModelStreamDelta(channel="reasoning", text="uncommitted reasoning"))
+    store.reject_append_status = "conflict"
+
+    with pytest.raises(DurableStreamWriteError, match="flush worker failed"):
+        writer.prepare_settlement()  # type: ignore[attr-defined]
+    writer.abort()  # type: ignore[attr-defined]
+
+    for head in store.heads.values():
+        assert head.state == "open"
+        assert head.cursor_bytes == 0
 
 
 def test_model_stream_observer_fencing_revokes_activation_authority() -> None:

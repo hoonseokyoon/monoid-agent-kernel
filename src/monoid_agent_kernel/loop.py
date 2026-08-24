@@ -68,7 +68,9 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamOutcome,
     ModelStreamStatus,
     ModelStreamWriter,
-    safe_begin_model_stream_dispatch,
+    abort_model_stream,
+    begin_model_stream_dispatch,
+    prepare_model_stream_settlement,
     safe_open_model_stream,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
@@ -2945,6 +2947,7 @@ class AgentLoop:
         )
         observer_writers: tuple[ModelStreamWriter, ...] = ()
         before_dispatch: Callable[[], None] | None = None
+        before_settlement: Callable[[], None] | None = None
         output_fragments: list[str] = []
 
         if wants_stream:
@@ -2987,15 +2990,37 @@ class AgentLoop:
                 observer_writers = tuple(writers)
                 if observer_writers:
 
+                    def abort_observer_writers() -> None:
+                        for writer in observer_writers:
+                            abort_model_stream(writer)
+
                     def begin_observer_dispatch() -> None:
                         self._assert_write_authority()
-                        for writer in observer_writers:
-                            self.write_authority.guard_external_call(
-                                lambda writer=writer: safe_begin_model_stream_dispatch(writer)
-                            )
+                        try:
+                            for writer in observer_writers:
+                                self.write_authority.guard_external_call(
+                                    lambda writer=writer: begin_model_stream_dispatch(writer)
+                                )
+                        except BaseException:
+                            abort_observer_writers()
+                            raise
                         self._assert_write_authority()
 
                     before_dispatch = begin_observer_dispatch
+
+                    def prepare_observer_settlement() -> None:
+                        self._assert_write_authority()
+                        try:
+                            for writer in observer_writers:
+                                self.write_authority.guard_external_call(
+                                    lambda writer=writer: prepare_model_stream_settlement(writer)
+                                )
+                        except BaseException:
+                            abort_observer_writers()
+                            raise
+                        self._assert_write_authority()
+
+                    before_settlement = prepare_observer_settlement
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
                 self._assert_write_authority()
@@ -3053,6 +3078,7 @@ class AgentLoop:
                 deadline=deadline,
                 delta_consumer=delta_consumer,
                 before_dispatch=before_dispatch,
+                before_settlement=before_settlement,
                 should_abort=should_abort,
                 logical_call_id=(
                     logical_model_call_id(self.spec.run_id, turn_id)
