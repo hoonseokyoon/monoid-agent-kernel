@@ -197,6 +197,7 @@ def test_explicit_migration_lifecycle_and_doctor(
         "0002_checkpoint_invocation",
         "0003_event_terminal_evidence_outbox",
         "0004_object_association_gc",
+        "0005_activation_admission_dispatch",
     )
     assert migrations.doctor().ok is False
     with pytest.raises(PostgresSchemaIncompatible, match="check_ready"):
@@ -212,9 +213,10 @@ def test_explicit_migration_lifecycle_and_doctor(
         "0002_checkpoint_invocation",
         "0003_event_terminal_evidence_outbox",
         "0004_object_association_gc",
+        "0005_activation_admission_dispatch",
     )
     assert first.status.current is True
-    assert first.status.current_version == 4
+    assert first.status.current_version == 5
     assert first.status.schema == postgres_database.config.schema
 
     repeated = migrations.apply()
@@ -270,11 +272,11 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
                         sql.Identifier(postgres_database.config.schema),
                         sql.Identifier("monoid_schema_migrations"),
                     ),
-                    ("0005_forward_marker", 5, "f" * 64, 1, 1),
+                    ("0006_forward_marker", 6, "f" * 64, 1, 1),
                 )
 
     compatible = migrations.status()
-    assert compatible.current_version == 5
+    assert compatible.current_version == 6
     assert compatible.pending == ()
     assert compatible.reader_compatible is True
     assert compatible.writer_compatible is True
@@ -284,13 +286,13 @@ def test_forward_schema_uses_declared_reader_and_writer_floors(
             with connection.cursor() as cursor:
                 cursor.execute(
                     sql.SQL(
-                        "UPDATE {}.{} SET reader_floor = 5, writer_floor = 5 "
+                        "UPDATE {}.{} SET reader_floor = 6, writer_floor = 6 "
                         "WHERE migration_id = %s"
                     ).format(
                         sql.Identifier(postgres_database.config.schema),
                         sql.Identifier("monoid_schema_migrations"),
                     ),
-                    ("0005_forward_marker",),
+                    ("0006_forward_marker",),
                 )
 
     incompatible = migrations.status()
@@ -340,6 +342,7 @@ def test_migration_advisory_lock_serializes_independent_runners(
             "0002_checkpoint_invocation",
             "0003_event_terminal_evidence_outbox",
             "0004_object_association_gc",
+            "0005_activation_admission_dispatch",
         ),
     ]
     assert PostgresMigrations(postgres_database).status().current is True
@@ -398,6 +401,7 @@ def test_migration_path_resists_pooled_temp_table_shadowing(
             "0002_checkpoint_invocation",
             "0003_event_terminal_evidence_outbox",
             "0004_object_association_gc",
+            "0005_activation_admission_dispatch",
         )
 
         with database.connection() as connection:
@@ -484,7 +488,7 @@ def test_migration_schema_cannot_shadow_pg_catalog_builtins(
                             sql.Identifier(schema),
                             sql.Identifier("monoid_schema_migrations"),
                         ),
-                            ("9999_default_probe", 5, "f" * 64, 1, 1),
+                        ("9999_default_probe", 6, "f" * 64, 1, 1),
                     )
                     assert cursor.fetchone()[0].year >= 2020
                 raise RollBackDefaultProbe
@@ -606,6 +610,7 @@ def test_migration_lock_wait_enforces_read_committed_on_caller_pools(
             "0002_checkpoint_invocation",
             "0003_event_terminal_evidence_outbox",
             "0004_object_association_gc",
+            "0005_activation_admission_dispatch",
         ),
     ]
     assert PostgresMigrations(postgres_database).status().current is True

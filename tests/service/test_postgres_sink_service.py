@@ -2097,7 +2097,7 @@ def test_sink_readiness_requires_reader_and_writer_compatibility(
                         "monoid_schema_migrations",
                     )
                 ),
-                ("0005_reader_incompatible", 5, "f" * 64, 5, 4),
+                ("0006_reader_incompatible", 6, "f" * 64, 6, 5),
             )
 
     sink = sink_harness.sink

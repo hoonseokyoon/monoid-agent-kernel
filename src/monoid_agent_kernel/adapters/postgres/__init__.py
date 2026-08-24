@@ -1,6 +1,7 @@
 """PostgreSQL production adapter with an optional, lazy psycopg boundary."""
 
 from .authority import PostgresWriterAuthorityStore
+from .admission import PostgresAdmissionCorrupt, PostgresCommandAdmissionStore
 from .config import PostgresConfig
 from .migrations import (
     SCHEMA_VERSION,
@@ -50,6 +51,8 @@ __all__ = [
     "bundled_migrations",
     "PostgresMigrations",
     "PostgresWriterAuthorityStore",
+    "PostgresAdmissionCorrupt",
+    "PostgresCommandAdmissionStore",
     "PostgresBlobCorrupt",
     "PostgresFencedRunSink",
     "PostgresObjectAssociationCorrupt",
