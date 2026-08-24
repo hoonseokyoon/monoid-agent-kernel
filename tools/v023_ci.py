@@ -46,7 +46,8 @@ _QUALIFICATION_CATEGORIES = frozenset(
         "worker_crash_drain",
         "paid_call_crash_matrix",
         "durable_stream",
-        "operations_privacy_combined",
+        "operations",
+        "privacy_combined",
     }
 )
 
@@ -69,18 +70,30 @@ def validate_qualification_manifest() -> dict[str, Any]:
     loaded = json.loads(QUALIFICATION_PATH.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
         raise ValueError("qualification manifest root must be an object")
-    if loaded.get("schema_version") != 1 or loaded.get("campaign") != "v0.23":
+    if loaded.get("schema_version") != 2 or loaded.get("campaign") != "v0.23":
         raise ValueError("qualification manifest identity is invalid")
     categories = loaded.get("categories")
     if not isinstance(categories, dict) or set(categories) != _QUALIFICATION_CATEGORIES:
         raise ValueError("qualification manifest category set is invalid")
     seen: set[str] = set()
-    for category, node_ids in categories.items():
-        if not isinstance(node_ids, list) or not node_ids:
+    for category, entries in categories.items():
+        if not isinstance(entries, list) or not entries:
             raise ValueError(f"qualification category is empty: {category}")
-        for node_id in node_ids:
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"node_id", "profiles"}:
+                raise ValueError(f"qualification entry is invalid: {entry!r}")
+            node_id = entry["node_id"]
+            profiles = entry["profiles"]
             if not isinstance(node_id, str) or node_id.count("::") != 1:
                 raise ValueError(f"qualification node id is invalid: {node_id!r}")
+            if (
+                not isinstance(profiles, list)
+                or not profiles
+                or any(not isinstance(profile, str) for profile in profiles)
+                or profiles != sorted(set(profiles))
+                or any(profile not in ALLOWED_PROFILES for profile in profiles)
+            ):
+                raise ValueError(f"qualification profiles are invalid: {node_id}")
             if node_id in seen:
                 raise ValueError(f"qualification node id is duplicated: {node_id}")
             seen.add(node_id)
@@ -97,6 +110,21 @@ def validate_qualification_manifest() -> dict[str, Any]:
             if re.search(rf"^def {re.escape(test_name)}\(", source, re.MULTILINE) is None:
                 raise ValueError(f"qualification test function is missing: {node_id}")
     return loaded
+
+
+def qualification_tests_for_profile(
+    manifest: dict[str, Any], profile: str
+) -> dict[str, list[str]]:
+    """Select only tests that the requested L2 profile executes."""
+
+    if profile not in ALLOWED_PROFILES:
+        raise ValueError(f"unknown qualification profile: {profile}")
+    selected: dict[str, list[str]] = {}
+    for category, entries in manifest["categories"].items():
+        node_ids = [entry["node_id"] for entry in entries if profile in entry["profiles"]]
+        if node_ids:
+            selected[category] = node_ids
+    return selected
 
 
 def validate_lock() -> dict[str, Any]:
@@ -497,7 +525,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "qualification": {
                 "path": QUALIFICATION_PATH.relative_to(ROOT).as_posix(),
                 "sha256": _sha256_file(QUALIFICATION_PATH),
-                "required_tests": qualification["categories"],
+                "manifest_schema_version": qualification["schema_version"],
+                "required_tests": qualification_tests_for_profile(
+                    qualification, arguments.profile
+                ),
             },
         }
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
