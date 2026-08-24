@@ -235,7 +235,7 @@ def test_activity_phase_timeout_reserves_cleanup_inside_temporal_deadline() -> N
         )
         == 20
     )
-    with pytest.raises(RuntimeError, match="no bounded bootstrap execution budget"):
+    with pytest.raises(ValueError, match="must exceed the cleanup reserve"):
         activity_module._activity_phase_timeout(
             SimpleNamespace(start_to_close_timeout=timedelta(seconds=1)),
             attempt_started_monotonic=time.monotonic(),
@@ -243,6 +243,31 @@ def test_activity_phase_timeout_reserves_cleanup_inside_temporal_deadline() -> N
             cleanup_timeout_s=1,
             phase_name="bootstrap",
         )
+
+
+def test_impossible_activity_budget_is_a_non_retryable_configuration_conflict() -> None:
+    policy = TemporalActivityPolicy(
+        writer_lease_ttl_s=2,
+        writer_lease_renew_interval_s=0.02,
+        heartbeat_interval_s=0.01,
+        authority_call_timeout_s=1,
+        driver_call_timeout_s=1,
+        supervisor_join_timeout_s=1,
+        local_task_wait_s=1,
+    )
+    store = _AuthorityStore()
+
+    with pytest.raises(ApplicationError) as raised:
+        ActivityEnvironment().run(
+            _activity(store, policy=policy).run,
+            _command().to_json(),
+        )
+
+    assert raised.value.type == "monoid.activation_config_conflict"
+    assert raised.value.non_retryable is True
+    assert store.claimed_owner == ""
+    assert store.release_count == 0
+    assert _DriverDouble.constructed == []
 
 
 def test_temporal_activity_repr_excludes_host_dependencies() -> None:

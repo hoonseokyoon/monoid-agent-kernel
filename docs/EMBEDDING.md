@@ -345,7 +345,9 @@ Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`.
 `activity_start_to_close_timeout_s`; runtime caps both bootstrap and driver phases to the actual
 remaining attempt budget. Keep PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and
 `statement_timeout_s` below the relevant Activity bound. The Activity policy requires the writer
-lease TTL to cover at least two renewal intervals. Give
+lease TTL to cover at least two renewal intervals. A start-to-close timeout that cannot contain the
+configured cleanup reserve fails as a non-retryable configuration conflict before writer claim.
+Give
 `graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
 composition requires this timeout to cover the configured heartbeat interval, authority call
 timeout, and supervisor join window. Shutdown maps to `graceful_drain` by default; set

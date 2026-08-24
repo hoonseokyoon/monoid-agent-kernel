@@ -154,6 +154,10 @@ class _SupervisorUnhealthy(RuntimeError):
     pass
 
 
+class _ActivityBudgetConflict(ValueError):
+    pass
+
+
 @dataclass(frozen=True, kw_only=True)
 class _ActivationBootstrap:
     lease: WriterLease
@@ -564,13 +568,18 @@ def _activity_phase_timeout(
         return configured
     if not isinstance(start_to_close, timedelta):
         raise _SupervisorUnhealthy("Temporal Activity start-to-close timeout is invalid")
-    remaining = start_to_close.total_seconds() - (time.monotonic() - attempt_started_monotonic)
-    if remaining <= 0.002:
-        raise _SupervisorUnhealthy(f"Temporal Activity has no {phase_name} execution budget")
     cleanup_reserve = _require_duration(
         cleanup_timeout_s,
         "activation cleanup reserve",
     )
+    total = start_to_close.total_seconds()
+    if total <= cleanup_reserve + 0.001:
+        raise _ActivityBudgetConflict(
+            "Temporal Activity start-to-close timeout must exceed the cleanup reserve"
+        )
+    remaining = total - (time.monotonic() - attempt_started_monotonic)
+    if remaining <= 0.002:
+        raise _SupervisorUnhealthy(f"Temporal Activity has no {phase_name} execution budget")
     timeout = min(configured, remaining - cleanup_reserve)
     if timeout < 0.001:
         raise _SupervisorUnhealthy(
@@ -682,19 +691,20 @@ class TemporalActivationActivity:
         try:
             info = activity.info()
             owner_id = _activity_owner_id(info.task_token)
+            bootstrap_timeout = _activity_phase_timeout(
+                info,
+                attempt_started_monotonic=attempt_started_monotonic,
+                configured_timeout_s=float(self.policy.authority_call_timeout_s),
+                cleanup_timeout_s=float(self.policy.supervisor_join_timeout_s),
+                phase_name="bootstrap",
+            )
             activity.heartbeat()
             supervisor.start()
             bootstrap = supervisor.bootstrap(
                 command,
                 owner_id,
                 self.admission_store,
-                timeout_s=_activity_phase_timeout(
-                    info,
-                    attempt_started_monotonic=attempt_started_monotonic,
-                    configured_timeout_s=float(self.policy.authority_call_timeout_s),
-                    cleanup_timeout_s=float(self.policy.supervisor_join_timeout_s),
-                    phase_name="bootstrap",
-                ),
+                timeout_s=bootstrap_timeout,
             )
             lease = bootstrap.lease
             supervisor.assert_healthy()
