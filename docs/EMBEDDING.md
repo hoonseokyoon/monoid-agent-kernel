@@ -228,8 +228,8 @@ receipt, so later commands may advance the head without changing an earlier comm
 receipt. The digest hashes the boundary checkpoint with that receipt's own digest field blanked,
 which avoids a self-reference while retaining the rest of the exact boundary identity.
 
-The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`, and
-`write_authority`. It also configures
+The loop factory receives an `ActivationRuntime` and binds its exact `run_sink`, `writer_token`,
+`write_authority`, and `cancellation_token`. It also configures
 `authoritative_event_sinks=(runtime.event_sink,)`, seeds `event_sequence_seed` from the runtime, and
 keeps `emit_output_deltas=False` until a durable private stream sink is configured. The resulting
 event order is durable journal first, then local projections. A terminal winner closes new public
@@ -241,16 +241,23 @@ private checkpoint/blob channels referenced by the receipt.
 
 ### Temporal run orchestration
 
-Install `monoid-agent-kernel[temporal]` and register the versioned per-run Workflow explicitly:
+Install `monoid-agent-kernel[durable-host]`, check every storage adapter for readiness, and compose
+the versioned per-run Workflow with the production threaded Activity:
 
 ```python
-from temporalio.worker import Worker
-
 from monoid_agent_kernel.adapters.temporal import (
     TemporalRunPolicy,
     TemporalSignalWithStartTransport,
 )
-from monoid_agent_kernel.adapters.temporal.workflow import TemporalRunWorkflow
+from monoid_agent_kernel.adapters.temporal.activity import (
+    TemporalActivationActivity,
+    TemporalActivityPolicy,
+)
+from monoid_agent_kernel.adapters.temporal.worker import TemporalWorkerGroup
+
+authority_store.check_ready()
+admission_store.check_ready()
+fenced_run_sink.check_ready()
 
 policy = TemporalRunPolicy(activity_task_queue="monoid-activation-v1")
 transport = TemporalSignalWithStartTransport(
@@ -260,23 +267,61 @@ transport = TemporalSignalWithStartTransport(
     run_policy=policy,
 )
 
-workflow_worker = Worker(
-    temporal_client,
-    task_queue="monoid-run-v1",
-    workflows=[TemporalRunWorkflow],
+activation = TemporalActivationActivity(
+    authority_store=authority_store,
+    admission_store=admission_store,
+    run_sink=fenced_run_sink,
+    loop_factory=build_loop,
+    input_resolver=resolve_private_input,
+    policy=TemporalActivityPolicy(
+        writer_lease_ttl_s=30,
+        writer_lease_renew_interval_s=10,
+        heartbeat_interval_s=5,
+        supervisor_join_timeout_s=30,
+        local_task_wait_s=300,
+    ),
 )
-activity_worker = Worker(
-    temporal_client,
-    task_queue="monoid-activation-v1",
-    activities=[drive_activation],
+
+workers = TemporalWorkerGroup(
+    client=temporal_client,
+    workflow_task_queue="monoid-run-v1",
+    activity_task_queue=policy.activity_task_queue,
+    activation_activity=activation,
+    max_concurrent_activities=10,
+    graceful_shutdown_timeout_s=30,
 )
+
+async with workers:
+    await serve_until_shutdown()
 ```
 
-Register `drive_activation` under the exported
-`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name. It accepts an `AdmittedCommand.to_json()` payload and
-returns `TemporalActivationResult.to_json()`. The result binds the exact command identity to a
-canonical receipt ref and terminal flag. Database access, private payload resolution, provider and
-tool calls, checkpoint restore, and terminal settlement remain inside this finite Activity.
+`TemporalActivationActivity.run` is registered as the exported
+`TEMPORAL_DRIVE_ACTIVATION_ACTIVITY` name with
+`no_thread_cancel_exception=True`. It accepts an `AdmittedCommand.to_json()` payload and returns
+`TemporalActivationResult.to_json()`. The result binds the exact command identity to a canonical
+receipt ref and terminal flag. Database access, private payload resolution, provider and tool calls,
+checkpoint restore, and terminal settlement remain inside this finite Activity.
+
+The Activity derives a content-free owner ID from the Temporal task token, claims an independent
+PostgreSQL writer generation, and starts a copied-context supervisor thread. The supervisor renews
+the PostgreSQL lease, sends empty heartbeats, and propagates Activity cancellation or worker
+shutdown through the exact `ActivationRuntime.cancellation_token`. PostgreSQL remains the mutation
+authority. A heartbeat or renewal ambiguity revokes `ActivationWriteAuthority`, and every later
+checkpoint, invocation, event, and terminal publication fails closed at the PostgreSQL fence.
+
+Keep `heartbeat_interval_s` below the Workflow's `activity_heartbeat_timeout_s`. The Activity policy
+requires the writer lease TTL to cover at least two renewal intervals. Give
+`graceful_shutdown_timeout_s` enough time for AgentLoop to reach and commit a safe boundary. Worker
+composition requires this timeout to cover the configured heartbeat interval and supervisor join
+window. Shutdown maps to `graceful_drain` by default; set
+`worker_shutdown_cause=InterruptionCause.HOST_SHUTDOWN` when an orderly host termination should
+retain that distinct cause.
+
+A drain before provider entry commits a resumable `graceful_drain` receipt. A drain after durable
+`dispatch_started` and before trustworthy provider evidence commits `dispatch_unknown` with
+`after_reconciliation` eligibility. This result blocks automatic paid-call replay. A worker crash
+after the settled invocation commit lets the replacement generation reuse the stored result with
+zero additional provider calls.
 
 The Temporal client is asynchronous. Keep its owner event loop running and call the synchronous
 `transport.dispatch()` from the PostgreSQL outbox polling thread. Async code already executing on

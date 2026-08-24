@@ -17,6 +17,7 @@ from monoid_agent_kernel.core.authority import (
     ActivationWriteAuthority,
     WriteAuthorityRevoked,
 )
+from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import (
     LocalFsCheckpointStore,
     RunCheckpoint,
@@ -284,6 +285,7 @@ def _loop_factory(
             run_sink=runtime.run_sink,
             writer_token=runtime.writer_token,
             write_authority=runtime.write_authority,
+            cancellation_token=runtime.cancellation_token,
             authoritative_event_sinks=(runtime.event_sink,),
             event_sequence_seed=runtime.event_sequence_seed,
             status_file=False,
@@ -1047,6 +1049,7 @@ def test_activation_driver_rejects_duplicate_authoritative_event_sink(tmp_path: 
             run_sink=runtime.run_sink,
             writer_token=runtime.writer_token,
             write_authority=runtime.write_authority,
+            cancellation_token=runtime.cancellation_token,
             authoritative_event_sinks=(runtime.event_sink, runtime.event_sink),
             event_sequence_seed=runtime.event_sequence_seed,
             status_file=False,
@@ -1057,6 +1060,39 @@ def test_activation_driver_rejects_duplicate_authoritative_event_sink(tmp_path: 
             sink=harness.sink,
             writer_token=token,
             loop_factory=duplicate_factory,
+        ).drive(command)
+
+
+def test_activation_driver_requires_exact_cancellation_token(tmp_path: Path) -> None:
+    harness, token, checkpoint, spec = _seed_checkpoint(
+        tmp_path,
+        run_id="activation-cancellation-token",
+    )
+    command = _command(checkpoint)
+
+    def wrong_token_factory(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
+        return AgentLoop(
+            spec=AgentRunSpec(
+                run_id=command.run_id,
+                workspace_root=spec.workspace_root,
+                run_root=tmp_path / "wrong-token-runs",
+            ),
+            model_adapter=_ForbiddenAdapter(),
+            runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+            run_sink=runtime.run_sink,
+            writer_token=runtime.writer_token,
+            write_authority=runtime.write_authority,
+            cancellation_token=CancellationToken(),
+            authoritative_event_sinks=(runtime.event_sink,),
+            event_sequence_seed=runtime.event_sequence_seed,
+            status_file=False,
+        )
+
+    with pytest.raises(RuntimeError, match="exact cancellation token"):
+        ActivationDriver(
+            sink=harness.sink,
+            writer_token=token,
+            loop_factory=wrong_token_factory,
         ).drive(command)
 
 

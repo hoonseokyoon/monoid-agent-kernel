@@ -1473,6 +1473,7 @@ def test_activation_process_replacement_converges_on_postgres_receipt(
             run_sink=runtime.run_sink,
             writer_token=runtime.writer_token,
             write_authority=runtime.write_authority,
+            cancellation_token=runtime.cancellation_token,
             authoritative_event_sinks=(runtime.event_sink,),
             event_sequence_seed=runtime.event_sequence_seed,
             status_file=False,
