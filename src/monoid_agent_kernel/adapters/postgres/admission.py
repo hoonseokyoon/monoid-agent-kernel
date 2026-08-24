@@ -737,6 +737,7 @@ class PostgresCommandAdmissionStore:
             or not self._token_matches(stored, token)
             or stored.delivery_state != "leased"
             or not stored.lease_active
+            or stored.run_terminal
         ):
             raise DispatchClaimLost("dispatch mutation requires the current active claim")
         return stored
@@ -756,6 +757,8 @@ class PostgresCommandAdmissionStore:
         try:
             with self.database.transaction() as connection:
                 with self.database.cursor(connection) as cursor:
+                    if not self._lock_run(cursor, token.run_id):
+                        raise DispatchClaimLost("dispatch run no longer exists")
                     stored = self._stored(cursor, token.run_id, token.command_id, for_update=True)
                     if (
                         stored is not None
@@ -821,6 +824,8 @@ class PostgresCommandAdmissionStore:
         try:
             with self.database.transaction() as connection:
                 with self.database.cursor(connection) as cursor:
+                    if not self._lock_run(cursor, token.run_id):
+                        raise DispatchClaimLost("dispatch run no longer exists")
                     stored = self._stored(cursor, token.run_id, token.command_id, for_update=True)
                     if (
                         stored is not None

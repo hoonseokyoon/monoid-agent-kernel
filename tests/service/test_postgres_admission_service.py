@@ -364,6 +364,69 @@ def test_terminal_run_reconciles_delivered_unbound_commands_without_transport(
         )
 
 
+@pytest.mark.parametrize("settlement", ("acknowledge", "retry", "reject"))
+def test_terminal_commit_fences_every_active_dispatch_settlement(
+    harness: _Harness,
+    tmp_path: Path,
+    settlement: str,
+) -> None:
+    token, _ = harness.seed(tmp_path, f"terminal-settlement-{settlement}")
+    harness.admission.admit(_request(token.run_id, "command-1"))
+    claim = harness.admission.claim_dispatch("owner-a", "claim-1", lease_s=10)
+    assert claim is not None
+    assert (
+        harness.sink.settle_terminal(
+            TerminalOutcome(
+                run_id=token.run_id,
+                kind="cancelled",
+                retry_eligibility=RetryEligibility.FORBIDDEN,
+                error_code="cancelled",
+            ),
+            writer_token=token,
+        ).status
+        == "committed"
+    )
+
+    with pytest.raises(DispatchClaimLost):
+        if settlement == "acknowledge":
+            harness.admission.acknowledge_dispatch(
+                claim.token,
+                DispatchResult(status="accepted", dispatch_ref="temporal:too-late"),
+            )
+        elif settlement == "retry":
+            harness.admission.retry_dispatch(
+                claim.token,
+                error_code="transport_busy",
+                delay_s=0,
+            )
+        else:
+            harness.admission.reject_dispatch(
+                claim.token,
+                error_code="transport_rejected",
+            )
+
+    receipt = harness.admission.receipt(token.run_id, "command-1")
+    assert receipt is not None
+    assert receipt.state == "run_terminal"
+    assert receipt.error_code == "run_terminal"
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT delivery_state FROM {} WHERE run_id = %s AND command_id = %s"
+                ).format(
+                    sql.Identifier(
+                        harness.database.config.schema,
+                        "activation_dispatch_outbox",
+                    )
+                ),
+                (token.run_id, "command-1"),
+            )
+            assert cursor.fetchone() == ("leased",)
+    assert harness.admission.claim_dispatch("owner-b", "terminal-reconcile", lease_s=1) is None
+    assert harness.admission.receipt(token.run_id, "command-1") == receipt
+
+
 def test_concurrent_admission_converges_and_assigns_one_sequence_per_run(
     harness: _Harness,
     tmp_path: Path,
