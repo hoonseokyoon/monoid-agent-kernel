@@ -26,7 +26,7 @@ from .records import (
 try:
     from temporalio import workflow
     from temporalio.common import RetryPolicy
-    from temporalio.exceptions import ApplicationError
+    from temporalio.exceptions import ActivityError, ApplicationError, RetryState
 except ImportError as exc:  # pragma: no cover - exercised by isolated import tests
     raise TemporalDependencyMissing(
         "install monoid-agent-kernel[temporal] to use the Temporal Workflow"
@@ -38,6 +38,9 @@ _NON_RETRYABLE_ACTIVITY_ERROR_TYPES = (
     "monoid.activation_unsupported",
     "monoid.activation_config_conflict",
 )
+_ACTIVITY_REDRIVE_DELAY = timedelta(seconds=5)
+_MAX_ACTIVITY_REDRIVES_PER_EXECUTION = 100
+_ACTIVITY_RETRY_EXHAUSTED_CODE = "temporal_activity_retry_exhausted"
 
 
 @workflow.defn(name=TEMPORAL_RUN_WORKFLOW_TYPE)
@@ -134,7 +137,15 @@ class TemporalRunWorkflow:
             last_error_code=self._last_error_code,
         )
 
-    async def _drive(self, command: AdmittedCommand) -> TemporalActivationResult:
+    async def _drive(
+        self,
+        command: AdmittedCommand,
+        *,
+        redrive_count: int = 0,
+    ) -> TemporalActivationResult:
+        activity_id = f"activation-{command.command_sequence}-{command.identity_sha256[:16]}"
+        if redrive_count:
+            activity_id = f"{activity_id}-redrive-{redrive_count}"
         raw_result = await workflow.execute_activity(
             TEMPORAL_DRIVE_ACTIVATION_ACTIVITY,
             command.to_json(),
@@ -152,7 +163,7 @@ class TemporalRunWorkflow:
                 non_retryable_error_types=_NON_RETRYABLE_ACTIVITY_ERROR_TYPES,
             ),
             cancellation_type=workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
-            activity_id=(f"activation-{command.command_sequence}-{command.identity_sha256[:16]}"),
+            activity_id=activity_id,
         )
         try:
             result = TemporalActivationResult.from_json(raw_result)
@@ -177,7 +188,25 @@ class TemporalRunWorkflow:
             await workflow.wait_condition(lambda: self._next_sequence in self._pending)
             command = self._pending.pop(self._next_sequence)
             self._in_flight = command
-            result = await self._drive(command)
+            redrive_count = 0
+            while True:
+                try:
+                    result = await self._drive(command, redrive_count=redrive_count)
+                    break
+                except ActivityError as exc:
+                    if exc.retry_state != RetryState.MAXIMUM_ATTEMPTS_REACHED:
+                        raise
+                    redrive_count += 1
+                    self._last_error_code = _ACTIVITY_RETRY_EXHAUSTED_CODE
+                    if (
+                        redrive_count >= _MAX_ACTIVITY_REDRIVES_PER_EXECUTION
+                        or workflow.info().is_continue_as_new_suggested()
+                    ):
+                        self._pending[command.command_sequence] = command
+                        self._in_flight = None
+                        await workflow.wait_condition(workflow.all_handlers_finished)
+                        workflow.continue_as_new(self._continue_state().to_json())
+                    await workflow.sleep(_ACTIVITY_REDRIVE_DELAY)
             self._latest_receipt_ref = result.receipt_ref
             self._next_sequence += 1
             self._commands_since_rollover += 1

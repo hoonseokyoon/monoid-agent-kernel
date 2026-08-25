@@ -22,7 +22,7 @@ if os.environ.get("MONOID_SERVICE_PROFILE") not in {"temporal", "combined"}:
 from temporalio import activity  # noqa: E402
 from temporalio.api.workflowservice.v1 import GetSystemInfoRequest  # noqa: E402
 from temporalio.client import WorkflowHistory  # noqa: E402
-from temporalio.exceptions import WorkflowAlreadyStartedError  # noqa: E402
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError  # noqa: E402
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
@@ -48,6 +48,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
 _ACTIVITY_ORDER: dict[str, list[int]] = defaultdict(list)
 _ACTIVITY_STARTED: dict[tuple[str, int], asyncio.Event] = {}
 _ACTIVITY_RELEASE: dict[tuple[str, int], asyncio.Event] = {}
+_ACTIVITY_RETRYABLE_FAILURES: dict[tuple[str, int], int] = {}
 
 
 class _RaisingTemporalClient:
@@ -64,6 +65,14 @@ async def _drive_test_activation(payload: dict[str, Any]) -> dict[str, Any]:
     command = AdmittedCommand.from_json(payload)
     coordinate = (command.run_id, command.command_sequence)
     _ACTIVITY_ORDER[command.run_id].append(command.command_sequence)
+    failures_remaining = _ACTIVITY_RETRYABLE_FAILURES.get(coordinate, 0)
+    if failures_remaining:
+        _ACTIVITY_RETRYABLE_FAILURES[coordinate] = failures_remaining - 1
+        raise ApplicationError(
+            "retryable qualification failure",
+            type="monoid.qualification_retryable",
+            non_retryable=False,
+        )
     started = _ACTIVITY_STARTED.get(coordinate)
     if started is not None:
         started.set()
@@ -285,6 +294,60 @@ def test_temporal_signal_with_start_orders_and_deduplicates_on_actual_server() -
                 )
                 assert closed.status == "rejected"
                 assert closed.error_code == "temporal_workflow_closed"
+
+    asyncio.run(run())
+
+
+def test_temporal_activity_retry_exhaustion_redrives_without_closing_workflow() -> None:
+    executable, _ = _prepare_temporal_cli()
+
+    async def run() -> None:
+        run_id = f"retry-exhaustion-{uuid.uuid4().hex}"
+        coordinate = (run_id, 1)
+        _ACTIVITY_ORDER.pop(run_id, None)
+        _ACTIVITY_RETRYABLE_FAILURES[coordinate] = 2
+        try:
+            async with await WorkflowEnvironment.start_local(
+                dev_server_existing_path=executable,
+                dev_server_log_level="warn",
+            ) as environment:
+                task_queue = f"monoid-v023-{uuid.uuid4().hex}"
+                policy = TemporalRunPolicy(
+                    activity_task_queue=task_queue,
+                    activity_max_attempts=2,
+                )
+                transport = TemporalSignalWithStartTransport(
+                    client=environment.client,
+                    event_loop=asyncio.get_running_loop(),
+                    workflow_task_queue=task_queue,
+                    run_policy=policy,
+                )
+                command = _admitted_command(run_id, 1, terminal=True)
+
+                accepted = await transport.dispatch_async(command)
+                assert accepted.status == "accepted"
+                handle = environment.client.get_workflow_handle(
+                    temporal_workflow_id(run_id),
+                    result_type=dict,
+                )
+                async with Worker(
+                    environment.client,
+                    task_queue=task_queue,
+                    workflows=[TemporalRunWorkflow],
+                    activities=[_drive_test_activation],
+                ):
+                    terminal = TemporalRunStatus.from_json(await handle.result())
+                    history = await handle.fetch_history()
+                    await Replayer(workflows=[TemporalRunWorkflow]).replay_workflow(history)
+
+                assert _ACTIVITY_ORDER[run_id] == [1, 1, 1]
+                assert terminal.phase == "terminal"
+                assert terminal.next_command_sequence == 2
+                assert terminal.last_error_code == "temporal_activity_retry_exhausted"
+                _assert_history_payload_privacy(history)
+        finally:
+            _ACTIVITY_RETRYABLE_FAILURES.pop(coordinate, None)
+            _ACTIVITY_ORDER.pop(run_id, None)
 
     asyncio.run(run())
 

@@ -382,9 +382,16 @@ PostgreSQL sequence and immutable admitted-command identity, buffers future sequ
 one Activity for each sequence. A closed Workflow ID rejects another start, allowing the outbox lane
 to enter an operator-visible terminal/dead-letter disposition.
 
-The Workflow checks Temporal's Continue-As-New suggestion after every completed Activity. It waits
-for Signal handlers, transfers no in-flight Activity, and carries ordered pending commands, the next
-sequence, latest receipt ref, policy, build, and operational counters into the new Run ID. Keep
+`activity_max_attempts` bounds one Temporal Activity retry batch. When a retryable failure exhausts
+that batch, the Workflow records `temporal_activity_retry_exhausted`, waits five seconds, and
+schedules a new Activity with a distinct content-free ID for the same admitted command. PostgreSQL
+fencing and the paid-call journal make the redrive safe. A non-retryable Activity failure keeps its
+fail-stop behavior.
+
+The Workflow checks Temporal's Continue-As-New suggestion after every completed Activity and after
+retry exhaustion. It also rolls over after 100 exhausted batches. It waits for Signal handlers,
+returns an exhausted in-flight command to the ordered pending set, and carries pending commands, the
+next sequence, latest receipt ref, policy, build, and operational counters into the new Run ID. Keep
 `history_rollover_command_limit=0` in production to follow the service suggestion. A small positive
 value is a deterministic qualification hook.
 

@@ -147,6 +147,14 @@ mutation. Preserve the same invocation idempotency key during recovery. A `dispa
 `unknown` invocation blocks automatic paid-provider retry until reconciliation establishes a safe
 result.
 
+A retryable Temporal Activity failure receives the configured attempts within one retry batch. An
+exhausted batch remains in the same per-run Workflow, exposes
+`temporal_activity_retry_exhausted` through the public-safe status, and redrives the same admitted
+command after five seconds. The Workflow uses a distinct Activity ID for each redrive and rolls over
+with the command restored to the pending set when Temporal suggests Continue-As-New or 100 batches
+have exhausted. Investigate repeated exhaustion as an infrastructure incident; keep the Workflow
+and PostgreSQL admission records intact while restoring the Activity worker or its dependencies.
+
 ## Object inventory, garbage collection, and multipart cleanup
 
 Keep bucket versioning enabled. `S3ObjectStoreAdmin.inventory_page()` returns bounded content-address
