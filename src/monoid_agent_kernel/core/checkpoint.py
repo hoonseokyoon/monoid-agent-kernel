@@ -21,19 +21,30 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args
 
 from monoid_agent_kernel.core._util import file_lock, sha256_bytes, write_json_atomic
 from monoid_agent_kernel.core.cancellation import is_operational_cancellation_cause
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
+    is_portable_json_integer,
     loads_json_ingress,
     normalize_json_ingress,
 )
+from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.media import BLOB_SCHEME, blob_shas_in_messages
 from monoid_agent_kernel.core.model_invocation import decode_model_invocation
-from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.model_io import is_recorded_digest
+from monoid_agent_kernel.core.outcome import (
+    InterruptionCause,
+    RetryEligibility,
+    TerminalOutcomeKind,
+)
+from monoid_agent_kernel.core.safe_evidence import (
+    is_safe_opaque_address,
+    is_safe_taxonomy_code,
+)
 from monoid_agent_kernel.core._storage_capabilities import StorageCapabilities
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
@@ -488,6 +499,74 @@ def _validate_receipts(value: object) -> None:
                 raise ValueError(
                     f"checkpoint applied_input_receipts.{input_id}.{field_name} must be a string"
                 )
+        activation_identity = receipt.get("command_identity_sha256")
+        if activation_identity is None:
+            continue
+        field_prefix = f"applied_input_receipts.{input_id}"
+        if not is_recorded_digest(activation_identity):
+            raise ValueError(
+                f"checkpoint {field_prefix}.command_identity_sha256 must be a SHA-256 digest"
+            )
+        if input_id != f"monoid.activation/{activation_identity}":
+            raise ValueError(f"checkpoint {field_prefix} activation identity is inconsistent")
+        required_activation_fields = {
+            "checkpoint_seq",
+            "checkpoint_sha256",
+            "state",
+            "terminal",
+            "suspension",
+            "event_cursor",
+            "stream_cursor",
+            "outcome_kind",
+            "retry_eligibility",
+            "error_code",
+            "provider_error_code",
+            "interruption_cause",
+            "terminal_outcome_ref",
+        }
+        if not required_activation_fields.issubset(receipt):
+            raise ValueError(f"checkpoint {field_prefix} activation receipt is incomplete")
+        if not is_recorded_digest(receipt["checkpoint_sha256"]):
+            raise ValueError(f"checkpoint {field_prefix}.checkpoint_sha256 is invalid")
+        try:
+            SessionState(receipt["state"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"checkpoint {field_prefix}.state is invalid") from exc
+        for cursor_name in ("event_cursor", "stream_cursor"):
+            cursor = receipt[cursor_name]
+            if not is_portable_json_integer(cursor) or cursor < 0:
+                raise ValueError(
+                    f"checkpoint {field_prefix}.{cursor_name} must be a non-negative portable integer"
+                )
+        if receipt["outcome_kind"] not in get_args(TerminalOutcomeKind):
+            raise ValueError(f"checkpoint {field_prefix}.outcome_kind is invalid")
+        try:
+            RetryEligibility(receipt["retry_eligibility"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"checkpoint {field_prefix}.retry_eligibility is invalid") from exc
+        for code_name in ("error_code", "provider_error_code"):
+            code = receipt[code_name]
+            if type(code) is not str or (code and not is_safe_taxonomy_code(code)):
+                raise ValueError(f"checkpoint {field_prefix}.{code_name} is invalid")
+        cause = receipt["interruption_cause"]
+        if type(cause) is not str:
+            raise ValueError(f"checkpoint {field_prefix}.interruption_cause must be a string")
+        if cause:
+            try:
+                InterruptionCause(cause)
+            except ValueError as exc:
+                raise ValueError(
+                    f"checkpoint {field_prefix}.interruption_cause is invalid"
+                ) from exc
+        terminal_ref = receipt["terminal_outcome_ref"]
+        if type(terminal_ref) is not str or (
+            terminal_ref and not is_safe_opaque_address(terminal_ref)
+        ):
+            raise ValueError(f"checkpoint {field_prefix}.terminal_outcome_ref is invalid")
+        if bool(terminal_ref) is not receipt["terminal"]:
+            raise ValueError(
+                f"checkpoint {field_prefix}.terminal_outcome_ref disagrees with terminal"
+            )
 
 
 def _validate_checkpoint_payload(payload: dict[str, Any]) -> None:

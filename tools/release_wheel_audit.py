@@ -10,18 +10,72 @@ from pathlib import Path
 from zipfile import ZipFile
 
 
-EXPECTED_VERSION = "0.22.0"
+EXPECTED_VERSION = "0.23.0"
 EXPECTED_BASE_DEPENDENCIES = {"click", "jsonschema", "pathspec", "pydantic"}
 REQUIRED_MEMBERS = {
     "monoid_agent_kernel/core/authority.py",
     "monoid_agent_kernel/core/model_invocation.py",
     "monoid_agent_kernel/core/outcome.py",
     "monoid_agent_kernel/hosting/__init__.py",
+    "monoid_agent_kernel/hosting/activation.py",
+    "monoid_agent_kernel/hosting/admission.py",
+    "monoid_agent_kernel/hosting/authority.py",
     "monoid_agent_kernel/hosting/commit_results.py",
     "monoid_agent_kernel/hosting/contracts.py",
+    "monoid_agent_kernel/hosting/execution.py",
+    "monoid_agent_kernel/hosting/object_store_admin.py",
+    "monoid_agent_kernel/hosting/operations.py",
+    "monoid_agent_kernel/hosting/stream_observer.py",
+    "monoid_agent_kernel/hosting/streams.py",
+    "monoid_agent_kernel/adapters/__init__.py",
+    "monoid_agent_kernel/adapters/postgres/__init__.py",
+    "monoid_agent_kernel/adapters/postgres/admission.py",
+    "monoid_agent_kernel/adapters/postgres/authority.py",
+    "monoid_agent_kernel/adapters/postgres/config.py",
+    "monoid_agent_kernel/adapters/postgres/migrations.py",
+    "monoid_agent_kernel/adapters/postgres/object_store.py",
+    "monoid_agent_kernel/adapters/postgres/operations.py",
+    "monoid_agent_kernel/adapters/postgres/pool.py",
+    "monoid_agent_kernel/adapters/postgres/sink.py",
+    "monoid_agent_kernel/adapters/postgres/streams.py",
+    "monoid_agent_kernel/adapters/postgres/sql/0001_authority.sql",
+    "monoid_agent_kernel/adapters/postgres/sql/0002_checkpoint_invocation.sql",
+    "monoid_agent_kernel/adapters/postgres/sql/0003_event_terminal_evidence_outbox.sql",
+    "monoid_agent_kernel/adapters/postgres/sql/0004_object_association_gc.sql",
+    "monoid_agent_kernel/adapters/postgres/sql/0005_activation_admission_dispatch.sql",
+    "monoid_agent_kernel/adapters/postgres/sql/0006_durable_stream.sql",
+    "monoid_agent_kernel/adapters/object_store/__init__.py",
+    "monoid_agent_kernel/adapters/object_store/config.py",
+    "monoid_agent_kernel/adapters/object_store/s3.py",
+    "monoid_agent_kernel/adapters/temporal/__init__.py",
+    "monoid_agent_kernel/adapters/temporal/activity.py",
+    "monoid_agent_kernel/adapters/temporal/dependency.py",
+    "monoid_agent_kernel/adapters/temporal/dispatcher.py",
+    "monoid_agent_kernel/adapters/temporal/names.py",
+    "monoid_agent_kernel/adapters/temporal/records.py",
+    "monoid_agent_kernel/adapters/temporal/worker.py",
+    "monoid_agent_kernel/adapters/temporal/workflow.py",
+    "monoid_agent_kernel/hosting/blobs.py",
+    "monoid_agent_kernel/observability/operations.py",
+    "monoid_agent_kernel/conformance/blob_store.py",
+    "monoid_agent_kernel/conformance/durable_stream.py",
     "monoid_agent_kernel/conformance/fixtures/compatibility-v1.json",
 }
-FORBIDDEN_VENDORED_PACKAGES = {"dbos", "psycopg", "psycopg2", "redis", "temporalio"}
+FORBIDDEN_VENDORED_PACKAGES = {
+    "boto3",
+    "botocore",
+    "dbos",
+    "psycopg",
+    "psycopg2",
+    "redis",
+    "temporalio",
+}
+EXPECTED_DURABLE_EXTRA_DEPENDENCIES = {
+    "postgres": {"psycopg", "psycopg-pool"},
+    "object-store-s3": {"boto3"},
+    "temporal": {"temporalio"},
+    "durable-host": {"psycopg", "psycopg-pool", "boto3", "temporalio"},
+}
 
 
 def _requirement_name(requirement: str) -> str:
@@ -66,6 +120,23 @@ def audit_wheel(wheel_path: Path) -> None:
         if forbidden_base:
             raise ValueError(f"platform packages became base dependencies: {forbidden_base}")
 
+        provided_extras = set(metadata.get_all("Provides-Extra", []))
+        missing_extras = sorted(EXPECTED_DURABLE_EXTRA_DEPENDENCIES.keys() - provided_extras)
+        if missing_extras:
+            raise ValueError(f"release wheel is missing durable extras: {missing_extras}")
+        durable_requirements: dict[str, set[str]] = {
+            extra: set() for extra in EXPECTED_DURABLE_EXTRA_DEPENDENCIES
+        }
+        for requirement in requirements:
+            matched_extra = re.search(r"extra\s*==\s*['\"]([^'\"]+)['\"]", requirement)
+            if matched_extra and matched_extra.group(1) in durable_requirements:
+                durable_requirements[matched_extra.group(1)].add(_requirement_name(requirement))
+        if durable_requirements != EXPECTED_DURABLE_EXTRA_DEPENDENCIES:
+            raise ValueError(
+                "release wheel durable extra dependencies differ from the v0.23 boundary: "
+                f"{durable_requirements}"
+            )
+
         fixture = json.loads(
             archive.read(
                 "monoid_agent_kernel/conformance/fixtures/compatibility-v1.json"
@@ -78,6 +149,15 @@ def audit_wheel(wheel_path: Path) -> None:
             "checkpoint-v022-additive-v1",
             "terminal-outcome-current-v1",
             "model-invocation-current-v1",
+            "admission-request-v023-v1",
+            "admitted-command-v023-v1",
+            "admission-receipt-v023-v1",
+            "activation-command-v023-v1",
+            "activation-receipt-v023-v1",
+            "temporal-run-policy-v023-v1",
+            "temporal-run-state-v023-v1",
+            "temporal-activation-result-v023-v1",
+            "temporal-run-status-v023-v1",
         }
         missing_fixtures = sorted(required_fixture_ids - fixture_ids)
         if missing_fixtures:

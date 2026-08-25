@@ -1,0 +1,172 @@
+{
+  "schema_version": 2,
+  "campaign": "v0.23",
+  "categories": {
+    "migration_rolling": [
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_explicit_migration_lifecycle_and_doctor",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_forward_schema_uses_declared_reader_and_writer_floors",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_migration_advisory_lock_serializes_independent_runners",
+        "profiles": ["combined", "objectstore", "postgres"]
+      }
+    ],
+    "postgres_authority_sink": [
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_db_clock_writer_claim_renew_release_and_handoff",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_concurrent_expiry_handoff_has_one_generation_winner_across_pools",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_sink_service.py::test_actual_postgres_satisfies_full_fenced_run_sink_contract",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_sink_service.py::test_all_sink_mutations_use_canonical_readback_after_ambiguous_commit",
+        "profiles": ["combined", "objectstore", "postgres"]
+      }
+    ],
+    "objectstore_gc": [
+      {
+        "node_id": "tests/service/test_object_store_service.py::test_s3_adapter_conditional_race_converges_on_pinned_minio",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_object_store_service.py::test_s3_adapter_reconciles_actual_commit_after_response_loss",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_object_store_service.py::test_s3_admin_inventory_conditional_delete_and_response_loss_on_pinned_minio",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_sink_service.py::test_external_object_upload_followed_by_postgres_rollback_is_not_canonical",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_sink_service.py::test_gc_and_association_digest_lock_race_has_only_two_safe_outcomes",
+        "profiles": ["combined", "objectstore"]
+      }
+    ],
+    "temporal_workflow": [
+      {
+        "node_id": "tests/service/test_temporal_service.py::test_temporal_signal_with_start_orders_and_deduplicates_on_actual_server",
+        "profiles": ["combined", "temporal"]
+      },
+      {
+        "node_id": "tests/service/test_temporal_service.py::test_temporal_continue_as_new_transfers_pending_command_on_actual_server",
+        "profiles": ["combined", "temporal"]
+      },
+      {
+        "node_id": "tests/service/test_temporal_service.py::test_checked_in_temporal_v1_history_replays",
+        "profiles": ["combined", "temporal"]
+      }
+    ],
+    "worker_crash_drain": [
+      {
+        "node_id": "tests/service/test_temporal_postgres_activity_service.py::test_worker_kill_takes_over_expired_generation_without_repeating_paid_call",
+        "profiles": ["combined"]
+      },
+      {
+        "node_id": "tests/service/test_temporal_postgres_activity_service.py::test_worker_shutdown_during_paid_call_commits_reconciliation_receipt",
+        "profiles": ["combined"]
+      },
+      {
+        "node_id": "tests/service/test_temporal_postgres_activity_service.py::test_worker_shutdown_before_provider_entry_commits_graceful_drain_receipt",
+        "profiles": ["combined"]
+      }
+    ],
+    "paid_call_crash_matrix": [
+      {
+        "node_id": "tests/test_agent_loop_durable_recovery.py::test_reserved_dispatch_resumes_once_with_stored_idempotency_key",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_agent_loop_durable_recovery.py::test_started_dispatch_becomes_unknown_without_provider_reentry",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_agent_loop_durable_recovery.py::test_settled_success_replays_private_result_without_provider_call",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_model_stream_observer.py::test_dispatch_preparation_failure_aborts_before_provider_entry",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_model_call_runner.py::test_settlement_preparation_failure_marks_paid_dispatch_unknown",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_model_call_runner.py::test_hard_crash_failpoints_leave_the_last_committed_head_without_compensation",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_model_call_runner.py::test_ambiguous_transport_failure_becomes_unknown_and_disables_kernel_retry",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      },
+      {
+        "node_id": "tests/test_model_call_runner.py::test_settlement_write_failure_closes_the_started_dispatch_as_unknown",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      }
+    ],
+    "durable_stream": [
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_actual_postgres_objectstore_passes_reusable_stream_contract",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_actual_postgres_objectstore_stream_reconnect_reset_seal_and_terminal_race",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_actual_stream_store_fences_takeover_and_model_observer_persists",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_actual_stream_terminal_reset_races_and_slow_seal_do_not_starve_renewal",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_gc_delete_between_put_check_and_digest_lock_cannot_publish_chunk",
+        "profiles": ["combined", "objectstore"]
+      }
+    ],
+    "operations": [
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_operations_snapshot_is_read_only_and_aggregate_only",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_operations_outbox_lag_uses_claimable_rows_only",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_postgres_service.py::test_operations_snapshot_keeps_schema_and_aggregates_point_in_time",
+        "profiles": ["combined", "objectstore", "postgres"]
+      },
+      {
+        "node_id": "tests/service/test_durable_stream_service.py::test_actual_operations_snapshot_and_s3_doctor_are_public_and_content_free",
+        "profiles": ["combined", "objectstore"]
+      },
+      {
+        "node_id": "tests/test_operations_otel.py::test_otel_operational_sink_exports_latest_public_gauges",
+        "profiles": ["combined", "core", "objectstore", "postgres", "temporal"]
+      }
+    ],
+    "privacy_combined": [
+      {
+        "node_id": "tests/service/test_temporal_postgres_activity_service.py::test_actual_temporal_postgres_objectstore_stream_path_is_content_private",
+        "profiles": ["combined"]
+      }
+    ]
+  }
+}

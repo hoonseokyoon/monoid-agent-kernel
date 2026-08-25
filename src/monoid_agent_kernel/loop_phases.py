@@ -120,6 +120,8 @@ class LoopBootstrapper:
                 loop.spec.run_root,
                 loop.spec.run_id,
                 extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
+                authoritative_event_sinks=loop.authoritative_event_sinks,
+                event_sequence_seed=loop.event_sequence_seed,
                 status_file=loop.status_file,
                 model_content_file=loop.model_content_file,
                 model_calls_file=loop.model_calls_file,

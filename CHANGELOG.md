@@ -7,6 +7,74 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-25
+
+### Added — PostgreSQL and ObjectStore production persistence
+
+- Added the optional PostgreSQL production adapter with explicit migrations, pooled transaction
+  boundaries, DB-clock writer leases, monotonic generations, and full fenced checkpoint,
+  invocation, event, evidence, terminal, admission, activation, stream, and outbox storage. Every
+  authoritative mutation checks the writer generation inside the same database transaction.
+- Added migration status, plan, apply, doctor, checksum, advisory-lock, reader-floor, and
+  writer-floor controls. PostgreSQL 16 and 18 qualification covers fresh and idempotent migration,
+  rolling readers, concurrent migration runners, generation handoff, canonical readback after
+  ambiguous commits, and complete fenced-sink conformance.
+- Added the optional S3-compatible content-addressed blob adapter with conditional single-part and
+  multipart creation, checked reads, digest and size verification, bounded response-loss
+  reconciliation, and run-scoped PostgreSQL associations. Pinned MinIO qualification covers
+  conditional races, multipart behavior, corrupt or missing objects, PostgreSQL rollback orphans,
+  inventory, and fenced garbage collection.
+
+### Added — durable admission, activation, and Temporal orchestration
+
+- Added strict v1 admission request, admitted command, admission receipt, activation command, and
+  activation receipt records. Stable command identity, per-run PostgreSQL ordering, transactional
+  dispatch outbox, duplicate delivery, terminal convergence, and canonical checkpoint receipts now
+  survive process replacement.
+- Added the optional Temporal per-run Workflow, Signal-With-Start dispatcher, Continue-As-New state,
+  versioned Workflow policy/status/result records, saved-history replay, and finite threaded
+  activation Activity. PostgreSQL remains the writer and terminal authority while Temporal owns
+  orchestration order, timers, retry, signals, and history rollover.
+- Added bounded Activity supervision for lease renewal, copied-context heartbeat and cancellation,
+  graceful drain, host shutdown, database timeouts, and worker takeover. Crash qualification proves
+  stale-generation rejection and preserves the paid-call journal across reserved, started,
+  unknown, and settled boundaries.
+- Added Workflow-owned redrive after a retryable Activity exhausts its bounded attempt batch. The
+  same admitted command remains live, uses a distinct Activity ID on each redrive, and transfers
+  through Continue-As-New during a long infrastructure outage.
+
+### Added — durable private model streams
+
+- Added the durable stream v1 contract and PostgreSQL/ObjectStore implementation for batched private
+  model output and reasoning. Generation, UTF-8 byte cursor, chunk metadata, reset receipt, seal,
+  and terminal coordination are fenced with the same run authority used by the canonical sink.
+- Added reconnect, reset, gap, takeover, seal, late-delta, response-loss, and garbage-collection race
+  qualification. Prepared stream settlement preserves the full accepted generation across a crash;
+  an ambiguous paid dispatch remains ineligible for automatic provider retry.
+
+### Added — production operations and release qualification
+
+- Added aggregate-only PostgreSQL operational snapshots, read-only migration and S3 doctor checks,
+  OpenTelemetry operational gauges, and production runbooks for startup, rolling migration,
+  rollback, drain, takeover, backup/restore, corruption, and dry-run-first garbage collection.
+- Added the versioned v0.23 qualification manifest and campaign lock. CI pins PostgreSQL 16/18,
+  MinIO, Temporal local server, Python SDK versions, profile-specific required tests, and evidence
+  digests for every merge candidate.
+- Added actual-service integration for PostgreSQL, MinIO, and Temporal together, including private
+  payload scans across Temporal history, PostgreSQL receipts, public operations snapshots, and
+  streamed content boundaries.
+
+### Changed — package and compatibility boundary
+
+- Added independent `postgres`, `object-store-s3`, and `temporal` extras plus the explicit
+  `durable-host` composition. The default installation retains the v0.22 base dependency set and
+  imports root, hosting, and conformance surfaces without loading platform SDKs.
+- Registered the v0.23 admission, activation, Temporal, and live-stream record versions in the
+  compatibility ledger. Packaged fixtures exercise every new strict portable record alongside the
+  retained v0.21 and v0.22 checkpoint, terminal-outcome, and model-invocation fixtures.
+- Expanded wheel and install audits to require every production adapter module, PostgreSQL
+  migration, compatibility fixture, minimal import boundary, and all-adapter extra.
+
 ## [0.22.0] - 2026-08-23
 
 ### Added — portable production-boundary records

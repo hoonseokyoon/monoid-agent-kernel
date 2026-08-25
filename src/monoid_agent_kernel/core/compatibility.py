@@ -158,6 +158,84 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         source=("core/outcome.py:TerminalOutcome.from_json",),
         legacy_reader=True,
     ),
+    _monoid_artifact(
+        "admission-request.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/admission.py:AdmissionRequest.from_json",),
+        legacy_reader=True,
+        notes="Caller-selected identity and opaque private payload evidence for admission.",
+    ),
+    _monoid_artifact(
+        "admitted-command.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/admission.py:AdmittedCommand.from_json",),
+        legacy_reader=True,
+        notes="PostgreSQL-ordered content-free command reference for at-least-once delivery.",
+    ),
+    _monoid_artifact(
+        "admission-receipt.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/admission.py:AdmissionReceipt.from_json",),
+        legacy_reader=True,
+        notes="Content-free projection of dispatch, activation binding, and completion state.",
+    ),
+    _monoid_artifact(
+        "activation-command.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/activation.py:ActivationCommand.from_json",),
+        legacy_reader=True,
+        notes=(
+            "Content-free finite-activation identity with an opaque private payload address and "
+            "a canonical source-checkpoint digest."
+        ),
+    ),
+    _monoid_artifact(
+        "activation-receipt.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("hosting/activation.py:ActivationReceipt.from_json",),
+        legacy_reader=True,
+        notes=(
+            "Content-free operational copy reconstructed from the canonical checkpoint receipt "
+            "and terminal winner."
+        ),
+    ),
+    _monoid_artifact(
+        "temporal-run-policy.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunPolicy.from_json",),
+        legacy_reader=True,
+        notes="Recorded finite-Activity timeout, retry, task-queue, and rollover policy.",
+    ),
+    _monoid_artifact(
+        "temporal-run-state.v1",
+        kind="durable",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunState.from_json",),
+        legacy_reader=True,
+        notes="Content-free safe-point state transferred by Continue-As-New.",
+    ),
+    _monoid_artifact(
+        "temporal-activation-result.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalActivationResult.from_json",),
+        legacy_reader=True,
+        notes="Identity-bound Activity result containing only a receipt ref and terminal flag.",
+    ),
+    _monoid_artifact(
+        "temporal-run-status.v1",
+        kind="wire",
+        reader_policy="strict",
+        source=("adapters/temporal/records.py:TemporalRunStatus.from_json",),
+        legacy_reader=True,
+        notes="Operational Query and terminal-result projection without canonical authority.",
+    ),
     CompatibilityArtifact(
         key="model-stream-live",
         kind="wire",

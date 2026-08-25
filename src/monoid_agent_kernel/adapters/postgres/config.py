@@ -1,0 +1,92 @@
+"""Validated PostgreSQL adapter configuration without optional imports."""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass, field
+
+
+_SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z", re.ASCII)
+_RESERVED_SCHEMA_NAMES = frozenset({"information_schema"})
+_MAX_POSTGRES_BYTEA_BYTES = (1 << 30) - 1
+_MAX_POSTGRES_OPERATION_TIMEOUT_S = 86_400.0
+
+
+def _require_operation_timeout(value: object, field_name: str) -> None:
+    if (
+        type(value) not in {int, float}
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not 0 < float(value) <= _MAX_POSTGRES_OPERATION_TIMEOUT_S
+    ):
+        raise ValueError(
+            f"PostgreSQL {field_name} must be in the range "
+            f"(0, {_MAX_POSTGRES_OPERATION_TIMEOUT_S:g}]"
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PostgresConfig:
+    """Connection and pool policy for one PostgreSQL adapter family."""
+
+    dsn: str = field(repr=False)
+    schema: str = "monoid_kernel"
+    min_pool_size: int = 1
+    max_pool_size: int = 10
+    connect_timeout_s: int = 10
+    pool_timeout_s: float = 30.0
+    lock_timeout_s: float = 30.0
+    statement_timeout_s: float = 300.0
+    application_name: str = "monoid-agent-kernel"
+    max_bytea_blob_bytes: int = 8 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if type(self.dsn) is not str or not self.dsn.strip() or len(self.dsn) > 8192:
+            raise ValueError("PostgreSQL dsn must be a non-empty bounded string")
+        if "\x00" in self.dsn:
+            raise ValueError("PostgreSQL dsn cannot contain NUL")
+        if type(self.schema) is not str or _SCHEMA_PATTERN.fullmatch(self.schema) is None:
+            raise ValueError(
+                "PostgreSQL schema must be an ASCII identifier of at most 63 characters"
+            )
+        normalized_schema = self.schema.casefold()
+        if normalized_schema.startswith("pg_") or normalized_schema in _RESERVED_SCHEMA_NAMES:
+            raise ValueError("PostgreSQL schema cannot use a reserved system namespace")
+        if type(self.min_pool_size) is not int or self.min_pool_size < 0:
+            raise ValueError("PostgreSQL min_pool_size must be a non-negative integer")
+        if (
+            type(self.max_pool_size) is not int
+            or self.max_pool_size < 1
+            or self.max_pool_size < self.min_pool_size
+        ):
+            raise ValueError(
+                "PostgreSQL max_pool_size must be positive and at least min_pool_size"
+            )
+        if type(self.connect_timeout_s) is not int or self.connect_timeout_s < 1:
+            raise ValueError("PostgreSQL connect_timeout_s must be a positive integer")
+        if (
+            type(self.pool_timeout_s) not in {int, float}
+            or isinstance(self.pool_timeout_s, bool)
+            or not 0 < float(self.pool_timeout_s) <= 3600
+        ):
+            raise ValueError("PostgreSQL pool_timeout_s must be in the range (0, 3600]")
+        _require_operation_timeout(self.lock_timeout_s, "lock_timeout_s")
+        _require_operation_timeout(self.statement_timeout_s, "statement_timeout_s")
+        if (
+            type(self.application_name) is not str
+            or not self.application_name
+            or len(self.application_name.encode("utf-8")) > 63
+            or not all(character.isprintable() for character in self.application_name)
+        ):
+            raise ValueError("PostgreSQL application_name must be a bounded printable string")
+        if (
+            type(self.max_bytea_blob_bytes) is not int
+            or not 1 <= self.max_bytea_blob_bytes <= _MAX_POSTGRES_BYTEA_BYTES
+        ):
+            raise ValueError(
+                "PostgreSQL max_bytea_blob_bytes must be between 1 and 1073741823"
+            )
+
+
+__all__ = ["PostgresConfig"]

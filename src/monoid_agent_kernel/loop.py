@@ -68,6 +68,9 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamOutcome,
     ModelStreamStatus,
     ModelStreamWriter,
+    abort_model_stream,
+    begin_model_stream_dispatch,
+    prepare_model_stream_settlement,
     safe_open_model_stream,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
@@ -93,6 +96,7 @@ from monoid_agent_kernel.core.media import (
 )
 from monoid_agent_kernel.core.json_ingress import (
     UnportableValueError,
+    is_portable_json_integer,
     loads_json_ingress,
     normalize_json_ingress,
     normalize_unicode_scalars,
@@ -1365,6 +1369,10 @@ class AgentLoop:
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
+    # Durable host journals are ordered before local recorder projections. Hosts seed the shared
+    # EventBus from their authoritative cursor when a fresh process restores an existing run.
+    authoritative_event_sinks: tuple[EventSink, ...] = ()
+    event_sequence_seed: int = 0
     # Base provenance for model calls made by this run. AgentLoop supplies the authoritative
     # run/turn identity per call while preserving caller-owned Skill, batch, trace, and attributes.
     invocation_context: InvocationContext | None = None
@@ -1515,6 +1523,11 @@ class AgentLoop:
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
         if not isinstance(self.write_authority, ActivationWriteAuthority):
             raise AgentConfigError("write_authority must be an ActivationWriteAuthority")
+        if (
+            not is_portable_json_integer(self.event_sequence_seed)
+            or self.event_sequence_seed < 0
+        ):
+            raise AgentConfigError("event_sequence_seed must be a non-negative portable integer")
         self._authority_unsubscribe = self.write_authority.add_revoke_callback(
             self._wake_for_writer_authority_loss
         )
@@ -2933,6 +2946,8 @@ class AgentLoop:
             or wants_content_stream
         )
         observer_writers: tuple[ModelStreamWriter, ...] = ()
+        before_dispatch: Callable[[], None] | None = None
+        before_settlement: Callable[[], None] | None = None
         output_fragments: list[str] = []
 
         if wants_stream:
@@ -2947,6 +2962,8 @@ class AgentLoop:
                     run_id=self.spec.run_id,
                     root_run_id=self._validated_root_run_id(),
                     turn_id=turn_id,
+                    # This execution-local ID remains unique for legacy model-content sidecars.
+                    # Durable observers derive their reconnect address from run/turn lineage.
                     stream_id=f"stream_{uuid.uuid4().hex}",
                     step=step,
                     provider=provider,
@@ -2971,6 +2988,39 @@ class AgentLoop:
                     )
                     writers.append(writer)
                 observer_writers = tuple(writers)
+                if observer_writers:
+
+                    def abort_observer_writers() -> None:
+                        for writer in observer_writers:
+                            abort_model_stream(writer)
+
+                    def begin_observer_dispatch() -> None:
+                        self._assert_write_authority()
+                        try:
+                            for writer in observer_writers:
+                                self.write_authority.guard_external_call(
+                                    lambda writer=writer: begin_model_stream_dispatch(writer)
+                                )
+                        except BaseException:
+                            abort_observer_writers()
+                            raise
+                        self._assert_write_authority()
+
+                    before_dispatch = begin_observer_dispatch
+
+                    def prepare_observer_settlement() -> None:
+                        self._assert_write_authority()
+                        try:
+                            for writer in observer_writers:
+                                self.write_authority.guard_external_call(
+                                    lambda writer=writer: prepare_model_stream_settlement(writer)
+                                )
+                        except BaseException:
+                            abort_observer_writers()
+                            raise
+                        self._assert_write_authority()
+
+                    before_settlement = prepare_observer_settlement
 
             def delta_consumer(chunk: ModelStreamChunk) -> None:  # noqa: F811
                 self._assert_write_authority()
@@ -3027,6 +3077,8 @@ class AgentLoop:
                 context=invocation_context,
                 deadline=deadline,
                 delta_consumer=delta_consumer,
+                before_dispatch=before_dispatch,
+                before_settlement=before_settlement,
                 should_abort=should_abort,
                 logical_call_id=(
                     logical_model_call_id(self.spec.run_id, turn_id)

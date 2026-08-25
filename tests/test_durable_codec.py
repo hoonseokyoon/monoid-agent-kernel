@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sys
 
 from monoid_agent_kernel.core.durable_codec import DurableCodec, parse_artifact_version
 
@@ -53,7 +54,14 @@ def test_codec_classifies_a_recursive_defensive_copy_failure_as_corrupt() -> Non
     for _ in range(700):
         nested = {"nested": nested}
 
-    result = codec.decode({"schema_version": "monoid.demo.v1", "value": nested}, dict)
+    # pytest 9 raises the process recursion limit to 3000 while a test runs.  Pin the boundary this
+    # case is exercising so dependency upgrades cannot turn malformed-depth coverage into a pass.
+    previous_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(1000)
+        result = codec.decode({"schema_version": "monoid.demo.v1", "value": nested}, dict)
+    finally:
+        sys.setrecursionlimit(previous_limit)
 
     assert result.status == "corrupt"
     assert result.error_code == "demo_corrupt"

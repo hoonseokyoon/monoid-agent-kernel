@@ -60,6 +60,9 @@ default must be changed for production.
       `--auto-grant-capabilities` is **not** used in production.
 - [ ] Each run selects exactly one activation authority and proves fencing, per-run input ordering,
       idempotent receipts, admission limits, and credential-free durable records.
+- [ ] PostgreSQL `pool_timeout_s`, `lock_timeout_s`, and `statement_timeout_s` are below the
+      corresponding host or Temporal Activity operation bound. Temporal driver work leaves a
+      cleanup reserve inside `activity_start_to_close_timeout_s`.
 - [ ] Deployments derived from the Reference inbox assembly share durable checkpoint and lease
       stores plus one transactional command store across instances, enable owner watchdogs, set
       queue limits, isolate run roots and database access by tenant, and monitor persisted command
@@ -82,6 +85,10 @@ default must be changed for production.
       (`model_calls.jsonl` carries metadata only), and no projection, hydration
       path or HTTP route serves the replay corpus, so filesystem access is the
       only control over it (`monoid validate` and `monoid gc` read it in place).
+- [ ] Durable private stream reads are exposed only through a product-authenticated tenant/run
+      projection. PostgreSQL stream metadata stays content-free, ObjectStore chunk access remains
+      private, reconnect accepts committed cursor boundaries, and retention covers every old
+      generation retained after reset.
 - [ ] Only runtime event and metadata owners can write `run_root`. Tool workspaces,
       MCP servers, and untrusted processes cannot modify committed `events.jsonl`
       prefixes; the Reference warm offset index relies on this append-only boundary.
@@ -94,6 +101,29 @@ default must be changed for production.
       leave it off when the point is that no provider is contacted.
 - [ ] Application logs and OTel exporters do not carry bearer tokens or lease
       material.
+
+## Production durability adapters
+
+- [ ] PostgreSQL migration and runtime identities are separate; each role is restricted to the
+      selected schema and operation set.
+- [ ] PostgreSQL TLS verifies the server, pool/lock/statement timeouts fit inside the Activity
+      operation budget, and every store passes explicit `check_ready()` before traffic.
+- [ ] `PostgresMigrations.status()`, `plan()`, `doctor()`, and the reviewed explicit `apply()` step
+      agree on migration IDs, checksums, and reader/writer floors.
+- [ ] ObjectStore runtime and admin identities are separate; bucket policy restricts both to the
+      configured prefix and enables only their documented calls.
+- [ ] Bucket versioning is enabled, remote TLS is verified, server-side encryption policy is
+      configured, and `S3ObjectStoreAdmin.doctor()` passes before traffic.
+- [ ] GC begins with a reviewed dry-run plan; apply rechecks association/generation and archives
+      receipts. Multipart cleanup uses a separate reviewed age boundary.
+- [ ] Temporal namespace/task-queue access is scoped to the deployment, and Workflow history
+      contains only content-free command, policy, build, receipt, and status records.
+- [ ] Operational snapshots, doctor reports, public events, receipts, logs, traces, and Temporal
+      history pass a seeded private-marker and credential scan.
+- [ ] Backup/restore rehearsal restores ObjectStore versions before PostgreSQL, runs checked reads,
+      reconciles pending/unknown invocations, and starts dispatchers last.
+- [ ] Rolling deploy, rollback, drain, takeover, corruption response, and credential rotation follow
+      [the production adapter runbook](../PRODUCTION_OPERATIONS.md).
 
 ## Skills, MCP, and memory
 

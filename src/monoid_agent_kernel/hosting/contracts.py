@@ -134,6 +134,9 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
     invocation revision becomes authoritative. A loaded record exposes reused bytes through
     ``blob()``. Host adapters bind event and terminal writes to the same activation authority:
     either mutation returning ``fenced`` revokes that authority before the host continues.
+    Terminal settlement closes the public event journal. An exact retry of an event committed
+    before terminal settlement remains idempotent; every new event coordinate returns
+    ``conflict``.
     """
 
     def load_invocation(
@@ -178,12 +181,20 @@ class FencedRunSink(FencedCheckpointStore, Protocol):
         writer_token: WriterToken,
     ) -> CommitResult: ...
 
+    def latest_event_sequence(self, run_id: str) -> int:
+        """Return the authoritative event cursor, or zero before the first event."""
+        ...
+
     def settle_terminal(
         self,
         outcome: TerminalOutcome,
         *,
         writer_token: WriterToken,
     ) -> CommitResult: ...
+
+    def read_terminal(self, run_id: str) -> TerminalOutcome | None:
+        """Read and integrity-check the first-writer terminal winner."""
+        ...
 
 
 __all__ = [

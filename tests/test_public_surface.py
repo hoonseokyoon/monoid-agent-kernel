@@ -95,10 +95,15 @@ EXPECTED_CONTRACTS_ALL = [
     "ModelStreamStatus",
     "ModelStreamContext",
     "ModelStreamDelta",
+    "ModelStreamDispatchAwareWriter",
+    "ModelStreamSettlementAwareWriter",
     "ModelStreamOutcome",
     "ModelStreamWriter",
     "ModelStreamObserver",
     "ModelStreamObserverFactory",
+    "begin_model_stream_dispatch",
+    "prepare_model_stream_settlement",
+    "abort_model_stream",
     "safe_open_model_stream",
     "ModelCallRunner",
     # Writing a typed ``settled_sink`` needs the argument type, and every other type
@@ -180,12 +185,28 @@ EXPECTED_CONTRACTS_ALL = [
 ]
 
 REMOVED_PUBLIC_SURFACE_NAMES = [
+    "WriterAuthority",
+    "WriterLease",
+    "RenewResult",
+    "ReleaseResult",
+    "WriterLeaseUnavailable",
+    "WriterAuthorityStore",
+    "claim_writer_lease",
+    "renew_writer_lease",
     "WriterToken",
     "CommitResult",
     "ModelInvocationRecord",
     "StorageCapabilities",
     "FencedCheckpointStore",
     "FencedRunSink",
+    "ActivationCommand",
+    "ResolvedActivationInput",
+    "ActivationReceipt",
+    "ActivationRuntime",
+    "ActivationDriver",
+    "FencedEventSink",
+    "FencedTerminalBridge",
+    "TerminalSettlement",
     "LocalFsCheckpointStore",
     "read_checkpoint",
     "write_checkpoint",
@@ -402,6 +423,100 @@ def test_hosting_surface_is_narrow_and_explicit() -> None:
     import monoid_agent_kernel.hosting as hosting
 
     assert hosting.__all__ == [
+        "WriterAuthority",
+        "WriterLease",
+        "RenewResult",
+        "ReleaseResult",
+        "WriterLeaseUnavailable",
+        "WriterAuthorityStore",
+        "claim_writer_lease",
+        "renew_writer_lease",
+        "ActivationCommandKind",
+        "ActivationCommand",
+        "ResolvedActivationInput",
+        "ActivationReceipt",
+        "ActivationRuntime",
+        "ActivationLoopFactory",
+        "ActivationFaultHook",
+        "ActivationInputResolver",
+        "ActivationLoopConfigurationError",
+        "ActivationDriver",
+        "ADMISSION_REQUEST_SCHEMA_VERSION",
+        "ACCEPTED_ADMISSION_REQUEST_SCHEMA_VERSIONS",
+        "ADMITTED_COMMAND_SCHEMA_VERSION",
+        "ACCEPTED_ADMITTED_COMMAND_SCHEMA_VERSIONS",
+        "ADMISSION_RECEIPT_SCHEMA_VERSION",
+        "ACCEPTED_ADMISSION_RECEIPT_SCHEMA_VERSIONS",
+        "MAX_COMMAND_DISPATCH_LEASE_S",
+        "MAX_COMMAND_RETRY_DELAY_S",
+        "AdmissionState",
+        "DispatchStatus",
+        "AdmissionConflict",
+        "AdmissionRunUnavailable",
+        "AdmissionRunTerminal",
+        "DispatchClaimLost",
+        "ActivationBindingConflict",
+        "ActivationBindingWriterFenced",
+        "AdmissionRequest",
+        "AdmittedCommand",
+        "AdmissionReceipt",
+        "DispatchToken",
+        "DispatchClaim",
+        "DispatchResult",
+        "CommandTransport",
+        "CommandAdmissionStore",
+        "CommandDispatchStore",
+        "CommandOutboxDispatcher",
+        "FencedEventSink",
+        "FencedTerminalBridge",
+        "TerminalCommitStatus",
+        "TerminalSettlement",
+        "BlobStat",
+        "BlobPutResult",
+        "BlobStoreError",
+        "BlobNotFound",
+        "BlobCorrupt",
+        "BlobStoreConflict",
+        "BlobTooLarge",
+        "ContentAddressedBlobStore",
+        "is_content_sha256",
+        "ObjectInventoryEntry",
+        "ObjectInventoryPage",
+        "ObjectDeleteResult",
+        "IncompleteMultipartUpload",
+        "IncompleteMultipartPage",
+        "MultipartAbortResult",
+        "ObjectStoreAdmin",
+        "ObjectGcCandidate",
+        "ObjectGcPlan",
+        "ObjectGcReceipt",
+        "OperationalMetric",
+        "OperationalSnapshot",
+        "OperationalMetricSink",
+        "record_operational_snapshot",
+        "MAX_STREAM_CHUNK_BYTES",
+        "MAX_STREAM_READ_CHUNKS",
+        "durable_model_stream_id",
+        "StreamState",
+        "StreamOpenStatus",
+        "StreamResetStatus",
+        "StreamAppendStatus",
+        "StreamSealStatus",
+        "StreamReadStatus",
+        "DurableStreamIdentity",
+        "DurableStreamHead",
+        "DurableStreamChunk",
+        "DurableStreamReadChunk",
+        "DurableStreamOpenResult",
+        "DurableStreamResetResult",
+        "DurableStreamAppendResult",
+        "DurableStreamSealResult",
+        "DurableStreamReadResult",
+        "DurableStreamStore",
+        "DurableStreamWriteError",
+        "DurableStreamWriteRejected",
+        "DurableStreamWriterTimeout",
+        "DurableModelStreamObserver",
         "WriterToken",
         "CommitResult",
         "ModelInvocationRecord",
@@ -636,11 +751,16 @@ blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference.')
     or name.startswith('monoid_agent_kernel.hosting')
-    or name in {'openai', 'httpx', 'opentelemetry', 'dbos'}
+    or name.startswith('monoid_agent_kernel.adapters')
+    or name in {'openai', 'httpx', 'opentelemetry', 'dbos', 'psycopg', 'boto3', 'botocore', 'temporalio'}
     or name.startswith('openai.')
     or name.startswith('httpx.')
     or name.startswith('opentelemetry.')
     or name.startswith('dbos.')
+    or name.startswith('psycopg.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
+    or name.startswith('temporalio.')
 ]
 if blocked:
     raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
@@ -669,11 +789,123 @@ import monoid_agent_kernel.hosting
 blocked = [
     name for name in sys.modules
     if name.startswith('monoid_agent_kernel.reference')
-    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'temporalio'}
+    or name.startswith('monoid_agent_kernel.adapters')
+    or name in {'dbos', 'psycopg', 'psycopg2', 'redis', 'boto3', 'botocore', 'temporalio'}
     or name.startswith('dbos.')
     or name.startswith('psycopg.')
     or name.startswith('psycopg2.')
     or name.startswith('redis.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
+    or name.startswith('temporalio.')
+]
+if blocked:
+    raise SystemExit('unexpected imports: ' + ', '.join(sorted(blocked)))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_adapter_namespace_imports_are_explicit_and_dependency_lazy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    code = """
+import sys
+import monoid_agent_kernel.adapters as adapters
+import monoid_agent_kernel.adapters.postgres as postgres
+import monoid_agent_kernel.adapters.object_store as object_store
+import monoid_agent_kernel.adapters.temporal as temporal
+
+assert adapters.__all__ == []
+assert postgres.__all__ == [
+    'PostgresConfig',
+    'PostgresDependencyMissing',
+    'PostgresDatabaseClosed',
+    'UnsupportedPostgresVersion',
+    'PostgresHealth',
+    'PostgresDatabase',
+    'SCHEMA_VERSION',
+    'PostgresMigrationError',
+    'PostgresMigrationDrift',
+    'PostgresSchemaIncompatible',
+    'MigrationInfo',
+    'InstalledMigration',
+    'MigrationStatus',
+    'MigrationPlan',
+    'MigrationApplyResult',
+    'PostgresDoctorReport',
+    'bundled_migrations',
+    'PostgresMigrations',
+    'PostgresWriterAuthorityStore',
+    'PostgresAdmissionCorrupt',
+    'PostgresCommandAdmissionStore',
+    'PostgresBlobCorrupt',
+    'PostgresFencedRunSink',
+    'PostgresObjectAssociationCorrupt',
+    'PostgresObjectStoreFencedRunSink',
+    'PostgresObjectGarbageCollector',
+    'PostgresOperations',
+    'PostgresDurableStreamCorrupt',
+    'PostgresObjectStoreDurableStreamStore',
+]
+assert all(hasattr(postgres, name) for name in postgres.__all__)
+assert object_store.__all__ == [
+    'S3ObjectStoreConfig',
+    'S3DependencyMissing',
+    'S3ObjectStoreFailure',
+    'S3ObjectStoreDoctorReport',
+    'S3ContentAddressedBlobStore',
+    'S3ObjectStoreAdmin',
+]
+assert all(hasattr(object_store, name) for name in object_store.__all__)
+assert temporal.__all__ == [
+    'TemporalDependencyMissing',
+    'TEMPORAL_RUN_WORKFLOW_TYPE',
+    'TEMPORAL_COMMAND_SIGNAL',
+    'TEMPORAL_STATUS_QUERY',
+    'TEMPORAL_DRIVE_ACTIVATION_ACTIVITY',
+    'TEMPORAL_WORKFLOW_BUILD',
+    'DEFAULT_TEMPORAL_WORKFLOW_ID_PREFIX',
+    'TEMPORAL_RUN_POLICY_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_POLICY_SCHEMA_VERSIONS',
+    'TEMPORAL_RUN_STATE_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_STATE_SCHEMA_VERSIONS',
+    'TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_ACTIVATION_RESULT_SCHEMA_VERSIONS',
+    'TEMPORAL_RUN_STATUS_SCHEMA_VERSION',
+    'ACCEPTED_TEMPORAL_RUN_STATUS_SCHEMA_VERSIONS',
+    'MAX_ACTIVITY_TIMEOUT_S',
+    'MAX_ACTIVITY_ATTEMPTS',
+    'MAX_HISTORY_ROLLOVER_COMMANDS',
+    'MAX_TEMPORAL_RPC_TIMEOUT_S',
+    'TemporalRunPhase',
+    'TemporalRunPolicy',
+    'TemporalRunState',
+    'TemporalActivationResult',
+    'TemporalRunStatus',
+    'temporal_workflow_id',
+    'temporal_dispatch_ref',
+    'TemporalSignalWithStartTransport',
+]
+assert all(hasattr(temporal, name) for name in temporal.__all__)
+blocked = [
+    name for name in sys.modules
+    if name in {'psycopg', 'psycopg2', 'boto3', 'botocore', 'temporalio'}
+    or name.startswith('psycopg.')
+    or name.startswith('psycopg2.')
+    or name.startswith('boto3.')
+    or name.startswith('botocore.')
     or name.startswith('temporalio.')
 ]
 if blocked:
@@ -736,6 +968,23 @@ def test_v022_injected_constructor_dependencies_are_keyword_only() -> None:
         (ModelCallRunner, "current_write_authority"),
         (ModelCallRunner, "lifecycle_hook"),
         (TaskManager, "write_authority"),
+    ):
+        (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
+        assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"
+
+
+def test_v023_authoritative_event_dependencies_are_keyword_only() -> None:
+    """Durable journal injection preserves the pre-v0.23 positional constructor shapes."""
+    import dataclasses
+
+    from monoid_agent_kernel.loop import AgentLoop
+    from monoid_agent_kernel.recorder import AgentRecorder
+
+    for cls, name in (
+        (AgentLoop, "authoritative_event_sinks"),
+        (AgentLoop, "event_sequence_seed"),
+        (AgentRecorder, "authoritative_event_sinks"),
+        (AgentRecorder, "event_sequence_seed"),
     ):
         (fld,) = [item for item in dataclasses.fields(cls) if item.name == name]
         assert fld.kw_only, f"{cls.__name__}.{name} must preserve the positional ABI"

@@ -1246,7 +1246,7 @@ def test_limited_close_boundary_terminal_serves_one_classification(
 
 
 def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump(
-    tmp_path: Path, backend_factory: Any
+    tmp_path: Path, backend_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """TOCTOU half (a): the old cancel path read record.state on the HTTP thread and
     persisted later on the shared loop — a park state read just before the drive resumed
@@ -1265,6 +1265,29 @@ def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump
     assert stored is not None and stored.checkpoint.last_suspension is not None
     park_seq = stored.seq
 
+    # Observe the manifest inside the same synchronous shared-loop callback as the cancel
+    # ack. Once that callback returns, its close signal may immediately let the drive write
+    # its own cancellation boundary at this seq; reading from the test thread after
+    # ``cancel_run`` returns would then be observing the drive, not the ack under test.
+    ack_manifest: dict[str, Any] = {}
+    session_boundary = backend._session_boundary
+    ack_cancel = session_boundary._ack_cancel_on_drive_loop
+
+    def observe_cancel_ack(ack_record: Any) -> None:
+        ack_cancel(ack_record)
+        ack_manifest.update(
+            json.loads(
+                (
+                    ack_record.run_dir
+                    / "checkpoints"
+                    / str(park_seq)
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+        )
+
+    monkeypatch.setattr(session_boundary, "_ack_cancel_on_drive_loop", observe_cancel_ack)
+
     # The exact marker the pump clears synchronously at entry, before its first await —
     # from any shared-loop callable's view this IS "a pump owns the state now".
     record.loop._session.last_suspension = None
@@ -1274,13 +1297,8 @@ def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump
 
     # The committed park checkpoint's content is untouched (no same-seq overwrite): the
     # ack is honestly non-durable in this window rather than durably corrupting the park.
-    manifest = json.loads(
-        (record.run_dir / "checkpoints" / str(park_seq) / "manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert manifest["last_suspension"] is not None
-    assert manifest["cancellation_requested"] is False
+    assert ack_manifest["last_suspension"] is not None
+    assert ack_manifest["cancellation_requested"] is False
     assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.CANCELLED
 
 

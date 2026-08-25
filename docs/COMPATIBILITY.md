@@ -45,6 +45,15 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `llm-turn` | wire | `monoid.llm-turn.v1` | strict | `monoid.llm-turn.v1`<br>`native-agent-runner.llm-turn.v1` |
 | `llm-turn-result` | wire | `monoid.llm-turn-result.v1` | permissive; missing id accepted | `monoid.llm-turn-result.v1`<br>`native-agent-runner.llm-turn-result.v1` |
 | `terminal-outcome` | wire | `monoid.terminal-outcome.v1` | strict | `monoid.terminal-outcome.v1`<br>`native-agent-runner.terminal-outcome.v1` |
+| `admission-request` | wire | `monoid.admission-request.v1` | strict | `monoid.admission-request.v1`<br>`native-agent-runner.admission-request.v1` |
+| `admitted-command` | wire | `monoid.admitted-command.v1` | strict | `monoid.admitted-command.v1`<br>`native-agent-runner.admitted-command.v1` |
+| `admission-receipt` | wire | `monoid.admission-receipt.v1` | strict | `monoid.admission-receipt.v1`<br>`native-agent-runner.admission-receipt.v1` |
+| `activation-command` | wire | `monoid.activation-command.v1` | strict | `monoid.activation-command.v1`<br>`native-agent-runner.activation-command.v1` |
+| `activation-receipt` | wire | `monoid.activation-receipt.v1` | strict | `monoid.activation-receipt.v1`<br>`native-agent-runner.activation-receipt.v1` |
+| `temporal-run-policy` | wire | `monoid.temporal-run-policy.v1` | strict | `monoid.temporal-run-policy.v1`<br>`native-agent-runner.temporal-run-policy.v1` |
+| `temporal-run-state` | durable | `monoid.temporal-run-state.v1` | strict | `monoid.temporal-run-state.v1`<br>`native-agent-runner.temporal-run-state.v1` |
+| `temporal-activation-result` | wire | `monoid.temporal-activation-result.v1` | strict | `monoid.temporal-activation-result.v1`<br>`native-agent-runner.temporal-activation-result.v1` |
+| `temporal-run-status` | wire | `monoid.temporal-run-status.v1` | strict | `monoid.temporal-run-status.v1`<br>`native-agent-runner.temporal-run-status.v1` |
 | `model-stream-live` | wire | `monoid.model-stream.live.v1` | strict | `monoid.model-stream.live.v1` |
 | `web-search` | wire | `monoid.web-search.v1` | permissive; missing id accepted | `monoid.web-search.v1`<br>`native-agent-runner.web-search.v1` |
 | `web-search-result` | wire | `monoid.web-search-result.v1` | permissive; missing id accepted | `monoid.web-search-result.v1`<br>`native-agent-runner.web-search-result.v1` |
@@ -92,6 +101,52 @@ so an ambiguous paid call cannot be classified for automatic retry.
 The `limited` kind is a terminal v0.22 outcome and permits only `forbidden`; it keeps exhausted run
 limits distinct from a cooperative `paused` boundary. It was added inside the unreleased v0.22
 contract window, so deploy the current strict reader before a writer that can emit it.
+
+`monoid.admission-request.v1` binds a caller-selected command identity to a request digest and an
+opaque payload address. `monoid.admitted-command.v1` adds the PostgreSQL-assigned per-run sequence
+used for ordered, at-least-once delivery to an orchestrator. `monoid.admission-receipt.v1` projects
+dispatch state, the immutable activation binding, and canonical completion. These records carry
+opaque IDs, digests, addresses, counters, and public-safe taxonomy. Private command content and raw
+transport errors remain outside the wire records. The `run_terminal` receipt state closes an
+unapplied command when its run has already selected a canonical terminal winner; it may have zero
+dispatch attempts and carries the `run_terminal` error taxonomy. PostgreSQL projects admission,
+activation binding, and terminal evidence from one statement snapshot, so a concurrent bind and
+terminal commit cannot make a later receipt regress to an earlier lifecycle state.
+`MAX_COMMAND_RETRY_DELAY_S` defines the portable store range at 86,400 seconds. The finite
+dispatcher clamps larger retry-policy values before durable settlement, and dispatch-store adapters
+accept every finite delay in the inclusive range from zero through that maximum.
+`MAX_COMMAND_DISPATCH_LEASE_S` defines the matching portable lease maximum. Dispatchers validate
+their lease once at construction, and stores accept every finite lease in the interval
+`(0, MAX_COMMAND_DISPATCH_LEASE_S]`.
+
+`monoid.activation-command.v1` is the strict, orchestrator-neutral identity for one admitted input
+or control activation. It carries a canonical source-checkpoint digest, request digest, and bounded
+opaque payload address. Private input content, attempts, timestamps, and orchestrator identifiers
+stay outside the command, so retry and process replacement preserve the same identity.
+`monoid.activation-receipt.v1` is the content-free operational copy of the boundary stored in the
+canonical checkpoint receipt. It carries checkpoint identity, lifecycle state, event/stream
+cursors, terminal reference, and portable outcome taxonomy. Hosts reconstruct it from durable
+state after response loss; later checkpoint heads retain the original per-command boundary
+identity. The boundary digest blanks its own nested digest field before hashing to avoid a
+self-reference. Model output and raw exceptions never enter the receipt.
+
+The four Temporal v1 records keep long-lived orchestration content-free and replayable.
+`monoid.temporal-run-policy.v1` records the Activity queue, bounded timeout/retry controls, and
+optional deterministic qualification rollover threshold. `monoid.temporal-run-state.v1` carries
+the Workflow build, next PostgreSQL command sequence, ordered pending command refs, latest receipt
+ref, and bounded operational observations across Continue-As-New. It is transferred only at a safe
+point with no in-flight Activity. `monoid.temporal-activation-result.v1` binds one finite Activity
+result to the exact admitted-command identity and exposes only a canonical receipt ref plus the
+terminal flag. `monoid.temporal-run-status.v1` is a Query and terminal-result projection; it has no
+write or terminal authority. All four strict readers accept the retained namespace alias and reject
+unknown fields. Private model content, checkpoint bytes, credentials, and raw errors remain in the
+PostgreSQL/ObjectStore channels referenced by these records.
+
+The packaged compatibility fixture includes current v0.23 examples for admission request, admitted
+command, admission receipt, activation command, activation receipt, Temporal run policy, Temporal
+run state, Temporal activation result, and Temporal run status. CI round-trips each fixture through
+its strict reader and verifies the canonical writer output byte-for-structure. These fixtures ship
+beside the retained v0.21/v0.22 checkpoint and model-invocation examples.
 
 `monoid.model-invocation.v1` is the checked durable record for one revision of a logical model
 call. Current and retained namespace readers distinguish malformed data from future versions. The

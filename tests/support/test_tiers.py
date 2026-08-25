@@ -67,6 +67,8 @@ def primary_tier_for_path(path: Path) -> str:
     name = path.name
     if "/tests/conformance/" in f"/{normalized}" or name.endswith("_contract.py"):
         return "contract"
+    if "/tests/service/" in f"/{normalized}":
+        return "integration"
     if name.startswith("test_backend") or name.startswith("test_studio"):
         return "integration"
     if name in _CONTRACT_MODULES:
