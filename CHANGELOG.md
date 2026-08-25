@@ -39,6 +39,9 @@ out in commit messages and here.
   graceful drain, host shutdown, database timeouts, and worker takeover. Crash qualification proves
   stale-generation rejection and preserves the paid-call journal across reserved, started,
   unknown, and settled boundaries.
+- Added Workflow-owned redrive after a retryable Activity exhausts its bounded attempt batch. The
+  same admitted command remains live, uses a distinct Activity ID on each redrive, and transfers
+  through Continue-As-New during a long infrastructure outage.
 
 ### Added — durable private model streams
 
