@@ -29,7 +29,8 @@ PyPI publish는 별도 owner 승인 단계다.
 | reviewed PR13 source | `461605b62c924b8b2297d2692d984ebfbb7d635a` | passed |
 | implementation-qualified `develop` source | `510ffa8def8a5cae50136dbcf2d2aed2625be9cc` | passed |
 | integration PR | `#138`, `codex/v0.23-production-adapters` → `develop` | merged |
-| release PR/tag/publish | 별도 owner 승인 단계 | pending |
+| release PR | `#140`, `develop` → `main` | Draft review |
+| release tag/publish | 별도 owner 승인 단계 | pending |
 | Python | 3.11, 3.12 | passed |
 | PostgreSQL | 16.15, 18.6 | passed |
 | ObjectStore | pinned MinIO S3 protocol | passed |
@@ -95,6 +96,27 @@ combined actual services.
 Every combined artifact carries manifest schema `2`, manifest digest
 `f75e3d624556a5b5f36ee9f1229fd7816802344f746f2df13fcb0374adadfb84`, and campaign-lock digest
 `44e826410d2f91e334dfddf60530e38f0e11df02b90e7413bc1dbcdc6cddd2fd`.
+
+### 2.4 release-promotion review amendment
+
+Release PR `#140` reviewed source `7f6a10e648758666e7ea71189206e7cd48ad653d` and found a P1 in
+the Temporal retry boundary. A retryable activation Activity could exhaust its bounded retry policy,
+fail the per-run Workflow, and leave an already-delivered PostgreSQL command without automatic
+redrive. The release review paused before Ready/L3.
+
+Remediation commit `a786187` and PR `#141` keep the same admitted command inside the Workflow,
+redrive it with a distinct content-free Activity ID after retry exhaustion, and return it to the
+ordered pending set before Continue-As-New during a long outage. Non-retryable Activity failures
+retain fail-stop semantics. The initial Activity ID remains unchanged for v1 history compatibility.
+
+Local remediation evidence:
+
+- pinned Temporal 1.31.0 actual-server exhaustion, redrive, and generated-history replay: passed;
+- complete Temporal adapter and service module: `36 passed`;
+- repository Ruff 0.15.6 and `git diff --check`: passed.
+
+PR `#140` repeats review convergence and the release matrix on the corrected `develop` head before
+promotion to `main`. Its external CI evidence owns the final release-candidate source identity.
 
 ## 3. approved release result
 
