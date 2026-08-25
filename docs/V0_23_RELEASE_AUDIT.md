@@ -1,6 +1,6 @@
 # v0.23.0 Production Adapters Release Audit
 
-> 상태: PR13 release candidate
+> 상태: implementation campaign qualified; release approval pending
 >
 > 작성일: 2026-08-23
 >
@@ -16,9 +16,9 @@
 
 v0.23은 PostgreSQL, S3-compatible ObjectStore, Temporal, durable private stream을 하나의
 production hosting path로 완성한다. 이 문서는 구현 qualification과 release delivery를 분리해
-기록한다. 구현 qualification은 실제 PostgreSQL 16/18, pinned MinIO, Temporal local server,
-Python/OS/package matrix에서 완료됐다. PR13의 exact artifact와 최종 integration PR이 release
-delivery를 닫는다.
+기록한다. 구현 qualification과 `develop` 통합은 실제 PostgreSQL 16/18, pinned MinIO, Temporal
+local server, Python/OS/package matrix에서 완료됐다. `develop` → `main`, tag, GitHub release,
+PyPI publish는 별도 owner 승인 단계다.
 
 ## 1. release identity
 
@@ -26,18 +26,18 @@ delivery를 닫는다.
 |---|---|---|
 | version | `0.23.0` | passed |
 | integration baseline | `788a33ea2399573719050c68ed5cc3f0d8ee54f8` | passed |
-| release candidate | `codex/v0.23-pr13-release-closure` | in progress |
-| exact source SHA | PR13 L2 evidence의 `head_sha` | pending |
-| integration PR | `codex/v0.23-production-adapters` → `develop` | pending |
+| reviewed PR13 source | `461605b62c924b8b2297d2692d984ebfbb7d635a` | passed |
+| final `develop` source | `510ffa8def8a5cae50136dbcf2d2aed2625be9cc` | passed |
+| integration PR | `#138`, `codex/v0.23-production-adapters` → `develop` | merged |
 | release PR/tag/publish | 별도 owner 승인 단계 | pending |
 | Python | 3.11, 3.12 | passed |
 | PostgreSQL | 16.15, 18.6 | passed |
 | ObjectStore | pinned MinIO S3 protocol | passed |
 | Temporal | SDK 1.31.0, CLI 1.8.2, embedded server 1.31.2 | passed |
 
-Exact source identity는 GitHub L2/L3 evidence artifact가 소유한다. 소스 문서는 자기 commit SHA를
-내장할 수 없으므로 PR13 latest reviewed head와 artifact `head_sha`의 일치를 merge gate에서
-검증한다.
+Exact source identity는 GitHub L2/L3 evidence artifact가 소유한다. PR13 reviewed head, 최종
+integration PR head와 merge ref, `develop` merge commit을 각 gate에서 artifact `head_sha`와
+`merge_sha`에 대조했다.
 
 ## 2. authoritative evidence
 
@@ -69,6 +69,30 @@ coverage.
 All 13 integration jobs passed: lint, Python 3.11/3.12 fast+contract, Python 3.11/3.12 serial,
 coverage floor, Windows/macOS smoke, DBOS recovery, Studio assets, minimal/all-extras install, and
 combined actual services.
+
+### 2.3 final campaign closure
+
+- PR13 Ready L2: run `32787663492`, head
+  `461605b62c924b8b2297d2692d984ebfbb7d635a`, merge ref
+  `876bb8c364c81a4fe5a4dcf08058bf80bf12c094`, profile `combined`
+- PR13 merge: PR `#137`, integration commit
+  `bcfb5e54b7831c05856de9743c6532eb82fa1e7f`
+- PR13 integration L3: run `32788287342`, 13 jobs passed, evidence head/merge
+  `bcfb5e54b7831c05856de9743c6532eb82fa1e7f`
+- final integration review: PR `#138`, reviewed head `bcfb5e54b7`, major issues `0`, unresolved
+  threads `0`
+- final integration L2: run `32790257448`, head
+  `bcfb5e54b7831c05856de9743c6532eb82fa1e7f`, merge ref
+  `4d7df600dfcba5666bae737a3d5ee3b9380a8fcf`, profile `combined`
+- `develop` merge: `510ffa8def8a5cae50136dbcf2d2aed2625be9cc`
+- final `develop` L3: run `32790806355`, 14 jobs passed, evidence head/merge
+  `510ffa8def8a5cae50136dbcf2d2aed2625be9cc`
+- final coverage: 83.61% lines (`36,610 / 43,787`), 70.96% branches
+  (`9,908 / 13,962`)
+
+Every combined artifact carries manifest schema `2`, manifest digest
+`f75e3d624556a5b5f36ee9f1229fd7816802344f746f2df13fcb0374adadfb84`, and campaign-lock digest
+`44e826410d2f91e334dfddf60530e38f0e11df02b90e7413bc1dbcdc6cddd2fd`.
 
 ## 3. approved release result
 
@@ -199,14 +223,22 @@ The release candidate carries these compatibility guarantees:
 - minimal and all-extras CI install from the exact wheel audited in the same job;
 - publish workflow order: build distributions, audit wheel, twine check, upload exact artifacts.
 
-PR13 local focused evidence:
+PR13 exact-tree local evidence:
 
-- compatibility/package/public/ledger: `50 passed`;
+- compatibility/package/public/ledger/CI helper: `69 passed`;
 - `ruff`, compile, campaign-lock validation, and `git diff --check`: passed;
-- local `monoid_agent_kernel-0.23.0-py3-none-any.whl` build and wheel audit: passed.
+- wheel/sdist build, wheel audit, and `twine check`: passed;
+- isolated minimal exact-wheel import, 19 fixtures, and Studio acceptance: passed;
+- isolated all-extras exact-wheel install/import: passed;
+- wheel SHA-256:
+  `3ae6e207c14eb6b3b082d5cc3403f057b660500b02ae3b95bf00a26cd3c9f947`;
+- sdist SHA-256:
+  `26bb7cf36e1bec6ae5192c95fa682c6bc3868350850481e44a697639a6793a0b`.
 
-The final wheel/sdist SHA-256 values are recorded after PR13 review convergence because every source
-commit changes the sdist identity.
+PR13 reviewed source and final `develop` source have the same Git tree
+`5dabc209432bec22d7b114fa598c2dc36ff0a216`; the recorded distributions therefore correspond to the
+qualified release tree. CI rebuilt and audited the exact wheel independently in minimal and
+all-extras jobs.
 
 ## 9. operations, security, and privacy qualification
 
@@ -234,23 +266,22 @@ backup products before serving traffic.
 
 | gate | command/workflow | result | evidence |
 |---|---|---|---|
-| lint/compile | integration CI + PR13 local | passed | run `32785036958` |
-| Python 3.11 full partitions | integration CI | passed | fast+contract, serial |
-| Python 3.12 full partitions | integration CI | passed | fast+contract, serial |
-| coverage floor | integration CI | 83.61% lines | `coverage-xml` |
-| PostgreSQL 16/18 | combined actual services | passed | manifest nodes |
-| pinned MinIO | combined actual services | passed | `objectstore_gc`, `durable_stream` |
-| Temporal local server | combined actual services | passed | `temporal_workflow` |
-| combined kill/restart | combined actual services | passed | `worker_crash_drain` |
-| compatibility fixtures | PR13 local | 19 fixtures, 50 focused tests passed | packaged fixture |
-| wheel audit | PR13 local | `0.23.0` passed | exact local wheel |
-| minimal/all-extras install | integration baseline | passed | PR13 repeats exact wheel install |
-| Workflow history replay | combined actual services | passed | checked-in v1 history |
-| privacy scan | combined actual services | passed | `privacy_combined` |
+| lint/compile | final `develop` CI + PR13 local | passed | run `32790806355` |
+| Python 3.11 full partitions | final `develop` CI | passed | fast+contract, serial |
+| Python 3.12 full partitions | final `develop` CI | passed | fast+contract, serial |
+| coverage floor | final `develop` CI | 83.61% lines, 70.96% branches | `coverage-xml` |
+| PostgreSQL 16/18 | final combined actual services | passed | run `32790806355` |
+| pinned MinIO | final combined actual services | passed | `objectstore_gc`, `durable_stream` |
+| Temporal local server | final combined actual services | passed | `temporal_workflow` |
+| combined kill/restart | final combined actual services | passed | `worker_crash_drain` |
+| compatibility fixtures | PR13 exact tree | 19 fixtures, 69 focused tests passed | packaged fixture |
+| wheel audit | PR13 exact tree + final CI rebuild | `0.23.0` passed | exact wheel |
+| minimal/all-extras install | final `develop` CI | passed | exact audited wheel |
+| Workflow history replay | final combined actual services | passed | checked-in v1 history |
+| privacy scan | final combined actual services | passed | `privacy_combined` |
 
-PR13 Ready L2 replaces the local candidate rows with latest-head GitHub evidence. PR13 merge triggers
-the integration L3 matrix again. The final integration PR uses that merge commit as the release
-candidate source.
+PR13 L2, integration L3, final integration L2, and final `develop` L3 all emitted qualified combined
+evidence. The final evidence source is `510ffa8def8a5cae50136dbcf2d2aed2625be9cc`.
 
 ## 11. explicit exclusions
 
@@ -267,13 +298,15 @@ These items require separate contracts, compatibility policy, qualification, and
 
 ## 12. release delivery gate
 
-The implementation campaign closes after these steps:
+The implementation campaign completed these steps:
 
-1. PR13 latest head passes review convergence, L1, and `ci:combined` L2.
-2. PR13 merges into `codex/v0.23-production-adapters` with a merge commit.
-3. The integration branch passes the complete L3 matrix and emits exact combined evidence.
-4. Latest `origin/develop` merges into the integration branch.
-5. The integration → `develop` PR passes the Codex review cycle and required checks.
+1. PR13 latest head passed review convergence, L1, and `ci:combined` L2.
+2. PR13 merged into `codex/v0.23-production-adapters` with merge commit `bcfb5e5`.
+3. The integration branch passed the complete L3 matrix and emitted exact combined evidence.
+4. Latest `origin/develop` was already an ancestor of the integration branch; no synchronization
+   merge was required.
+5. Integration → `develop` PR `#138` passed the Codex review cycle and required checks.
+6. PR `#138` merged as `510ffa8`, and the resulting `develop` L3 matrix passed.
 
 `develop` → `main`, tag `v0.23.0`, GitHub release, and PyPI publish require the separate release
 approval defined by the project workflow.
@@ -286,5 +319,6 @@ approval defined by the project workflow.
 | storage/conformance | qualified | PostgreSQL/ObjectStore actual-service manifest |
 | Temporal/replay | qualified | local-server Workflow/Activity/history evidence |
 | security/privacy | qualified | combined private-content scan and runbook |
-| packaging/compatibility | PR13 in progress | fixture, exact wheel, install matrix |
-| final release | pending | integration PR and separate release approval |
+| packaging/compatibility | qualified | fixture, exact wheel, install matrix |
+| implementation campaign | complete | PR `#138`, `develop` run `32790806355` |
+| final release | pending | separate `develop` → `main`, tag, and publish approval |
