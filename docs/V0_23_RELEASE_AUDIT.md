@@ -27,7 +27,7 @@ PyPI publish는 별도 owner 승인 단계다.
 | version | `0.23.0` | passed |
 | integration baseline | `788a33ea2399573719050c68ed5cc3f0d8ee54f8` | passed |
 | reviewed PR13 source | `461605b62c924b8b2297d2692d984ebfbb7d635a` | passed |
-| final `develop` source | `510ffa8def8a5cae50136dbcf2d2aed2625be9cc` | passed |
+| implementation-qualified `develop` source | `510ffa8def8a5cae50136dbcf2d2aed2625be9cc` | passed |
 | integration PR | `#138`, `codex/v0.23-production-adapters` → `develop` | merged |
 | release PR/tag/publish | 별도 owner 승인 단계 | pending |
 | Python | 3.11, 3.12 | passed |
@@ -36,8 +36,10 @@ PyPI publish는 별도 owner 승인 단계다.
 | Temporal | SDK 1.31.0, CLI 1.8.2, embedded server 1.31.2 | passed |
 
 Exact source identity는 GitHub L2/L3 evidence artifact가 소유한다. PR13 reviewed head, 최종
-integration PR head와 merge ref, `develop` merge commit을 각 gate에서 artifact `head_sha`와
-`merge_sha`에 대조했다.
+integration PR head와 merge ref, implementation-qualified `develop` merge commit을 각 gate에서
+artifact `head_sha`와 `merge_sha`에 대조했다. 이 tracked audit도 sdist에 포함되므로 audit closure
+source와 최종 tag artifact identity는 해당 source를 빌드한 후 생성되는 외부 CI/release
+attestation이 소유한다.
 
 ## 2. authoritative evidence
 
@@ -70,7 +72,7 @@ All 13 integration jobs passed: lint, Python 3.11/3.12 fast+contract, Python 3.1
 coverage floor, Windows/macOS smoke, DBOS recovery, Studio assets, minimal/all-extras install, and
 combined actual services.
 
-### 2.3 final campaign closure
+### 2.3 final implementation campaign closure
 
 - PR13 Ready L2: run `32787663492`, head
   `461605b62c924b8b2297d2692d984ebfbb7d635a`, merge ref
@@ -229,16 +231,13 @@ PR13 exact-tree local evidence:
 - `ruff`, compile, campaign-lock validation, and `git diff --check`: passed;
 - wheel/sdist build, wheel audit, and `twine check`: passed;
 - isolated minimal exact-wheel import, 19 fixtures, and Studio acceptance: passed;
-- isolated all-extras exact-wheel install/import: passed;
-- wheel SHA-256:
-  `3ae6e207c14eb6b3b082d5cc3403f057b660500b02ae3b95bf00a26cd3c9f947`;
-- sdist SHA-256:
-  `26bb7cf36e1bec6ae5192c95fa682c6bc3868350850481e44a697639a6793a0b`.
+- isolated all-extras exact-wheel install/import: passed.
 
-PR13 reviewed source and final `develop` source have the same Git tree
-`5dabc209432bec22d7b114fa598c2dc36ff0a216`; the recorded distributions therefore correspond to the
-qualified release tree. CI rebuilt and audited the exact wheel independently in minimal and
-all-extras jobs.
+PR13 reviewed source and implementation-qualified `develop` source have the same Git tree
+`5dabc209432bec22d7b114fa598c2dc36ff0a216`. CI rebuilt and audited the exact wheel independently in
+minimal and all-extras jobs. These builds qualify the implementation tree. They do not identify the
+future tagged distribution because this tracked audit changes the sdist source. The release workflow
+rebuilds the frozen tag source and publishes its wheel/sdist hashes in external release attestation.
 
 ## 9. operations, security, and privacy qualification
 
@@ -281,7 +280,7 @@ backup products before serving traffic.
 | privacy scan | final combined actual services | passed | `privacy_combined` |
 
 PR13 L2, integration L3, final integration L2, and final `develop` L3 all emitted qualified combined
-evidence. The final evidence source is `510ffa8def8a5cae50136dbcf2d2aed2625be9cc`.
+evidence. The implementation evidence source is `510ffa8def8a5cae50136dbcf2d2aed2625be9cc`.
 
 ## 11. explicit exclusions
 
@@ -310,6 +309,10 @@ The implementation campaign completed these steps:
 
 `develop` → `main`, tag `v0.23.0`, GitHub release, and PyPI publish require the separate release
 approval defined by the project workflow.
+
+The audit closure changes tracked package source. Its merge result receives a new `develop` L3 run.
+The separately approved release stage repeats L3 on the frozen release candidate and records exact
+wheel/sdist identities outside that source tree.
 
 ## 13. sign-off
 
