@@ -804,7 +804,9 @@ fail-closed preparation boundaries above because their durable bytes participate
 recovery correctness.
 
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
-This keeps token-boundary interruption responsive while durable events remain compact.
+This keeps token-boundary interruption responsive while durable events remain compact. With
+`async_model_abort_drain_s` set, an interrupted stream is drained for its usage before the turn
+parks; the observer outcome stays `interrupted` with no usage (see the stopped-stream drain above).
 `emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
 `model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
 execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes
@@ -1054,6 +1056,50 @@ reported once the worker has stopped rather than while it races run finalization
 running when the grace expires is abandoned: the run reports `cancelled` or `run_timeout` while the
 worker keeps going and its late outcome is discarded. A settled worker does not change the outcome —
 the grace is not an extension of the deadline.
+
+**Stopped-stream drain (v0.24, opt-in).** A cooperative stop of a streamed call —
+`should_abort` (the loop's `interrupt_turn`) or a `user_cancel` of the run's cancellation token —
+normally closes the provider stream at once, so the terminal chunk that reports the bill is never
+read. `ModelCallRunner.abort_drain_s` (live accessor `current_abort_drain_s`; the loop plumbs
+`AgentLoop.async_model_abort_drain_s` the way it plumbs the cancel grace) turns that stop into a
+drain. The budget is read once when the stream opens; a budget that cannot be read, or is not a
+positive finite number, means no drain. `0` (the default) keeps closing at the stop.
+
+- **Window.** The same stream is read on until it ends or `min(stop + abort_drain_s, deadline)`
+  passes (`stop + abort_drain_s` without a deadline), and is then closed within the ordinary cancel
+  grace. The worst-case wall time after the stop is `abort_drain_s + async_model_cancel_grace_s`.
+  The drain is raced outside the run-deadline race: a deadline that closes the window ends the
+  drain and never turns the stop into `RunTimeout`.
+- **Delivery.** Nothing read after the stop reaches `delta_consumer`, the durable delta mirror, a
+  model-stream observer, a recorder or a sidecar, and drained chunks are never assembled into a
+  turn: only `TurnComplete` usage (the last terminal chunk carrying a nonzero count, the rule
+  `assemble_streamed_turn` applies) and retry evidence are kept. A chunk already in flight when the
+  stop is observed is delivered as before; the stop still retracts nothing. `should_abort` is not
+  polled while draining, and drained chunks do not mark the call `stream_committed`.
+- **Outcome.** The stop raises what it raised before — `ModelCallAborted` for `should_abort`,
+  `RunCancelled(user_cancel)` for the token — stamped (`provider_usage_of`) with the drained usage.
+  The failed receipt, its attempt log, the escaping exception and the loop's totals, metrics and
+  token budget each carry that usage once. An empty stamp means "not reported": the kernel never
+  estimates. Durable lifecycle calls still settle `dispatch_unknown`; the drained usage rides the
+  `DurableModelCallError` stamp only and is not journalled.
+
+| During the drain | Result |
+|---|---|
+| stream ends, with or without usage | the stop, stamped with the usage (or empty) |
+| window closes (budget or deadline) | the stop, stamped with any usage already drained |
+| provider raises | the stop; the failure is its `__context__`; the failure's own usage stamp wins, else drained usage |
+| `user_cancel` after a `should_abort` stop | no effect; the drain continues and ends as `ModelCallAborted` |
+| `graceful_drain` / `deadline` / `host_shutdown` cancel | immediate `RunCancelled(cause)`, no stamp (unchanged precedence) |
+| lease loss | immediate `WriteAuthorityRevoked`, nothing published (checked per drained chunk and on revoke) |
+
+A `user_cancel` becomes a drain only once the stream task has entered the provider; a cancel that
+arrives earlier is an ordinary cancellation. Because a token keeps its first cause, a later
+`host_shutdown` cannot interrupt a drain that a `user_cancel` started: that drain ends at its
+window. Draining costs what the provider keeps generating for up to `abort_drain_s` and holds the
+connection that long; hosts that stop many calls at once own that concurrency.
+
+Independently of the drain, a stop observed after the terminal chunk was delivered now carries that
+chunk's usage (previously discarded). This is the one v0.24 change to the default path.
 
 "Discarded" is about the *result*, not about everything the call touched on its way there, and
 an adapter holding shared state needs a way to hear about it. Two routes reach a discarded

@@ -688,6 +688,42 @@ model text. `read_after()` returns private bytes and performs no tenant authoriz
 only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
 apply tenant scoping in that wrapper.
 
+### Billing a stopped stream
+
+A Stop normally closes the provider stream before its terminal chunk, so the tokens the provider
+already generated are billed to you but reported to no one. Hosts that meter per call opt into a
+bounded drain:
+
+```python
+loop = make_loop(stream_model_calls=True)
+loop.async_model_abort_drain_s = 5.0  # read live; 0 (default) closes at the stop
+
+runner = ModelCallRunner(adapter=adapter, abort_drain_s=5.0)  # direct/`ctx.llm`-style callers
+```
+
+Both Stop paths drain: `interrupt_turn()` (or a caller's `should_abort`) and
+`cancellation_token.cancel()` with the default `user_cancel` cause, which is the path a
+`RunStream`/`astream` chat Stop takes. `graceful_drain`, `deadline`, `host_shutdown` and lease loss
+still stop at once. Nothing read after the Stop is delivered to the UI, observers, recorder or
+sidecars; the Stop's outcome is unchanged (`interrupted` suspension or `cancelled` run), only later —
+by at most `async_model_abort_drain_s + async_model_cancel_grace_s`.
+
+Read the bill where you already read it:
+
+- `AgentLoop`: the run's `total_usage`, `metrics.updated`, the checkpoint totals and the token
+  budget include the drained usage.
+- `ModelCallRunner` / `ValidatedModelCall`: `provider_usage_of(exc)` on the escaping
+  `ModelCallAborted` or `RunCancelled`; the failed receipt delivered to `settled_sink` and
+  subscriptions carries the same usage (the escaping validated-call error keeps earlier attempts in
+  `receipts`).
+- An empty usage means the provider reported none before the stream ended or the window closed. Do
+  not substitute an estimate for it.
+
+Choose the budget below `RunStream`'s 8 s cancel grace minus the model cancel grace, or an early
+consumer exit abandons the draining run. The drain keeps the connection and the provider's
+generation alive for up to the budget; durable lifecycle calls still end `dispatch_unknown` with the
+usage on the exception stamp only.
+
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
 Reference facade exposes the same behavior through `subscribe_events()`:

@@ -7,6 +7,26 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added — stopped-stream drain
+
+- Added `ModelCallRunner.abort_drain_s` and `current_abort_drain_s` (keyword-only) and
+  `AgentLoop.async_model_abort_drain_s` (keyword-only, read live). With a positive budget, a
+  streamed call's cooperative stop — `should_abort`/`interrupt_turn`, or the run token's
+  `user_cancel` — keeps reading the same provider stream, undelivered, until it ends or
+  `min(stop + budget, deadline)` passes, then closes it within the cancel grace. The stop still
+  raises `ModelCallAborted` or `RunCancelled(user_cancel)`, now stamped with the drained
+  `TurnComplete` usage, which reaches the failed receipt, the attempt log and the run's totals and
+  token budget. `graceful_drain`, `deadline`, `host_shutdown` and lease loss still end the call at
+  once; a deadline that closes the window never reclassifies the stop as a timeout. The default of
+  `0` keeps closing the stream at the stop. No receipt, ledger, codec, schema or fixture changes.
+
+### Fixed
+
+- A streamed call stopped by `should_abort` after the provider's terminal chunk had already been
+  delivered now carries that chunk's usage on `ModelCallAborted` and its receipt; it was discarded.
+  This applies with the drain off too — the one deliberate change to the default path in this
+  release.
+
 ## [0.23.0] - 2026-08-25
 
 ### Added — PostgreSQL and ObjectStore production persistence
