@@ -1434,7 +1434,8 @@ class AgentLoop:
     # provider bills; 0 closes it at the stop. Covers ``interrupt_turn`` and a ``user_cancel`` of
     # ``cancellation_token`` on a streamed call; the stop's outcome is unchanged and carries the
     # drained usage into the run totals. Read live, like the grace above. Subagent child and fork
-    # loops are not given it: they keep 0, so their streamed calls still close at the stop.
+    # loops are not given it: they keep 0, so a token cancel still closes their streamed calls at
+    # once (``interrupt_turn`` never reaches a child, which streams to completion as before).
     async_model_abort_drain_s: float = field(default=0.0, kw_only=True)
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None

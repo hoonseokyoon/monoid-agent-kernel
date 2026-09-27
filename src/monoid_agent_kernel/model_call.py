@@ -723,7 +723,8 @@ class ModelCallRunner:
     ``RunCancelled(user_cancel)`` for the run's cancellation token -- now stamped with that usage.
     ``graceful_drain``, ``deadline``, ``host_shutdown`` and lease loss still end the call at once,
     unless a ``user_cancel`` already turned the stop into a drain (the token keeps its first
-    cause); then, of these, only lease loss cuts that drain short.
+    cause); then, of these, only lease loss cuts it short, and the run deadline still closes its
+    window.
 
     Used when ``current_abort_drain_s`` is unset, the way ``cancel_grace_s`` is."""
 

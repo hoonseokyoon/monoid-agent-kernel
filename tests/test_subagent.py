@@ -745,8 +745,10 @@ def test_child_loops_keep_the_default_abort_drain(
     """A documented v0.24 limit, pinned so the docs cannot drift from it silently.
 
     ``async_model_abort_drain_s`` applies to the loop's own model calls; child and fork loops are
-    built with their default 0, so a Stop during a child's streamed call is still cut and bills
-    nothing (CONTRACTS "Stopped-stream drain", EMBEDDING "Billing a stopped stream", CHANGELOG).
+    built with their default 0, so a token ``cancel()`` during a child's streamed call still cuts
+    it and bills nothing; ``interrupt_turn()`` never reaches a child, which streams to completion
+    and bills in full (CONTRACTS "Stopped-stream drain", EMBEDDING "Billing a stopped stream",
+    CHANGELOG).
     Passing the knob to children is a follow-up: when it lands, update those three with this.
     """
 

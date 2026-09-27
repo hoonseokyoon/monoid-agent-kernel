@@ -705,14 +705,18 @@ Both Stop paths drain: `interrupt_turn()` (or a caller's `should_abort`) and
 `cancellation_token.cancel()` with the default `user_cancel` cause, which is the path a
 `RunStream`/`astream` chat Stop takes. `graceful_drain`, `deadline`, `host_shutdown` and lease loss
 still stop at once, unless a `user_cancel` already turned the stop into a drain (the token keeps its
-first cause); then, of these, only lease loss cuts that drain short. Nothing read after the Stop
-is delivered to the UI, observers, recorder or sidecars. The Stop's outcome is unchanged (the
-`interrupted` suspension, or the terminal `limited` result with `interruption_cause=user_cancel`
-that a `user_cancel` produces), only later: the stopped call ends at most
-`async_model_abort_drain_s + async_model_cancel_grace_s` after the Stop is observed.
+first cause); then, of these, only lease loss cuts it short, and the run deadline still closes its
+window: a drain ends by `min(Stop + async_model_abort_drain_s, run deadline)` and is still reported
+as the Stop, never as a timeout. Nothing read after the Stop is delivered to the UI, observers,
+recorder or sidecars. The Stop's outcome is unchanged (the `interrupted` suspension, or the
+terminal `limited` result with `interruption_cause=user_cancel` that a `user_cancel` produces), only
+later: the stopped call ends at most `async_model_abort_drain_s + async_model_cancel_grace_s` after
+the Stop is observed.
 
 The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
-of `0`, so a Stop during a child's streamed call is still cut and reports no usage for that call.
+of `0`, so a token `cancel()` during a child's streamed call still cuts it and reports no usage for
+that call. `interrupt_turn()` never reaches a child: the child streams its call to completion and
+its whole bill is counted, as before this release.
 
 The drain keeps reading the adapter's own `astream_turn` generator, toward its end, for up to the
 budget. An adapter that retries or re-dispatches inside that generator (an empty-turn retry, say)
@@ -736,7 +740,8 @@ with `user_cancel`, which drains a streamed call in flight. `RunStream` then wai
 `async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (both knobs read when `astream`
 opens; 8 s with the drain off) before it hard-cancels the drive, so that drain finishes and keeps
 its bill. The drain keeps the connection and the provider's generation alive for up to the budget;
-durable lifecycle calls still end `dispatch_unknown` with the usage on the exception stamp only.
+durable lifecycle calls still end `dispatch_unknown` with the usage on the exception stamp; it is
+not journalled, though the failed receipt delivered to `settled_sink` still carries it.
 
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
