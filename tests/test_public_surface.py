@@ -1037,6 +1037,28 @@ def test_v022_positional_construction_keeps_its_pre_v022_meaning() -> None:
     assert manager.write_authority.revoked is False
 
 
+def test_v024_abort_drain_knobs_are_keyword_only_and_off_by_default() -> None:
+    """The drain knobs are growth, so they are keyword-only and default to today's behaviour.
+
+    Positional-only growth would rebind every later argument of ``AgentLoop`` (whose later fields
+    are still positional) and of ``ModelCallRunner`` (pinned in the test below); a non-zero default
+    would make every existing embedder read stopped streams it used to close.
+    """
+    import dataclasses
+
+    from monoid_agent_kernel.loop import AgentLoop
+    from monoid_agent_kernel.model_call import ModelCallRunner
+
+    runner_fields = {f.name: f for f in dataclasses.fields(ModelCallRunner)}
+    assert runner_fields["abort_drain_s"].kw_only is True
+    assert runner_fields["abort_drain_s"].default == 0.0
+    assert runner_fields["current_abort_drain_s"].kw_only is True
+    assert runner_fields["current_abort_drain_s"].default is None
+    loop_field = {f.name: f for f in dataclasses.fields(AgentLoop)}["async_model_abort_drain_s"]
+    assert loop_field.kw_only is True
+    assert loop_field.default == 0.0
+
+
 def test_stable_constructor_positional_order_is_append_only() -> None:
     """The positional signature of the shipped constructors is a compatibility surface.
 

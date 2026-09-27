@@ -1426,6 +1426,11 @@ class AgentLoop:
     # Native async model calls and streams use the same bounded-cancellation shape, but keep a
     # separate knob so a slow provider connection cannot consume the tool-handler cleanup budget.
     async_model_cancel_grace_s: float = 1.0
+    # Seconds a stopped model stream is still read -- delivered to no one -- for the usage the
+    # provider bills; 0 closes it at the stop. Covers ``interrupt_turn`` and a ``user_cancel`` of
+    # ``cancellation_token`` on a streamed call; the stop's outcome is unchanged and carries the
+    # drained usage into the run totals. Read live, like the grace above.
+    async_model_abort_drain_s: float = field(default=0.0, kw_only=True)
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
@@ -1906,7 +1911,9 @@ class AgentLoop:
         With autonomous model streaming (``stream_model_calls``, a configured content observer,
         the private content file, or legacy ``emit_output_deltas``) it takes effect mid-generation
         — the in-flight stream is aborted at the next token. Otherwise it lands at the next step
-        boundary (a non-streamed model call finishes first)."""
+        boundary (a non-streamed model call finishes first). With ``async_model_abort_drain_s``
+        set, the aborted stream is read (undelivered) for up to that long so the usage it bills
+        reaches the run totals; the suspension waits for that drain."""
         self._interrupt_requested = True
 
     def pause_turn(self) -> None:

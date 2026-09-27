@@ -908,3 +908,101 @@ def test_run_stream_interrupt_drains_the_call_then_surfaces_a_suspension(tmp_pat
             usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         )
     ]
+
+
+# --- abort drain (v0.24) ------------------------------------------------------------------------
+
+_DRAINED_BILL = {"input_tokens": 6, "output_tokens": 3, "total_tokens": 9}
+
+
+def test_interrupt_with_abort_drain_delivers_nothing_after_stop_to_observers_or_delta_events(
+    tmp_path: Path,
+) -> None:
+    sink = MemoryEventSink()
+    observer = _RecordingObserver()
+
+    class InterruptingAdapter(_ScriptedStreamAdapter):
+        loop: AgentLoop
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            for index, chunk in enumerate(
+                (
+                    TextDelta("part 1"),
+                    TextDelta("part 2"),
+                    TextDelta("drained"),
+                    ReasoningDelta("drained thought"),
+                    TurnComplete(response_id="late", usage=_DRAINED_BILL),
+                )
+            ):
+                if index == 1:
+                    self.loop.interrupt_turn()
+                self.yielded += 1
+                yield chunk
+
+    adapter = InterruptingAdapter([])
+    loop = _loop(
+        tmp_path,
+        adapter,
+        event_sink=sink,
+        observer_factories=(lambda: observer,),
+        emit_output_deltas=True,
+    )
+    loop.async_model_abort_drain_s = 5.0
+    adapter.loop = loop
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.reason == "interrupted"
+        assert adapter.yielded == 5, "the stream was not drained"
+        texts = [e.data["text"] for e in sink.events if e.type == "model.output.delta"]
+        assert texts == ["part 1", "part 2"]
+        assert not [e for e in sink.events if e.type == "model.reasoning.delta"]
+        assert [delta.text for delta in observer.writers[0].deltas] == ["part 1", "part 2"]
+        assert observer.writers[0].outcomes == [
+            ModelStreamOutcome(
+                status="interrupted", final_text="part 1part 2", error_code="interrupted"
+            )
+        ]
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == _DRAINED_BILL
+    finally:
+        loop.close()
+
+
+def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) -> None:
+    """The run's cancel token (the RunStream/host Stop) drains too, and stays a cancellation."""
+
+    token = CancellationToken()
+    observer = _RecordingObserver()
+
+    class CancellingAdapter(_ScriptedStreamAdapter):
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            self.yielded += 1
+            yield TextDelta("partial")
+            token.cancel(InterruptionCause.USER_CANCEL)
+            for chunk in (TextDelta("late"), TurnComplete(response_id="r", usage=_DRAINED_BILL)):
+                self.yielded += 1
+                yield chunk
+
+    adapter = CancellingAdapter([])
+    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,), stream_model_calls=True)
+    loop.cancellation_token = token
+    loop.async_model_abort_drain_s = 5.0
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.interruption_cause is InterruptionCause.USER_CANCEL
+        assert adapter.yielded == 3
+        assert [delta.text for delta in observer.writers[0].deltas] == ["partial"]
+        assert [outcome.status for outcome in observer.writers[0].outcomes] == ["cancelled"]
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == _DRAINED_BILL
+    finally:
+        loop.discard_uncommitted()
