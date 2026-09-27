@@ -1006,3 +1006,77 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
         assert dict(loop._session.state.total_usage) == _DRAINED_BILL
     finally:
         loop.discard_uncommitted()
+
+
+def test_an_early_break_from_astream_waits_out_the_drain_and_keeps_its_bill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the ``astream`` block early cancels the run; the drain that starts must finish.
+
+    ``RunStream``'s own hard-cancel fallback is shrunk below the drain here (it is 8 s in
+    production) to stand in for a drain longer than that fallback: the loop, not the fallback's
+    default, must size the wait, or the host cancel cuts the drain and loses the bill.
+    """
+
+    from monoid_agent_kernel.core.streaming import RunStream
+
+    monkeypatch.setitem(RunStream.__init__.__kwdefaults__, "cancel_grace_s", 0.3)
+
+    class SlowTerminalAdapter(_ScriptedStreamAdapter):
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            self.yielded += 1
+            yield TextDelta("partial")
+            await asyncio.sleep(0.6)
+            for chunk in (TextDelta("late"), TurnComplete(response_id="r", usage=_DRAINED_BILL)):
+                self.yielded += 1
+                yield chunk
+
+    adapter = SlowTerminalAdapter([])
+    loop = _loop(tmp_path, adapter, stream_model_calls=True)
+    loop.async_model_abort_drain_s = 1.0
+    loop.async_model_cancel_grace_s = 0.2
+
+    async def drive() -> tuple[list[object], object]:
+        await loop.aopen()
+        items: list[object] = []
+        async with loop.astream("go") as stream:
+            async for item in stream:
+                items.append(item)
+                if isinstance(item, TextDelta):
+                    break
+        result = stream.result
+        await loop.aclose()
+        return items, result
+
+    items, result = asyncio.run(drive())
+
+    assert [item.text for item in items if isinstance(item, TextDelta)] == ["partial"]
+    assert adapter.yielded == 3, "the host cancel cut the drain"
+    assert result is not None
+    assert result.interruption_cause is InterruptionCause.USER_CANCEL
+    assert result.metrics["total_tokens"] == _DRAINED_BILL["total_tokens"]
+
+
+def test_astream_sizes_its_early_exit_wait_from_the_drain_read_as_it_opens(tmp_path: Path) -> None:
+    """8 s with the drain off (today's value); drain + model cancel grace on top with it on."""
+
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
+
+    async def waits() -> list[float]:
+        await loop.aopen()
+        try:
+            seen = [loop.astream("go")._cancel_grace_s]
+            loop.async_model_abort_drain_s = 3.0
+            loop.async_model_cancel_grace_s = 0.5
+            seen.append(loop.astream("go")._cancel_grace_s)
+            loop.async_model_abort_drain_s = float("nan")
+            seen.append(loop.astream("go")._cancel_grace_s)
+            return seen
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(waits()) == [8.0, 11.5, 8.0]

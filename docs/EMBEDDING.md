@@ -719,8 +719,11 @@ Read the bill where you already read it:
 - An empty usage means the provider reported none before the stream ended or the window closed. Do
   not substitute an estimate for it.
 
-Choose the budget below `RunStream`'s 8 s cancel grace minus the model cancel grace, or an early
-consumer exit abandons the draining run. The drain keeps the connection and the provider's
+Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
+with `user_cancel` and so starts a drain. `RunStream` then waits
+`async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (both knobs read when `astream`
+opens; 8 s with the drain off) before it hard-cancels the drive, so that drain finishes and keeps
+its bill. The drain keeps the connection and the provider's
 generation alive for up to the budget; durable lifecycle calls still end `dispatch_unknown` with the
 usage on the exception stamp only.
 

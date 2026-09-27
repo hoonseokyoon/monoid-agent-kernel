@@ -19,6 +19,9 @@ out in commit messages and here.
   token budget. `graceful_drain`, `deadline`, `host_shutdown` and lease loss still end the call at
   once; a deadline that closes the window never reclassifies the stop as a timeout. The default of
   `0` keeps closing the stream at the stop. No receipt, ledger, codec, schema or fixture changes.
+- With the drain on, `AgentLoop.astream`'s early-exit wait before it hard-cancels the drive grows
+  from 8 s to `8 s + async_model_abort_drain_s + async_model_cancel_grace_s` (read when the stream
+  opens), so a drain started by leaving the block early is not cut. Unchanged with the drain off.
 
 ### Fixed
 

@@ -513,6 +513,20 @@ def _reports_usage(usage: Mapping[str, int] | None) -> bool:
     return bool(usage) and any(usage.values())
 
 
+def _positive_seconds(read: Callable[[], Any]) -> float:
+    """A duration knob's value, or 0 when it cannot be read or is not a positive finite number.
+
+    The drain budget's reading rule, shared with the loop's `RunStream` sizing so the two agree on
+    whether a drain is on: a broken knob means "off", never a failure of its own.
+    """
+
+    try:
+        seconds = float(read())
+    except Exception:
+        return 0.0
+    return seconds if math.isfinite(seconds) and seconds > 0 else 0.0
+
+
 _DRAINING = object()
 """What the first phase of a draining stream returns when a stop turned the stream into a drain."""
 
@@ -779,16 +793,13 @@ class ModelCallRunner:
         be the reason a stop is reported as something else.
         """
 
-        try:
-            raw = (
+        return _positive_seconds(
+            lambda: (
                 self.abort_drain_s
                 if self.current_abort_drain_s is None
                 else self.current_abort_drain_s()
             )
-            budget = float(raw)
-        except Exception:
-            return 0.0
-        return budget if math.isfinite(budget) and budget > 0 else 0.0
+        )
 
     def _check_cancel_or_deadline(self, deadline: float | None) -> None:
         """Check only terminal run boundaries while model I/O is in flight.
