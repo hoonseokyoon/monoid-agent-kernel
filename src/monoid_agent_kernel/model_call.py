@@ -739,6 +739,14 @@ class ModelCallRunner:
     ``current_cancel_grace_s`` exists: ``AgentLoop.async_model_abort_drain_s`` is a public mutable
     field. A budget that cannot be read, or is not a positive finite number, means no drain."""
 
+    _open_drain_budgets: list[float] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
+    """The drain budget each streamed call now open on this runner read as it opened.
+
+    What a stop of that call will drain for, whatever the knob says by then; ``AgentLoop``'s
+    ``RunStream`` sizes its early-exit wait from it (:meth:`_open_abort_drain_s`)."""
+
     def _effective_model(
         self,
         request: ModelRequest,
@@ -823,6 +831,16 @@ class ModelCallRunner:
                 else self.current_abort_drain_s()
             )
         )
+
+    def _open_abort_drain_s(self) -> float:
+        """The largest drain budget a streamed call now open on this runner committed to; 0 if none.
+
+        The budget is read once as a stream opens (:meth:`_abort_drain_s`), so a knob lowered
+        afterwards does not shorten the drain a stop of that call starts. Anything that must
+        outlast that drain has to size from this, not from the knob.
+        """
+
+        return max(self._open_drain_budgets, default=0.0)
 
     def _check_cancel_or_deadline(self, deadline: float | None) -> None:
         """Check only terminal run boundaries while model I/O is in flight.
@@ -1982,6 +2000,8 @@ class ModelCallRunner:
                 with contextlib.suppress(Exception):
                     deliver_remainder()
 
+        if drain is not None:
+            self._open_drain_budgets.append(budget_s)
         try:
             if drain is None:
                 return await self._aawait(consume(), deadline)
@@ -2011,6 +2031,8 @@ class ModelCallRunner:
             # handler, or reorder those two statements, and an abandoned stream starts talking to a
             # finished call again. A `finally` costs nothing and survives all three.
             driving = False
+            if drain is not None:
+                self._open_drain_budgets.remove(budget_s)
 
     async def _await_draining_stream(
         self,

@@ -115,8 +115,9 @@ PostgreSQL pins did not. Run `36293292352` (§2.3) is the first green combined r
 - The token keeps its first cause: once a `user_cancel` has turned a stop into a drain, a later
   `host_shutdown` (or `graceful_drain`/`deadline` cause) is not observed; only lease loss and the
   run deadline end that drain early.
-- `RunStream`'s enlarged early-exit wait is read when the stream opens; changing the knobs mid-stream
-  does not resize it.
+- ~~`RunStream`'s enlarged early-exit wait is read when the stream opens; changing the knobs
+  mid-stream does not resize it.~~ Closed before the tag (Codex review of the release PR #145): the
+  wait is sized when it starts, from the live knobs and the budget the in-flight call opened with.
 - Durable lifecycle mode keeps classifying an abort as `dispatch_unknown`; drained usage rides only
   on the exception stamp (PR01 decision D3).
 
