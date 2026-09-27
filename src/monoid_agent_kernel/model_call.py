@@ -1912,10 +1912,11 @@ class ModelCallRunner:
                         and should_abort()
                     ):
                         deliver_remainder()
-                        # `started` without `begin`: a user cancel landed while `should_abort` was
-                        # answering and began the drain first. That cancel is the stop (the
-                        # token's first writer), and it drains all the same.
-                        if drain is not None and (drain.begin(None) or drain.started):
+                        if drain is not None:
+                            # A no-op when a user cancel landed while `should_abort` was answering
+                            # and began the drain first: that cancel is the stop (the token's
+                            # first writer), and it drains all the same.
+                            drain.begin(None)
                             return await drain_rest(drain, None)
                         # A stop after the terminal chunk still owes what that chunk billed.
                         aborted = ModelCallAborted("model call aborted")
