@@ -2097,6 +2097,16 @@ class ModelCallRunner:
                 return None
             return drain.outcome(exc)
 
+        def ended_by_stream(exc: Exception) -> bool:
+            # Whether phase one ended with the stream task's own outcome -- its raise, or its
+            # provider cancelling the read -- rather than with a boundary. Only then did the race
+            # clear its boundaries, lease loss included, as the `_DRAINING` transition has.
+            if task is None or not task.done() or isinstance(exc, WriteAuthorityRevoked):
+                return False
+            if task.cancelled():
+                return _is_provider_cancel(exc)
+            return task.exception() is exc
+
         def streaming_boundary(boundary: float | None) -> None:
             self._assert_write_authority()
             if run_token is not None:
@@ -2169,6 +2179,11 @@ class ModelCallRunner:
             except Exception as exc:
                 if not drain.started:
                     raise
+                if drain.cancel_cause is not None and ended_by_stream(exc):
+                    # A stream task that ended in the tick a user cancel began the drain leaves
+                    # this race before the transition below; the held remainder is still the stop's.
+                    # A boundary that ended the race instead (lease loss) delivers nothing.
+                    settle_cancelled_remainder()
                 if _is_provider_cancel(exc):
                     # The provider cancelled its own read after the stop, and the stream task
                     # ended in the tick the drain began (nothing awaits in its cleanup without an
