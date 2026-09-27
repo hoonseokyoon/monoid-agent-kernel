@@ -32,8 +32,8 @@ services:
     profiles: ["combined", "release"]
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
-    command: server /data --console-address ":9001"
+    image: docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+    command: server /bitnami/minio/data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: monoid-test-access
       MINIO_ROOT_PASSWORD: monoid-test-secret-only
