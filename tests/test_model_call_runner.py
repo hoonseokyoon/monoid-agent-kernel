@@ -6575,3 +6575,28 @@ def test_operational_cancel_causes_never_drain(cause: InterruptionCause) -> None
     assert outcome.elapsed < 3.0
     assert len(stream.yielded) == 1 and stream.closed is True
     assert provider_usage_of(outcome.error) == {}
+
+
+def test_a_user_cancel_landing_as_should_abort_answers_still_drains_as_the_cancel() -> None:
+    """A user cancel between `should_abort` answering True and the drain beginning.
+
+    The cancel's callback begins the drain first, so the token's first writer is the stop: the
+    call must still drain and end as that cancel, with the bill -- not fall back to closing at
+    once as a plain abort that carries nothing.
+    """
+
+    token = CancellationToken()
+
+    def stop_and_cancel() -> bool:
+        token.cancel(InterruptionCause.USER_CANCEL)
+        return True
+
+    stream = _DrainStream(TextDelta("a"), TextDelta("late"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, token=token, should_abort=stop_and_cancel, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["a"]
+    assert len(stream.yielded) == 3 and stream.closed is True
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.usage == _BILL
