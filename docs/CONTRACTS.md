@@ -1090,7 +1090,7 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 |---|---|
 | stream ends, with or without usage | the stop, stamped with the usage (or empty) |
 | window closes (budget or deadline) | the stop, stamped with any usage already drained |
-| provider raises (including the read in flight when a `user_cancel` began the drain) | the stop; an `Exception` failure is its `__context__` (a provider's own cancellation is suppressed, `from None`); usage = an `Exception` failure's own stamp, else a drained `TurnComplete`'s, else one delivered before the stop |
+| provider raises (including the read in flight when a `user_cancel` began the drain, and a failure a `user_cancel` lands behind while the failed stream is closing — the same `RunCancelled(user_cancel)` the drain-off race gives) | the stop; an `Exception` failure is its `__context__` (a provider's own cancellation is suppressed, `from None`); usage = an `Exception` failure's own stamp, else a drained `TurnComplete`'s, else one delivered before the stop |
 | `user_cancel` after a `should_abort` stop | no effect; the drain continues and ends as `ModelCallAborted` |
 | `graceful_drain` / `deadline` / `host_shutdown` cancel | immediate `RunCancelled(cause)`, no stamp (unchanged precedence): usage a `should_abort` drain already read is discarded, and the run counts none of it; a no-op once a `user_cancel` began the drain (below) |
 | lease loss | immediate `WriteAuthorityRevoked`, nothing published (checked per drained chunk and on revoke) |

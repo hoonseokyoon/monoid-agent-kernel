@@ -536,6 +536,12 @@ _DRAINING = object()
 """What the first phase of a draining stream returns when a stop turned the stream into a drain."""
 
 
+def _is_provider_cancel(exc: BaseException) -> bool:
+    """Whether `exc` is a provider cancelling its own read, as the bridge translates it."""
+
+    return isinstance(exc, ModelAdapterError) and exc.error_code == "model_adapter_cancelled"
+
+
 class _AbortDrain:
     """One streamed call's post-stop drain: who stopped it, when, and what the provider billed.
 
@@ -2057,6 +2063,18 @@ class ModelCallRunner:
                 drain.started
             )
 
+        def stop_over(exc: Exception) -> ModelCallAborted | RunCancelled | None:
+            # Every `Exception` the stream task raises after the stop is mapped to the stop inside
+            # the task. One it raised *before* the stop is not: a user cancel landed while the
+            # failing stream was closing, and began the drain over a task already failing. The
+            # cancel is still the outcome, as with the drain off; the failure is its context.
+            # None for anything else: a boundary's own exception, or the drain's own ending.
+            if drain.ends_as(exc):
+                return None
+            if task is None or not task.done() or task.cancelled() or task.exception() is not exc:
+                return None
+            return drain.outcome(exc)
+
         def streaming_boundary(boundary: float | None) -> None:
             self._assert_write_authority()
             if run_token is not None:
@@ -2126,14 +2144,20 @@ class ModelCallRunner:
                 if not drain.started:
                     raise
                 streamed = _DRAINING
-            except ModelAdapterError as exc:
-                # The provider cancelled its own read after the stop, and the stream task ended in
-                # the tick the drain began (nothing awaits in its cleanup without an `aclose`), so
-                # this race saw the task before the drain signal. The stop is the outcome, as in
-                # phase two below; before the stop the failure is the provider's, as ever.
-                if not drain.started or exc.error_code != "model_adapter_cancelled":
+            except Exception as exc:
+                if not drain.started:
                     raise
-                raise drain.outcome(exc) from None
+                if _is_provider_cancel(exc):
+                    # The provider cancelled its own read after the stop, and the stream task
+                    # ended in the tick the drain began (nothing awaits in its cleanup without an
+                    # `aclose`), so this race saw the task before the drain signal. The stop is the
+                    # outcome, as in phase two below; before the stop the failure is the
+                    # provider's, as ever.
+                    raise drain.outcome(exc) from None
+                stop = stop_over(exc)
+                if stop is None:
+                    raise
+                raise stop
             if streamed is not _DRAINING and not drain.started:
                 return streamed
             if drain.cancel_cause is not None:
@@ -2146,14 +2170,16 @@ class ModelCallRunner:
             except RunTimeout:
                 # The window closed; `draining_boundary` never raises a timeout of its own.
                 raise drain.outcome() from None
-            except ModelAdapterError as exc:
-                # The provider cancelled its own read (`CalleeCancelled`, translated): a
-                # `CancelledError` is not an `Exception`, so `consume` cannot map it and it reaches
-                # the race instead. Every `Exception` the stream task raises after the stop is
-                # mapped to the stop inside the task, so no other error code arrives from it here.
-                if exc.error_code != "model_adapter_cancelled":
+            except Exception as exc:
+                if _is_provider_cancel(exc):
+                    # The provider cancelled its own read (`CalleeCancelled`, translated): a
+                    # `CancelledError` is not an `Exception`, so `consume` cannot map it and it
+                    # reaches the race instead.
+                    raise drain.outcome(exc) from None
+                stop = stop_over(exc)
+                if stop is None:
                     raise
-                raise drain.outcome(exc) from None
+                raise stop
             # A stream that finished in the tick its stop became a drain is still that stop.
             raise drain.outcome()
         finally:

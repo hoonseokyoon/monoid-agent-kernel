@@ -6715,6 +6715,78 @@ def test_a_provider_cancel_with_no_stop_stays_the_providers_failure(drain_s: flo
     assert outcome.receipt.error_code == "model_adapter_cancelled"
 
 
+class _CancelsOnClose:
+    """A provider iterator whose second read fails, and whose ``aclose`` is where a cancel lands.
+
+    The stream task is already failing when the user's cancel arrives, so the cancel begins the
+    drain (the stream was entered) with nothing left to read. A close that awaits after the cancel
+    lets the drain signal win the streaming race; one that does not ends the task in that tick.
+    """
+
+    def __init__(self, token: CancellationToken, failure: Exception, *, awaits: bool) -> None:
+        self.token = token
+        self.failure = failure
+        self.awaits = awaits
+        self.reads = 0
+        self.closed = False
+
+    def astream_turn(self, request: ModelRequest) -> "_CancelsOnClose":
+        del request
+        return self
+
+    def __aiter__(self) -> "_CancelsOnClose":
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if self.reads == 1:
+            return TextDelta("a")
+        raise self.failure
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self.token.cancel(InterruptionCause.USER_CANCEL)
+        if self.awaits:
+            await asyncio.sleep(0.05)
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        raise AssertionError("the streamed path is under test")
+
+
+@pytest.mark.parametrize("awaits", [True, False], ids=["close_awaits", "close_returns"])
+@pytest.mark.parametrize("raw", [False, True], ids=["adapter_error", "raw_exception"])
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_user_cancel_landing_while_a_failed_stream_closes_is_the_cancel_either_way(
+    drain_s: float, raw: bool, awaits: bool
+) -> None:
+    """A read fails, and the user's cancel lands while the provider closes the failed stream.
+
+    With the drain off the race answers that cancel. With it on, the cancel begins a drain over a
+    stream task that is already failing -- and the call must still end as the same cancel, not as
+    the provider's error, whichever phase of the race sees the failed task and whether or not the
+    adapter translated the failure: the drain budget never changes which of the two a user sees.
+    """
+
+    token = CancellationToken()
+    failure: Exception = (
+        ConnectionError("connection reset")
+        if raw
+        else ModelAdapterError("gateway stream dropped", error_code="model_adapter_error")
+    )
+    stream = _CancelsOnClose(token, failure, awaits=awaits)
+    outcome = _drain_call(stream, drain_s=drain_s, token=token, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["a"]
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.error_code == "cancelled"
+    assert outcome.receipt.retryable is False
+    if drain_s:
+        assert outcome.error.__context__ is failure
+        assert outcome.error.__suppress_context__ is False
+
 def test_a_stop_after_a_terminal_chunk_without_usage_stamps_nothing_with_the_drain_off() -> None:
     """The default half of the zero-fill rule: an all-zero fill is not a report.
 
