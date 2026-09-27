@@ -6600,3 +6600,48 @@ def test_a_user_cancel_landing_as_should_abort_answers_still_drains_as_the_cance
     assert len(stream.yielded) == 3 and stream.closed is True
     assert provider_usage_of(outcome.error) == _BILL
     assert outcome.receipt.usage == _BILL
+
+
+class _NoCloseStream:
+    """A provider iterator without ``aclose``: its reads never yield to the event loop."""
+
+    def __init__(self, *script: Any) -> None:
+        self.script = list(script)
+        self.reads = 0
+
+    def astream_turn(self, request: ModelRequest) -> "_NoCloseStream":
+        del request
+        return self
+
+    def __aiter__(self) -> "_NoCloseStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if not self.script:
+            raise StopAsyncIteration
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        raise AssertionError("the streamed path is under test")
+
+
+def test_a_provider_cancel_that_finishes_the_drain_in_its_first_tick_stays_the_stop() -> None:
+    """A provider that cancels its own read after the stop, finishing before phase one wakes.
+
+    Without ``aclose`` nothing awaits in the stream's cleanup, so the stream task ends in the tick
+    the drain began and the streaming race sees the provider's cancel before the drain signal. The
+    decided stop is still the outcome -- not a terminal ``model_adapter_cancelled`` failure.
+    """
+
+    stream = _NoCloseStream(TextDelta("a"), TurnComplete(usage=_BILL), asyncio.CancelledError())
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert stream.reads == 3
+    assert outcome.texts == ["a"]
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.error_code == "model_call_aborted"

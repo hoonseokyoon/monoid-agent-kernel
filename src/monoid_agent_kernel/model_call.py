@@ -2094,6 +2094,14 @@ class ModelCallRunner:
                 if not drain.started:
                     raise
                 streamed = _DRAINING
+            except ModelAdapterError as exc:
+                # The provider cancelled its own read after the stop, and the stream task ended in
+                # the tick the drain began (nothing awaits in its cleanup without an `aclose`), so
+                # this race saw the task before the drain signal. The stop is the outcome, as in
+                # phase two below; before the stop the failure is the provider's, as ever.
+                if not drain.started or exc.error_code != "model_adapter_cancelled":
+                    raise
+                raise drain.outcome() from None
             if streamed is not _DRAINING and not drain.started:
                 return streamed
             if drain.cancel_cause is not None:
