@@ -6345,7 +6345,24 @@ def test_a_provider_failure_during_drain_keeps_the_abort_and_carries_its_stamped
     assert outcome.receipt.retryable is False, "a drain failure must not open a retry"
     if isinstance(failure, Exception):
         assert outcome.error.__context__ is failure
+        assert outcome.error.__suppress_context__ is False
 
+
+@pytest.mark.parametrize(
+    "failure", [SystemExit(3), KeyboardInterrupt()], ids=["system_exit", "keyboard_interrupt"]
+)
+def test_a_drained_read_raising_a_process_exit_escapes_unmapped(failure: BaseException) -> None:
+    """Only an `Exception` a drained read raises is absorbed into the stop.
+
+    A process-level exit is not a provider failure: mapping it to the `ModelCallAborted` the drain
+    ends as would swallow an interpreter shutdown or a Ctrl-C.
+    """
+
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert outcome.error is failure, outcome.error
+    assert outcome.texts == ["a"]
 
 @pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
 def test_a_stream_finished_at_the_abort_point_bills_what_it_already_reported(
@@ -6690,6 +6707,7 @@ def test_a_read_that_fails_after_a_user_cancel_began_the_drain_is_still_the_canc
     assert type(outcome.error) is RunCancelled, outcome.error
     assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
     assert outcome.error.__context__ is failure
+    assert outcome.error.__suppress_context__ is False
     assert outcome.texts == ["a"]
     assert stream.closed is True
     assert provider_usage_of(outcome.error) == expected_usage
@@ -6851,6 +6869,7 @@ def test_a_drain_failure_that_reports_a_provider_retry_is_folded_into_the_receip
 
     assert type(outcome.error) is ModelCallAborted, outcome.error
     assert outcome.error.__context__ is failure
+    assert outcome.error.__suppress_context__ is False
     assert outcome.receipt.provider_retried is True
 
 
