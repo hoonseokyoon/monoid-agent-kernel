@@ -737,9 +737,11 @@ Read the bill where you already read it:
 
 Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
 with `user_cancel`, which drains a streamed call in flight. `RunStream` then waits
-`async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (both knobs read when `astream`
-opens; 8 s with the drain off) before it hard-cancels the drive, so that drain finishes and keeps
-its bill. The drain keeps the connection and the provider's generation alive for up to the budget;
+`async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (8 s with the drain off) before it
+hard-cancels the drive, so that drain finishes and keeps its bill. Both knobs are read when that
+wait starts, not when `astream()` is called, and the drain term is never less than the budget the
+in-flight call opened with, so setting them inside the `async with` before the first call, or
+lowering them mid-call, cannot leave the wait shorter than the drain. The drain keeps the connection and the provider's generation alive for up to the budget;
 durable lifecycle calls still end `dispatch_unknown` with the usage on the exception stamp; it is
 not journalled, though the failed receipt delivered to `settled_sink` still carries it.
 

@@ -1070,6 +1070,9 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 - **Window.** The same stream is read on until it ends or `min(stop + abort_drain_s, deadline)`
   passes (`stop + abort_drain_s` without a deadline), and is then closed within the ordinary cancel
   grace. The worst-case wall time after the stop is `abort_drain_s + async_model_cancel_grace_s`.
+  `AgentLoop.astream`'s early exit waits that long plus its own 8 s before hard-cancelling the
+  drive, sized when the wait starts from the knobs then and never below the budget the in-flight
+  call opened with.
   The drain is raced outside the run-deadline race: a deadline that closes the window ends the
   drain and never turns the stop into `RunTimeout`.
 - **Delivery.** Nothing read after the stop reaches `delta_consumer`, the durable delta mirror, a

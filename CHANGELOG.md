@@ -24,8 +24,13 @@ out in commit messages and here.
   window. A deadline that closes the window never reclassifies the stop as a timeout. The default
   of `0` keeps closing the stream at the stop. No receipt, ledger, codec, schema or fixture changes.
 - With the drain on, `AgentLoop.astream`'s early-exit wait before it hard-cancels the drive grows
-  from 8 s to `8 s + async_model_abort_drain_s + async_model_cancel_grace_s` (read when the stream
-  opens), so a drain started by leaving the block early is not cut. Unchanged with the drain off.
+  from 8 s to `8 s + async_model_abort_drain_s + async_model_cancel_grace_s`, so a drain started by
+  leaving the block early is not cut. Both knobs are read when that wait starts, not when
+  `astream()` is called, and the drain term is never less than the budget the in-flight streamed
+  call opened with: a knob raised inside the `async with` before the first call, or lowered after
+  the call opened, still leaves the wait covering the drain the runner actually runs.
+  `RunStream` takes an optional `current_extra_grace_s` callable for this. Unchanged with the drain
+  off.
 - Known limit: the drain applies to the loop's own model calls. Subagent child and fork loops keep
   their default `async_model_abort_drain_s` of `0`, so a token `cancel()` during a child's
   streamed call still cuts it at once and reports no usage for that call. `interrupt_turn()` never

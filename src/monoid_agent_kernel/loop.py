@@ -138,9 +138,6 @@ from monoid_agent_kernel.core.result import (
 from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
 )
-from monoid_agent_kernel.core.streaming import (
-    _DEFAULT_CANCEL_GRACE_S as _RUN_STREAM_CANCEL_GRACE_S,
-)
 from monoid_agent_kernel.core.streaming import QueueEventSink, RunStream
 from monoid_agent_kernel.core.subagent_runtime import (
     SubagentRuntimeContext,
@@ -1872,25 +1869,37 @@ class AgentLoop:
             sink=sink,
             drive_factory=lambda: self._astream_drive(user_input),
             request_cancel=token.cancel,
-            **self._run_stream_cancel_grace(),
+            current_extra_grace_s=self._run_stream_drain_grace_s,
         )
 
-    def _run_stream_cancel_grace(self) -> dict[str, float]:
-        """Size ``RunStream``'s early-exit wait so it outlasts a drain the exit itself starts.
+    def _run_stream_drain_grace_s(self) -> float:
+        """What ``RunStream``'s early-exit wait adds so it outlasts a drain the exit itself starts.
 
         Leaving the ``astream`` block early cancels the run with ``user_cancel``, which with
         ``async_model_abort_drain_s`` set turns an in-flight stream into a drain lasting up to that
         budget plus the model cancel grace. ``RunStream`` hard-cancels the drive after its own
         fixed wait, and a hard cancel cuts the drain and loses its bill, so the drain and the
-        close are added to that wait. Both knobs are read here, as the stream opens; with the
-        drain off ``RunStream`` keeps its default.
+        close are added to that wait.
+
+        Read when the exit's wait starts, not when ``astream()`` is called: the runner reads the
+        drain as each stream opens and the grace where it is spent, so a knob raised inside the
+        ``async with`` before the first call is a drain this wait must cover. The drain is the
+        larger of the knob now and the budget the in-flight stream opened with, which a knob
+        lowered since does not shorten. With neither on, nothing is added and ``RunStream`` keeps
+        its default.
         """
 
         drain_s = _positive_seconds(lambda: self.async_model_abort_drain_s)
+        try:
+            session = self._session
+            resources = session.res if session is not None else self._bootstrap_resources
+            if resources is not None:
+                drain_s = max(drain_s, resources.model_runner._open_abort_drain_s())
+        except Exception:  # noqa: BLE001 - sizing an exit must not be what fails it
+            pass
         if not drain_s:
-            return {}
-        close_s = _positive_seconds(lambda: self.async_model_cancel_grace_s)
-        return {"cancel_grace_s": _RUN_STREAM_CANCEL_GRACE_S + drain_s + close_s}
+            return 0.0
+        return drain_s + _positive_seconds(lambda: self.async_model_cancel_grace_s)
 
     async def _astream_drive(
         self, user_input: str | tuple[ContentPart, ...]

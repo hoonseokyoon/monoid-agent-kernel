@@ -1118,6 +1118,69 @@ def test_an_early_break_from_astream_waits_out_the_drain_and_keeps_its_bill(
     assert result.metrics["total_tokens"] == _DRAINED_BILL["total_tokens"]
 
 
+@pytest.mark.parametrize(
+    ("before_first_call", "at_first_chunk"),
+    [((1.0, 0.2), None), ((1.0, 0.2), (0.0, 0.2))],
+    ids=["raised_after_astream_before_the_call", "lowered_after_the_call_opened"],
+)
+def test_an_early_break_waits_out_the_drain_the_call_opened_with_not_the_one_astream_saw(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_first_call: tuple[float, float],
+    at_first_chunk: tuple[float, float] | None,
+) -> None:
+    """The exit wait is sized when it starts, from the drain the in-flight call actually runs.
+
+    ``astream()`` is entered with the drain off. Raising the knobs inside the ``async with``
+    before the first await is a drain the runner reads as its stream opens; a wait sized when
+    ``astream()`` was called kept the (shrunk) default and hard-cancelled that drain. Lowering
+    the knob after the stream opened does not shorten the drain the runner already committed
+    to, so the wait must not shrink with it either.
+    """
+
+    from monoid_agent_kernel.core.streaming import RunStream
+
+    monkeypatch.setitem(RunStream.__init__.__kwdefaults__, "cancel_grace_s", 0.3)
+
+    class SlowTerminalAdapter(_ScriptedStreamAdapter):
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            self.yielded += 1
+            yield TextDelta("partial")
+            await asyncio.sleep(0.6)
+            for chunk in (TextDelta("late"), TurnComplete(response_id="r", usage=_DRAINED_BILL)):
+                self.yielded += 1
+                yield chunk
+
+    adapter = SlowTerminalAdapter([])
+    loop = _loop(tmp_path, adapter, stream_model_calls=True)
+
+    async def drive() -> object:
+        await loop.aopen()
+        async with loop.astream("go") as stream:
+            loop.async_model_abort_drain_s, loop.async_model_cancel_grace_s = before_first_call
+            async for item in stream:
+                if isinstance(item, TextDelta):
+                    if at_first_chunk is not None:
+                        loop.async_model_abort_drain_s, loop.async_model_cancel_grace_s = (
+                            at_first_chunk
+                        )
+                    break
+        result = stream.result
+        await loop.aclose()
+        return result
+
+    result = asyncio.run(drive())
+
+    assert adapter.yielded == 3, "the host cancel cut the drain"
+    assert result is not None
+    assert result.interruption_cause is InterruptionCause.USER_CANCEL
+    assert result.metrics["total_tokens"] == _DRAINED_BILL["total_tokens"]
+
+
 @pytest.mark.parametrize("knob", ["5", True], ids=["numeric_string", "bool"])
 def test_a_drain_knob_that_is_not_a_real_number_means_no_drain_at_the_loop(
     tmp_path: Path, knob: Any
@@ -1135,27 +1198,34 @@ def test_a_drain_knob_that_is_not_a_real_number_means_no_drain_at_the_loop(
         try:
             loop.async_model_abort_drain_s = knob
             runner = loop._bootstrap_resources.model_runner
-            return runner._abort_drain_s(), loop.astream("go")._cancel_grace_s
+            return runner._abort_drain_s(), loop.astream("go")._exit_wait_s()
         finally:
             await loop.aclose()
 
     assert asyncio.run(read()) == (0.0, 8.0)
 
 
-def test_astream_sizes_its_early_exit_wait_from_the_drain_read_as_it_opens(tmp_path: Path) -> None:
-    """8 s with the drain off (today's value); drain + model cancel grace on top with it on."""
+def test_astream_sizes_its_early_exit_wait_from_the_knobs_read_as_the_wait_starts(
+    tmp_path: Path,
+) -> None:
+    """8 s with the drain off (today's value); drain + model cancel grace on top with it on.
+
+    One ``RunStream``, made before any knob moves: the wait follows the knobs live, as the
+    runner does, instead of freezing them when ``astream()`` is called.
+    """
 
     loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
 
     async def waits() -> list[float]:
         await loop.aopen()
         try:
-            seen = [loop.astream("go")._cancel_grace_s]
+            stream = loop.astream("go")
+            seen = [stream._exit_wait_s()]
             loop.async_model_abort_drain_s = 3.0
             loop.async_model_cancel_grace_s = 0.5
-            seen.append(loop.astream("go")._cancel_grace_s)
+            seen.append(stream._exit_wait_s())
             loop.async_model_abort_drain_s = float("nan")
-            seen.append(loop.astream("go")._cancel_grace_s)
+            seen.append(stream._exit_wait_s())
             return seen
         finally:
             await loop.aclose()
