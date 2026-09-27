@@ -135,7 +135,10 @@ accept the forward schema.
 
 Stop admission dispatch before a planned global drain. Ask `TemporalWorkerGroup` to close with its
 bounded graceful timeout. The Activity requests `graceful_drain`, settles a canonical receipt where
-possible, and releases or revokes its writer lease.
+possible, and releases or revokes its writer lease. When runs enable the stopped-stream drain
+(`async_model_abort_drain_s`), a run already draining a user Stop ignores that `graceful_drain` —
+its cancellation token keeps the first cause — and finishes the drain first, so keep the worker
+group's graceful timeout at least `async_model_abort_drain_s + async_model_cancel_grace_s`.
 
 Inspect one known run through `PostgresWriterAuthorityStore.read(run_id)`. The returned authority
 contains current generation, owner, expiry, revocation, and active status. Keep this run-scoped

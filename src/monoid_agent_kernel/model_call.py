@@ -554,8 +554,8 @@ class _AbortDrain:
         """Start the drain; False when it already started or there is no stream to drain.
 
         A cancel that lands before the stream task entered the provider has nothing to drain
-        and stays an ordinary cancellation -- draining it would open a request the stop was
-        meant to prevent.
+        and stays an ordinary cancellation -- draining it would read on, and pay for, a request
+        the stop came before.
         """
 
         with self._lock:
@@ -707,7 +707,9 @@ class ModelCallRunner:
     ``TurnComplete``'s usage and the retry flag are kept from the drained chunks; the stop still
     raises what it raised before -- ``ModelCallAborted`` for ``should_abort``, or
     ``RunCancelled(user_cancel)`` for the run's cancellation token -- now stamped with that usage.
-    ``graceful_drain``, ``deadline``, ``host_shutdown`` and lease loss still end the call at once.
+    ``graceful_drain``, ``deadline``, ``host_shutdown`` and lease loss still end the call at once,
+    unless a ``user_cancel`` already turned the stop into a drain (the token keeps its first
+    cause); then, of these, only lease loss cuts that drain short.
 
     Used when ``current_abort_drain_s`` is unset, the way ``cancel_grace_s`` is."""
 

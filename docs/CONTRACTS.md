@@ -1045,9 +1045,11 @@ switches on both shapes, as `monoid run --model-calls-file` / `monoid run --mode
 and `monoid backend serve --model-calls-file` / `monoid backend serve --model-payload-file`.
 
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
-`next_turn`, or `astream_turn`. Stream cancellation closes the async iterator and runs its cleanup;
-cleanup may use at most `AgentLoop.async_model_cancel_grace_s` before the provider task is detached
-so a cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
+`next_turn`, or `astream_turn` — except a `user_cancel` of a streamed call that has entered the
+provider under a positive `abort_drain_s`, which drains first (below). Stream cancellation closes
+the async iterator and runs its cleanup; cleanup may use at most
+`AgentLoop.async_model_cancel_grace_s` before the provider task is detached so a
+cancellation-suppressing adapter cannot block the run result. Turn interrupt and pause remain
 step-boundary signals for non-streamed model calls. A synchronous `next_turn` observes the same two
 run boundaries: Python cannot force-stop its worker thread, so exceeding a boundary *abandons* the
 call rather than stopping it. The grace interval applies to the worker itself — a call that returns
@@ -1087,23 +1089,27 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 |---|---|
 | stream ends, with or without usage | the stop, stamped with the usage (or empty) |
 | window closes (budget or deadline) | the stop, stamped with any usage already drained |
-| provider raises | the stop; the failure is its `__context__`; the failure's own usage stamp wins, else drained usage |
+| provider raises | the stop; an `Exception` failure is its `__context__` (a provider's own cancellation is suppressed, `from None`); usage = an `Exception` failure's own stamp, else a drained `TurnComplete`'s, else one delivered before the stop |
 | `user_cancel` after a `should_abort` stop | no effect; the drain continues and ends as `ModelCallAborted` |
-| `graceful_drain` / `deadline` / `host_shutdown` cancel | immediate `RunCancelled(cause)`, no stamp (unchanged precedence) |
+| `graceful_drain` / `deadline` / `host_shutdown` cancel | immediate `RunCancelled(cause)`, no stamp (unchanged precedence); a no-op once a `user_cancel` began the drain (below) |
 | lease loss | immediate `WriteAuthorityRevoked`, nothing published (checked per drained chunk and on revoke) |
 
 A `user_cancel` becomes a drain only once the stream task has entered the provider; a cancel that
-arrives earlier is an ordinary cancellation. Because a token keeps its first cause, a later
-`host_shutdown` cannot interrupt a drain that a `user_cancel` started: that drain ends at its
-window. Draining costs what the provider keeps generating for up to `abort_drain_s` and holds the
-connection that long; hosts that stop many calls at once own that concurrency.
+arrives earlier is an ordinary cancellation. A `user_cancel` that lands before a `should_abort` stop
+began the drain — even while `should_abort` is answering — is itself the stop and ends as
+`RunCancelled(user_cancel)`. Because a token keeps its first cause, a later `graceful_drain`,
+`deadline` or `host_shutdown` cancel cannot interrupt a drain that a `user_cancel` started: of the
+run's boundaries only lease loss cuts that drain short, and otherwise it runs until the stream ends
+or its window closes. Draining costs what the provider keeps generating for up to `abort_drain_s`
+and holds the connection that long; hosts that stop many calls at once own that concurrency.
 
 The drain applies to the loop's own model calls. Child and fork (subagent) loops are built with
 their default `async_model_abort_drain_s` of `0`, so a Stop during a child's streamed call is still
 cut at once and reports no usage for that call; passing the knob to children is a follow-up.
 
-Independently of the drain, a stop observed after the terminal chunk was delivered now carries that
-chunk's usage (previously discarded). This is the one v0.24 change to the default path.
+Independently of the drain, a `should_abort` stop observed after the terminal chunk was delivered
+now carries that chunk's usage (previously discarded); a run-token cancel with the drain off still
+carries none. This is the one v0.24 change to the default path.
 
 "Discarded" is about the *result*, not about everything the call touched on its way there, and
 an adapter holding shared state needs a way to hear about it. Two routes reach a discarded

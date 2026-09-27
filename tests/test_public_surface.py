@@ -1059,6 +1059,24 @@ def test_v024_abort_drain_knobs_are_keyword_only_and_off_by_default() -> None:
     assert loop_field.default == 0.0
 
 
+def test_v024_the_stopped_call_bill_is_read_from_an_explicit_provider_module() -> None:
+    """``provider_usage_of`` is how a direct runner caller reads a drained stop's bill (EMBEDDING
+    "Billing a stopped stream" names this import path), so the path is pinned. It stays an
+    explicit-module name, off the root and ``contracts`` surfaces like ``assemble_streamed_turn``.
+    """
+    import monoid_agent_kernel as root
+    import monoid_agent_kernel.contracts as contracts
+    from monoid_agent_kernel.errors import ModelCallAborted
+    from monoid_agent_kernel.providers.base import mark_provider_usage, provider_usage_of
+
+    stop = ModelCallAborted("model call aborted")
+    assert provider_usage_of(stop) == {}
+    mark_provider_usage(stop, {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})
+    assert provider_usage_of(stop) == {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+    assert not hasattr(root, "provider_usage_of")
+    assert not hasattr(contracts, "provider_usage_of")
+
+
 def test_stable_constructor_positional_order_is_append_only() -> None:
     """The positional signature of the shipped constructors is a compatibility surface.
 

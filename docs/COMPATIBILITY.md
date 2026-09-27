@@ -294,6 +294,12 @@ the two shapes are deliberately not interchangeable — a recorded line does not
 Adding a field to `ModelCallReceipt` therefore does not change this artifact; adding one *here*
 is a schema change like any other, because `additionalProperties` is false.
 
+One v0.24 change moves an existing *answer* rather than adding a key: a streamed call stopped by
+`should_abort` after its terminal chunk was delivered now records that chunk's usage (the abort
+receipt, its attempt log, its `model_calls.jsonl` line, the run's totals and a `metrics.updated`
+event) where it recorded none, with the stopped-stream drain off too; an abort receipt could already
+carry usage from absorbed retries, so no reader meets a new shape.
+
 `model_payloads.jsonl` follows the same two rules (optional; single-namespace, literal enum) and
 adds a third that is this artifact's whole contract: every `model_request` record must reassemble
 to the exact preimage of its `request_digest`, and `monoid validate` recomputes that per record —
