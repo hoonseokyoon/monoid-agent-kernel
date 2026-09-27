@@ -57,7 +57,7 @@ from monoid_agent_kernel.core._sync_bridge import (
     is_async_callable,
     start_abandonable_sync_call,
 )
-from monoid_agent_kernel.core.authority import ActivationWriteAuthority
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
@@ -547,6 +547,7 @@ class _AbortDrain:
         self.cancel_cause: InterruptionCause | None = None
         self.abort_at = 0.0
         self.usage: dict[str, int] = {}
+        self.stop: ModelCallAborted | RunCancelled | None = None
         self.on_begin: Callable[[], None] = lambda: None
         self._lock = threading.Lock()
 
@@ -582,7 +583,15 @@ class _AbortDrain:
             stop = ModelCallAborted("model call aborted")
         usage = provider_usage_of(failure) if failure is not None else {}
         mark_provider_usage(stop, usage or self.usage or _streamed_usage(self.delivered))
+        self.stop = stop
         return stop
+
+    def ends_as(self, exc: BaseException) -> bool:
+        """Whether `exc` is how this drain itself ends: its own stop, or the lease loss that is
+        the one boundary allowed to cut it short. Anything else raised after the stop is a failure
+        the stop absorbs."""
+
+        return exc is self.stop or isinstance(exc, WriteAuthorityRevoked)
 
 
 @dataclass
@@ -1870,12 +1879,6 @@ class ModelCallRunner:
                     raw = await anext(agen)
                 except StopAsyncIteration:
                     break
-                except Exception as failure:
-                    # The stop was decided before this failure; it stays the outcome, and the
-                    # failure travels only as its context and its stamps.
-                    if getattr(failure, "provider_retried", False) is True:
-                        retried = True
-                    raise drain.outcome(failure)
                 fold(raw)
             raise drain.outcome()
 
@@ -1921,13 +1924,22 @@ class ModelCallRunner:
                 if drain is not None and drain.started:
                     return await drain_rest(drain, None)
                 deliver_remainder()
-            except BaseException:
+            except BaseException as exc:
+                if drain is not None and drain.started:
+                    # The one place a failure meets a decided stop, whichever read it came from:
+                    # the drain's, or the main read a user cancel began the drain under. The stop
+                    # stays the outcome; the failure travels only as its context and its stamps.
+                    # A drain has already settled the held-back remainder and delivers nothing.
+                    if not isinstance(exc, Exception) or drain.ends_as(exc):
+                        raise
+                    if getattr(exc, "provider_retried", False) is True:
+                        retried = True
+                    raise drain.outcome(exc)
                 # A boundary can end the stream after a provider-delivered high surrogate and
                 # before its continuation arrives.  At that point the unit is definitively lone;
                 # deliver its replacement before propagating the original outcome.  Preserve the
                 # original failure if a diagnostic consumer also rejects the synthetic suffix.
-                # A drain has already settled that remainder at its stop and delivers nothing.
-                if driving and (drain is None or not drain.started):
+                if driving:
                     with contextlib.suppress(Exception):
                         deliver_remainder()
                 raise
@@ -2114,7 +2126,7 @@ class ModelCallRunner:
                 # phase two below; before the stop the failure is the provider's, as ever.
                 if not drain.started or exc.error_code != "model_adapter_cancelled":
                     raise
-                raise drain.outcome() from None
+                raise drain.outcome(exc) from None
             if streamed is not _DRAINING and not drain.started:
                 return streamed
             if drain.cancel_cause is not None:
@@ -2128,11 +2140,13 @@ class ModelCallRunner:
                 # The window closed; `draining_boundary` never raises a timeout of its own.
                 raise drain.outcome() from None
             except ModelAdapterError as exc:
-                # The provider cancelled its own read (`CalleeCancelled`, translated). The stream
-                # task raises nothing else of this type once it drains.
+                # The provider cancelled its own read (`CalleeCancelled`, translated): a
+                # `CancelledError` is not an `Exception`, so `consume` cannot map it and it reaches
+                # the race instead. Every `Exception` the stream task raises after the stop is
+                # mapped to the stop inside the task, so no other error code arrives from it here.
                 if exc.error_code != "model_adapter_cancelled":
                     raise
-                raise drain.outcome() from None
+                raise drain.outcome(exc) from None
             # A stream that finished in the tick its stop became a drain is still that stop.
             raise drain.outcome()
         finally:

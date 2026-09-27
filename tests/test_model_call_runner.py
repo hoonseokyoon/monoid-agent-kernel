@@ -6652,6 +6652,52 @@ def test_a_provider_cancel_that_finishes_the_drain_in_its_first_tick_stays_the_s
     assert outcome.receipt.error_code == "model_call_aborted"
 
 
+def _read_failure(error_code: str, usage: dict[str, int]) -> ModelAdapterError:
+    failure = ModelAdapterError("gateway stream dropped", error_code=error_code)
+    mark_provider_usage(failure, usage)
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_usage"),
+    [
+        (_read_failure("model_adapter_error", _BILL), _BILL),
+        (_read_failure("model_adapter_cancelled", _BILL), _BILL),
+        (ConnectionError("connection reset"), {}),
+    ],
+    ids=["adapter_error_stamped", "adapter_cancelled_stamped", "raw_exception"],
+)
+def test_a_read_that_fails_after_a_user_cancel_began_the_drain_is_still_the_cancel(
+    failure: Exception, expected_usage: dict[str, int]
+) -> None:
+    """A user cancel lands while a provider read is in flight, and that read then fails.
+
+    The cancel began the drain before the failure, so the cancel is the outcome whatever the
+    failure is -- a provider error, an adapter's own ``model_adapter_cancelled``, or a raw
+    exception -- and it carries the failure's own usage stamp when there is one. No chunk follows
+    the cancel: this is the main read failing, not a drained one.
+    """
+
+    token = CancellationToken()
+    stream = _DrainStream(
+        TextDelta("a"),
+        lambda: token.cancel(InterruptionCause.USER_CANCEL),
+        0.05,
+        failure,
+    )
+    outcome = _drain_call(stream, token=token, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.error.__context__ is failure
+    assert outcome.texts == ["a"]
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == expected_usage
+    assert outcome.receipt.usage == expected_usage
+    assert outcome.receipt.error_code == "cancelled"
+    assert outcome.receipt.retryable is False
+
+
 def test_a_stop_after_a_terminal_chunk_without_usage_stamps_nothing_with_the_drain_off() -> None:
     """The default half of the zero-fill rule: an all-zero fill is not a report.
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_usage,
 )
 from monoid_agent_kernel.recorder import MemoryEventSink
 
@@ -1004,6 +1006,61 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
         assert [outcome.status for outcome in observer.writers[0].outcomes] == ["cancelled"]
         assert loop._session is not None
         assert dict(loop._session.state.total_usage) == _DRAINED_BILL
+    finally:
+        loop.discard_uncommitted()
+
+
+def _stamped_drop() -> ModelAdapterError:
+    failure = ModelAdapterError("gateway stream dropped", error_code="model_stream_dropped")
+    mark_provider_usage(failure, _DRAINED_BILL)
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("drain_s", "make_failure", "expected_usage"),
+    [
+        (0.0, _stamped_drop, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+        (5.0, _stamped_drop, _DRAINED_BILL),
+        (
+            5.0,
+            lambda: ConnectionError("connection reset"),
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+    ],
+    ids=["drain_off", "drain_on_stamped_failure", "drain_on_raw_exception"],
+)
+def test_a_read_failing_after_a_user_cancel_still_settles_the_run_as_that_cancel(
+    tmp_path: Path, drain_s: float, make_failure: Any, expected_usage: dict[str, int]
+) -> None:
+    """The Stop's loop outcome does not depend on the drain: ``limited``/``user_cancel``.
+
+    The cancel lands while the provider read is in flight and that read then fails with no
+    further chunk. Without the drain the race ends the call at the cancel; with it, the failure
+    comes after the stop was decided and must not turn the run ``failed``. A failure's own usage
+    stamp is the drained bill.
+    """
+
+    token = CancellationToken()
+
+    class FailingAfterCancel(_ScriptedStreamAdapter):
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            yield TextDelta("partial")
+            token.cancel(InterruptionCause.USER_CANCEL)
+            await asyncio.sleep(0.05)
+            raise make_failure()
+
+    loop = _loop(tmp_path, FailingAfterCancel([]), stream_model_calls=True)
+    loop.cancellation_token = token
+    loop.async_model_abort_drain_s = drain_s
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.interruption_cause is InterruptionCause.USER_CANCEL
+        assert suspension.status == "limited"
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == expected_usage
     finally:
         loop.discard_uncommitted()
 
