@@ -2169,6 +2169,10 @@ class ModelCallRunner:
             except Exception as exc:
                 if not drain.started:
                     raise
+                if drain.cancel_cause is not None:
+                    # A stream task that ended in the tick a user cancel began the drain leaves
+                    # this race before the transition below; the held remainder is still the stop's.
+                    settle_cancelled_remainder()
                 if _is_provider_cancel(exc):
                     # The provider cancelled its own read after the stop, and the stream task
                     # ended in the tick the drain began (nothing awaits in its cleanup without an

@@ -6625,7 +6625,11 @@ def test_a_user_cancel_landing_as_should_abort_answers_still_drains_as_the_cance
 
 
 class _NoCloseStream:
-    """A provider iterator without ``aclose``: its reads never yield to the event loop."""
+    """A provider iterator without ``aclose``: its reads never yield to the event loop.
+
+    A step is a chunk to return, an exception to raise, or a zero-argument callable run in place
+    before the same read goes on to the next step.
+    """
 
     def __init__(self, *script: Any) -> None:
         self.script = list(script)
@@ -6640,6 +6644,8 @@ class _NoCloseStream:
 
     async def __anext__(self) -> Any:
         self.reads += 1
+        while self.script and callable(self.script[0]):
+            self.script.pop(0)()
         if not self.script:
             raise StopAsyncIteration
         step = self.script.pop(0)
@@ -6898,6 +6904,37 @@ def test_a_user_cancel_drain_settles_a_held_back_lone_surrogate() -> None:
     assert type(outcome.error) is RunCancelled, outcome.error
     assert outcome.texts == ["x", "\ufffd"]
     assert provider_usage_of(outcome.error) == _BILL
+
+
+@pytest.mark.parametrize("ending", ["provider_cancel", "provider_failure", "finished"])
+def test_a_user_cancel_drain_that_ends_in_its_first_tick_still_settles_the_held_surrogate(
+    ending: str,
+) -> None:
+    """The read a user cancel lands in ends at once, before phase one sees the drain signal.
+
+    Without ``aclose`` nothing awaits between the cancel and the stream task's end, so the
+    streaming race sees the finished task first and leaves through its exception branch rather
+    than the drain transition. The held-back high surrogate is still content the provider sent
+    before the stop, so its U+FFFD is due on this exit too -- and the cancel stays the outcome.
+    """
+
+    token = CancellationToken()
+    endings: dict[str, tuple[Any, ...]] = {
+        "provider_cancel": (asyncio.CancelledError(),),
+        "provider_failure": (_read_failure("model_adapter_error", _BILL),),
+        "finished": (),
+    }
+    stream = _NoCloseStream(
+        TextDelta("x\ud83d"),
+        lambda: token.cancel(InterruptionCause.USER_CANCEL),
+        *endings[ending],
+    )
+    outcome = _drain_call(stream, token=token, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["x", "\ufffd"]
+    assert outcome.receipt.error_code == "cancelled"
 
 
 def _leftover_callbacks(token: CancellationToken, authority: ActivationWriteAuthority) -> tuple:
