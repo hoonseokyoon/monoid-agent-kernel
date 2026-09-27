@@ -1098,6 +1098,10 @@ arrives earlier is an ordinary cancellation. Because a token keeps its first cau
 window. Draining costs what the provider keeps generating for up to `abort_drain_s` and holds the
 connection that long; hosts that stop many calls at once own that concurrency.
 
+The drain applies to the loop's own model calls. Child and fork (subagent) loops are built with
+their default `async_model_abort_drain_s` of `0`, so a Stop during a child's streamed call is still
+cut at once and reports no usage for that call; passing the knob to children is a follow-up.
+
 Independently of the drain, a stop observed after the terminal chunk was delivered now carries that
 chunk's usage (previously discarded). This is the one v0.24 change to the default path.
 

@@ -22,6 +22,9 @@ out in commit messages and here.
 - With the drain on, `AgentLoop.astream`'s early-exit wait before it hard-cancels the drive grows
   from 8 s to `8 s + async_model_abort_drain_s + async_model_cancel_grace_s` (read when the stream
   opens), so a drain started by leaving the block early is not cut. Unchanged with the drain off.
+- Known limit: the drain applies to the loop's own model calls. Subagent child and fork loops keep
+  their default `async_model_abort_drain_s` of `0`, so a Stop during a child's streamed call is
+  still cut at once and reports no usage for that call.
 
 ### Fixed
 

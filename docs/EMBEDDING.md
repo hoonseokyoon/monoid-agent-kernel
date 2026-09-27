@@ -708,6 +708,9 @@ still stop at once. Nothing read after the Stop is delivered to the UI, observer
 sidecars; the Stop's outcome is unchanged (`interrupted` suspension or `cancelled` run), only later —
 by at most `async_model_abort_drain_s + async_model_cancel_grace_s`.
 
+The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
+of `0`, so a Stop during a child's streamed call is still cut and reports no usage for that call.
+
 Read the bill where you already read it:
 
 - `AgentLoop`: the run's `total_usage`, `metrics.updated`, the checkpoint totals and the token
