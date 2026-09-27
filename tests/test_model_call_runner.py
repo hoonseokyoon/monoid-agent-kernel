@@ -67,6 +67,7 @@ from monoid_agent_kernel.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
     collect_retry_reports,
+    mark_provider_retried,
     mark_provider_usage,
     normalize_model_request,
     provider_usage_of,
@@ -5970,8 +5971,8 @@ _STALL = object()
 class _DrainStream:
     """A provider stream scripted step by step, recording how far the runner read it.
 
-    A step is a chunk to yield, an ``asyncio.Event`` to wait for, ``_STALL``, a zero-argument
-    callable to run in place, or an exception to raise.
+    A step is a chunk to yield, an ``asyncio.Event`` to wait for, ``_STALL``, a float of seconds
+    to sleep, a zero-argument callable to run in place, or an exception to raise.
     """
 
     def __init__(self, *script: Any) -> None:
@@ -5987,6 +5988,8 @@ class _DrainStream:
                     await asyncio.Event().wait()
                 elif isinstance(step, asyncio.Event):
                     await step.wait()
+                elif isinstance(step, float):
+                    await asyncio.sleep(step)
                 elif isinstance(step, BaseException):
                     raise step
                 elif callable(step):
@@ -6047,6 +6050,7 @@ def _drain_call(
     request: ModelRequest = REQUEST,
     during: Any = None,
     timeout_s: float = 10.0,
+    before_dispatch: Any = None,
     **runner_kwargs: Any,
 ) -> _DrainOutcome:
     """One streamed call; `during` is a coroutine function run beside it (a canceller)."""
@@ -6072,6 +6076,7 @@ def _drain_call(
                     deadline=deadline,
                     should_abort=should_abort,
                     delta_consumer=outcome.seen.append,
+                    before_dispatch=before_dispatch,
                 ),
                 timeout_s,
             )
@@ -6645,3 +6650,157 @@ def test_a_provider_cancel_that_finishes_the_drain_in_its_first_tick_stays_the_s
     assert outcome.texts == ["a"]
     assert provider_usage_of(outcome.error) == _BILL
     assert outcome.receipt.error_code == "model_call_aborted"
+
+
+def test_a_stop_after_a_terminal_chunk_without_usage_stamps_nothing_with_the_drain_off() -> None:
+    """The default half of the zero-fill rule: an all-zero fill is not a report.
+
+    The ingress zero-fills a terminal chunk that reported no usage; stamped on the stop it would
+    record a bill of zero no provider made, and break "the default path is unchanged apart from
+    the delivered-terminal fix".
+    """
+
+    stream = _DrainStream(TextDelta("a"), TurnComplete(response_id="r"))
+    outcome = _drain_call(stream, drain_s=0.0, should_abort=_Polls(2))
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert len(stream.yielded) == 2
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.usage == {}
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_user_cancel_before_the_stream_is_entered_stays_an_ordinary_cancel(
+    drain_s: float,
+) -> None:
+    """A cancel before the stream task entered the provider is not a drain trigger.
+
+    The stream task still gets the tick it always got (this stream yields within it, with the
+    drain on or off), and the call ends as the same unstamped cancellation either way. Draining
+    would read on, and bill, a request the Stop came before.
+    """
+
+    token = CancellationToken()
+    stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(
+        stream,
+        drain_s=drain_s,
+        token=token,
+        before_dispatch=lambda: token.cancel(InterruptionCause.USER_CANCEL),
+        timeout_s=5.0,
+    )
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.usage == {}
+
+
+def test_the_drain_window_is_measured_from_the_stop_not_the_stream_opening() -> None:
+    """A stop half a second into the stream still gets its whole budget."""
+
+    stream = _DrainStream(TextDelta("a"), 0.5, TextDelta("b"), 0.1, TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, drain_s=0.3, should_abort=_Polls(2), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert outcome.texts == ["a", "b"]
+    assert len(stream.yielded) == 3
+    assert provider_usage_of(outcome.error) == _BILL
+
+
+def test_a_drain_failure_that_reports_a_provider_retry_is_folded_into_the_receipt() -> None:
+    failure = RuntimeError("socket reset after a retried attempt")
+    mark_provider_retried(failure)
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert outcome.error.__context__ is failure
+    assert outcome.receipt.provider_retried is True
+
+
+def test_a_user_cancel_drain_settles_a_held_back_lone_surrogate() -> None:
+    """The ingress held back a high surrogate; the cancel leaves it lone, so its U+FFFD is due.
+
+    Its delivery belongs to the stop (it is content the provider sent before it), not the drain.
+    """
+
+    token = CancellationToken()
+    reached = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def cancel_then_release() -> None:
+        await reached.wait()
+        await asyncio.sleep(0.1)
+        token.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    stream = _DrainStream(
+        TextDelta("x\ud83d"), reached.set, gate, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(stream, token=token, during=cancel_then_release, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.texts == ["x", "\ufffd"]
+    assert provider_usage_of(outcome.error) == _BILL
+
+
+def _leftover_callbacks(token: CancellationToken, authority: ActivationWriteAuthority) -> tuple:
+    return len(token._callbacks), len(authority._callbacks)
+
+
+@pytest.mark.parametrize(
+    "exit_path",
+    [
+        "completed",
+        "abort_drained_to_the_end",
+        "abort_window_closed",
+        "user_cancel_drained",
+        "graceful_drain_cancel",
+        "lease_lost",
+    ],
+)
+def test_every_exit_from_a_drain_enabled_stream_leaves_no_callback_behind(exit_path: str) -> None:
+    """A leaked callback would begin a stale drain on the run's next cancel, or reach a closed loop.
+
+    The run token's and the authority's callbacks are one-shot: whatever did not fire must be
+    removed on the way out, on every path.
+    """
+
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    reached = asyncio.Event()
+    kwargs: dict[str, Any] = {"token": token, "authority": authority, "timeout_s": 5.0}
+    if exit_path == "completed":
+        stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+    elif exit_path == "abort_drained_to_the_end":
+        stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+        kwargs["should_abort"] = _Polls(1)
+    elif exit_path == "abort_window_closed":
+        stream = _DrainStream(TextDelta("a"), _STALL)
+        kwargs.update(should_abort=_Polls(1), drain_s=0.2, grace_s=0.2)
+    else:
+        stream = _DrainStream(TextDelta("a"), reached.set, _STALL, TurnComplete(usage=_BILL))
+        if exit_path == "lease_lost":
+
+            async def revoke() -> None:
+                await reached.wait()
+                await asyncio.sleep(0.1)
+                authority.revoke()
+
+            kwargs["during"] = revoke
+        else:
+            cause = (
+                InterruptionCause.USER_CANCEL
+                if exit_path == "user_cancel_drained"
+                else InterruptionCause.GRACEFUL_DRAIN
+            )
+            kwargs.update(during=_cancel_when(reached, token, cause), drain_s=0.3, grace_s=0.2)
+    outcome = _drain_call(stream, **kwargs)
+
+    if exit_path == "completed":
+        assert outcome.error is None and outcome.turn is not None
+    else:
+        assert outcome.error is not None
+    assert _leftover_callbacks(token, authority) == (0, 0)
