@@ -736,3 +736,39 @@ def test_subagent_usage_counts_against_parent_token_budget(tmp_path: Path) -> No
         request for request in adapter.requests if PARENT_MARK in request.system_prompt
     ]
     assert len(parent_requests) == 1
+
+
+@pytest.mark.parametrize("context", ["fresh", "fork"])
+def test_child_loops_keep_the_default_abort_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: str
+) -> None:
+    """A documented v0.24 limit, pinned so the docs cannot drift from it silently.
+
+    ``async_model_abort_drain_s`` applies to the loop's own model calls; child and fork loops are
+    built with their default 0, so a token ``cancel()`` during a child's streamed call still cuts
+    it and bills nothing; ``interrupt_turn()`` never reaches a child, which streams to completion
+    and bills in full (CONTRACTS "Stopped-stream drain", EMBEDDING "Billing a stopped stream",
+    CHANGELOG).
+    Passing the knob to children is a follow-up: when it lands, update those three with this.
+    """
+
+    child_drains: list[float] = []
+    original = AgentLoop.arun_once
+
+    async def spy(self: AgentLoop, *args: object, **kwargs: object):  # noqa: ANN202
+        if self is not loop:
+            child_drains.append(self.async_model_abort_drain_s)
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AgentLoop, "arun_once", spy)
+    adapter = RoutingAdapter(
+        parent=[_spawn_call("do X"), ModelTurn(final_text="parent done")],
+        child=[ModelTurn(final_text="CHILD_OUTPUT")],
+    )
+    loop = _loop(tmp_path, adapter, _parent_config(), child=_child_def(context=context))
+    loop.async_model_abort_drain_s = 5.0
+
+    result = loop.run_once("go")
+
+    assert result.status == "completed"
+    assert child_drains == [0.0]

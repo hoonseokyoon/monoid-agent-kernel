@@ -34,7 +34,8 @@ building against, and securing the kernel.
   [v0.23 development workflow](V0_23_DEVELOPMENT_WORKFLOW.md) defines the sequential PR, review, and
   cost-controlled CI routine. The [v0.23 implementation plan](V0_23_IMPLEMENTATION_PLAN.md) records
   the PostgreSQL, ObjectStore, Temporal, durable-stream scope and owner decisions. The
-  [v0.23 release audit](V0_23_RELEASE_AUDIT.md) is the evidence gate for that campaign.
+  [v0.23 release audit](V0_23_RELEASE_AUDIT.md) is the evidence gate for that campaign. The
+  [v0.24 release audit](V0_24_RELEASE_AUDIT.md) records the stopped-stream drain release evidence.
 
 ## All documents
 
@@ -62,6 +63,7 @@ building against, and securing the kernel.
 | [V0_23_DEVELOPMENT_WORKFLOW.md](V0_23_DEVELOPMENT_WORKFLOW.md) | Sequential PR and review routine, Draft/Ready CI checkpoints, actual-service profiles, cost controls, and release workflow. |
 | [V0_23_IMPLEMENTATION_PLAN.md](V0_23_IMPLEMENTATION_PLAN.md) | Pre-implementation audit, recommended PostgreSQL/ObjectStore/Temporal and durable-stream architecture, PR sequence, risks, and owner approval matrix. |
 | [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Qualified storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release-delivery evidence. |
+| [V0_24_RELEASE_AUDIT.md](V0_24_RELEASE_AUDIT.md) | Stopped-stream drain release scope, known limits, no-migration statement, CI and exact-wheel evidence, and the release-delivery gate. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |

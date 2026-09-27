@@ -4,7 +4,7 @@ import asyncio
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -3658,3 +3658,92 @@ def test_the_policy_gate_reads_the_two_kernel_fields_and_nothing_else() -> None:
     assert _TenantPermissionPolicy(tenant_id="acme").is_default is True
     assert _TenantPermissionPolicy(deny_patterns=(".env",), tenant_id="acme").is_default is False
     assert _TenantPermissionPolicy(redact_patterns=("*.key",)).is_default is False
+
+
+# --- abort drain (v0.24) ------------------------------------------------------------------------
+
+
+class _StopThenBillAdapter:
+    """Streams, flips the interrupt, then keeps streaming past the stop to a billed terminal.
+
+    The fragment the generator yields after flipping the flag is in flight when the flag is first
+    polled, so it is delivered (the pre-existing rule); only the terminal chunk is drained.
+    """
+
+    bill = {"input_tokens": 11, "output_tokens": 4, "total_tokens": 15}
+
+    def __init__(self) -> None:
+        self.loop: AgentLoop | None = None
+        self.yielded = 0
+
+    async def astream_turn(self, request):  # noqa: ANN001, ANN201
+        del request
+        self.yielded += 1
+        yield TextDelta("seen ")
+        assert self.loop is not None
+        self.loop.interrupt_turn()
+        for chunk in (TextDelta("in flight "), TurnComplete(response_id="r1", usage=self.bill)):
+            self.yielded += 1
+            yield chunk
+
+    def next_turn(self, request):  # noqa: ANN001
+        return ModelTurn(final_text="unused")
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_interrupt_with_abort_drain_accounts_drained_usage_in_totals_metrics_and_budget(
+    tmp_path: Path, drain_s: float
+) -> None:
+    """The drained bill reaches the run exactly where an ordinary call's does.
+
+    ``total_usage`` is what the token budget reads (``_token_budget_exceeded``), so the totals and
+    the checkpoint that persists them are the budget's input; ``metrics.updated`` is its report.
+    With the drain off the stop closes the stream before the terminal chunk and bills nothing.
+    """
+
+    adapter = _StopThenBillAdapter()
+    loop, sink = _streaming_loop(tmp_path, adapter, emit=True)
+    loop.async_model_abort_drain_s = drain_s
+    loop.spec = replace(loop.spec, limits=RunLimits(max_total_tokens=10))
+    adapter.loop = loop
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.reason == "interrupted"
+        assert loop._session is not None and loop._session.terminal is False
+        texts = [e.data["text"] for e in sink.events if e.type == "model.output.delta"]
+        assert texts == ["seen ", "in flight "], "a drained chunk reached the delta mirror"
+        totals = dict(loop._session.state.total_usage)
+        expected = _StopThenBillAdapter.bill if drain_s else {}
+        assert {key: value for key, value in totals.items() if value} == expected
+        assert loop._token_budget_exceeded(loop._session.state) == (
+            "total_tokens_exceeded" if drain_s else None
+        )
+        metrics = [event for event in sink.events if event.type == "metrics.updated"]
+        if drain_s:
+            assert adapter.yielded == 3
+            assert metrics and metrics[-1].data["total_tokens"] == 15
+            assert loop.checkpoint_store is not None
+            latest = loop.checkpoint_store.latest(loop.spec.run_id)
+            assert latest is not None and latest.checkpoint.total_usage == expected
+        else:
+            assert adapter.yielded == 2
+    finally:
+        loop.close()
+
+
+def test_agentloop_abort_drain_knob_reaches_the_runner_live(tmp_path: Path) -> None:
+    """The twin of the cancel-grace knob: a public mutable field the runner reads live."""
+
+    loop, _sink = _streaming_loop(tmp_path, _StopThenBillAdapter(), emit=True)
+    assert loop.async_model_abort_drain_s == 0.0
+    loop.open()
+    try:
+        runner = loop._bootstrap_resources.model_runner
+        assert runner._abort_drain_s() == 0.0
+        loop.async_model_abort_drain_s = 2.5
+        assert runner._abort_drain_s() == pytest.approx(2.5)
+        loop.async_model_abort_drain_s = float("nan")
+        assert runner._abort_drain_s() == 0.0
+    finally:
+        loop.close()

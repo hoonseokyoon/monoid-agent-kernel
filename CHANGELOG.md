@@ -7,6 +7,48 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-27
+
+### Added — stopped-stream drain
+
+- Added `ModelCallRunner.abort_drain_s` and `current_abort_drain_s` (keyword-only) and
+  `AgentLoop.async_model_abort_drain_s` (keyword-only, read live). With a positive budget, a
+  streamed call's cooperative stop — `should_abort`/`interrupt_turn`, or the run token's
+  `user_cancel` — keeps reading the same provider stream, undelivered, until it ends or
+  `min(stop + budget, deadline)` passes, then closes it within the cancel grace. The stop still
+  raises `ModelCallAborted` or `RunCancelled(user_cancel)`, now stamped with the drained
+  `TurnComplete` usage, which reaches the failed receipt, the attempt log and the run's totals and
+  token budget. `graceful_drain`, `deadline`, `host_shutdown` and lease loss still end the call at
+  once, unless a `user_cancel` already turned the stop into a drain (the token keeps its first
+  cause); then, of these, only lease loss cuts it short, and the run deadline still closes its
+  window. A deadline that closes the window never reclassifies the stop as a timeout. The default
+  of `0` keeps closing the stream at the stop. No receipt, ledger, codec, schema or fixture changes.
+- With the drain on, `AgentLoop.astream`'s early-exit wait before it hard-cancels the drive grows
+  from 8 s to `8 s + async_model_abort_drain_s + async_model_cancel_grace_s`, so a drain started by
+  leaving the block early is not cut. Both knobs are read when that wait starts, not when
+  `astream()` is called, and the drain term is never less than the budget the in-flight streamed
+  call opened with: a knob raised inside the `async with` before the first call, or lowered after
+  the call opened, still leaves the wait covering the drain the runner actually runs.
+  `RunStream` takes an optional `current_extra_grace_s` callable for this. Unchanged with the drain
+  off.
+- Known limit: the drain applies to the loop's own model calls. Subagent child and fork loops keep
+  their default `async_model_abort_drain_s` of `0`, so a token `cancel()` during a child's
+  streamed call still cuts it at once and reports no usage for that call. `interrupt_turn()` never
+  reaches a child, which streams its call to completion and bills it in full, as before.
+
+### Fixed
+
+- A streamed call stopped by `should_abort` after the provider's terminal chunk had already been
+  delivered now carries that chunk's usage on `ModelCallAborted` and its receipt; it was discarded.
+  This applies with the drain off too — the one deliberate change to the default path in this
+  release.
+
+### Changed — CI service pin
+
+- Re-pinned the actual-service MinIO image to `docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5`
+  (the same upstream commit as `RELEASE.2025-07-23T15-54-02Z`) because upstream MinIO archived its
+  image distribution; CI and the campaign lock only, no package change.
+
 ## [0.23.0] - 2026-08-25
 
 ### Added — PostgreSQL and ObjectStore production persistence

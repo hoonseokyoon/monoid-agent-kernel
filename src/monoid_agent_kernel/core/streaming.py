@@ -38,6 +38,12 @@ class _Sentinel:
 
 _STREAM_END = _Sentinel()
 
+_DEFAULT_CANCEL_GRACE_S = 8.0
+"""How long an early exit waits for the cancelled drive before hard-cancelling it.
+
+The loop adds a stopped-stream drain on top of this when one is on (`AgentLoop.astream`), read
+when the wait starts."""
+
 
 class QueueEventSink:
     """An :class:`~monoid_agent_kernel.core.events.EventSink` that forwards events onto
@@ -105,12 +111,17 @@ class RunStream:
         sink: QueueEventSink,
         drive_factory: Callable[[], Awaitable[Any]],
         request_cancel: Callable[[], None],
-        cancel_grace_s: float = 8.0,
+        cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S,
+        current_extra_grace_s: Callable[[], float] | None = None,
     ) -> None:
         self._sink = sink
         self._drive_factory = drive_factory
         self._request_cancel = request_cancel
         self._cancel_grace_s = cancel_grace_s
+        # Read when an early exit starts its wait, not here: what the exit has to outlast (a
+        # stopped stream's drain) is decided by knobs the embedder may still move after
+        # ``astream()`` returns, and by the call that is in flight when the exit happens.
+        self._current_extra_grace_s = current_extra_grace_s
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -133,7 +144,7 @@ class RunStream:
             # in-flight turn reaches a boundary and emits its terminal events, with a
             # bounded hard-cancel fallback for an adapter wedged in a thread.
             self._request_cancel()
-            _done, pending = await asyncio.wait({task}, timeout=self._cancel_grace_s)
+            _done, pending = await asyncio.wait({task}, timeout=self._exit_wait_s())
             if pending:
                 task.cancel()
         if task is not None:
@@ -151,6 +162,21 @@ class RunStream:
         ):
             raise self._error
         return False
+
+    def _exit_wait_s(self) -> float:
+        """How long an early exit waits for the cancelled drive, sized as the wait starts.
+
+        The fixed grace plus whatever the owner says the exit may have started on top of it. An
+        owner callback that raises adds nothing: the exit must still close the stream.
+        """
+
+        extra_s = 0.0
+        if self._current_extra_grace_s is not None:
+            try:
+                extra_s = self._current_extra_grace_s()
+            except Exception:  # noqa: BLE001 - the exit falls back to the fixed grace
+                extra_s = 0.0
+        return self._cancel_grace_s + extra_s if extra_s else self._cancel_grace_s
 
     async def _run(self) -> None:
         try:
