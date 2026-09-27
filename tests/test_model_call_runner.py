@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
-from monoid_agent_kernel.core.authority import ActivationWriteAuthority
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.model_io import (
@@ -6935,6 +6935,44 @@ def test_a_user_cancel_drain_that_ends_in_its_first_tick_still_settles_the_held_
     assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
     assert outcome.texts == ["x", "\ufffd"]
     assert outcome.receipt.error_code == "cancelled"
+
+
+@pytest.mark.parametrize("ending", ["stalls", "finished", "provider_cancel"])
+@pytest.mark.parametrize("order", ["cancel_then_revoke", "revoke_then_cancel"])
+def test_a_lease_lost_in_the_tick_a_user_cancel_began_the_drain_settles_nothing(
+    order: str, ending: str
+) -> None:
+    """Lease loss lands in the same phase-one tick as the user cancel that began the drain.
+
+    The streaming race then ends with the lease-loss boundary, not with the stream task's own
+    outcome, and a stale activation must not be handed the held-back surrogate's U+FFFD: nothing
+    after the revocation reaches the consumer, whether the stream stalls, ends, or cancels itself.
+    """
+
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+
+    def cancel_and_revoke() -> None:
+        if order == "cancel_then_revoke":
+            token.cancel(InterruptionCause.USER_CANCEL)
+            authority.revoke()
+        else:
+            authority.revoke()
+            token.cancel(InterruptionCause.USER_CANCEL)
+
+    stream: Any
+    if ending == "stalls":
+        stream = _DrainStream(TextDelta("x\ud83d"), cancel_and_revoke, _STALL)
+    elif ending == "finished":
+        stream = _NoCloseStream(TextDelta("x\ud83d"), cancel_and_revoke)
+    else:
+        stream = _NoCloseStream(TextDelta("x\ud83d"), cancel_and_revoke, asyncio.CancelledError())
+    outcome = _drain_call(stream, token=token, authority=authority, timeout_s=5.0)
+
+    assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.texts == ["x"], "a revoked activation was handed the held-back remainder"
+    assert outcome.settled == []
 
 
 def _leftover_callbacks(token: CancellationToken, authority: ActivationWriteAuthority) -> tuple:
