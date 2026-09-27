@@ -6445,8 +6445,8 @@ def test_should_abort_is_not_polled_while_draining() -> None:
 
 @pytest.mark.parametrize(
     "broken",
-    [float("nan"), float("inf"), -1.0, "soon", RuntimeError("knob store down")],
-    ids=["nan", "inf", "negative", "not_a_number", "raises"],
+    [float("nan"), float("inf"), -1.0, "soon", "5", True, RuntimeError("knob store down")],
+    ids=["nan", "inf", "negative", "not_a_number", "numeric_string", "bool", "raises"],
 )
 def test_the_abort_drain_budget_is_read_live_and_a_broken_accessor_means_no_drain(
     broken: Any,

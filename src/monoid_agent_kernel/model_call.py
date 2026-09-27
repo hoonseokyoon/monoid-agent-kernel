@@ -517,11 +517,16 @@ def _positive_seconds(read: Callable[[], Any]) -> float:
     """A duration knob's value, or 0 when it cannot be read or is not a positive finite number.
 
     The drain budget's reading rule, shared with the loop's `RunStream` sizing so the two agree on
-    whether a drain is on: a broken knob means "off", never a failure of its own.
+    whether a drain is on: a broken knob means "off", never a failure of its own. Only an `int` or
+    a `float` is a number here: a string that would parse, or a bool, is not, so it is not coerced
+    into a drain nobody set.
     """
 
     try:
-        seconds = float(read())
+        value = read()
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        seconds = float(value)  # an int too large for a float overflows here
     except Exception:
         return 0.0
     return seconds if math.isfinite(seconds) and seconds > 0 else 0.0

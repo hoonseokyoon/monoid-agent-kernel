@@ -1118,6 +1118,30 @@ def test_an_early_break_from_astream_waits_out_the_drain_and_keeps_its_bill(
     assert result.metrics["total_tokens"] == _DRAINED_BILL["total_tokens"]
 
 
+@pytest.mark.parametrize("knob", ["5", True], ids=["numeric_string", "bool"])
+def test_a_drain_knob_that_is_not_a_real_number_means_no_drain_at_the_loop(
+    tmp_path: Path, knob: Any
+) -> None:
+    """Not a positive finite number means no drain -- a string or a bool is not one.
+
+    Both readers of the loop's knob agree: the runner drains nothing and ``astream`` keeps the
+    8 s early-exit wait it has with the drain off.
+    """
+
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
+
+    async def read() -> tuple[float, float]:
+        await loop.aopen()
+        try:
+            loop.async_model_abort_drain_s = knob
+            runner = loop._bootstrap_resources.model_runner
+            return runner._abort_drain_s(), loop.astream("go")._cancel_grace_s
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(read()) == (0.0, 8.0)
+
+
 def test_astream_sizes_its_early_exit_wait_from_the_drain_read_as_it_opens(tmp_path: Path) -> None:
     """8 s with the drain off (today's value); drain + model cancel grace on top with it on."""
 
