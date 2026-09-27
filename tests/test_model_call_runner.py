@@ -6698,6 +6698,23 @@ def test_a_read_that_fails_after_a_user_cancel_began_the_drain_is_still_the_canc
     assert outcome.receipt.retryable is False
 
 
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_provider_cancel_with_no_stop_stays_the_providers_failure(drain_s: float) -> None:
+    """The control for the provider-cancel-after-a-stop pins above: no stop, nothing to map to.
+
+    A provider that cancels its own read when nothing stopped the call ends it with
+    ``model_adapter_cancelled``, drain budget or not -- the drain must not invent a stop.
+    """
+
+    stream = _DrainStream(TextDelta("a"), asyncio.CancelledError())
+    outcome = _drain_call(stream, drain_s=drain_s, should_abort=_Polls(99), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelAdapterError, outcome.error
+    assert outcome.error.error_code == "model_adapter_cancelled"
+    assert outcome.texts == ["a"]
+    assert outcome.receipt.error_code == "model_adapter_cancelled"
+
+
 def test_a_stop_after_a_terminal_chunk_without_usage_stamps_nothing_with_the_drain_off() -> None:
     """The default half of the zero-fill rule: an all-zero fill is not a report.
 
