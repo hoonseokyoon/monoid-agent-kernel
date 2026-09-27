@@ -7,6 +7,8 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-27
+
 ### Added — stopped-stream drain
 
 - Added `ModelCallRunner.abort_drain_s` and `current_abort_drain_s` (keyword-only) and
@@ -35,6 +37,12 @@ out in commit messages and here.
   delivered now carries that chunk's usage on `ModelCallAborted` and its receipt; it was discarded.
   This applies with the drain off too — the one deliberate change to the default path in this
   release.
+
+### Changed — CI service pin
+
+- Re-pinned the actual-service MinIO image to `docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5`
+  (the same upstream commit as `RELEASE.2025-07-23T15-54-02Z`) because upstream MinIO archived its
+  image distribution; CI and the campaign lock only, no package change.
 
 ## [0.23.0] - 2026-08-25
 
