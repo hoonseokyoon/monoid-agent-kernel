@@ -38,6 +38,11 @@ class _Sentinel:
 
 _STREAM_END = _Sentinel()
 
+_DEFAULT_CANCEL_GRACE_S = 8.0
+"""How long an early exit waits for the cancelled drive before hard-cancelling it.
+
+The loop adds a stopped-stream drain on top of this when one is on (`AgentLoop.astream`)."""
+
 
 class QueueEventSink:
     """An :class:`~monoid_agent_kernel.core.events.EventSink` that forwards events onto
@@ -105,7 +110,7 @@ class RunStream:
         sink: QueueEventSink,
         drive_factory: Callable[[], Awaitable[Any]],
         request_cancel: Callable[[], None],
-        cancel_grace_s: float = 8.0,
+        cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S,
     ) -> None:
         self._sink = sink
         self._drive_factory = drive_factory

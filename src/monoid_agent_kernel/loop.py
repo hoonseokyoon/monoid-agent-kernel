@@ -29,6 +29,7 @@ from monoid_agent_kernel.core.authority import (
 )
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
+    _positive_seconds,
     _recovered_receipt,
     _recovered_result_matches_evidence,
     _settled_model_stream_outcome,
@@ -136,6 +137,9 @@ from monoid_agent_kernel.core.result import (
 )
 from monoid_agent_kernel.core.output_validator import (
     OutputValidator,
+)
+from monoid_agent_kernel.core.streaming import (
+    _DEFAULT_CANCEL_GRACE_S as _RUN_STREAM_CANCEL_GRACE_S,
 )
 from monoid_agent_kernel.core.streaming import QueueEventSink, RunStream
 from monoid_agent_kernel.core.subagent_runtime import (
@@ -1426,6 +1430,13 @@ class AgentLoop:
     # Native async model calls and streams use the same bounded-cancellation shape, but keep a
     # separate knob so a slow provider connection cannot consume the tool-handler cleanup budget.
     async_model_cancel_grace_s: float = 1.0
+    # Seconds a stopped model stream is still read -- delivered to no one -- for the usage the
+    # provider bills; 0 closes it at the stop. Covers ``interrupt_turn`` and a ``user_cancel`` of
+    # ``cancellation_token`` on a streamed call; the stop's outcome is unchanged and carries the
+    # drained usage into the run totals. Read live, like the grace above. Subagent child and fork
+    # loops are not given it: they keep 0, so a token cancel still closes their streamed calls at
+    # once (``interrupt_turn`` never reaches a child, which streams to completion as before).
+    async_model_abort_drain_s: float = field(default=0.0, kw_only=True)
     shell_approval_provider: ShellApprovalProvider | None = None
     web_gateway_client: WebGatewayClient | None = None
     workspace_factory: Callable[[AgentRunSpec], Workspace] | None = None
@@ -1861,7 +1872,25 @@ class AgentLoop:
             sink=sink,
             drive_factory=lambda: self._astream_drive(user_input),
             request_cancel=token.cancel,
+            **self._run_stream_cancel_grace(),
         )
+
+    def _run_stream_cancel_grace(self) -> dict[str, float]:
+        """Size ``RunStream``'s early-exit wait so it outlasts a drain the exit itself starts.
+
+        Leaving the ``astream`` block early cancels the run with ``user_cancel``, which with
+        ``async_model_abort_drain_s`` set turns an in-flight stream into a drain lasting up to that
+        budget plus the model cancel grace. ``RunStream`` hard-cancels the drive after its own
+        fixed wait, and a hard cancel cuts the drain and loses its bill, so the drain and the
+        close are added to that wait. Both knobs are read here, as the stream opens; with the
+        drain off ``RunStream`` keeps its default.
+        """
+
+        drain_s = _positive_seconds(lambda: self.async_model_abort_drain_s)
+        if not drain_s:
+            return {}
+        close_s = _positive_seconds(lambda: self.async_model_cancel_grace_s)
+        return {"cancel_grace_s": _RUN_STREAM_CANCEL_GRACE_S + drain_s + close_s}
 
     async def _astream_drive(
         self, user_input: str | tuple[ContentPart, ...]
@@ -1906,7 +1935,9 @@ class AgentLoop:
         With autonomous model streaming (``stream_model_calls``, a configured content observer,
         the private content file, or legacy ``emit_output_deltas``) it takes effect mid-generation
         — the in-flight stream is aborted at the next token. Otherwise it lands at the next step
-        boundary (a non-streamed model call finishes first)."""
+        boundary (a non-streamed model call finishes first). With ``async_model_abort_drain_s``
+        set, the aborted stream is read (undelivered) for up to that long so the usage it bills
+        reaches the run totals; the suspension waits for that drain."""
         self._interrupt_requested = True
 
     def pause_turn(self) -> None:

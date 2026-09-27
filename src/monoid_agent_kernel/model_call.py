@@ -40,6 +40,8 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import math
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
@@ -51,10 +53,11 @@ from monoid_agent_kernel.core._sync_bridge import (
     abandon_unwaited_call,
     await_abandonable_call,
     consume_task_outcome,
+    detach_unfinished_call,
     is_async_callable,
     start_abandonable_sync_call,
 )
-from monoid_agent_kernel.core.authority import ActivationWriteAuthority
+from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import (
@@ -101,6 +104,7 @@ from monoid_agent_kernel.providers.base import (
     ModelStreamIngressNormalizer,
     ModelStreamChunk,
     ModelTurn,
+    TurnComplete,
     assemble_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
@@ -109,6 +113,7 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_request,
     normalize_model_config,
     normalize_model_turn,
+    provider_usage_of,
     resolved_provider_name,
 )
 from monoid_agent_kernel.providers._common import retry_delay_s
@@ -488,6 +493,118 @@ def _discard_hook(adapter: Any, request: Any) -> Any:
     return discarded
 
 
+def _streamed_usage(chunks: Sequence[ModelStreamChunk]) -> dict[str, int]:
+    """The usage a stream has already reported, read the way `assemble_streamed_turn` reads it.
+
+    The last `TurnComplete` carrying usage wins. The chunks are ingress-normalized, so the counts
+    are the provider's own report and nothing is estimated: an empty answer means "not reported".
+    The ingress zero-fills a terminal chunk that reported nothing, so "carrying" means a nonzero
+    count -- an all-zero fill stamped on a stop would record a report no provider made.
+    """
+
+    usage: dict[str, int] = {}
+    for chunk in chunks:
+        if isinstance(chunk, TurnComplete) and _reports_usage(chunk.usage):
+            usage = dict(chunk.usage)
+    return usage
+
+
+def _reports_usage(usage: Mapping[str, int] | None) -> bool:
+    return bool(usage) and any(usage.values())
+
+
+def _positive_seconds(read: Callable[[], Any]) -> float:
+    """A duration knob's value, or 0 when it cannot be read or is not a positive finite number.
+
+    The drain budget's reading rule, shared with the loop's `RunStream` sizing so the two agree on
+    whether a drain is on: a broken knob means "off", never a failure of its own. Only an `int` or
+    a `float` is a number here: a string that would parse, or a bool, is not, so it is not coerced
+    into a drain nobody set.
+    """
+
+    try:
+        value = read()
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        seconds = float(value)  # an int too large for a float overflows here
+    except Exception:
+        return 0.0
+    return seconds if math.isfinite(seconds) and seconds > 0 else 0.0
+
+
+_DRAINING = object()
+"""What the first phase of a draining stream returns when a stop turned the stream into a drain."""
+
+
+def _is_provider_cancel(exc: BaseException) -> bool:
+    """Whether `exc` is a provider cancelling its own read, as the bridge translates it."""
+
+    return isinstance(exc, ModelAdapterError) and exc.error_code == "model_adapter_cancelled"
+
+
+class _AbortDrain:
+    """One streamed call's post-stop drain: who stopped it, when, and what the provider billed.
+
+    A drain begins at most once. `should_abort` begins it from the stream task; the run's
+    `user_cancel` begins it from the canceller's thread, which is why `begin` takes a lock and the
+    task-side reads are plain attribute reads of values written before `started` is set.
+    """
+
+    def __init__(self, budget_s: float, delivered: list[ModelStreamChunk]) -> None:
+        self.budget_s = budget_s
+        self.delivered = delivered
+        self.entered = False
+        self.started = False
+        self.cancel_cause: InterruptionCause | None = None
+        self.abort_at = 0.0
+        self.usage: dict[str, int] = {}
+        self.stop: ModelCallAborted | RunCancelled | None = None
+        self.on_begin: Callable[[], None] = lambda: None
+        self._lock = threading.Lock()
+
+    def begin(self, cancel_cause: InterruptionCause | None) -> bool:
+        """Start the drain; False when it already started or there is no stream to drain.
+
+        A cancel that lands before the stream task entered the provider has nothing to drain
+        and stays an ordinary cancellation -- draining it would read on, and pay for, a request
+        the stop came before.
+        """
+
+        with self._lock:
+            if self.started or (cancel_cause is not None and not self.entered):
+                return False
+            self.abort_at = time.time()
+            self.cancel_cause = cancel_cause
+            self.started = True
+        self.on_begin()
+        return True
+
+    def outcome(self, failure: BaseException | None = None) -> ModelCallAborted | RunCancelled:
+        """The stop the drain ends as, carrying the bill it learned.
+
+        Precedence: the usage a failing adapter stamped on its own exception (the gateway stamps
+        its terminal frame's usage on a drop after it), then a drained `TurnComplete`, then one
+        already delivered before the stop. Absent all three the stamp is empty: "not reported".
+        """
+
+        stop: ModelCallAborted | RunCancelled
+        if self.cancel_cause is not None:
+            stop = RunCancelled("run cancelled", interruption_cause=self.cancel_cause)
+        else:
+            stop = ModelCallAborted("model call aborted")
+        usage = provider_usage_of(failure) if failure is not None else {}
+        mark_provider_usage(stop, usage or self.usage or _streamed_usage(self.delivered))
+        self.stop = stop
+        return stop
+
+    def ends_as(self, exc: BaseException) -> bool:
+        """Whether `exc` is how this drain itself ends: its own stop, or the lease loss that is
+        the one boundary allowed to cut it short. Anything else raised after the stop is a failure
+        the stop absorbs."""
+
+        return exc is self.stop or isinstance(exc, WriteAuthorityRevoked)
+
+
 @dataclass
 class ModelCallRunner:
     """Runs one model call against an adapter, whatever shape that adapter is.
@@ -600,6 +717,28 @@ class ModelCallRunner:
     delivery. Durable mode requires an explicit ``logical_call_id`` on :meth:`acall`.
     """
 
+    abort_drain_s: float = field(default=0.0, kw_only=True)
+    """How long a stopped stream keeps being read, undelivered, for the usage it will bill.
+
+    ``0`` (the default) closes the provider stream at the stop, as every release before this one
+    did. A positive budget turns a streamed call's stop into a drain: nothing more reaches
+    ``delta_consumer``, and the runner keeps reading the same stream until it ends or
+    ``min(stop + abort_drain_s, deadline)`` passes, then closes it within the cancel grace. Only a
+    ``TurnComplete``'s usage and the retry flag are kept from the drained chunks; the stop still
+    raises what it raised before -- ``ModelCallAborted`` for ``should_abort``, or
+    ``RunCancelled(user_cancel)`` for the run's cancellation token -- now stamped with that usage.
+    ``graceful_drain``, ``deadline``, ``host_shutdown`` and lease loss still end the call at once,
+    unless a ``user_cancel`` already turned the stop into a drain (the token keeps its first
+    cause); then, of these, only lease loss cuts it short, and the run deadline still closes its
+    window.
+
+    Used when ``current_abort_drain_s`` is unset, the way ``cancel_grace_s`` is."""
+
+    current_abort_drain_s: Callable[[], float] | None = field(default=None, kw_only=True)
+    """Returns the drain budget when a streamed call opens, for the reason
+    ``current_cancel_grace_s`` exists: ``AgentLoop.async_model_abort_drain_s`` is a public mutable
+    field. A budget that cannot be read, or is not a positive finite number, means no drain."""
+
     def _effective_model(
         self,
         request: ModelRequest,
@@ -668,6 +807,23 @@ class ModelCallRunner:
             else self.current_cancel_grace_s()
         )
 
+    def _abort_drain_s(self) -> float:
+        """The drain budget for one streamed call, read once as the stream opens; 0 disables.
+
+        Read at the opening rather than at the stop because a run cancel can only become a
+        drain if the stream's race was set up to let it, before the cancel could fire. A knob
+        that raises or reads NaN, infinite, or not positive is "no drain": the knob must never
+        be the reason a stop is reported as something else.
+        """
+
+        return _positive_seconds(
+            lambda: (
+                self.abort_drain_s
+                if self.current_abort_drain_s is None
+                else self.current_abort_drain_s()
+            )
+        )
+
     def _check_cancel_or_deadline(self, deadline: float | None) -> None:
         """Check only terminal run boundaries while model I/O is in flight.
 
@@ -721,7 +877,8 @@ class ModelCallRunner:
         `should_abort` is polled once per chunk **after** that chunk has been delivered, and only on
         the streamed path. Delivering first is the observable rule: a stop arriving while a chunk is
         in flight does not retract that chunk, it stops the one after it. Aborting raises
-        `ModelCallAborted`.
+        `ModelCallAborted`, stamped (`provider_usage_of`) with the usage the stream had already
+        reported. With `abort_drain_s` set, the stream is drained for that usage before the raise.
 
         A receipt is produced whether the call succeeded or failed -- a failed call is exactly the
         one an audit trail needs -- and is delivered to every subscription before the exception is
@@ -1673,8 +1830,12 @@ class ModelCallRunner:
         holds the same fact for the half where there is nothing to assemble -- a stream cancelled or
         aborted after a retried attempt committed. Stamping the exception is how the adapters
         already report it, and `with_error` already reads it back.
+
+        With a positive `abort_drain_s` a stop becomes a drain (see `_await_draining_stream`):
+        the same stream task keeps reading, delivers nothing, and folds only usage and retries.
         """
 
+        budget_s = self._abort_drain_s()
         agen = astream_turn(request)
         retried = False
         # Cleared the moment this call stops driving the stream, and read before every delivery.
@@ -1688,15 +1849,62 @@ class ModelCallRunner:
         # abandoned stream's tokens arrived in the next turn's stream -- output attributed to a turn
         # that never produced it, which is worse than the leak the grace interval already accepts.
         driving = True
+        chunks: list[ModelStreamChunk] = []
+        ingress = ModelStreamIngressNormalizer()
+        drain = _AbortDrain(budget_s, chunks) if budget_s > 0 else None
+
+        def deliver_remainder() -> None:
+            # The ingress holds back a high surrogate until its continuation arrives; a stream that
+            # ends, or is stopped, leaves that unit definitively lone and its replacement is due.
+            nonlocal retried
+            for normalized_chunk in ingress.finish():
+                if getattr(normalized_chunk, "provider_retried", False):
+                    retried = True
+                chunks.append(normalized_chunk)
+                delta_consumer(normalized_chunk)
+
+        async def drain_rest(drain: _AbortDrain, first: Any) -> ModelTurn:
+            # Everything the provider still sends goes through a normalizer of its own and is
+            # dropped after the fold: no delivery, no assembly (a truncated tool argument must not
+            # become a `stream_bad_tool_args` failure, nor unread text a buffer), no abort poll.
+            nonlocal retried
+            normalizer = ModelStreamIngressNormalizer()
+
+            def fold(raw: Any) -> None:
+                nonlocal retried
+                # The drain spends no authority, but a stale activation must stop reading too.
+                self._assert_write_authority()
+                try:
+                    pieces = normalizer.normalize(raw)
+                except Exception:
+                    return  # a fragment nobody will read cannot fail the stop
+                for piece in pieces:
+                    if getattr(piece, "provider_retried", False):
+                        retried = True
+                    if isinstance(piece, TurnComplete) and _reports_usage(piece.usage):
+                        drain.usage = dict(piece.usage)
+
+            if first is not None:
+                fold(first)
+            while driving:
+                try:
+                    raw = await anext(agen)
+                except StopAsyncIteration:
+                    break
+                fold(raw)
+            raise drain.outcome()
 
         async def consume() -> ModelTurn:
             nonlocal retried
-            chunks: list[ModelStreamChunk] = []
-            ingress = ModelStreamIngressNormalizer()
+            if drain is not None:
+                drain.entered = True
             try:
                 async for chunk in agen:
                     if not driving:
                         break
+                    if drain is not None and drain.started:
+                        # The run's cancel turned into a drain while this chunk was in flight.
+                        return await drain_rest(drain, chunk)
                     try:
                         normalized_chunks = ingress.normalize(chunk)
                     except ModelAdapterError:
@@ -1710,30 +1918,43 @@ class ModelCallRunner:
                             retried = True
                         chunks.append(normalized_chunk)
                         delta_consumer(normalized_chunk)
-                    if should_abort is not None and should_abort():
-                        for normalized_chunk in ingress.finish():
-                            if getattr(normalized_chunk, "provider_retried", False):
-                                retried = True
-                            chunks.append(normalized_chunk)
-                            delta_consumer(normalized_chunk)
-                        raise ModelCallAborted("model call aborted")
-                for normalized_chunk in ingress.finish():
-                    if getattr(normalized_chunk, "provider_retried", False):
+                    if (
+                        (drain is None or not drain.started)
+                        and should_abort is not None
+                        and should_abort()
+                    ):
+                        deliver_remainder()
+                        if drain is not None:
+                            # A no-op when a user cancel landed while `should_abort` was answering
+                            # and began the drain first: that cancel is the stop (the token's
+                            # first writer), and it drains all the same.
+                            drain.begin(None)
+                            return await drain_rest(drain, None)
+                        # A stop after the terminal chunk still owes what that chunk billed.
+                        aborted = ModelCallAborted("model call aborted")
+                        mark_provider_usage(aborted, _streamed_usage(chunks))
+                        raise aborted
+                if drain is not None and drain.started:
+                    return await drain_rest(drain, None)
+                deliver_remainder()
+            except BaseException as exc:
+                if drain is not None and drain.started:
+                    # The one place a failure meets a decided stop, whichever read it came from:
+                    # the drain's, or the main read a user cancel began the drain under. The stop
+                    # stays the outcome; the failure travels only as its context and its stamps.
+                    # A drain has already settled the held-back remainder and delivers nothing.
+                    if not isinstance(exc, Exception) or drain.ends_as(exc):
+                        raise
+                    if getattr(exc, "provider_retried", False) is True:
                         retried = True
-                    chunks.append(normalized_chunk)
-                    delta_consumer(normalized_chunk)
-            except BaseException:
+                    raise drain.outcome(exc)
                 # A boundary can end the stream after a provider-delivered high surrogate and
                 # before its continuation arrives.  At that point the unit is definitively lone;
                 # deliver its replacement before propagating the original outcome.  Preserve the
                 # original failure if a diagnostic consumer also rejects the synthetic suffix.
                 if driving:
                     with contextlib.suppress(Exception):
-                        for normalized_chunk in ingress.finish():
-                            if getattr(normalized_chunk, "provider_retried", False):
-                                retried = True
-                            chunks.append(normalized_chunk)
-                            delta_consumer(normalized_chunk)
+                        deliver_remainder()
                 raise
             finally:
                 # Provider async iterators own network resources, so the iterator is closed
@@ -1756,8 +1977,17 @@ class ModelCallRunner:
                         await self._aclose_within_grace(aclose)
             return assemble_streamed_turn(chunks)
 
+        def settle_cancelled_remainder() -> None:
+            if driving:
+                with contextlib.suppress(Exception):
+                    deliver_remainder()
+
         try:
-            return await self._aawait(consume(), deadline)
+            if drain is None:
+                return await self._aawait(consume(), deadline)
+            return await self._await_draining_stream(
+                consume, drain, deadline, settle_cancelled_remainder
+            )
         except BaseException as exc:
             # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
             # the ways this ends. `RunCancelled` and `RunTimeout` are raised by the race *around*
@@ -1781,6 +2011,188 @@ class ModelCallRunner:
             # handler, or reorder those two statements, and an abandoned stream starts talking to a
             # finished call again. A `finally` costs nothing and survives all three.
             driving = False
+
+    async def _await_draining_stream(
+        self,
+        consume: Callable[[], Any],
+        drain: _AbortDrain,
+        deadline: float | None,
+        settle_cancelled_remainder: Callable[[], None],
+    ) -> ModelTurn:
+        """Race one stream task in two phases: streaming, then -- after a stop -- draining.
+
+        Phase one is the ordinary race with one difference: the run's `user_cancel` does not end
+        it but begins the drain (the cancel's first-writer cause is final, so no other cause can
+        follow it). Phase two races the *same* task against a window of `min(stop + budget,
+        deadline)`, and the window closing is not a boundary: the bridge's `RunTimeout` is caught
+        and the stop is raised instead, so a deadline that ends the drain never reclassifies it.
+        `graceful_drain`, `deadline` and `host_shutdown` cancels and lease loss still end either
+        phase at once, with the precedence they always had, through a private token that sees
+        every run cancel except the one that became the drain. The shared bridge is unchanged: it
+        cannot tell these phases apart and does not need to.
+        """
+
+        run_token = self._token()
+        authority = None if self.current_write_authority is None else self.current_write_authority()
+        # What each phase's race observes: every run cancel except one the drain absorbed. Lease
+        # loss is forwarded here too, because a cancel that became the drain already spent the
+        # run token's one cause, and revocation would otherwise wait for the next drained chunk.
+        view = CancellationToken()
+        loop = asyncio.get_running_loop()
+        began: asyncio.Future[None] = loop.create_future()
+
+        def signal_began() -> None:
+            def resolve() -> None:
+                if not began.done():
+                    began.set_result(None)
+
+            loop.call_soon_threadsafe(resolve)
+
+        drain.on_begin = signal_began
+
+        def on_run_cancel() -> None:
+            if run_token is None:  # pragma: no cover - registered only on a token
+                return
+            cause = run_token.cause or InterruptionCause.USER_CANCEL
+            if cause is InterruptionCause.USER_CANCEL and (drain.begin(cause) or drain.started):
+                return
+            view._request(cause)
+
+        def absorbed(cause: InterruptionCause | None) -> bool:
+            return (cause or InterruptionCause.USER_CANCEL) is InterruptionCause.USER_CANCEL and (
+                drain.started
+            )
+
+        def stop_over(exc: Exception) -> ModelCallAborted | RunCancelled | None:
+            # Every `Exception` the stream task raises after the stop is mapped to the stop inside
+            # the task. One it raised *before* the stop is not: a user cancel landed while the
+            # failing stream was closing, and began the drain over a task already failing. The
+            # cancel is still the outcome, as with the drain off; the failure is its context.
+            # None for anything else: a boundary's own exception, or the drain's own ending.
+            if drain.ends_as(exc):
+                return None
+            if task is None or not task.done() or task.cancelled() or task.exception() is not exc:
+                return None
+            return drain.outcome(exc)
+
+        def streaming_boundary(boundary: float | None) -> None:
+            self._assert_write_authority()
+            if run_token is not None:
+                requested, cause = run_token.snapshot()
+                if requested and not absorbed(cause):
+                    raise RunCancelled(
+                        "run cancelled",
+                        interruption_cause=cause or InterruptionCause.USER_CANCEL,
+                    )
+            # Once the stop is decided the deadline only shortens the drain window below.
+            if not drain.started and boundary is not None and time.time() >= boundary:
+                raise RunTimeout("run exceeded max duration")
+
+        def draining_boundary(boundary: float | None) -> None:
+            del boundary  # the window closing is answered by the caller, not raised as a timeout
+            self._assert_write_authority()
+            if run_token is not None:
+                requested, cause = run_token.snapshot()
+                if requested and not absorbed(cause):
+                    raise RunCancelled(
+                        "run cancelled",
+                        interruption_cause=cause or InterruptionCause.USER_CANCEL,
+                    )
+
+        task: asyncio.Future[Any] | None = None
+        released = False
+
+        async def follow(until_drain: bool) -> Any:
+            # The raced awaitable in both phases. Cancelled by the race, it cancels the stream task
+            # and waits for it, so the race's grace bounds the stream's own cleanup exactly as it
+            # did when the stream task itself was raced -- except when phase one is cancelled after
+            # the stop was decided: that stream belongs to the drain phase and is left running.
+            nonlocal task, released
+            if task is None:
+                task = asyncio.ensure_future(consume())
+            try:
+                await asyncio.wait(
+                    {task, began} if until_drain else {task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                if not (until_drain and drain.started):
+                    released = True
+                    task.cancel()
+                    await asyncio.wait({task})
+                    consume_task_outcome(task)
+                raise
+            if task.done():
+                return task.result()
+            return _DRAINING
+
+        remove_cancel_callback: Callable[[], None] = lambda: None  # noqa: E731
+        remove_revoke_callback: Callable[[], None] = lambda: None  # noqa: E731
+        try:
+            if run_token is not None:
+                remove_cancel_callback = run_token.add_cancel_callback(on_run_cancel)
+            if authority is not None:
+                remove_revoke_callback = authority.add_revoke_callback(
+                    lambda: view._request(InterruptionCause.LEASE_LOST)
+                )
+            try:
+                streamed = await self._aawait(
+                    follow(True), deadline, boundary=(view, streaming_boundary)
+                )
+            except RunTimeout:
+                # The deadline fired in the tick the stop was decided, before phase one saw it.
+                if not drain.started:
+                    raise
+                streamed = _DRAINING
+            except Exception as exc:
+                if not drain.started:
+                    raise
+                if _is_provider_cancel(exc):
+                    # The provider cancelled its own read after the stop, and the stream task
+                    # ended in the tick the drain began (nothing awaits in its cleanup without an
+                    # `aclose`), so this race saw the task before the drain signal. The stop is the
+                    # outcome, as in phase two below; before the stop the failure is the
+                    # provider's, as ever.
+                    raise drain.outcome(exc) from None
+                stop = stop_over(exc)
+                if stop is None:
+                    raise
+                raise stop
+            if streamed is not _DRAINING and not drain.started:
+                return streamed
+            if drain.cancel_cause is not None:
+                settle_cancelled_remainder()
+            window_end = drain.abort_at + drain.budget_s
+            if deadline is not None:
+                window_end = min(window_end, deadline)
+            try:
+                await self._aawait(follow(False), window_end, boundary=(view, draining_boundary))
+            except RunTimeout:
+                # The window closed; `draining_boundary` never raises a timeout of its own.
+                raise drain.outcome() from None
+            except Exception as exc:
+                if _is_provider_cancel(exc):
+                    # The provider cancelled its own read (`CalleeCancelled`, translated): a
+                    # `CancelledError` is not an `Exception`, so `consume` cannot map it and it
+                    # reaches the race instead.
+                    raise drain.outcome(exc) from None
+                stop = stop_over(exc)
+                if stop is None:
+                    raise
+                raise stop
+            # A stream that finished in the tick its stop became a drain is still that stop.
+            raise drain.outcome()
+        finally:
+            remove_cancel_callback()
+            remove_revoke_callback()
+            if task is not None and not task.done() and not released:
+                # A boundary ended phase one after the stop was decided, so the race released
+                # only the follower. The drain is over; close its stream under the same grace.
+                try:
+                    grace_s = self._grace_s()
+                except Exception:
+                    grace_s = self.cancel_grace_s
+                await detach_unfinished_call(task, None, grace_s=grace_s)
 
     async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
         """Close a provider's stream, spending at most the grace interval on its cleanup.
@@ -1853,8 +2265,12 @@ class ModelCallRunner:
         *,
         adapter: Any = None,
         request: ModelRequest | None = None,
+        boundary: tuple[CancellationToken | None, Callable[[float | None], None]] | None = None,
     ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
+
+        ``boundary`` replaces the run token and the boundary check for a draining stream, whose
+        phases each observe a different subset of the run's boundaries (`_await_draining_stream`).
 
         Only terminal run boundaries apply while a model call is in flight. Interrupt and pause are
         step-boundary signals for a one-shot call and are the caller's to check after the model
@@ -1887,7 +2303,7 @@ class ModelCallRunner:
         # exits of this function carry it, and
         # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
         try:
-            token = self._token()
+            token = self._token() if boundary is None else boundary[0]
             grace_s = self._grace_s()
         except BaseException:
             await abandon_unwaited_call(
@@ -1902,7 +2318,9 @@ class ModelCallRunner:
                 deadline=deadline,
                 token=token,
                 grace_s=grace_s,
-                check_boundary=self._check_cancel_or_deadline,
+                check_boundary=(
+                    self._check_cancel_or_deadline if boundary is None else boundary[1]
+                ),
                 on_discarded=_discard_hook(adapter, request),
             )
         except CalleeCancelled as exc:

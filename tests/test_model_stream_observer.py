@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from threading import Event, Thread
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolCallDelta,
     TurnComplete,
+    mark_provider_usage,
 )
 from monoid_agent_kernel.recorder import MemoryEventSink
 
@@ -908,3 +910,254 @@ def test_run_stream_interrupt_drains_the_call_then_surfaces_a_suspension(tmp_pat
             usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         )
     ]
+
+
+# --- abort drain (v0.24) ------------------------------------------------------------------------
+
+_DRAINED_BILL = {"input_tokens": 6, "output_tokens": 3, "total_tokens": 9}
+
+
+def test_interrupt_with_abort_drain_delivers_nothing_after_stop_to_observers_or_delta_events(
+    tmp_path: Path,
+) -> None:
+    sink = MemoryEventSink()
+    observer = _RecordingObserver()
+
+    class InterruptingAdapter(_ScriptedStreamAdapter):
+        loop: AgentLoop
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            for index, chunk in enumerate(
+                (
+                    TextDelta("part 1"),
+                    TextDelta("part 2"),
+                    TextDelta("drained"),
+                    ReasoningDelta("drained thought"),
+                    TurnComplete(response_id="late", usage=_DRAINED_BILL),
+                )
+            ):
+                if index == 1:
+                    self.loop.interrupt_turn()
+                self.yielded += 1
+                yield chunk
+
+    adapter = InterruptingAdapter([])
+    loop = _loop(
+        tmp_path,
+        adapter,
+        event_sink=sink,
+        observer_factories=(lambda: observer,),
+        emit_output_deltas=True,
+    )
+    loop.async_model_abort_drain_s = 5.0
+    adapter.loop = loop
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.reason == "interrupted"
+        assert adapter.yielded == 5, "the stream was not drained"
+        texts = [e.data["text"] for e in sink.events if e.type == "model.output.delta"]
+        assert texts == ["part 1", "part 2"]
+        assert not [e for e in sink.events if e.type == "model.reasoning.delta"]
+        assert [delta.text for delta in observer.writers[0].deltas] == ["part 1", "part 2"]
+        assert observer.writers[0].outcomes == [
+            ModelStreamOutcome(
+                status="interrupted", final_text="part 1part 2", error_code="interrupted"
+            )
+        ]
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == _DRAINED_BILL
+    finally:
+        loop.close()
+
+
+def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) -> None:
+    """The run's cancel token (the RunStream/host Stop) drains too, and stays a cancellation."""
+
+    token = CancellationToken()
+    observer = _RecordingObserver()
+
+    class CancellingAdapter(_ScriptedStreamAdapter):
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            self.yielded += 1
+            yield TextDelta("partial")
+            token.cancel(InterruptionCause.USER_CANCEL)
+            for chunk in (TextDelta("late"), TurnComplete(response_id="r", usage=_DRAINED_BILL)):
+                self.yielded += 1
+                yield chunk
+
+    adapter = CancellingAdapter([])
+    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,), stream_model_calls=True)
+    loop.cancellation_token = token
+    loop.async_model_abort_drain_s = 5.0
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.interruption_cause is InterruptionCause.USER_CANCEL
+        assert adapter.yielded == 3
+        assert [delta.text for delta in observer.writers[0].deltas] == ["partial"]
+        assert [outcome.status for outcome in observer.writers[0].outcomes] == ["cancelled"]
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == _DRAINED_BILL
+    finally:
+        loop.discard_uncommitted()
+
+
+def _stamped_drop() -> ModelAdapterError:
+    failure = ModelAdapterError("gateway stream dropped", error_code="model_stream_dropped")
+    mark_provider_usage(failure, _DRAINED_BILL)
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("drain_s", "make_failure", "expected_usage"),
+    [
+        (0.0, _stamped_drop, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+        (5.0, _stamped_drop, _DRAINED_BILL),
+        (
+            5.0,
+            lambda: ConnectionError("connection reset"),
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+    ],
+    ids=["drain_off", "drain_on_stamped_failure", "drain_on_raw_exception"],
+)
+def test_a_read_failing_after_a_user_cancel_still_settles_the_run_as_that_cancel(
+    tmp_path: Path, drain_s: float, make_failure: Any, expected_usage: dict[str, int]
+) -> None:
+    """The Stop's loop outcome does not depend on the drain: ``limited``/``user_cancel``.
+
+    The cancel lands while the provider read is in flight and that read then fails with no
+    further chunk. Without the drain the race ends the call at the cancel; with it, the failure
+    comes after the stop was decided and must not turn the run ``failed``. A failure's own usage
+    stamp is the drained bill.
+    """
+
+    token = CancellationToken()
+
+    class FailingAfterCancel(_ScriptedStreamAdapter):
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            yield TextDelta("partial")
+            token.cancel(InterruptionCause.USER_CANCEL)
+            await asyncio.sleep(0.05)
+            raise make_failure()
+
+    loop = _loop(tmp_path, FailingAfterCancel([]), stream_model_calls=True)
+    loop.cancellation_token = token
+    loop.async_model_abort_drain_s = drain_s
+    loop.open()
+    try:
+        suspension = loop.run_until_suspended("go")
+        assert suspension.interruption_cause is InterruptionCause.USER_CANCEL
+        assert suspension.status == "limited"
+        assert loop._session is not None
+        assert dict(loop._session.state.total_usage) == expected_usage
+    finally:
+        loop.discard_uncommitted()
+
+
+def test_an_early_break_from_astream_waits_out_the_drain_and_keeps_its_bill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the ``astream`` block early cancels the run; the drain that starts must finish.
+
+    ``RunStream``'s own hard-cancel fallback is shrunk below the drain here (it is 8 s in
+    production) to stand in for a drain longer than that fallback: the loop, not the fallback's
+    default, must size the wait, or the host cancel cuts the drain and loses the bill.
+    """
+
+    from monoid_agent_kernel.core.streaming import RunStream
+
+    monkeypatch.setitem(RunStream.__init__.__kwdefaults__, "cancel_grace_s", 0.3)
+
+    class SlowTerminalAdapter(_ScriptedStreamAdapter):
+        yielded = 0
+
+        async def astream_turn(self, request: ModelRequest):  # noqa: ANN202
+            del request
+            self.stream_calls += 1
+            self.yielded += 1
+            yield TextDelta("partial")
+            await asyncio.sleep(0.6)
+            for chunk in (TextDelta("late"), TurnComplete(response_id="r", usage=_DRAINED_BILL)):
+                self.yielded += 1
+                yield chunk
+
+    adapter = SlowTerminalAdapter([])
+    loop = _loop(tmp_path, adapter, stream_model_calls=True)
+    loop.async_model_abort_drain_s = 1.0
+    loop.async_model_cancel_grace_s = 0.2
+
+    async def drive() -> tuple[list[object], object]:
+        await loop.aopen()
+        items: list[object] = []
+        async with loop.astream("go") as stream:
+            async for item in stream:
+                items.append(item)
+                if isinstance(item, TextDelta):
+                    break
+        result = stream.result
+        await loop.aclose()
+        return items, result
+
+    items, result = asyncio.run(drive())
+
+    assert [item.text for item in items if isinstance(item, TextDelta)] == ["partial"]
+    assert adapter.yielded == 3, "the host cancel cut the drain"
+    assert result is not None
+    assert result.interruption_cause is InterruptionCause.USER_CANCEL
+    assert result.metrics["total_tokens"] == _DRAINED_BILL["total_tokens"]
+
+
+@pytest.mark.parametrize("knob", ["5", True], ids=["numeric_string", "bool"])
+def test_a_drain_knob_that_is_not_a_real_number_means_no_drain_at_the_loop(
+    tmp_path: Path, knob: Any
+) -> None:
+    """Not a positive finite number means no drain -- a string or a bool is not one.
+
+    Both readers of the loop's knob agree: the runner drains nothing and ``astream`` keeps the
+    8 s early-exit wait it has with the drain off.
+    """
+
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
+
+    async def read() -> tuple[float, float]:
+        await loop.aopen()
+        try:
+            loop.async_model_abort_drain_s = knob
+            runner = loop._bootstrap_resources.model_runner
+            return runner._abort_drain_s(), loop.astream("go")._cancel_grace_s
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(read()) == (0.0, 8.0)
+
+
+def test_astream_sizes_its_early_exit_wait_from_the_drain_read_as_it_opens(tmp_path: Path) -> None:
+    """8 s with the drain off (today's value); drain + model cancel grace on top with it on."""
+
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
+
+    async def waits() -> list[float]:
+        await loop.aopen()
+        try:
+            seen = [loop.astream("go")._cancel_grace_s]
+            loop.async_model_abort_drain_s = 3.0
+            loop.async_model_cancel_grace_s = 0.5
+            seen.append(loop.astream("go")._cancel_grace_s)
+            loop.async_model_abort_drain_s = float("nan")
+            seen.append(loop.astream("go")._cancel_grace_s)
+            return seen
+        finally:
+            await loop.aclose()
+
+    assert asyncio.run(waits()) == [8.0, 11.5, 8.0]

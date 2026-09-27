@@ -1873,3 +1873,45 @@ def test_the_kernel_layer_turns_the_streamed_loop_off_too(monkeypatch: Any) -> N
     with pytest.raises(ModelAdapterError):
         _stream(adapter_layer)
     assert len(attempts) == 3
+
+
+def test_a_drained_gateway_stream_meters_the_tenant() -> None:
+    """A client that drains after its stop reads the gateway to its terminal frame.
+
+    The reference gateway meters a stream's tenant just before it writes that frame, so the drain
+    is what lets the success meter run -- and the client learns the same bill the tenant ledger
+    records, on the stop it raises.
+    """
+
+    pytest.importorskip("httpx")
+    from monoid_agent_kernel.errors import ModelCallAborted
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    bill = {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10}
+    chunks = [TextDelta("a"), TextDelta("b"), TextDelta("c"), TurnComplete(usage=dict(bill))]
+    manager = _token_manager()
+    gateway = LlmGatewayBackend(
+        token_manager=manager,
+        provider_adapter_factory=lambda *_: FakeStreamingModelAdapter(chunk_turns=[chunks]),
+    )
+    server = create_llm_gateway_server(gateway, host="127.0.0.1", port=0, admin_token="admin")
+    seen: list[Any] = []
+    with serving(server) as base_url:
+        runner = ModelCallRunner(
+            adapter=_adapter(base_url, _llm_token(manager)), abort_drain_s=10.0
+        )
+
+        async def run() -> None:
+            await runner.acall(
+                ModelRequest(instruction="go", system_prompt="sys", tools=()),
+                delta_consumer=seen.append,
+                should_abort=lambda: True,
+            )
+
+        with pytest.raises(ModelCallAborted) as caught:
+            asyncio.run(run())
+
+    assert [chunk.text for chunk in seen if isinstance(chunk, TextDelta)] == ["a"]
+    assert provider_usage_of(caught.value) == bill
+    assert gateway.tenant_usage("tenant_a")["total_tokens"] == 10

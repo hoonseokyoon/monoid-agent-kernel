@@ -904,3 +904,54 @@ def test_a_synthesized_repair_has_no_reasoning_to_prune() -> None:
     repair = h.adapter.requests[1]
     assert repair.messages is not None
     assert all(set(message) == {"role", "content"} for message in repair.messages)
+
+
+def test_validated_call_abort_drain_usage_rides_the_escaping_exception() -> None:
+    """A repair attempt stopped mid-stream still reports what the drain learned it billed.
+
+    The stopped attempt's bill rides the escaping ``ModelCallAborted`` (the runner's stamp); the
+    attempts that completed before it ride ``receipts``, as they do for every escaping error.
+    """
+
+    from monoid_agent_kernel.errors import ModelCallAborted
+    from monoid_agent_kernel.providers.base import TurnComplete, provider_usage_of
+
+    first_bill = {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    drained_bill = {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12}
+    adapter = FakeStreamingModelAdapter(
+        chunk_turns=[
+            [TextDelta("prose"), TurnComplete(response_id="r1", usage=first_bill)],
+            [
+                TextDelta("{"),
+                TextDelta('"never": "seen"}'),
+                TurnComplete(response_id="r2", usage=drained_bill),
+            ],
+        ]
+    )
+    runner = ValidatedCallRunner(
+        runner=ModelCallRunner(adapter=adapter, abort_drain_s=5.0),
+        validators=(_Validator(),),
+        max_repair_calls=1,
+    )
+    polls = {"n": 0}
+
+    def should_abort() -> bool:
+        polls["n"] += 1
+        return polls["n"] >= 3  # the first poll of the repair attempt
+
+    seen: list[tuple[int, object]] = []
+
+    async def _drive() -> ValidatedCallResult:
+        return await runner.acall(
+            ModelRequest(instruction="answer", system_prompt="sys", tools=()),
+            should_abort=should_abort,
+            delta_consumer=lambda attempt, event: seen.append((attempt, event)),
+        )
+
+    with pytest.raises(ModelCallAborted) as caught:
+        asyncio.run(_drive())
+
+    assert provider_usage_of(caught.value) == drained_bill
+    receipts = caught.value.receipts  # type: ignore[attr-defined]
+    assert [receipt.usage for receipt in receipts] == [first_bill]
+    assert [getattr(event, "text", None) for attempt, event in seen if attempt == 1][1:] == ["{"]

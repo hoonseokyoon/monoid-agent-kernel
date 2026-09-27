@@ -67,6 +67,7 @@ from monoid_agent_kernel.providers.base import (
     TurnComplete,
     assemble_streamed_turn,
     collect_retry_reports,
+    mark_provider_retried,
     mark_provider_usage,
     normalize_model_request,
     provider_usage_of,
@@ -5954,3 +5955,1006 @@ def test_settlement_write_failure_closes_the_started_dispatch_as_unknown() -> No
     assert adapter.calls == 1
     head = lifecycle._head("call-durable-1")
     assert head is not None and head.dispatch_state == "unknown"
+
+
+# --- abort drain (v0.24) ------------------------------------------------------------------------
+#
+# A stopped stream can be read on, undelivered, for the usage it bills. Every test here bounds its
+# own wall clock (`timeout_s`): the mutants these tests exist for -- a drain that ignores its
+# window, the deadline, a run boundary or lease loss -- hang rather than fail, and a hang must
+# become a red test instead of a stuck suite.
+
+_STALL = object()
+"""A stream step that waits until the stream task is cancelled."""
+
+
+class _DrainStream:
+    """A provider stream scripted step by step, recording how far the runner read it.
+
+    A step is a chunk to yield, an ``asyncio.Event`` to wait for, ``_STALL``, a float of seconds
+    to sleep, a zero-argument callable to run in place, or an exception to raise.
+    """
+
+    def __init__(self, *script: Any) -> None:
+        self.script = script
+        self.yielded: list[Any] = []
+        self.closed = False
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        del request
+        try:
+            for step in self.script:
+                if step is _STALL:
+                    await asyncio.Event().wait()
+                elif isinstance(step, asyncio.Event):
+                    await step.wait()
+                elif isinstance(step, float):
+                    await asyncio.sleep(step)
+                elif isinstance(step, BaseException):
+                    raise step
+                elif callable(step):
+                    step()
+                else:
+                    self.yielded.append(step)
+                    yield step
+        finally:
+            self.closed = True
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        raise AssertionError("the streamed path is under test")
+
+
+class _Polls:
+    """`should_abort` answering True from its `after`-th poll on, counting every poll."""
+
+    def __init__(self, after: int = 1) -> None:
+        self.after = after
+        self.count = 0
+
+    def __call__(self) -> bool:
+        self.count += 1
+        return self.count >= self.after
+
+
+class _DrainOutcome:
+    def __init__(self) -> None:
+        self.error: BaseException | None = None
+        self.turn: ModelTurn | None = None
+        self.seen: list[Any] = []
+        self.settled: list[SettledModelCall] = []
+        self.elapsed = 0.0
+
+    @property
+    def receipt(self) -> Any:
+        assert len(self.settled) == 1, self.settled
+        return self.settled[0].receipt
+
+    @property
+    def texts(self) -> list[str]:
+        return [chunk.text for chunk in self.seen if isinstance(chunk, TextDelta)]
+
+
+_BILL = {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+_ABSORBED = {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+
+
+def _drain_call(
+    adapter: Any,
+    *,
+    drain_s: float | None = 5.0,
+    should_abort: ShouldAbort | None = None,
+    token: CancellationToken | None = None,
+    authority: ActivationWriteAuthority | None = None,
+    deadline: float | None = None,
+    grace_s: float = 1.0,
+    request: ModelRequest = REQUEST,
+    during: Any = None,
+    timeout_s: float = 10.0,
+    before_dispatch: Any = None,
+    **runner_kwargs: Any,
+) -> _DrainOutcome:
+    """One streamed call; `during` is a coroutine function run beside it (a canceller)."""
+
+    outcome = _DrainOutcome()
+    if drain_s is not None:
+        runner_kwargs.setdefault("abort_drain_s", drain_s)
+    runner = ModelCallRunner(
+        adapter=adapter,
+        cancel_grace_s=grace_s,
+        current_cancellation_token=None if token is None else (lambda: token),
+        current_write_authority=None if authority is None else (lambda: authority),
+        settled_sink=outcome.settled.append,
+        **runner_kwargs,
+    )
+
+    async def run() -> None:
+        side = asyncio.ensure_future(during()) if during is not None else None
+        try:
+            outcome.turn, _receipt = await asyncio.wait_for(
+                runner.acall(
+                    request,
+                    deadline=deadline,
+                    should_abort=should_abort,
+                    delta_consumer=outcome.seen.append,
+                    before_dispatch=before_dispatch,
+                ),
+                timeout_s,
+            )
+        finally:
+            if side is not None:
+                side.cancel()
+                with contextlib.suppress(BaseException):
+                    await side
+
+    started = time.monotonic()
+    try:
+        asyncio.run(run())
+    except BaseException as exc:  # noqa: BLE001 - the outcome under test
+        outcome.error = exc
+    outcome.elapsed = time.monotonic() - started
+    return outcome
+
+
+def _cancel_when(reached: asyncio.Event, token: Any, cause: InterruptionCause) -> Any:
+    """Cancel once the stream is parked -- and settled into whatever phase it parked in.
+
+    The settle matters: a cancel landing in the tick the stop is decided is answered by the
+    streaming race, and the drain race it is meant to probe would never be exercised.
+    """
+
+    async def fire() -> None:
+        await reached.wait()
+        await asyncio.sleep(0.1)
+        token.cancel(cause)
+
+    return fire
+
+
+def test_abort_drain_is_off_by_default_and_closes_at_the_abort_point() -> None:
+    """The default is today's close-at-the-stop, down to what the adapter was asked for."""
+
+    assert ModelCallRunner(adapter=object()).abort_drain_s == 0.0
+    for drain_s in (None, 0.0):
+        stream = _DrainStream(
+            TextDelta("a"), TextDelta("b"), TextDelta("c"), TurnComplete(usage=_BILL)
+        )
+        outcome = _drain_call(stream, drain_s=drain_s, should_abort=_Polls(1))
+
+        assert isinstance(outcome.error, ModelCallAborted), outcome.error
+        assert len(stream.yielded) == 1, "a zero budget must not read past the stop"
+        assert stream.closed is True
+        assert outcome.texts == ["a"]
+        assert outcome.receipt.usage == {}
+        assert provider_usage_of(outcome.error) == {}
+
+
+def test_abort_drain_reads_to_the_end_without_delivering_and_bills_the_terminal_usage() -> None:
+    stream = _DrainStream(
+        TextDelta("a"),
+        TextDelta("unseen"),
+        ReasoningDelta("private"),
+        TurnComplete(response_id="r", usage=_BILL, stop_reason="stop"),
+    )
+    outcome = _drain_call(stream, should_abort=_Polls(1))
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert len(stream.yielded) == 4 and stream.closed is True
+    assert outcome.texts == ["a"], "a drained chunk reached the consumer"
+    assert [type(chunk) for chunk in outcome.seen] == [TextDelta]
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.usage == _BILL
+    assert [attempt.usage for attempt in outcome.receipt.attempt_log] == [_BILL]
+    assert outcome.receipt.error_code == "model_call_aborted"
+    assert outcome.elapsed < 5.0, "a stream that ends must end the drain, not the budget"
+
+
+@pytest.mark.parametrize("ending", ["no_terminal", "terminal_without_usage"])
+def test_abort_drain_that_ends_without_usage_reports_none(ending: str) -> None:
+    """No `TurnComplete` usage means "not reported", and drained content is never assembled.
+
+    The truncated tool argument is the assembly probe: folded into a turn, it refuses as
+    `stream_bad_tool_args` and replaces the stop the caller asked for.
+    """
+
+    script: list[Any] = [
+        TextDelta("a"),
+        ToolCallDelta(index=0, id="c1", name="t", arguments_fragment='{"trunc'),
+    ]
+    if ending == "terminal_without_usage":
+        script.append(TurnComplete(response_id="r"))
+    stream = _DrainStream(*script)
+    outcome = _drain_call(stream, should_abort=_Polls(1))
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert len(stream.yielded) == len(script)
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.usage == {}
+
+
+def test_abort_drain_stops_at_its_budget_and_closes_within_grace() -> None:
+    stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL), _STALL, TextDelta("never"))
+    outcome = _drain_call(
+        stream,
+        drain_s=0.3,
+        grace_s=0.2,
+        should_abort=_Polls(1),
+        deadline=time.time() + 60,
+        timeout_s=5.0,
+    )
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert 0.25 <= outcome.elapsed < 0.3 + 0.2 + 1.5, outcome.elapsed
+    assert stream.closed is True
+    assert len(stream.yielded) == 2
+    assert provider_usage_of(outcome.error) == _BILL, "usage drained before the window closed"
+
+
+def test_abort_drain_is_clamped_by_the_run_deadline_and_stays_an_abort() -> None:
+    """The deadline ends the drain window, and never turns the decided stop into a timeout."""
+
+    stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL), _STALL)
+    outcome = _drain_call(
+        stream,
+        drain_s=30.0,
+        grace_s=0.2,
+        should_abort=_Polls(1),
+        deadline=time.time() + 0.4,
+        timeout_s=5.0,
+    )
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert outcome.elapsed < 0.4 + 0.2 + 1.5, outcome.elapsed
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.error_code == "model_call_aborted"
+
+
+def test_abort_drain_without_a_run_deadline_uses_only_its_own_budget() -> None:
+    stream = _DrainStream(TextDelta("a"), _STALL)
+    outcome = _drain_call(stream, drain_s=0.3, grace_s=0.2, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert 0.25 <= outcome.elapsed < 0.3 + 0.2 + 1.5, outcome.elapsed
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        InterruptionCause.GRACEFUL_DRAIN,
+        InterruptionCause.DEADLINE,
+        InterruptionCause.HOST_SHUTDOWN,
+    ],
+    ids=lambda cause: cause.value,
+)
+def test_a_run_boundary_during_drain_stops_it_immediately(cause: InterruptionCause) -> None:
+    token = CancellationToken()
+    reached = asyncio.Event()
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, asyncio.Event(), TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(
+        stream,
+        drain_s=30.0,
+        token=token,
+        should_abort=_Polls(1),
+        during=_cancel_when(reached, token, cause),
+        timeout_s=5.0,
+    )
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is cause
+    assert outcome.elapsed < 3.0
+    assert len(stream.yielded) == 1, "the drain read on after the boundary fired"
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+
+
+def test_a_user_cancel_during_an_abort_drain_changes_nothing() -> None:
+    """The stop was decided first; the run's user cancel is that stop's twin, not a new one."""
+
+    token = CancellationToken()
+    reached = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def cancel_then_release() -> None:
+        await reached.wait()
+        token.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, gate, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(
+        stream, token=token, should_abort=_Polls(1), during=cancel_then_release, timeout_s=5.0
+    )
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert len(stream.yielded) == 3
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.texts == ["a"]
+
+
+def test_lease_loss_during_drain_stops_it_and_publishes_nothing() -> None:
+    authority = ActivationWriteAuthority()
+    reached = asyncio.Event()
+
+    async def revoke() -> None:
+        await reached.wait()
+        await asyncio.sleep(0.1)  # into the drain race, as `_cancel_when` explains
+        authority.revoke()
+
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, _STALL, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(
+        stream,
+        drain_s=30.0,
+        authority=authority,
+        should_abort=_Polls(1),
+        during=revoke,
+        timeout_s=5.0,
+    )
+
+    assert isinstance(outcome.error, RunCancelled), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.elapsed < 3.0
+    assert outcome.settled == [], "a stale activation published a receipt"
+    assert len(stream.yielded) == 1 and stream.closed is True
+
+
+def test_lease_loss_is_also_checked_at_every_drained_chunk() -> None:
+    authority = ActivationWriteAuthority()
+    stream = _DrainStream(
+        TextDelta("a"), authority.revoke, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(stream, authority=authority, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert isinstance(outcome.error, RunCancelled), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.settled == []
+    assert len(stream.yielded) == 2, "the chunk after the revocation must not be read"
+
+
+def _stamped(usage: dict[str, int]) -> ModelAdapterError:
+    failure = ModelAdapterError("connection dropped after the terminal frame", retryable=True)
+    mark_provider_usage(failure, usage)
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_usage"),
+    [
+        (_stamped({"input_tokens": 9, "total_tokens": 9}), {"input_tokens": 9, "total_tokens": 9}),
+        (RuntimeError("socket reset"), _BILL),
+        (asyncio.CancelledError(), _BILL),
+    ],
+    ids=["stamped_failure", "unstamped_failure_after_terminal", "provider_cancels_itself"],
+)
+def test_a_provider_failure_during_drain_keeps_the_abort_and_carries_its_stamped_usage(
+    failure: BaseException, expected_usage: dict[str, int]
+) -> None:
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), TurnComplete(usage=_BILL), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert provider_usage_of(outcome.error) == expected_usage
+    assert outcome.receipt.usage == expected_usage
+    assert outcome.receipt.retryable is False, "a drain failure must not open a retry"
+    if isinstance(failure, Exception):
+        assert outcome.error.__context__ is failure
+        assert outcome.error.__suppress_context__ is False
+
+
+@pytest.mark.parametrize(
+    "failure", [SystemExit(3), KeyboardInterrupt()], ids=["system_exit", "keyboard_interrupt"]
+)
+def test_a_drained_read_raising_a_process_exit_escapes_unmapped(failure: BaseException) -> None:
+    """Only an `Exception` a drained read raises is absorbed into the stop.
+
+    A process-level exit is not a provider failure: mapping it to the `ModelCallAborted` the drain
+    ends as would swallow an interpreter shutdown or a Ctrl-C.
+    """
+
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert outcome.error is failure, outcome.error
+    assert outcome.texts == ["a"]
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_stream_finished_at_the_abort_point_bills_what_it_already_reported(
+    drain_s: float,
+) -> None:
+    """The terminal chunk was delivered, then the stop: the bill is known and is carried.
+
+    With the drain off this is the one deliberate change to the default path (CHANGELOG, Fixed).
+    """
+
+    stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, drain_s=drain_s, should_abort=_Polls(2))
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.usage == _BILL
+    assert [attempt.usage for attempt in outcome.receipt.attempt_log] == [_BILL]
+
+
+class _FailsThenStreams(_DrainStream):
+    """Attempt one fails retryable with a billed body before streaming; later attempts stream."""
+
+    def __init__(self, *script: Any) -> None:
+        super().__init__(*script)
+        self.calls = 0
+
+    async def astream_turn(self, request: ModelRequest):  # noqa: ANN201
+        self.calls += 1
+        if self.calls == 1:
+            raise _stamped(_ABSORBED)
+            yield  # pragma: no cover - makes this an async generator
+        async for chunk in super().astream_turn(request):
+            yield chunk
+
+
+def test_drained_usage_lands_once_after_absorbed_retries() -> None:
+    """Receipt, attempt log and escaping stamp each carry the drained bill exactly once.
+
+    The drained stream reports its usage cumulatively on two terminal chunks; the last one is the
+    bill (the rule `assemble_streamed_turn` applies), never their sum.
+    """
+
+    partial = {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+    stream = _FailsThenStreams(
+        TextDelta("a"), TurnComplete(usage=partial), TurnComplete(usage=_BILL)
+    )
+    request = ModelRequest(instruction="hi", system_prompt="sys", tools=(), model=_kernel_model(2))
+    outcome = _drain_call(stream, should_abort=_Polls(1), request=request)
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert stream.calls == 2
+    receipt = outcome.receipt
+    assert [attempt.usage for attempt in receipt.attempt_log] == [_ABSORBED, _BILL]
+    total = {"input_tokens": 7, "output_tokens": 8, "total_tokens": 15}
+    assert receipt.usage == total
+    assert provider_usage_of(outcome.error) == total
+
+
+def test_drained_chunks_never_commit_the_call_but_still_report_retries() -> None:
+    """A user cancel before the first chunk drains the whole stream: nothing was delivered."""
+
+    token = CancellationToken()
+    reached = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def cancel_then_release() -> None:
+        await reached.wait()
+        token.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    stream = _DrainStream(
+        reached.set,
+        gate,
+        TextDelta("a", provider_retried=True),
+        TurnComplete(usage=_BILL),
+    )
+    outcome = _drain_call(stream, token=token, during=cancel_then_release, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.seen == []
+    receipt = outcome.receipt
+    assert [attempt.stream_committed for attempt in receipt.attempt_log] == [False]
+    assert receipt.provider_retried is True
+    assert receipt.usage == _BILL
+
+
+def test_should_abort_is_not_polled_while_draining() -> None:
+    polls = _Polls(1)
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), TextDelta("c"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, should_abort=polls)
+
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert polls.count == 1
+    assert len(stream.yielded) == 4
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [float("nan"), float("inf"), -1.0, "soon", "5", True, RuntimeError("knob store down")],
+    ids=["nan", "inf", "negative", "not_a_number", "numeric_string", "bool", "raises"],
+)
+def test_the_abort_drain_budget_is_read_live_and_a_broken_accessor_means_no_drain(
+    broken: Any,
+) -> None:
+    budget: dict[str, Any] = {"value": 0.0}
+
+    def read() -> Any:
+        if isinstance(budget["value"], BaseException):
+            raise budget["value"]
+        return budget["value"]
+
+    def call() -> tuple[_DrainOutcome, _DrainStream]:
+        stream = _DrainStream(TextDelta("a"), TextDelta("b"), TurnComplete(usage=_BILL))
+        outcome = _drain_call(
+            stream,
+            drain_s=None,
+            should_abort=_Polls(1),
+            current_abort_drain_s=read,
+        )
+        return outcome, stream
+
+    outcome, stream = call()
+    assert isinstance(outcome.error, ModelCallAborted) and len(stream.yielded) == 1
+
+    budget["value"] = 5.0
+    outcome, stream = call()
+    assert isinstance(outcome.error, ModelCallAborted), outcome.error
+    assert len(stream.yielded) == 3, "a budget raised between calls must reach the next call"
+    assert provider_usage_of(outcome.error) == _BILL
+
+    budget["value"] = broken
+    outcome, stream = call()
+    assert type(outcome.error) is ModelCallAborted, "a broken knob replaced the stop"
+    assert len(stream.yielded) == 1
+
+
+def test_durable_abort_drain_carries_usage_on_dispatch_unknown() -> None:
+    harness = DeterministicFencedRunHarness()
+    lifecycle = _JournalLifecycle(harness)
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), TurnComplete(usage=_BILL))
+    seen: list[Any] = []
+
+    async def run() -> None:
+        await ModelCallRunner(adapter=stream, lifecycle_hook=lifecycle, abort_drain_s=5.0).acall(
+            REQUEST,
+            logical_call_id="call-durable-1",
+            delta_consumer=seen.append,
+            should_abort=_Polls(1),
+        )
+
+    with pytest.raises(DurableModelCallError) as caught:
+        asyncio.run(run())
+
+    assert caught.value.error_code == "dispatch_unknown"
+    assert isinstance(caught.value.__cause__ or caught.value.__context__, ModelCallAborted)
+    assert provider_usage_of(caught.value) == _BILL
+    assert lifecycle.states == ["reserved", "dispatch_started", "unknown"]
+    assert len(stream.yielded) == 3
+
+
+def test_user_cancel_token_triggers_drain_and_bills_on_run_cancelled() -> None:
+    token = CancellationToken()
+    reached = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def cancel_then_release() -> None:
+        await reached.wait()
+        token.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, gate, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(stream, token=token, during=cancel_then_release, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["a"], "nothing after the cancel may be delivered"
+    assert len(stream.yielded) == 3 and stream.closed is True
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.usage == _BILL
+    assert outcome.receipt.error_code == "cancelled"
+
+
+def test_a_user_cancel_without_a_drain_budget_still_closes_at_once() -> None:
+    token = CancellationToken()
+    reached = asyncio.Event()
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, _STALL, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(
+        stream,
+        drain_s=0.0,
+        token=token,
+        during=_cancel_when(reached, token, InterruptionCause.USER_CANCEL),
+        timeout_s=5.0,
+    )
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.elapsed < 3.0
+    assert len(stream.yielded) == 1 and stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        InterruptionCause.GRACEFUL_DRAIN,
+        InterruptionCause.DEADLINE,
+        InterruptionCause.HOST_SHUTDOWN,
+    ],
+    ids=lambda cause: cause.value,
+)
+def test_operational_cancel_causes_never_drain(cause: InterruptionCause) -> None:
+    token = CancellationToken()
+    reached = asyncio.Event()
+    stream = _DrainStream(
+        TextDelta("a"), reached.set, _STALL, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(
+        stream,
+        drain_s=30.0,
+        token=token,
+        during=_cancel_when(reached, token, cause),
+        timeout_s=5.0,
+    )
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is cause
+    assert outcome.elapsed < 3.0
+    assert len(stream.yielded) == 1 and stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+
+
+def test_a_user_cancel_landing_as_should_abort_answers_still_drains_as_the_cancel() -> None:
+    """A user cancel between `should_abort` answering True and the drain beginning.
+
+    The cancel's callback begins the drain first, so the token's first writer is the stop: the
+    call must still drain and end as that cancel, with the bill -- not fall back to closing at
+    once as a plain abort that carries nothing.
+    """
+
+    token = CancellationToken()
+
+    def stop_and_cancel() -> bool:
+        token.cancel(InterruptionCause.USER_CANCEL)
+        return True
+
+    stream = _DrainStream(TextDelta("a"), TextDelta("late"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, token=token, should_abort=stop_and_cancel, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["a"]
+    assert len(stream.yielded) == 3 and stream.closed is True
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.usage == _BILL
+
+
+class _NoCloseStream:
+    """A provider iterator without ``aclose``: its reads never yield to the event loop."""
+
+    def __init__(self, *script: Any) -> None:
+        self.script = list(script)
+        self.reads = 0
+
+    def astream_turn(self, request: ModelRequest) -> "_NoCloseStream":
+        del request
+        return self
+
+    def __aiter__(self) -> "_NoCloseStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if not self.script:
+            raise StopAsyncIteration
+        step = self.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        raise AssertionError("the streamed path is under test")
+
+
+def test_a_provider_cancel_that_finishes_the_drain_in_its_first_tick_stays_the_stop() -> None:
+    """A provider that cancels its own read after the stop, finishing before phase one wakes.
+
+    Without ``aclose`` nothing awaits in the stream's cleanup, so the stream task ends in the tick
+    the drain began and the streaming race sees the provider's cancel before the drain signal. The
+    decided stop is still the outcome -- not a terminal ``model_adapter_cancelled`` failure.
+    """
+
+    stream = _NoCloseStream(TextDelta("a"), TurnComplete(usage=_BILL), asyncio.CancelledError())
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert stream.reads == 3
+    assert outcome.texts == ["a"]
+    assert provider_usage_of(outcome.error) == _BILL
+    assert outcome.receipt.error_code == "model_call_aborted"
+
+
+def _read_failure(error_code: str, usage: dict[str, int]) -> ModelAdapterError:
+    failure = ModelAdapterError("gateway stream dropped", error_code=error_code)
+    mark_provider_usage(failure, usage)
+    return failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_usage"),
+    [
+        (_read_failure("model_adapter_error", _BILL), _BILL),
+        (_read_failure("model_adapter_cancelled", _BILL), _BILL),
+        (ConnectionError("connection reset"), {}),
+    ],
+    ids=["adapter_error_stamped", "adapter_cancelled_stamped", "raw_exception"],
+)
+def test_a_read_that_fails_after_a_user_cancel_began_the_drain_is_still_the_cancel(
+    failure: Exception, expected_usage: dict[str, int]
+) -> None:
+    """A user cancel lands while a provider read is in flight, and that read then fails.
+
+    The cancel began the drain before the failure, so the cancel is the outcome whatever the
+    failure is -- a provider error, an adapter's own ``model_adapter_cancelled``, or a raw
+    exception -- and it carries the failure's own usage stamp when there is one. No chunk follows
+    the cancel: this is the main read failing, not a drained one.
+    """
+
+    token = CancellationToken()
+    stream = _DrainStream(
+        TextDelta("a"),
+        lambda: token.cancel(InterruptionCause.USER_CANCEL),
+        0.05,
+        failure,
+    )
+    outcome = _drain_call(stream, token=token, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.error.__context__ is failure
+    assert outcome.error.__suppress_context__ is False
+    assert outcome.texts == ["a"]
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == expected_usage
+    assert outcome.receipt.usage == expected_usage
+    assert outcome.receipt.error_code == "cancelled"
+    assert outcome.receipt.retryable is False
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_provider_cancel_with_no_stop_stays_the_providers_failure(drain_s: float) -> None:
+    """The control for the provider-cancel-after-a-stop pins above: no stop, nothing to map to.
+
+    A provider that cancels its own read when nothing stopped the call ends it with
+    ``model_adapter_cancelled``, drain budget or not -- the drain must not invent a stop.
+    """
+
+    stream = _DrainStream(TextDelta("a"), asyncio.CancelledError())
+    outcome = _drain_call(stream, drain_s=drain_s, should_abort=_Polls(99), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelAdapterError, outcome.error
+    assert outcome.error.error_code == "model_adapter_cancelled"
+    assert outcome.texts == ["a"]
+    assert outcome.receipt.error_code == "model_adapter_cancelled"
+
+
+class _CancelsOnClose:
+    """A provider iterator whose second read fails, and whose ``aclose`` is where a cancel lands.
+
+    The stream task is already failing when the user's cancel arrives, so the cancel begins the
+    drain (the stream was entered) with nothing left to read. A close that awaits after the cancel
+    lets the drain signal win the streaming race; one that does not ends the task in that tick.
+    """
+
+    def __init__(self, token: CancellationToken, failure: Exception, *, awaits: bool) -> None:
+        self.token = token
+        self.failure = failure
+        self.awaits = awaits
+        self.reads = 0
+        self.closed = False
+
+    def astream_turn(self, request: ModelRequest) -> "_CancelsOnClose":
+        del request
+        return self
+
+    def __aiter__(self) -> "_CancelsOnClose":
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if self.reads == 1:
+            return TextDelta("a")
+        raise self.failure
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self.token.cancel(InterruptionCause.USER_CANCEL)
+        if self.awaits:
+            await asyncio.sleep(0.05)
+
+    def next_turn(self, request: ModelRequest) -> ModelTurn:
+        raise AssertionError("the streamed path is under test")
+
+
+@pytest.mark.parametrize("awaits", [True, False], ids=["close_awaits", "close_returns"])
+@pytest.mark.parametrize("raw", [False, True], ids=["adapter_error", "raw_exception"])
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_user_cancel_landing_while_a_failed_stream_closes_is_the_cancel_either_way(
+    drain_s: float, raw: bool, awaits: bool
+) -> None:
+    """A read fails, and the user's cancel lands while the provider closes the failed stream.
+
+    With the drain off the race answers that cancel. With it on, the cancel begins a drain over a
+    stream task that is already failing -- and the call must still end as the same cancel, not as
+    the provider's error, whichever phase of the race sees the failed task and whether or not the
+    adapter translated the failure: the drain budget never changes which of the two a user sees.
+    """
+
+    token = CancellationToken()
+    failure: Exception = (
+        ConnectionError("connection reset")
+        if raw
+        else ModelAdapterError("gateway stream dropped", error_code="model_adapter_error")
+    )
+    stream = _CancelsOnClose(token, failure, awaits=awaits)
+    outcome = _drain_call(stream, drain_s=drain_s, token=token, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert outcome.texts == ["a"]
+    assert stream.closed is True
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.error_code == "cancelled"
+    assert outcome.receipt.retryable is False
+    if drain_s:
+        assert outcome.error.__context__ is failure
+        assert outcome.error.__suppress_context__ is False
+
+def test_a_stop_after_a_terminal_chunk_without_usage_stamps_nothing_with_the_drain_off() -> None:
+    """The default half of the zero-fill rule: an all-zero fill is not a report.
+
+    The ingress zero-fills a terminal chunk that reported no usage; stamped on the stop it would
+    record a bill of zero no provider made, and break "the default path is unchanged apart from
+    the delivered-terminal fix".
+    """
+
+    stream = _DrainStream(TextDelta("a"), TurnComplete(response_id="r"))
+    outcome = _drain_call(stream, drain_s=0.0, should_abort=_Polls(2))
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert len(stream.yielded) == 2
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.usage == {}
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
+def test_a_user_cancel_before_the_stream_is_entered_stays_an_ordinary_cancel(
+    drain_s: float,
+) -> None:
+    """A cancel before the stream task entered the provider is not a drain trigger.
+
+    The stream task still gets the tick it always got (this stream yields within it, with the
+    drain on or off), and the call ends as the same unstamped cancellation either way. Draining
+    would read on, and bill, a request the Stop came before.
+    """
+
+    token = CancellationToken()
+    stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+    outcome = _drain_call(
+        stream,
+        drain_s=drain_s,
+        token=token,
+        before_dispatch=lambda: token.cancel(InterruptionCause.USER_CANCEL),
+        timeout_s=5.0,
+    )
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
+    assert provider_usage_of(outcome.error) == {}
+    assert outcome.receipt.usage == {}
+
+
+def test_the_drain_window_is_measured_from_the_stop_not_the_stream_opening() -> None:
+    """A stop half a second into the stream still gets its whole budget."""
+
+    stream = _DrainStream(TextDelta("a"), 0.5, TextDelta("b"), 0.1, TurnComplete(usage=_BILL))
+    outcome = _drain_call(stream, drain_s=0.3, should_abort=_Polls(2), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert outcome.texts == ["a", "b"]
+    assert len(stream.yielded) == 3
+    assert provider_usage_of(outcome.error) == _BILL
+
+
+def test_a_drain_failure_that_reports_a_provider_retry_is_folded_into_the_receipt() -> None:
+    failure = RuntimeError("socket reset after a retried attempt")
+    mark_provider_retried(failure)
+    stream = _DrainStream(TextDelta("a"), TextDelta("b"), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+
+    assert type(outcome.error) is ModelCallAborted, outcome.error
+    assert outcome.error.__context__ is failure
+    assert outcome.error.__suppress_context__ is False
+    assert outcome.receipt.provider_retried is True
+
+
+def test_a_user_cancel_drain_settles_a_held_back_lone_surrogate() -> None:
+    """The ingress held back a high surrogate; the cancel leaves it lone, so its U+FFFD is due.
+
+    Its delivery belongs to the stop (it is content the provider sent before it), not the drain.
+    """
+
+    token = CancellationToken()
+    reached = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def cancel_then_release() -> None:
+        await reached.wait()
+        await asyncio.sleep(0.1)
+        token.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    stream = _DrainStream(
+        TextDelta("x\ud83d"), reached.set, gate, TextDelta("late"), TurnComplete(usage=_BILL)
+    )
+    outcome = _drain_call(stream, token=token, during=cancel_then_release, timeout_s=5.0)
+
+    assert type(outcome.error) is RunCancelled, outcome.error
+    assert outcome.texts == ["x", "\ufffd"]
+    assert provider_usage_of(outcome.error) == _BILL
+
+
+def _leftover_callbacks(token: CancellationToken, authority: ActivationWriteAuthority) -> tuple:
+    return len(token._callbacks), len(authority._callbacks)
+
+
+@pytest.mark.parametrize(
+    "exit_path",
+    [
+        "completed",
+        "abort_drained_to_the_end",
+        "abort_window_closed",
+        "user_cancel_drained",
+        "graceful_drain_cancel",
+        "lease_lost",
+    ],
+)
+def test_every_exit_from_a_drain_enabled_stream_leaves_no_callback_behind(exit_path: str) -> None:
+    """A leaked callback would begin a stale drain on the run's next cancel, or reach a closed loop.
+
+    The run token's and the authority's callbacks are one-shot: whatever did not fire must be
+    removed on the way out, on every path.
+    """
+
+    token = CancellationToken()
+    authority = ActivationWriteAuthority()
+    reached = asyncio.Event()
+    kwargs: dict[str, Any] = {"token": token, "authority": authority, "timeout_s": 5.0}
+    if exit_path == "completed":
+        stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+    elif exit_path == "abort_drained_to_the_end":
+        stream = _DrainStream(TextDelta("a"), TurnComplete(usage=_BILL))
+        kwargs["should_abort"] = _Polls(1)
+    elif exit_path == "abort_window_closed":
+        stream = _DrainStream(TextDelta("a"), _STALL)
+        kwargs.update(should_abort=_Polls(1), drain_s=0.2, grace_s=0.2)
+    else:
+        stream = _DrainStream(TextDelta("a"), reached.set, _STALL, TurnComplete(usage=_BILL))
+        if exit_path == "lease_lost":
+
+            async def revoke() -> None:
+                await reached.wait()
+                await asyncio.sleep(0.1)
+                authority.revoke()
+
+            kwargs["during"] = revoke
+        else:
+            cause = (
+                InterruptionCause.USER_CANCEL
+                if exit_path == "user_cancel_drained"
+                else InterruptionCause.GRACEFUL_DRAIN
+            )
+            kwargs.update(during=_cancel_when(reached, token, cause), drain_s=0.3, grace_s=0.2)
+    outcome = _drain_call(stream, **kwargs)
+
+    if exit_path == "completed":
+        assert outcome.error is None and outcome.turn is not None
+    else:
+        assert outcome.error is not None
+    assert _leftover_callbacks(token, authority) == (0, 0)

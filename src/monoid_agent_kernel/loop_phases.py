@@ -204,6 +204,8 @@ class LoopBootstrapper:
             current_write_authority=lambda: loop.write_authority,
             cancel_grace_s=loop.async_model_cancel_grace_s,
             current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
+            abort_drain_s=loop.async_model_abort_drain_s,
+            current_abort_drain_s=lambda: loop.async_model_abort_drain_s,
             thread_name=f"nar-model-call-{loop.spec.run_id}",
             # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
             # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
