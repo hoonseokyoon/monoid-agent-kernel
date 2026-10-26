@@ -3066,6 +3066,15 @@ may finish its own in-flight operation; no later subscriber, sidecar, delta writ
 runs under the stale activation. Best-effort diagnostic publication contains extension failures
 while always re-raising lease-loss control flow.
 
+Standalone `ModelCallRunner` delta consumers use the same before/after authority boundary for
+each normalized piece. This includes ordinary provider deltas, all pieces emitted by a terminal
+chunk, and held-back Unicode suffixes flushed at EOF or an error. A revoked activation appends
+and delivers no new piece after its authority check observes the loss, whether drain is disabled
+or configured but not yet started. A consumer that revokes the lease stops the rest of that batch.
+Normal Unicode finalization and user-cancel drain behavior remain unchanged while authority is
+active. An already entered consumer may finish its own external effect; its callback runs without
+holding the authority lock.
+
 Bootstrap applies the same operation boundary before a session exists. It checks authority before
 workspace and recorder creation, around each extension callback, and around workspace-index,
 workspace-base, manifest, and `run.started` publication. `AgentRecorder` checks between its own
