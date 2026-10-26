@@ -6,7 +6,7 @@
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.
 범위의 기준은 통합 계획이고 첫 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md)이다.
-P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. P3 구현은 보류 상태다.
+P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. P3 구현은 승인됐으며 §9에 실행 증거를 기록한다.
 새 API 명칭과 후속 릴리스 배치는 설계 제안이다. DX1의 순수 typed 도구는 develop의
 [실행 예제](../examples/custom_tool_quickstart.py)에 반영했다. 나머지 신규 API는 후속 구현 대상이다.
 

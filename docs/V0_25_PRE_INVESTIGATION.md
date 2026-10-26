@@ -2,9 +2,9 @@
 
 작성일: 2026-09-28. 통합 갱신: 2026-10-25. 코드 기준: v0.24.0 / `8d56e0d`.
 
-상태: **2026-10-27 P5 #148·DX1 #149 병합 / P3 사전조사·계획, 구현 보류**.
+상태: **2026-10-27 P5 #148·DX1 #149 병합 / P3 구현 승인·P3-00/01 착수**.
 P3의 현재 기준은 `origin/develop=5b08b10d82a948268d1a95b51112b1508e233e3d`다.
-사용자는 최신 코드와 외부 사례를 조사해 정책·PR별 변경 범위·검증 기준을 먼저 구체화하도록 요청했다.
+사용자는 P3-00·01부터 구현하고 리뷰·CI 확인 뒤 통합 브랜치에서 P3-02·03을 순차 진행하도록 요청했다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
 [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)에 기록한다. 릴리스 범위의 기준은 이 문서다.
@@ -171,7 +171,7 @@ backend live-stream closed frame과 Studio reader, OTel의 attempt/call 계측�
 2026-10-27 구체화한 정책·외부 근거·코드 재현·PR 의존성·수용 행렬은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 둔다.
 기존 cleanup 두 경계 보완 후 root의 주입·권한·복구와 실제 보고서 소비자를 한 PR에서 완결하고,
 child/fork 명시 상속을 다음 PR로 연결한다. 동기 activation adapter, 호출에 고정한 façade,
-deferred workspace, 별도 P3 lifetime guard를 채택한다. 구현은 아직 시작하지 않는다.
+deferred workspace, 별도 P3 lifetime guard를 채택한다. 현재 구현 실행 기록은 P3 PR 계획 §9에 둔다.
 
 **현재 간격.** [ToolContext](../src/monoid_agent_kernel/tools/base.py)는 method-only Protocol이고,
 [extension façade](../src/monoid_agent_kernel/loop.py)는 내부 workspace·recorder를 감춘다.

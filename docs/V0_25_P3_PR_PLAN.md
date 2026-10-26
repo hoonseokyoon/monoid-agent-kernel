@@ -2,8 +2,9 @@
 
 작성·조사일: 2026-10-27 KST. 기준: 최신 `origin/develop`
 `5b08b10d82a948268d1a95b51112b1508e233e3d` (P5 #148, DX1 #149 병합).
-상태: **설계·사전조사 단계. 구현 보류.** 이번 변경은 계획 문서와 제한된 baseline 조사다.
-구현·새 회귀 테스트 작성·PR 생성·병합·릴리스는 이번 요청에 포함하지 않는다.
+상태: **2026-10-27 구현 승인·P3-00/01 사전조사 갱신 중.** 사용자는 P3-00·01부터 진행하고,
+P3-01은 실패 회귀를 먼저 고정한 독립 PR로 구현한 뒤 리뷰·CI를 확인하도록 요청했다.
+이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·CSP 변경은 범위 밖이다.
 
 범위의 기준은 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#52-p3-타입-있는-주입과-호출별-권한)이다.
 [개발자 API 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#4-v025-api-예시-타입-있는-도구와-자원-주입)의
@@ -21,7 +22,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 | 외부 조사 | p3_external_research: 공식 문서, 채택된 수정과 미병합 제안 구분 |
 | 수명 조사 | p3_lifecycle_audit: bootstrap/restore/close/park/child의 실제 순서 감사 |
 | 독립 계획 검토 | 작성·조사에 참여하지 않은 fresh reviewer; §8에 대상과 판정 기록 |
-| 향후 구현 | PR마다 소유자 지정. 현재 구현 작업은 시작하지 않음 |
+| 구현 | root가 P3-00·01을 소유하고 runner·공유 파일 편집을 직렬화. 후속 PR도 착수 시 담당 기록 |
 
 상위 저장소의 현재 운영 권위인 `docs/operations/campaign-workflow.md`와
 `docs/operations/campaign-preflight-review.md`를 따른다. 권한·수명 변경은 A 등급이다.
@@ -226,7 +227,7 @@ child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 �
 ## 5. PR별 변경 범위·의존성·완료 기준
 
 예정 통합 브랜치: `codex/v0.25-p3-host-resources`. 아직 생성하지 않았다.
-현재 계획 브랜치는 `codex/v0.25-p3-plan`이다.
+계획 보존 브랜치는 `codex/v0.25-p3-plan`이다. 현재 실행 브랜치·증거는 §9에 기록한다.
 `pr-fast.yml`/`pr-full.yml`은 base 필터가 없지만 `ci.yml` push는 main/develop/v0.23만 등록한다.
 운영 규칙에 따라 P3-00에서 새 통합 base를 먼저 등록한다.
 P3-01은 기존 결함을 고치는 독립 PR로 develop에 병합하고, 두 준비 PR 후 최신 develop에서 통합 브랜치를 만든다.
@@ -419,7 +420,7 @@ head/base가 바뀌면 영향을 받는 merge candidate 증거를 갱신한다.
 
 초기 설계 결정: 제한된 typed key/adapter, 호출에 고정한 façade, deferred workspace,
 동기 lifecycle, 표준 cleanup, 기본 상속 OFF와 명시적 fresh child, 기존 cleanup 두 지점 선행 보완.
-현재 구현 변경 0, 새 회귀 테스트 0. baseline probe 2건, 기존 회귀 13건 통과.
+계획 검토 당시 구현 변경 0, 새 회귀 테스트 0. baseline probe 2건, 기존 회귀 13건 통과.
 fresh 독립 reviewer `p3_plan_review`의 최초 판정은 **ready — 계획 단계 진행 가능**이다.
 대상은 base `5b08b10`과 계획 SHA256 `B63FD7982E9490ECE614A81E52178C20DE3FF93F8B4F4086CFBE3A0E34D2AB05`다.
 작성·조사에 참여하지 않은 reviewer가 실제 dispatch·bootstrap·close/discard·restore·CSP 소비자와 외부 근거를 대조했다.
@@ -432,7 +433,7 @@ recorder constructor의 guard postcheck를 P3-01 사전조사 입력에 포함�
 
 같은 reviewer가 최종 정책 SHA256 `4713A36EFB11D26ADC05B762804E6669CC52DF1FB6224507A2E897F3EC9AF5CF`를
 targeted 재검토했고 **ready, 새 차단 지적 없음**으로 판정했다. failed-session 호환성·중복 소유권·안전한 진단·lexical scope
-변경을 확인했다. 이후 수정은 이 리뷰·문서 검증 기록뿐이다. 현재 production/test/example/CI source 변경은 0이다.
+변경을 확인했다. 계획 commit까지의 후속 수정은 이 리뷰·문서 검증 기록뿐이었다. 해당 시점 source 변경은 0이다.
 문서의 Python 예시는 AST 문법 검사만 수행했으며 새 API의 실행 성공을 주장하지 않는다.
 최종 문서 검증은 5개 관련 문서의 로컬 링크·anchor **127개**, Python AST block **10개** 통과다.
 diff 공백 검사와 production/test/example/CI source가 기준 commit과 동일하다는 검사도 통과했다.
@@ -446,3 +447,29 @@ diff 공백 검사와 production/test/example/CI source가 기준 commit과 동�
 | CSP raw workspace 보관 제거 | CSP 통합 담당. P3 패키지 릴리스 뒤 새 seam으로 이관 PR·pin·운영 검증 |
 
 각 PR 착수 시 이 기록에 실제 base/head, 수정 전 실패, 수정 후 결과, 최종 리뷰·CI, 예상 대비 누적 비용을 이어 기록한다.
+
+## 9. 구현 실행 기록
+
+### P3-00 사전조사 — 2026-10-27
+
+- 최신 fetch 결과 `origin/develop=5b08b10d82a948268d1a95b51112b1508e233e3d`로 계획 기준과 동일하다.
+  `3599b21`은 승인된 계획 문서만 담은 commit이다. 이를 포함해 `codex/v0.25-p3-00-ci-base`에서 준비 PR을 만든다.
+- 실제 생산자·소비자: `.github/workflows/ci.yml`의 push branch allowlist가 통합 브랜치의 전체 CI 실행을 결정한다.
+  현재 main/develop/v0.23만 포함한다. `pr-fast.yml`/`pr-full.yml`에는 base branch 제한이 없다.
+  `tools/v023_ci.py::resolve_profile`은 v0.23 외 일반 PR의 기본 core profile을 이미 지원한다.
+- 선택: allowlist에 `codex/v0.25-p3-host-resources` 한 항목 추가. CI job·권한·SDK pin·service profile·검사 도구는 유지한다.
+  단순 등록에 새 mirror test를 만들지 않고 YAML readback, 기존 `tests/test_v023_ci_foundation.py`, lock 검사를 사용한다.
+- 현재 계획의 독립 검토는 동일 production base를 대상으로 했으므로 유효하다. 이 PR의 독립 preflight reviewer는
+  `p3_00_preflight_review`다. 새로운 CI 등록 동작을 검토하고, 실제 최종 diff도 별도로 확인한다.
+- 범위·비용: 기능 1줄 변경 예상. 이전 계획 문서 commit을 함께 게시하므로 PR 전체 문서량은 초기 준비 PR 추정보다 크다.
+  새 구현·검증 체계를 추가하지 않으며 계획 수립 비용을 중복 계상하지 않는다. L1/L2 core 및 develop merge CI를 확인한다.
+
+독립 P3-00 사전조사 판정은 **ready**다. 기존 모든 full-CI job이 새 branch push에도 적용되고,
+PR base 제한·profile 변경이 필요 없음을 확인했다. `validate-lock`은 valid이며 lock SHA256은
+`5e536963c707778e9309936d5768edc367a6c49ece5c51223999dde46697b498`이다.
+`resolve-profile --head-ref codex/v0.25-p3-host-resources`는 core를 반환했다.
+Ready 이후 head/base가 바뀌면 현재 후보로 L2를 다시 실행하고, 실제 통합 branch push CI도 확인한다.
+
+P3-00 local 검증: 기존 CI foundation **18 passed / 3.78s**. `ci.yml`의 기준/현재 전체 텍스트 비교에서
+정확한 push branch 한 항목만 추가되고 job·permissions가 그대로임을 확인했다. YAML parser는 로컬 환경에 없어
+새 의존성을 설치하지 않았고 기존 workflow 검사와 GitHub CI를 사용한다. diff 공백 검사도 통과했다.
