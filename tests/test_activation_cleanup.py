@@ -138,6 +138,43 @@ def test_constructor_guard_postcheck_closes_owned_handles(
     assert sink.close_count == 0
 
 
+@pytest.mark.parametrize("published", [False, True])
+def test_stale_discard_closes_only_the_recorder_owned_event_sink(
+    tmp_path: Path,
+    handles: list[Any],
+    published: bool,
+) -> None:
+    spec = _spec(tmp_path)
+    authority = ActivationWriteAuthority()
+    host_sink = JsonlEventSink(tmp_path / "host-events.jsonl")
+    handles.clear()
+
+    def revoke_during_bootstrap() -> None:
+        authority.revoke()
+
+    loop = _loop(
+        spec,
+        write_authority=authority,
+        authoritative_event_sinks=(host_sink,),
+        model_stream_observer_factories=() if published else (revoke_during_bootstrap,),
+    )
+    try:
+        if published:
+            loop.open()
+            authority.revoke()
+            loop.discard_uncommitted()
+        else:
+            with pytest.raises(WriteAuthorityRevoked):
+                loop.open()
+        assert not host_sink._handle.closed
+        assert len(handles) == 2
+        assert all(handle.closed for handle in handles)
+        _assert_released(loop)
+    finally:
+        loop.discard_uncommitted()
+        host_sink.close()
+
+
 @pytest.mark.parametrize("operation", ["open", "restore"])
 @pytest.mark.parametrize("failure_stage", ["recorder_return", "observer", "control"])
 def test_prepublication_failure_releases_first_owned_resources(
