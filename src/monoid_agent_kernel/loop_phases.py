@@ -115,8 +115,11 @@ class LoopBootstrapper:
         raw_workspace = self._guard_external(lambda: workspace_factory(loop.spec))
         workspace = AuthorityBoundWorkspace(raw_workspace, loop.write_authority)
         loop._stream_sink = QueueEventSink()
-        recorder = self._guard_external(
-            lambda: AgentRecorder(
+        recorder: AgentRecorder | None = None
+
+        def acquire_recorder() -> AgentRecorder:
+            nonlocal recorder
+            recorder = AgentRecorder(
                 loop.spec.run_root,
                 loop.spec.run_id,
                 extra_event_sinks=(*loop.event_sinks, loop._stream_sink),
@@ -132,110 +135,122 @@ class LoopBootstrapper:
                 reopen=loop._restoring,
                 write_authority=loop.write_authority,
             )
-        )
-        model_stream_observers = loop._materialize_model_stream_observers()
-        job_manager = TaskManager(
-            run_id=loop.spec.run_id,
-            workspace=workspace,
-            recorder=recorder,
-            permission_policy=loop.permission_policy,
-            write_authority=loop.write_authority,
-        )
-        shell_service = ShellService(
-            run_id=loop.spec.run_id,
-            workspace=workspace,
-            recorder=recorder,
-            job_manager=job_manager,
-            permission_policy=loop.permission_policy,
-            approval_provider=loop.shell_approval_provider,
-        )
-        web_service = WebService(
-            recorder=recorder,
-            web_gateway_client=loop.web_gateway_client,
-            permission_policy=loop.permission_policy,
-        )
-        jobs_service = JobsService(job_manager=job_manager)
-        from monoid_agent_kernel.loop import AgentToolContext
+            return recorder
 
-        safe_invocation_context = loop._safe_invocation_context()
-        context = AgentToolContext(
-            loop.spec.run_id,
-            workspace,
-            recorder,
-            job_manager,
-            shell_service,
-            web_service,
-            jobs_service,
-            loop.write_authority,
-            permission_policy=loop.permission_policy,
-            _capability_vault=loop._capability_vault,
-            _outbox=loop._outbox,
-            invocation_traceparent=safe_invocation_context.traceparent,
-        )
-        started = time.time()
-        deadline = (
-            started + loop.spec.limits.max_duration_s
-            if loop.spec.limits.max_duration_s is not None
-            else None
-        )
-        # Built once and shared by all three publications below, so every loop field it needs is
-        # read through a callable rather than captured here. Not only the cancellation token, whose
-        # case is the loudest -- ``astream`` installs one on a run already in progress, so a captured
-        # token is one nobody cancels. ``model_adapter`` and ``async_model_cancel_grace_s`` are
-        # public mutable fields the loop reads live everywhere else, and a snapshot of either made
-        # this runner disagree with the code around it rather than merely go stale.
-        lifecycle_hook = None
-        if loop.run_sink is not None and loop.writer_token is not None:
-            # Keep the host package lazy for standalone/core-only imports. A configured host is
-            # the only activation that needs this adapter, and __post_init__ already validated the
-            # pair and its declared capabilities before bootstrap reaches this point.
-            from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
-
-            lifecycle_hook = FencedModelCallLifecycle(
-                loop.run_sink,
-                loop.writer_token,
-                evidence_policy=loop.model_evidence_policy,
+        try:
+            recorder = self._guard_external(acquire_recorder)
+            model_stream_observers = loop._materialize_model_stream_observers()
+            job_manager = TaskManager(
+                run_id=loop.spec.run_id,
+                workspace=workspace,
+                recorder=recorder,
+                permission_policy=loop.permission_policy,
                 write_authority=loop.write_authority,
             )
-        model_runner = ModelCallRunner(
-            adapter=loop.model_adapter,
-            current_adapter=lambda: loop.model_adapter,
-            current_cancellation_token=lambda: loop.cancellation_token,
-            current_write_authority=lambda: loop.write_authority,
-            cancel_grace_s=loop.async_model_cancel_grace_s,
-            current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
-            abort_drain_s=loop.async_model_abort_drain_s,
-            current_abort_drain_s=lambda: loop.async_model_abort_drain_s,
-            thread_name=f"nar-model-call-{loop.spec.run_id}",
-            # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
-            # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
-            subscriptions=tuple(loop.model_io_subscriptions),
-            # A bound method, not a closure: the recorder already owns the run id, the root, the
-            # switch and the counter, so there is nothing for a closure to capture. Gated on both
-            # sides -- here and in the method -- the same way ``recorder.open_model_stream`` is.
-            settled_sink=(
-                recorder.record_settled_call
-                if (loop.model_calls_file or loop.model_payload_file)
+            shell_service = ShellService(
+                run_id=loop.spec.run_id,
+                workspace=workspace,
+                recorder=recorder,
+                job_manager=job_manager,
+                permission_policy=loop.permission_policy,
+                approval_provider=loop.shell_approval_provider,
+            )
+            web_service = WebService(
+                recorder=recorder,
+                web_gateway_client=loop.web_gateway_client,
+                permission_policy=loop.permission_policy,
+            )
+            jobs_service = JobsService(job_manager=job_manager)
+            from monoid_agent_kernel.loop import AgentToolContext
+
+            safe_invocation_context = loop._safe_invocation_context()
+            context = AgentToolContext(
+                loop.spec.run_id,
+                workspace,
+                recorder,
+                job_manager,
+                shell_service,
+                web_service,
+                jobs_service,
+                loop.write_authority,
+                permission_policy=loop.permission_policy,
+                _capability_vault=loop._capability_vault,
+                _outbox=loop._outbox,
+                invocation_traceparent=safe_invocation_context.traceparent,
+            )
+            started = time.time()
+            deadline = (
+                started + loop.spec.limits.max_duration_s
+                if loop.spec.limits.max_duration_s is not None
                 else None
-            ),
-            # The corpus needs the exact bytes the key was hashed over; the ledger alone does
-            # not, and must not pay the per-call buffering for them.
-            capture_request_preimage=loop.model_payload_file,
-            lifecycle_hook=lifecycle_hook,
-        )
-        # Publish partial ownership as soon as recorder/task resources exist. If a provider,
-        # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
-        loop._bootstrap_resources = _RunResources(
-            workspace=workspace,
-            recorder=recorder,
-            context=context,
-            base_tool_specs=(),
-            started=started,
-            deadline=deadline,
-            static_segments=(),
-            model_runner=model_runner,
-            model_stream_observers=model_stream_observers,
-        )
+            )
+            # Built once and shared by all three publications below, so every loop field it needs is
+            # read through a callable rather than captured here. Not only the cancellation token, whose
+            # case is the loudest -- ``astream`` installs one on a run already in progress, so a captured
+            # token is one nobody cancels. ``model_adapter`` and ``async_model_cancel_grace_s`` are
+            # public mutable fields the loop reads live everywhere else, and a snapshot of either made
+            # this runner disagree with the code around it rather than merely go stale.
+            lifecycle_hook = None
+            if loop.run_sink is not None and loop.writer_token is not None:
+                # Keep the host package lazy for standalone/core-only imports. A configured host is
+                # the only activation that needs this adapter, and __post_init__ already validated the
+                # pair and its declared capabilities before bootstrap reaches this point.
+                from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
+
+                lifecycle_hook = FencedModelCallLifecycle(
+                    loop.run_sink,
+                    loop.writer_token,
+                    evidence_policy=loop.model_evidence_policy,
+                    write_authority=loop.write_authority,
+                )
+            model_runner = ModelCallRunner(
+                adapter=loop.model_adapter,
+                current_adapter=lambda: loop.model_adapter,
+                current_cancellation_token=lambda: loop.cancellation_token,
+                current_write_authority=lambda: loop.write_authority,
+                cancel_grace_s=loop.async_model_cancel_grace_s,
+                current_cancel_grace_s=lambda: loop.async_model_cancel_grace_s,
+                abort_drain_s=loop.async_model_abort_drain_s,
+                current_abort_drain_s=lambda: loop.async_model_abort_drain_s,
+                thread_name=f"nar-model-call-{loop.spec.run_id}",
+                # AgentLoop owns this activation-scoped snapshot. The runner only delivers calls;
+                # lifecycle cleanup stays with the loop alongside its recorder and event sinks.
+                subscriptions=tuple(loop.model_io_subscriptions),
+                # A bound method, not a closure: the recorder already owns the run id, the root, the
+                # switch and the counter, so there is nothing for a closure to capture. Gated on both
+                # sides -- here and in the method -- the same way ``recorder.open_model_stream`` is.
+                settled_sink=(
+                    recorder.record_settled_call
+                    if (loop.model_calls_file or loop.model_payload_file)
+                    else None
+                ),
+                # The corpus needs the exact bytes the key was hashed over; the ledger alone does
+                # not, and must not pay the per-call buffering for them.
+                capture_request_preimage=loop.model_payload_file,
+                lifecycle_hook=lifecycle_hook,
+            )
+            # Publish partial ownership as soon as recorder/task resources exist. If a provider,
+            # registry, or runtime-config bootstrap step fails, recovery cleanup can still close them.
+            loop._bootstrap_resources = _RunResources(
+                workspace=workspace,
+                recorder=recorder,
+                context=context,
+                base_tool_specs=(),
+                started=started,
+                deadline=deadline,
+                static_segments=(),
+                model_runner=model_runner,
+                model_stream_observers=model_stream_observers,
+            )
+        except BaseException:
+            # Before publication the constructor callback owns this provisional recorder, including
+            # a result rejected by the external guard postcheck. Preserve the original failure.
+            if recorder is not None:
+                try:
+                    recorder.discard_uncommitted()
+                except BaseException:
+                    pass
+            raise
         base_registry = ToolRegistry()
         base_registry.register_many(builtin_tools(workspace))
         for provider in loop.tool_providers:

@@ -514,12 +514,13 @@ class AgentRecorder:
     _payload_chunk_shas: set[str] = field(default_factory=set, init=False, repr=False)
     _payload_request_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
-    @_authority_local_mutation
     def __post_init__(self) -> None:
         transcript_file: TextIO | None = None
         event_file_sink: JsonlEventSink | None = None
-        self._check_writer_authority()
-        try:
+
+        def initialize() -> None:
+            nonlocal transcript_file, event_file_sink
+            self._check_writer_authority()
             if (
                 not is_portable_json_integer(self.event_sequence_seed)
                 or self.event_sequence_seed < 0
@@ -562,6 +563,11 @@ class AgentRecorder:
                 write_authority=self.write_authority,
             )
             self._check_writer_authority()
+
+        try:
+            # The guard's postcheck can fail after initialization returns. Keep ownership of the
+            # opened handles until that check has also succeeded and the constructor can return.
+            self.write_authority.guard_local_mutation(initialize)
         except BaseException:
             # Construction can lose authority after opening local files but before bootstrap can
             # publish this recorder for ordinary cleanup. Release only recorder-owned handles:

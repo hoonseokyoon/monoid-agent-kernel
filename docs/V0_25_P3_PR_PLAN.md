@@ -530,3 +530,19 @@ python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thre
 
 Python은 공유 `.venv`의 3.11.9이며 PYTHONPATH는 이 worktree의 src, xdist worker 상한은 4다.
 ruff는 CI와 같은 0.15.6을 `uvx`로 사용한다. 이 회귀·preflight를 먼저 commit하고 production 수정을 이어간다.
+
+수정 전 회귀 commit은 `b4fff8f`다. constructor guard 전체를 handle cleanup 안으로 이동하고,
+bootstrap의 guarded callback에서 provisional recorder 소유권을 확보했다. 첫 resource 게시 시점과
+recordable failed-session 수명은 유지했다. close/discard의 subscription 실패 뒤에도 teardown을 마치며,
+escaping open/restore 제어 예외도 정리 후 원래 의미로 전파한다.
+
+동일 신규 회귀는 **15 passed / 3.61s**였다. 기존 checkpoint·취소·model-I/O·hosting·loop/session lifecycle·
+stream observer·public/compat를 포함한 최종 focused 검사는 **337 passed / 12.90s**다.
+원본은 `.tmp/v025/p3-01-green.log`, `.tmp/v025/p3-01-focused.log`다.
+
+~~~powershell
+python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_activation_cleanup.py tests/test_checkpoint.py tests/test_cancellation.py tests/test_loop_model_io_integration.py tests/test_activation_hosting.py tests/test_agent_loop_lifecycle.py tests/test_session_lifecycle.py tests/test_session_drive.py tests/test_model_stream_observer.py tests/test_public_surface.py tests/test_compatibility_ledger.py --tb=short --durations=8
+~~~
+
+기능 수정은 기존 소유권과 finally를 사용한다. 공백을 제외한 production diff는 41줄 추가/11줄 제거이며,
+일반 diff에는 bootstrap cleanup 범위의 indentation 이동도 포함한다. 새 lifecycle framework는 추가하지 않았다.
