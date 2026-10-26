@@ -473,3 +473,60 @@ Ready 이후 head/base가 바뀌면 현재 후보로 L2를 다시 실행하고, 
 P3-00 local 검증: 기존 CI foundation **18 passed / 3.78s**. `ci.yml`의 기준/현재 전체 텍스트 비교에서
 정확한 push branch 한 항목만 추가되고 job·permissions가 그대로임을 확인했다. YAML parser는 로컬 환경에 없어
 새 의존성을 설치하지 않았고 기존 workflow 검사와 GitHub CI를 사용한다. diff 공백 검사도 통과했다.
+
+P3-00 최종 head `6274c20de0afcd53bb267a35e3308982dc53fd61`의 독립 diff review는 PASS다.
+[PR #150](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/150)을 develop 대상으로 열었다.
+현재 P3-01 브랜치는 이 준비 head에서 분기했으며, PR #150 병합 후 최신 develop을 포함한 독립 diff로 제출한다.
+
+### P3-01 사전조사 — 2026-10-27
+
+- source base는 `5b08b10`이며 P3-00 head `6274c20`과 production tree가 같다. 브랜치는
+  `codex/v0.25-p3-01-cleanup`이다. root가 구현·runner를 소유하고 `p3_01_research`가 읽기 전용 조사를 수행했다.
+- recorder 내부에서도 같은 인계 결함이 있다. `AgentRecorder.__post_init__`의 decorator가
+  initialization body 반환 뒤 authority를 검사하므로, 해당 실패는 body 안의 handle cleanup 밖에서 발생한다.
+  초기화 동작을 작은 내부 함수로 두고 **guard 호출 전체를 기존 handle cleanup try 안에** 넣는다.
+- bootstrap은 guarded constructor callback 안에서 provisional recorder를 먼저 확보한다.
+  첫 `_bootstrap_resources` 게시까지 local cleanup try를 유지하고, 그 전 실패에는 local discard를 수행한다.
+  게시 시점은 유지한다. provider/config 실패를 기록하는 기존 terminal failed session과 recorder의 close 수명을 보존한다.
+- 현재 게시 전 TaskManager는 executor/injector만 만들고 event loop는 지연 생성한다. 이 PR의 실소유 handle은
+  recorder다. 하나의 소유권에 local try/finally와 기존 closed flag를 사용한다. 범용 cleanup manager나 새 state machine은
+  추가하지 않는다. 여러 host resource를 획득할 P3-02는 표준 ExitStack 적용을 별도로 검증한다.
+- escaping open/restore 실패는 best-effort discard 뒤 원래 오류를 재발생한다. ordinary Exception의 기존
+  failed-session 기록 여부는 유지하고, BaseException 제어 신호는 기록 경로로 바꾸지 않는다.
+- close는 성공한 recorder finalization 후 subscription close를 기존 checkpoint-delete try/finally 안으로 옮긴다.
+  discard는 subscription 오류가 있어도 session/resources/stream/callback/owned loop를 정리한다.
+  기존 subscription authority 오류는 앞서 모은 ordinary cleanup 오류보다 우선한다. 원래 bootstrap/restore/finalize
+  오류가 이미 전파 중이면 cleanup 오류가 이를 덮지 않는다. ordinary observer 오류의 격리 정책도 유지한다.
+- release_parked에는 이미 실패 시 discard fallback이 있다. 해당 경로는 baseline 실패라고 단정하지 않고 통과 대조로 둔다.
+  close는 subscription close 전에 run.finished를 이미 기록하지만, release/discard는 이를 기록하지 않는다.
+  revoke 뒤 checkpoint 삭제·외부 observer 후속 호출이 시작되지 않는지도 실제 파일과 callback 수로 확인한다.
+- 회귀 범위: real recorder constructor guard postcheck; bootstrap external postcheck/observer revoke의 open·restore;
+  close/discard/committed release의 subscription revoke; 기존 recordable failure 결과; 원래 escaping error 보존.
+  restore는 실제 durable checkpoint를 남겨 hosted task 취소 표식과 checkpoint 보존도 확인한다.
+  실패 회귀를 production 수정 전 별도 commit으로 고정한다.
+- 기존 `test_cancellation.py` constructor capture, checkpoint/model-I/O/hosting/session lifecycle 회귀를 재사용한다.
+  예상 기능 100–250줄, 전체 300–600줄을 유지하고 indentation 이동도 실제 diff 비용에 포함해 기록한다.
+  A 등급 독립 preflight, 서로 다른 두 final-code reviewer, L1/L2 core, develop 통합 CI가 완료 기준이다.
+
+P3-00은 [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40420031463),
+[L2 required](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40420031631)를 통과하고
+develop `61865effbabfec28adebd85e9574c52bc572c62a`로 병합했다. P3-01은 이 최신 base로 갱신했다.
+새 base의 production source는 `5b08b10`과 같다. 전체 develop CI run은 `40420547924`다.
+
+P3-01 독립 preflight reviewer `p3_01_preflight_review`의 판정은 **ready**다.
+검토 대상은 base `61865ef`와 preflight SHA256 `038001BC9396D04F66B697501728507C402FBF5B0226108E23234CA29957614A`다.
+추가 constructor probe에서도 initialization body 반환 뒤 revoke하면 두 owned handle이 모두 열린 채 남음을 확인했다.
+출력은 `.tmp/v025/p3-01-constructor-probe.json`이다.
+
+**수정 전 회귀:** `tests/test_activation_cleanup.py`는 **12 failed, 3 passed / 4.31s**다.
+실패는 constructor/초기화 handle 누수, 첫 종료의 session 잔존, cleanup이 원래 오류를 덮는 경계다.
+committed release와 provider/config의 recordable failed-session 수명은 통과 대조다.
+초기 fixture의 config 주입은 runtime-config provider Protocol에 맞춰 수정한 뒤 이 결과를 고정했다.
+production source는 아직 base와 동일하다. 원본 출력은 `.tmp/v025/p3-01-red.log`다.
+
+~~~powershell
+python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_activation_cleanup.py --tb=short
+~~~
+
+Python은 공유 `.venv`의 3.11.9이며 PYTHONPATH는 이 worktree의 src, xdist worker 상한은 4다.
+ruff는 CI와 같은 0.15.6을 `uvx`로 사용한다. 이 회귀·preflight를 먼저 commit하고 production 수정을 이어간다.
