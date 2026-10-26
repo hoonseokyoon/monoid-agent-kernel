@@ -401,4 +401,25 @@ ruff는 기존 .venv에 설치되어 있지 않았다. lint는 CI와 같은 0.15
 다음 턴 테스트가 두 runner+QueueEventSink라는 설명을 바로잡고, 기존 실제 AgentLoop 통합 테스트 두 개를 검증 목록에 연결했다.
 수정 전 테스트 파일 SHA256: `7C8BF996C1D00675A9A36FFBB5D7DEC057161D314EB19E298E3EA49331A1240E`.
 CI와 같은 `uvx --from ruff==0.15.6 ruff check tests/test_model_call_runner.py`도 통과했다.
-수정 후 green·코드 리뷰·CI·병합 증거를 이어 기록한다.
+수정 전 회귀와 사전조사는 `c3f9115`에 먼저 고정했다. 이 commit의 production source는 원래 base와 동일하다.
+최소 수정은 `_astream`의 `deliver` helper에서 조각 append 직전과 consumer 전후에 기존 authority 검사를 적용하고
+normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합이 **12 passed / 8.61s / exit 0**으로 전환됐다.
+원본 출력은 `.tmp/v025/p5-green.log`다. `uvx --from ruff==0.15.6 ruff check src tests tools/v023_ci.py`와
+`git diff --check`도 통과했다. 기존 Unicode·취소·drain·retry·observer·공개 표면·호환성 검증과 코드 리뷰를 이어간다.
+
+검증 중 drain=0의 stalled provider가 테스트 watchdog 취소로 끝나는 것을 확인했다. 해당 fixture에 호스트의
+명시적 HOST_SHUTDOWN 신호를 연결하고, watchdog 전에 끝나는 시간 상한 assertion을 추가했다. 제품 취소 정책은 유지했다.
+명시적 wake를 넣은 회귀도 `c3f9115`의 원래 model_call.py에서 **12 failed / 9.62s**였고,
+실험 뒤 수정 source의 원래 bytes를 복구했다(`.tmp/v025/p5-red-final.log`). 모든 실패는 동일한 출력 assertion이었다.
+그 뒤 추가한 종료 시간 상한과 문서 설명은 이 red 원인에 영향을 주지 않는다.
+
+최종 테스트 파일 SHA256은 `C8E8307022748AD5E6528DC11C507896D01501C8E8116FB2CFD06E84A492CF24`다.
+현재 수정에서 아래 관련 회귀는 **197 passed / 8.55s / exit 0**, ruff 전체 Python 범위·diff 공백 검사도 통과했다.
+원본 출력: `.tmp/v025/p5-focused-final.log`.
+
+```powershell
+& $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_model_call_runner.py tests/test_model_stream_observer.py tests/test_authority.py tests/test_public_surface.py tests/test_compatibility_ledger.py -k 'stream or drain or lease_loss or consumer or delivered_chunk or delivery_is_marked or authority or public or compatibility' --durations=8 --tb=short
+```
+
+기능 수정은 source 16줄 추가/9줄 제거와 회귀 약 100줄이다. 기존 계획 편입 외 신규 설계·구현 비용은 최초 S 범위 안이다.
+코드 reviewer 두 명과 최종 head CI 결과를 다음에 기록한다.

@@ -7,6 +7,13 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fence each streamed model delta and buffered Unicode suffix before delivery to a standalone
+  `ModelCallRunner` consumer, including when drain is configured but has not started. Lease loss
+  during one callback prevents the remaining normalized pieces from reaching the consumer.
+  Normal Unicode flush, cancellation, drain usage settlement, and wire formats are preserved.
+
 ## [0.24.0] - 2026-09-27
 
 ### Added — stopped-stream drain

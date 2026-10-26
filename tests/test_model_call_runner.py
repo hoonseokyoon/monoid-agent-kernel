@@ -6942,10 +6942,19 @@ def test_a_user_cancel_drain_that_ends_in_its_first_tick_still_settles_the_held_
 def test_lease_loss_before_drain_blocks_the_held_back_remainder(
     drain_s: float, ending: str
 ) -> None:
-    """Revocation alone must fence the suffix, even when a drain is configured but not started."""
+    """A revoked activation cannot flush a suffix while a configured drain has not started."""
 
     authority = ActivationWriteAuthority()
-    steps = (TextDelta("x\ud83d"), authority.revoke)
+    token = CancellationToken()
+
+    def revoke() -> None:
+        authority.revoke()
+        if ending == "stalls":
+            # A standalone, drain-off runner needs its host's stop signal to wake an idle read.
+            # Trigger that wake explicitly so the test watchdog is never its cancellation source.
+            token.cancel(InterruptionCause.HOST_SHUTDOWN)
+
+    steps = (TextDelta("x\ud83d"), revoke)
     if ending == "stalls":
         stream: Any = _DrainStream(*steps, _STALL)
     elif ending == "finished":
@@ -6953,12 +6962,15 @@ def test_lease_loss_before_drain_blocks_the_held_back_remainder(
     else:
         stream = _NoCloseStream(*steps, asyncio.CancelledError())
 
-    outcome = _drain_call(stream, drain_s=drain_s, authority=authority, timeout_s=5.0)
+    outcome = _drain_call(
+        stream, drain_s=drain_s, authority=authority, token=token, timeout_s=5.0
+    )
 
     assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
     assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
     assert outcome.texts == ["x"], "a revoked activation received the held-back suffix"
     assert outcome.settled == []
+    assert outcome.elapsed < 3.0, "the test watchdog supplied the stream's missing stop"
 
 
 @pytest.mark.parametrize("drain_s", [0.0, 5.0])
@@ -6973,6 +6985,7 @@ def test_lease_loss_before_drain_blocks_the_next_regular_delta(drain_s: float) -
     assert outcome.texts == ["x"], "a revoked activation received a new provider delta"
     assert outcome.settled == []
     assert stream.closed
+    assert outcome.elapsed < 3.0, "the test watchdog supplied the stream's missing stop"
 
 
 @pytest.mark.parametrize("drain_s", [0.0, 5.0])

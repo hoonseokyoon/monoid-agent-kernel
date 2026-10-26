@@ -69,7 +69,7 @@ building against, and securing the kernel.
 | [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Qualified storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release-delivery evidence. |
 | [V0_24_RELEASE_AUDIT.md](V0_24_RELEASE_AUDIT.md) | Stopped-stream drain release scope, known limits, no-migration statement, CI and exact-wheel evidence, and the release-delivery gate. |
 | [V0_25_PRE_INVESTIGATION.md](V0_25_PRE_INVESTIGATION.md) | v0.25 integrated P1–P5 + DX1/DX2 scope, conditional child policy, independent workgroups, compatibility and release checks. |
-| [V0_25_P5_DX1_PR_PLAN.md](V0_25_P5_DX1_PR_PLAN.md) | First two PR work orders: change boundaries, dependencies, upstream issues and implementations, consumer examples, regression and CI criteria. Planning only. |
+| [V0_25_P5_DX1_PR_PLAN.md](V0_25_P5_DX1_PR_PLAN.md) | First two PR work orders and execution evidence: change boundaries, dependencies, upstream examples, red/green regressions, review and CI. |
 | [V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) | Target developer APIs for typed tools, host resources, termination, usage and budgets; integration recipes and later web/Studio directions. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |

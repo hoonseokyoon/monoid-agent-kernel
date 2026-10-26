@@ -1871,15 +1871,25 @@ class ModelCallRunner:
         ingress = ModelStreamIngressNormalizer()
         drain = _AbortDrain(budget_s, chunks) if budget_s > 0 else None
 
+        def deliver(normalized_chunk: ModelStreamChunk) -> None:
+            nonlocal retried
+            if getattr(normalized_chunk, "provider_retried", False):
+                retried = True
+            self._assert_write_authority()
+            chunks.append(normalized_chunk)
+            # A terminal or remainder flush can contain several logical channels. Fence each
+            # piece and the arbitrary callback separately; one consumer can revoke the lease.
+            self._assert_write_authority()
+            try:
+                delta_consumer(normalized_chunk)
+            finally:
+                self._assert_write_authority()
+
         def deliver_remainder() -> None:
             # The ingress holds back a high surrogate until its continuation arrives; a stream that
             # ends, or is stopped, leaves that unit definitively lone and its replacement is due.
-            nonlocal retried
             for normalized_chunk in ingress.finish():
-                if getattr(normalized_chunk, "provider_retried", False):
-                    retried = True
-                chunks.append(normalized_chunk)
-                delta_consumer(normalized_chunk)
+                deliver(normalized_chunk)
 
         async def drain_rest(drain: _AbortDrain, first: Any) -> ModelTurn:
             # Everything the provider still sends goes through a normalizer of its own and is
@@ -1932,10 +1942,7 @@ class ModelCallRunner:
                             "model adapter returned a non-portable stream fragment"
                         ) from exc
                     for normalized_chunk in normalized_chunks:
-                        if getattr(normalized_chunk, "provider_retried", False):
-                            retried = True
-                        chunks.append(normalized_chunk)
-                        delta_consumer(normalized_chunk)
+                        deliver(normalized_chunk)
                     if (
                         (drain is None or not drain.started)
                         and should_abort is not None
