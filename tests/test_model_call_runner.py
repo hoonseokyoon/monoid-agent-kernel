@@ -6937,6 +6937,91 @@ def test_a_user_cancel_drain_that_ends_in_its_first_tick_still_settles_the_held_
     assert outcome.receipt.error_code == "cancelled"
 
 
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+@pytest.mark.parametrize("ending", ["stalls", "finished", "provider_cancel"])
+def test_lease_loss_before_drain_blocks_the_held_back_remainder(
+    drain_s: float, ending: str
+) -> None:
+    """Revocation alone must fence the suffix, even when a drain is configured but not started."""
+
+    authority = ActivationWriteAuthority()
+    steps = (TextDelta("x\ud83d"), authority.revoke)
+    if ending == "stalls":
+        stream: Any = _DrainStream(*steps, _STALL)
+    elif ending == "finished":
+        stream = _NoCloseStream(*steps)
+    else:
+        stream = _NoCloseStream(*steps, asyncio.CancelledError())
+
+    outcome = _drain_call(stream, drain_s=drain_s, authority=authority, timeout_s=5.0)
+
+    assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.texts == ["x"], "a revoked activation received the held-back suffix"
+    assert outcome.settled == []
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+def test_lease_loss_before_drain_blocks_the_next_regular_delta(drain_s: float) -> None:
+    authority = ActivationWriteAuthority()
+    stream = _DrainStream(TextDelta("x"), authority.revoke, TextDelta("late"), _STALL)
+
+    outcome = _drain_call(stream, drain_s=drain_s, authority=authority, timeout_s=5.0)
+
+    assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.texts == ["x"], "a revoked activation received a new provider delta"
+    assert outcome.settled == []
+    assert stream.closed
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+@pytest.mark.parametrize("ending", ["terminal", "eof"])
+def test_consumer_revocation_blocks_the_rest_of_a_normalized_batch(
+    drain_s: float, ending: str
+) -> None:
+    """One terminal or EOF flush can publish several channels; each piece spends authority."""
+
+    authority = ActivationWriteAuthority()
+    pieces: list[Any] = [
+        TextDelta("x\ud83d"),
+        ReasoningDelta("r\ud83d"),
+        ToolCallDelta(index=0, arguments_fragment="\ud83d"),
+    ]
+    if ending == "terminal":
+        pieces.append(TurnComplete(usage=_BILL))
+    stream = _DrainStream(*pieces)
+    seen: list[Any] = []
+    settled: list[SettledModelCall] = []
+
+    def consume(chunk: Any) -> None:
+        seen.append(chunk)
+        if isinstance(chunk, TextDelta) and chunk.text == "\ufffd":
+            authority.revoke()
+
+    runner = ModelCallRunner(
+        adapter=stream,
+        abort_drain_s=drain_s,
+        current_write_authority=lambda: authority,
+        settled_sink=settled.append,
+    )
+
+    async def run() -> None:
+        with pytest.raises(WriteAuthorityRevoked):
+            await asyncio.wait_for(runner.acall(REQUEST, delta_consumer=consume), timeout=5.0)
+
+    asyncio.run(run())
+
+    assert seen == [
+        TextDelta("x"),
+        ReasoningDelta("r"),
+        ToolCallDelta(index=0, arguments_fragment=""),
+        TextDelta("\ufffd"),
+    ]
+    assert settled == []
+    assert stream.closed
+
+
 @pytest.mark.parametrize("ending", ["stalls", "finished", "provider_cancel"])
 @pytest.mark.parametrize("order", ["cancel_then_revoke", "revoke_then_cancel"])
 def test_a_lease_lost_in_the_tick_a_user_cancel_began_the_drain_settles_nothing(

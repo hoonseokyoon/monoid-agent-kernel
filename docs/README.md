@@ -36,6 +36,10 @@ building against, and securing the kernel.
   the PostgreSQL, ObjectStore, Temporal, durable-stream scope and owner decisions. The
   [v0.23 release audit](V0_23_RELEASE_AUDIT.md) is the evidence gate for that campaign. The
   [v0.24 release audit](V0_24_RELEASE_AUDIT.md) records the stopped-stream drain release evidence.
+  The [v0.25 integrated plan](V0_25_PRE_INVESTIGATION.md) defines P1–P5 plus DX1/DX2, independent workgroups,
+  compatibility boundaries, and research evidence. Start with the [P5/DX1 PR plan](V0_25_P5_DX1_PR_PLAN.md)
+  for change scopes, dependencies, external implementation lessons, and acceptance criteria; see the
+  [developer API design](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) for target examples and later directions.
 
 ## All documents
 
@@ -64,6 +68,9 @@ building against, and securing the kernel.
 | [V0_23_IMPLEMENTATION_PLAN.md](V0_23_IMPLEMENTATION_PLAN.md) | Pre-implementation audit, recommended PostgreSQL/ObjectStore/Temporal and durable-stream architecture, PR sequence, risks, and owner approval matrix. |
 | [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Qualified storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release-delivery evidence. |
 | [V0_24_RELEASE_AUDIT.md](V0_24_RELEASE_AUDIT.md) | Stopped-stream drain release scope, known limits, no-migration statement, CI and exact-wheel evidence, and the release-delivery gate. |
+| [V0_25_PRE_INVESTIGATION.md](V0_25_PRE_INVESTIGATION.md) | v0.25 integrated P1–P5 + DX1/DX2 scope, conditional child policy, independent workgroups, compatibility and release checks. |
+| [V0_25_P5_DX1_PR_PLAN.md](V0_25_P5_DX1_PR_PLAN.md) | First two PR work orders: change boundaries, dependencies, upstream issues and implementations, consumer examples, regression and CI criteria. Planning only. |
+| [V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) | Target developer APIs for typed tools, host resources, termination, usage and budgets; integration recipes and later web/Studio directions. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
 | [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
