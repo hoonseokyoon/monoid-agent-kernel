@@ -1,8 +1,9 @@
 # v0.25 P5·DX1 PR 계획
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
-상태: **2026-10-27 P5 #148 병합 / DX1 구현·로컬 검증 완료**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
-고정하고 P5 독립 PR, 이후 DX1 별도 PR을 진행하도록 요청했다. 현재 실행 상태와 증거는 §9에 기록한다.
+상태: **2026-10-27 P5 #148·DX1 #149 develop 병합 완료**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
+고정하고 P5 독립 PR, 이후 DX1 별도 PR을 진행하도록 요청했다. 실행 상태와 증거는 §9에 기록한다.
+다음 작업의 정책·PR 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. 현재 P3는 계획 단계다.
 
 범위의 기준은 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)이다. [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)는
 목표 API와 후속 방향을 설명한다. 이 문서는 첫 두 PR의 변경 경계·의존성·실제 소비자·검증 기준을 고정한다.
@@ -497,3 +498,18 @@ async tools `BA653829B9099138CAB3878BA904E4F26A6E8927396A493E2B9EABF4AE05D546`.
 ruff 0.15.6의 `src tests tools/v023_ci.py examples/custom_tool_quickstart.py`와 diff 공백 검사도 통과했다.
 기능 source는 28줄 추가/4줄 제거, 회귀는 약 470줄, 순수 typed 예제와 마이그레이션 안내가 동반된다.
 누적 구현 비용은 S 범위다. 독립 코드 리뷰·최종 head CI·develop 병합 결과는 DX1 PR에 연결해 기록한다.
+
+### P5·DX1 완료와 P3 인계 — 2026-10-27
+
+[DX1 PR #149](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/149)의 최종 구현 head는
+`44f02cceecd3754314999bbbd69977316b3be263`이며 독립 코드 리뷰 PASS다.
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40409327255),
+[L2 required](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40409327309)를 통과하고
+develop merge `5b08b10d82a948268d1a95b51112b1508e233e3d`로 통합했다. 검토 head와 merge tree는 같다.
+[전체 develop CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40410007998)는
+14개 job 모두 통과했다. 실제 서비스·플랫폼·wheel 설치·DBOS 복구·Studio·coverage 80.65% 검증을 포함한다.
+P5의 [전체 develop CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40407263870)도 통과했다.
+
+두 구현 PR은 완료했다. 릴리스·태그·PyPI·CSP pin은 변경하지 않았다.
+사용자가 다음으로 요청한 P3는 [별도 계획](V0_25_P3_PR_PLAN.md)에서 최신 develop 코드와 외부 사례,
+정책·PR별 변경 범위·검증 기준을 구체화한다. 현재 요청은 P3 사전조사와 계획이며 구현은 보류한다.
