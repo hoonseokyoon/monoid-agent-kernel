@@ -2,11 +2,12 @@
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
-상태: **기존 계획에 통합 / 2026-10-27 P5 병합·DX1 구현 검증**. 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
+상태: **기존 계획에 통합 / 2026-10-27 P5·DX1 병합, P3 계획 구체화**. 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.
 범위의 기준은 통합 계획이고 첫 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md)이다.
-새 API 명칭과 후속 릴리스 배치는 설계 제안이다. DX1의 순수 typed 도구는 개발 브랜치의
+P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. P3 구현은 승인됐으며 §9에 실행 증거를 기록한다.
+새 API 명칭과 후속 릴리스 배치는 설계 제안이다. DX1의 순수 typed 도구는 develop의
 [실행 예제](../examples/custom_tool_quickstart.py)에 반영했다. 나머지 신규 API는 후속 구현 대상이다.
 
 ## 1. 제품 방향과 릴리스 경계
@@ -172,6 +173,10 @@ loop = AgentLoop.from_config(
 P3 없이 실행할 순수 도구의 목표 API와 상세 회귀는 [DX1 PR 명세](V0_25_P5_DX1_PR_PLAN.md#4-pr-02--dx1-typed-도구-입력과-결과)에 있다.
 
 ### P3의 자원 수명 계약
+
+이 절의 계약을 구체화한 [P3 정책](V0_25_P3_PR_PLAN.md#4-채택-정책)을 구현 기준으로 사용한다.
+동기 open/bind_call/close, call별 façade, kernel local-dispose와 host pool 소유권,
+workspace write의 승인된 `side_effect="write"` 요건, 정상 종료와 writer revoke의 분리를 포함한다.
 
 `HostToolKey[T]`는 프로세스 내 identity를 갖고 이름은 진단용이다. 같은 프로세스의 host와 handler가 같은 키 인스턴스를 공유한다.
 중복 identity/name은 자원 생성 전에 거부한다. 기존 method-only `ToolContext`의 필수 멤버는 유지하고 선택적 확장 프로토콜과 helper를 제공한다.

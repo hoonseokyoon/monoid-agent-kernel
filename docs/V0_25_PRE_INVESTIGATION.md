@@ -2,8 +2,10 @@
 
 작성일: 2026-09-28. 통합 갱신: 2026-10-25. 코드 기준: v0.24.0 / `8d56e0d`.
 
-상태: **2026-10-27 P5 #148 병합 / DX1 구현·로컬 검증 완료**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
-먼저 고정하고 P5 독립 PR, 이후 DX1 별도 PR을 진행하도록 요청했다. 현재 실행 기록은 PR 계획 §9에 있다.
+상태: **2026-10-27 P5 #148·DX1 #149 병합 / P3 구현 승인·P3-00/01 착수**.
+P3의 현재 기준은 `origin/develop=5b08b10d82a948268d1a95b51112b1508e233e3d`다.
+사용자는 P3-00·01부터 구현하고 리뷰·CI 확인 뒤 통합 브랜치에서 P3-02·03을 순차 진행하도록 요청했다.
+P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
 [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)에 기록한다. 릴리스 범위의 기준은 이 문서다.
 
@@ -165,6 +167,11 @@ backend live-stream closed frame과 Studio reader, OTel의 attempt/call 계측�
 전달하는 wire에서는 schema·reader·fixture를 함께 갱신한다. 새 증거 metadata를 별도 token 가산 경로로 사용하지 않는다.
 
 ### 5.2 P3: 타입 있는 주입과 호출별 권한
+
+2026-10-27 구체화한 정책·외부 근거·코드 재현·PR 의존성·수용 행렬은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 둔다.
+기존 cleanup 두 경계 보완 후 root의 주입·권한·복구와 실제 보고서 소비자를 한 PR에서 완결하고,
+child/fork 명시 상속을 다음 PR로 연결한다. 동기 activation adapter, 호출에 고정한 façade,
+deferred workspace, 별도 P3 lifetime guard를 채택한다. 현재 구현 실행 기록은 P3 PR 계획 §9에 둔다.
 
 **현재 간격.** [ToolContext](../src/monoid_agent_kernel/tools/base.py)는 method-only Protocol이고,
 [extension façade](../src/monoid_agent_kernel/loop.py)는 내부 workspace·recorder를 감춘다.
