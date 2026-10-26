@@ -422,4 +422,51 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 ```
 
 기능 수정은 source 16줄 추가/9줄 제거와 회귀 약 100줄이다. 기존 계획 편입 외 신규 설계·구현 비용은 최초 S 범위 안이다.
-코드 reviewer 두 명과 최종 head CI 결과를 다음에 기록한다.
+독립 코드 reviewer 두 명은 head `274204c2a48a9e4b9f99da34eb0298a0ad316f25`에서 지적 없이 통과 판정했다.
+[P5 PR #148](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/148)은 아래 최종 head CI를 통과하고
+2026-10-27 develop에 merge commit `f19bbdcd18e66841a9cf4c5fee2da5bec4e6e89f`로 통합했다.
+
+- [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40406622349): 4,515 passed, 52 skipped.
+- [L2 required](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40406622355): Python 3.11/3.12
+  각각 4,545 passed, 19 skipped + serial 621 passed, 15 skipped. core profile의 service job은 선택 대상 밖이다.
+
+### DX1 PR preflight — 2026-10-27
+
+- 최신 base: P5 병합 후 fetch한 `origin/develop=f19bbdcd18e66841a9cf4c5fee2da5bec4e6e89f`.
+  `274204c`와 tree 차이 0. 같은 격리 checkout에서 `codex/v0.25-dx1-typed-tools`를 새로 만들었다.
+- 생산자·소비자: decorator가 만든 Args 모델은 JSON 인자를 검증하고 sync/async Python handler가 값을 사용한다.
+  현재 `validated.model_dump()`는 중첩 모델을 dict로 바꾸고 입력 serializer를 실행한다. 기존 fields를 순회해
+  `getattr(validated, name)`으로 전달하면 추가 모델·새 프레임워크 없이 타입과 기본값을 유지한다.
+- 출력 경계: 최상위 BaseModel만 `model_dump(mode="json")`으로 바꾸고 실제 dict/비-dict 모양에 기존 envelope를 적용한다.
+  `normalize_tool_result`의 portable 검사를 유지한다. 일반 실패는 고정 진단의 ToolExecutionError로 전달해 기존
+  `tool_result_unportable`·category=tool·retryable=True를 사용한다. schema/return annotation/재귀 변환/P3는 범위 밖이다.
+- 취소 경계: 직접 RunCancelled/RunTimeout/TurnInterrupted를 보존하고 PydanticSerializationError의 cause에 있는
+  동일 제어 예외와 BaseException 제어 신호를 재발생한다. 일반 도메인 오류의 cause는 탐색하지 않는다.
+  wrapper cause를 순회하면 cycle guard를 둔다. loop의 host 취소와 handler-local 취소 분류는 그대로 사용한다.
+- 지원 하한 조사: Python 3.12.11/Pydantic 2.6.0을 `.tmp/v025/dx1-pydantic26`에 격리 설치했다.
+  Python 3.11.9/Pydantic 2.13.4와 함께 direct serializer·중첩 모델 필드의 원래 제어 예외 cause 보존을 확인했다.
+  custom serializer가 다른 모델의 `model_dump()`를 직접 호출하면 두 버전에서 cause/context가 사라진다.
+  decorator는 남아 있는 원인 정보만 복원할 수 있다. 오류 문자열 추정이나 Pydantic monkeypatch는 추가하지 않는다.
+  소비자는 중첩 모델 필드의 기본 직렬화를 사용한다. 원본 probe와 출력은 `.tmp/v025/dx1_probe.py`,
+  `dx1-probe-current.log`, `dx1-probe-floor.log`다.
+- 외부 근거 재확인: [LangChain #34770](https://github.com/langchain-ai/langchain/issues/34770)은 입력 dump가
+  context 직렬화를 유발하는 열린 이슈다. 입력 serializer 호출 0회로 이 문제를 예방한다.
+  [Pydantic 2.6 공식 직렬화 계약](https://docs.pydantic.dev/2.6/concepts/serialization/)의 JSON mode·RootModel·
+  비-dict custom serializer를 사용한다. §2의 pinned 외부 코드는 참고 근거로 유지한다.
+- 검증·비용: §4 수용 행렬을 기존 decorator/async tool 테스트에 고정한다. 실제 from_tools→handler→다음 요청의
+  observation과 성공/실패 이벤트를 확인한다. current/floor 환경, 설치 wheel의 순수 예제, 기존 host 취소·공개 표면·
+  호환성, ruff와 B등급 독립 코드 리뷰, 최종 head core CI가 완료 기준이다. 구현은 100줄 미만을 예상하고
+  기존 serializer·envelope·오류 계약을 재사용한다. 총괄이 파일 수정과 runner를 직렬화한다.
+
+최신 base의 독립 preflight 판정은 **READY**다. reviewer는 실제 decorator·portable boundary·loop 취소 경로와
+두 버전의 probe를 읽었고 구현을 막는 지적은 없었다. 신규 회귀를 작성하는 동안 production source는 base와 동일했다.
+
+**수정 전 red:** 신규 수용 회귀 74개 중 **59 failed, 15 passed / 4.87s**.
+중첩 타입 손실·입력 serializer 실행·반환 모델 거부·제어 예외 손실이 의도한 assertion에서 드러났다.
+기존 dict/ToolResult 및 거부해야 할 중첩 모델의 대조 경로는 통과했다. 원본 출력은 `.tmp/v025/dx1-red.log`다.
+
+```powershell
+& $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py -k 'typed or serializer or validated_inputs or input_validation or top_level_models or model_serialization or model_conversion or existing_return or model_dump_preserves' --tb=short
+```
+
+신규 회귀와 이 preflight를 먼저 커밋한 뒤 decorator의 최소 수정을 적용한다.

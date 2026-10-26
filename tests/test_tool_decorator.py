@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, ClassVar
+from uuid import UUID
 
 import pytest
+from pydantic import BaseModel, Field, RootModel, SecretStr, model_serializer
+from pydantic_core import PydanticSerializationError
 
 from monoid_agent_kernel import tool
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked
+from monoid_agent_kernel.errors import RunCancelled, RunTimeout, ToolExecutionError, TurnInterrupted
 from monoid_agent_kernel.tools.base import (
     ToolContext,
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    normalize_tool_result,
     normalize_tool_spec,
 )
 
@@ -178,3 +187,283 @@ def test_a_tool_id_that_is_a_string_subclass_is_accepted_and_reduced_to_its_base
         return {"text": text}
 
     assert (plain.id, defaulted.id) == ("skill.plain", "defaulted")
+
+
+class _Tier(Enum):
+    STANDARD = "standard"
+
+
+class _Customer(BaseModel):
+    name: str
+
+
+class _Draft(BaseModel):
+    customer: _Customer
+    title: str = "Weekly"
+
+
+class _SerializedInput(BaseModel):
+    value: int
+    calls: ClassVar[int] = 0
+    fail: ClassVar[bool] = False
+
+    @model_serializer
+    def serialize(self) -> dict:
+        type(self).calls += 1
+        if self.fail:
+            raise ValueError("input serialization should never run")
+        return {"serialized": self.value}
+
+
+def _invoke(spec: ToolSpec, args: dict, ctx: object = None) -> ToolResult:
+    result = spec.handler(ctx, args)
+    return asyncio.run(result) if inspect.isawaitable(result) else result
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_validated_inputs_keep_domain_types_defaults_and_context(is_async: bool) -> None:
+    seen = []
+
+    def capture(
+        ctx: ToolContext,
+        draft: _Draft,
+        customers: list[_Customer],
+        by_name: dict[str, _Customer],
+        tier: _Tier = _Tier.STANDARD,
+        limit: int = 7,
+    ) -> dict:
+        seen.append((ctx, draft, customers, by_name, tier, limit))
+        return {"called": True}
+
+    async def capture_async(
+        ctx: ToolContext,
+        draft: _Draft,
+        customers: list[_Customer],
+        by_name: dict[str, _Customer],
+        tier: _Tier = _Tier.STANDARD,
+        limit: int = 7,
+    ) -> dict:
+        return capture(ctx, draft, customers, by_name, tier, limit)
+
+    spec = tool(capture_async if is_async else capture)
+    sentinel = object()
+    args = {
+        "draft": {"customer": {"name": "Ada"}},
+        "customers": [{"name": "Lin"}],
+        "by_name": {"owner": {"name": "Grace"}},
+    }
+    assert _invoke(spec, args, sentinel).ok
+    ctx, draft, customers, by_name, tier, limit = seen.pop()
+    assert ctx is sentinel
+    assert isinstance(draft, _Draft) and isinstance(draft.customer, _Customer)
+    assert (draft.customer.name, draft.title) == ("Ada", "Weekly")
+    assert isinstance(customers[0], _Customer) and customers[0].name == "Lin"
+    assert isinstance(by_name["owner"], _Customer) and by_name["owner"].name == "Grace"
+    assert tier is _Tier.STANDARD and limit == 7
+    assert set(spec.input_schema["properties"]) == {
+        "draft",
+        "customers",
+        "by_name",
+        "tier",
+        "limit",
+    }
+    assert spec.input_schema["required"] == ["draft", "customers", "by_name"]
+    invalid = _invoke(spec, {**args, "draft": {"customer": {}}}, sentinel)
+    assert not invalid.ok and invalid.error_code == "invalid_tool_args"
+    assert seen == []
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("serializer_fails", [False, True])
+def test_input_validation_never_calls_serializers(is_async: bool, serializer_fails: bool) -> None:
+    _SerializedInput.calls = 0
+    _SerializedInput.fail = serializer_fails
+
+    def capture(payload: _SerializedInput) -> dict:
+        assert isinstance(payload, _SerializedInput)
+        return {"value": payload.value}
+
+    async def capture_async(payload: _SerializedInput) -> dict:
+        return capture(payload)
+
+    result = _invoke(tool(capture_async if is_async else capture), {"payload": {"value": "3"}})
+    assert result.content == {"value": 3}
+    assert _SerializedInput.calls == 0
+
+
+class _Report(BaseModel):
+    customer: _Customer
+    at: datetime
+    reference: UUID
+    tier: _Tier
+
+
+class _ScalarReport(BaseModel):
+    @model_serializer
+    def serialize(self) -> str:
+        return "ready"
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    "value, content",
+    [
+        (
+            _Report(
+                customer=_Customer(name="Ada"),
+                at=datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+                reference=UUID("12345678-1234-5678-1234-567812345678"),
+                tier=_Tier.STANDARD,
+            ),
+            {
+                "customer": {"name": "Ada"},
+                "at": "2030-01-02T03:04:05Z",
+                "reference": "12345678-1234-5678-1234-567812345678",
+                "tier": "standard",
+            },
+        ),
+        (RootModel[dict[str, int]]({"count": 3}), {"count": 3}),
+        (RootModel[list[int]]([1, 2]), {"result": [1, 2]}),
+        (RootModel[int](3), {"result": 3}),
+        (_ScalarReport(), {"result": "ready"}),
+    ],
+)
+def test_top_level_models_use_json_mode_and_actual_dump_shape(is_async, value, content) -> None:
+    def report():
+        return value
+
+    async def report_async():
+        return value
+
+    result = normalize_tool_result(_invoke(tool(report_async if is_async else report), {}))
+    assert result.to_observation() == {"ok": True, "result": content}
+
+
+def test_model_serialization_respects_domain_keys_exclusion_and_actual_subclass() -> None:
+    class Public(BaseModel):
+        ok: bool = False
+        error: str = "domain status"
+        result: int = 4
+        secret: SecretStr = SecretStr("private-secret")
+        hidden: str = Field(default="private-hidden", exclude=True)
+
+    class Actual(Public):
+        detail: str = "published by actual return type"
+
+    @tool
+    def report() -> Public:
+        return Actual()
+
+    result = normalize_tool_result(report.handler(None, {}))
+    assert result.to_observation() == {
+        "ok": True,
+        "result": {
+            "ok": False,
+            "error": "domain status",
+            "result": 4,
+            "secret": "**********",
+            "detail": "published by actual return type",
+        },
+    }
+
+
+@pytest.mark.parametrize("envelope", ["dict", "explicit"])
+def test_model_conversion_stays_at_the_decorated_return_boundary(envelope: str) -> None:
+    payload = {"customer": _Customer(name="Ada")}
+
+    @tool
+    def report():
+        return ToolResult(ok=True, content=payload) if envelope == "explicit" else payload
+
+    with pytest.raises(ToolExecutionError) as caught:
+        normalize_tool_result(report.handler(None, {}))
+    assert caught.value.error_code == "tool_result_unportable"
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"ok": False, "error": "domain", "result": 1},
+        "scalar",
+        [1, 2],
+        None,
+        ToolResult(
+            ok=False, content={"detail": 1}, error="retry", error_code="app_error", retryable=True
+        ),
+    ],
+)
+def test_existing_return_envelopes_are_preserved(value) -> None:
+    @tool
+    def report():
+        return value
+
+    result = report.handler(None, {})
+    if isinstance(value, ToolResult):
+        assert result is value
+    else:
+        assert result.ok
+        assert result.content == (value if isinstance(value, dict) else {"result": value})
+
+
+@pytest.mark.parametrize("failure_kind", ["unsupported", "serializer"])
+def test_model_serialization_failures_have_a_fixed_tool_diagnostic(failure_kind: str) -> None:
+    class Unsupported(BaseModel):
+        payload: Any
+
+    class Broken(BaseModel):
+        @model_serializer
+        def serialize(self):
+            raise ValueError("private serializer details")
+
+    @tool
+    def report():
+        return Unsupported(payload=object()) if failure_kind == "unsupported" else Broken()
+
+    with pytest.raises(ToolExecutionError) as caught:
+        report.handler(None, {})
+    assert caught.value.error_code == "tool_result_unportable"
+    assert caught.value.category == "tool" and caught.value.retryable is True
+    assert str(caught.value) == "tool result model could not be serialized as JSON"
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        RunCancelled("stop"),
+        RunTimeout("time"),
+        TurnInterrupted("interrupt"),
+        WriteAuthorityRevoked(),
+        asyncio.CancelledError("local"),
+        KeyboardInterrupt(),
+        SystemExit(1),
+    ],
+)
+@pytest.mark.parametrize("route", ["direct", "serializer", "nested_field", "explicit_wrapper"])
+def test_model_dump_preserves_available_control_exception_identity(original, route) -> None:
+    class Broken(BaseModel):
+        @model_serializer
+        def serialize(self):
+            raise original
+
+    class Nested(BaseModel):
+        payload: Any
+
+    class Override(BaseModel):
+        def model_dump(self, **kwargs):
+            if route == "explicit_wrapper":
+                try:
+                    raise original
+                except BaseException as cause:
+                    raise PydanticSerializationError("wrapper") from cause
+            raise original
+
+    @tool
+    def report():
+        if route == "nested_field":
+            return Nested(payload=Broken())
+        return Broken() if route == "serializer" else Override()
+
+    with pytest.raises(type(original)) as caught:
+        report.handler(None, {})
+    assert caught.value is original

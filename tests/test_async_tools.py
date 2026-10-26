@@ -11,17 +11,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, model_serializer
 
 from support.runtime import runtime_config, runtime_provider, tool_binding
 
 from monoid_agent_kernel import tool
+from monoid_agent_kernel.core.authority import WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.capability import AutoGrantBroker, CapabilityLease
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import ToolScope
-from monoid_agent_kernel.errors import RunCancelled, ToolExecutionError
+from monoid_agent_kernel.errors import RunCancelled, RunTimeout, ToolExecutionError, TurnInterrupted
 from monoid_agent_kernel.core._sync_bridge import dispose_unawaited, start_abandonable_sync_call
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
@@ -1465,3 +1467,182 @@ def test_the_disposal_rule_handles_every_shape_it_claims_to() -> None:
     exotic = _ExoticAwaitable()
     dispose_unawaited(exotic)  # no generic disposal exists; leaving it alone is the contract
     assert inspect.isawaitable(exotic)
+
+
+class _ReportCustomer(BaseModel):
+    name: str
+
+
+class _ReportDraft(BaseModel):
+    customer: _ReportCustomer
+    title: str
+
+
+class _ReportSummary(BaseModel):
+    customer: str
+    title: str
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_typed_tool_reaches_the_next_model_request(tmp_path: Path, is_async: bool) -> None:
+    seen = []
+
+    def summarize(draft: _ReportDraft) -> _ReportSummary:
+        seen.append((type(draft), type(draft.customer)))
+        return _ReportSummary(customer=draft.customer.name, title=draft.title)
+
+    async def summarize_async(draft: _ReportDraft) -> _ReportSummary:
+        return summarize(draft)
+
+    report = tool(summarize_async if is_async else summarize, id="typed.report")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "typed_report",
+                        {
+                            "draft": {"customer": {"name": "Ada"}, "title": "Weekly"},
+                        },
+                        "c1",
+                    ),
+                )
+            ),
+            ModelTurn(final_text="done"),
+        ]
+    )
+    result = asyncio.run(AgentLoop.from_tools(_spec(tmp_path), adapter, [report]).arun_once("go"))
+    assert result.status == "completed"
+    assert seen == [(_ReportDraft, _ReportCustomer)]
+    assert adapter.requests[1].observations[0].output == {
+        "ok": True,
+        "result": {"customer": "Ada", "title": "Weekly"},
+    }
+    events = _event_types(result.run_dir)
+    assert "tool.call.finished" in events and "tool.call.failed" not in events
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("failure_kind", ["unsupported", "serializer", "dict", "explicit"])
+def test_typed_result_failure_is_a_recoverable_tool_observation(
+    tmp_path: Path,
+    is_async: bool,
+    failure_kind: str,
+) -> None:
+    class Unsupported(BaseModel):
+        payload: Any
+
+    class Broken(BaseModel):
+        @model_serializer
+        def serialize(self):
+            raise ValueError("private serializer details")
+
+    def report():
+        if failure_kind == "unsupported":
+            return Unsupported(payload=object())
+        if failure_kind == "serializer":
+            return Broken()
+        payload = {"customer": _ReportCustomer(name="Ada")}
+        return payload if failure_kind == "dict" else ToolResult(ok=True, content=payload)
+
+    async def report_async():
+        return report()
+
+    spec = tool(report_async if is_async else report, id="typed.report")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("typed_report", {}, "c1"),)),
+            ModelTurn(final_text="recovered"),
+        ]
+    )
+    result = asyncio.run(AgentLoop.from_tools(_spec(tmp_path), adapter, [spec]).arun_once("go"))
+    assert result.status == "completed" and result.final_text == "recovered"
+    observation = adapter.requests[1].observations[0].output
+    assert observation["ok"] is False
+    error = observation["error"]
+    assert (error["code"], error["category"], error["retryable"]) == (
+        "tool_result_unportable",
+        "tool",
+        True,
+    )
+    assert "private serializer details" not in error["message"]
+    assert "0x" not in error["message"]
+    events = _event_types(result.run_dir)
+    assert "tool.call.failed" in events and "tool.call.finished" not in events
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    "original, reason, cause",
+    [
+        (RunCancelled("stop"), "terminal", InterruptionCause.USER_CANCEL),
+        (RunTimeout("time"), "terminal", InterruptionCause.DEADLINE),
+        (TurnInterrupted("interrupt"), "interrupted", InterruptionCause.USER_CANCEL),
+        (WriteAuthorityRevoked(), "interrupted", InterruptionCause.LEASE_LOST),
+    ],
+)
+def test_serializer_control_errors_stop_before_the_next_model_request(
+    tmp_path: Path,
+    is_async,
+    original,
+    reason,
+    cause,
+) -> None:
+    class InterruptedReport(BaseModel):
+        @model_serializer
+        def serialize(self):
+            raise original
+
+    def report():
+        return InterruptedReport()
+
+    async def report_async():
+        return report()
+
+    spec = tool(report_async if is_async else report, id="typed.report")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("typed_report", {}, "c1"),)),
+            ModelTurn(final_text="must not be requested"),
+        ]
+    )
+    run_spec = _spec(tmp_path)
+    loop = AgentLoop.from_tools(run_spec, adapter, [spec])
+    loop.open()
+    try:
+        suspension = asyncio.run(loop.arun_until_suspended("go"))
+        assert (suspension.reason, suspension.interruption_cause) == (reason, cause)
+        assert len(adapter.requests) == 1
+        events = _event_types(run_spec.run_root / run_spec.run_id)
+        assert "tool.call.failed" not in events and "tool.call.finished" not in events
+    finally:
+        loop.discard_uncommitted()
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_serializer_local_cancellation_keeps_the_handler_failure_contract(
+    tmp_path, is_async
+) -> None:
+    class CancelledReport(BaseModel):
+        @model_serializer
+        def serialize(self):
+            raise asyncio.CancelledError("local")
+
+    def report():
+        return CancelledReport()
+
+    async def report_async():
+        return report()
+
+    spec = tool(report_async if is_async else report, id="typed.report")
+    adapter = FakeModelAdapter(
+        turns=[
+            ModelTurn(tool_calls=(fake_tool_call("typed_report", {}, "c1"),)),
+            ModelTurn(final_text="continued"),
+        ]
+    )
+    result = asyncio.run(AgentLoop.from_tools(_spec(tmp_path), adapter, [spec]).arun_once("go"))
+    assert result.status == "completed" and result.final_text == "continued"
+    error = adapter.requests[1].observations[0].output["error"]
+    assert error["code"] == "tool_handler_cancelled" and error["retryable"] is True
+    assert "tool.call.failed" in _event_types(result.run_dir)
