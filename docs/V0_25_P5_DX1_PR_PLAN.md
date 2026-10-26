@@ -1,7 +1,7 @@
 # v0.25 P5·DX1 PR 계획
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
-상태: **2026-10-26 실행 착수 — P5 사전조사, DX1 후속**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
+상태: **2026-10-27 P5 #148 병합 / DX1 구현·로컬 검증 완료**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
 고정하고 P5 독립 PR, 이후 DX1 별도 PR을 진행하도록 요청했다. 현재 실행 상태와 증거는 §9에 기록한다.
 
 범위의 기준은 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)이다. [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)는
@@ -19,7 +19,7 @@ P5는 실행 권한 결함이므로 먼저 착수한다. DX1은 별도 소스 �
 후속 P1/P2/P4가 `model_call.py`를 수정할 때 P5의 전달 경계를 유지하도록 최신 develop에 재기준화한다.
 이는 공유 파일의 통합 순서이며 새 API를 기다리는 의존성이 아니다.
 
-예정 브랜치는 `codex/v0.25-p5-stream-authority`, `codex/v0.25-dx1-typed-tools`다. 구현 착수 때 생성한다.
+구현 브랜치는 `codex/v0.25-p5-stream-authority`, `codex/v0.25-dx1-typed-tools`다. 각 PR 착수 때 생성했다.
 현재 두 PR에는 캠페인 전용 통합 브랜치가 필요하지 않다. P3·P1/P2·P4는 각각 독립 작업군을 유지한다.
 
 ```mermaid
@@ -422,4 +422,78 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 ```
 
 기능 수정은 source 16줄 추가/9줄 제거와 회귀 약 100줄이다. 기존 계획 편입 외 신규 설계·구현 비용은 최초 S 범위 안이다.
-코드 reviewer 두 명과 최종 head CI 결과를 다음에 기록한다.
+독립 코드 reviewer 두 명은 head `274204c2a48a9e4b9f99da34eb0298a0ad316f25`에서 지적 없이 통과 판정했다.
+[P5 PR #148](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/148)은 아래 최종 head CI를 통과하고
+2026-10-27 develop에 merge commit `f19bbdcd18e66841a9cf4c5fee2da5bec4e6e89f`로 통합했다.
+
+- [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40406622349): 4,515 passed, 52 skipped.
+- [L2 required](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40406622355): Python 3.11/3.12
+  각각 4,545 passed, 19 skipped + serial 621 passed, 15 skipped. core profile의 service job은 선택 대상 밖이다.
+
+### DX1 PR preflight — 2026-10-27
+
+- 최신 base: P5 병합 후 fetch한 `origin/develop=f19bbdcd18e66841a9cf4c5fee2da5bec4e6e89f`.
+  `274204c`와 tree 차이 0. 같은 격리 checkout에서 `codex/v0.25-dx1-typed-tools`를 새로 만들었다.
+- 생산자·소비자: decorator가 만든 Args 모델은 JSON 인자를 검증하고 sync/async Python handler가 값을 사용한다.
+  현재 `validated.model_dump()`는 중첩 모델을 dict로 바꾸고 입력 serializer를 실행한다. 기존 fields를 순회해
+  `getattr(validated, name)`으로 전달하면 추가 모델·새 프레임워크 없이 타입과 기본값을 유지한다.
+- 출력 경계: 최상위 BaseModel만 `model_dump(mode="json")`으로 바꾸고 실제 dict/비-dict 모양에 기존 envelope를 적용한다.
+  `normalize_tool_result`의 portable 검사를 유지한다. 일반 실패는 고정 진단의 ToolExecutionError로 전달해 기존
+  `tool_result_unportable`·category=tool·retryable=True를 사용한다. schema/return annotation/재귀 변환/P3는 범위 밖이다.
+- 취소 경계: 직접 RunCancelled/RunTimeout/TurnInterrupted를 보존하고 PydanticSerializationError의 cause에 있는
+  동일 제어 예외와 BaseException 제어 신호를 재발생한다. 일반 도메인 오류의 cause는 탐색하지 않는다.
+  wrapper cause를 순회하면 cycle guard를 둔다. loop의 host 취소와 handler-local 취소 분류는 그대로 사용한다.
+- 지원 하한 조사: Python 3.12.11/Pydantic 2.6.0을 `.tmp/v025/dx1-pydantic26`에 격리 설치했다.
+  Python 3.11.9/Pydantic 2.13.4와 함께 direct serializer·중첩 모델 필드의 원래 제어 예외 cause 보존을 확인했다.
+  custom serializer가 다른 모델의 `model_dump()`를 직접 호출하면 두 버전에서 cause/context가 사라진다.
+  decorator는 남아 있는 원인 정보만 복원할 수 있다. 오류 문자열 추정이나 Pydantic monkeypatch는 추가하지 않는다.
+  소비자는 중첩 모델 필드의 기본 직렬화를 사용한다. 원본 probe와 출력은 `.tmp/v025/dx1_probe.py`,
+  `dx1-probe-current.log`, `dx1-probe-floor.log`다.
+- 외부 근거 재확인: [LangChain #34770](https://github.com/langchain-ai/langchain/issues/34770)은 입력 dump가
+  context 직렬화를 유발하는 열린 이슈다. 입력 serializer 호출 0회로 이 문제를 예방한다.
+  [Pydantic 2.6 공식 직렬화 계약](https://docs.pydantic.dev/2.6/concepts/serialization/)의 JSON mode·RootModel·
+  비-dict custom serializer를 사용한다. §2의 pinned 외부 코드는 참고 근거로 유지한다.
+- 검증·비용: §4 수용 행렬을 기존 decorator/async tool 테스트에 고정한다. 실제 from_tools→handler→다음 요청의
+  observation과 성공/실패 이벤트를 확인한다. current/floor 환경, 설치 wheel의 순수 예제, 기존 host 취소·공개 표면·
+  호환성, ruff와 B등급 독립 코드 리뷰, 최종 head core CI가 완료 기준이다. 구현은 100줄 미만을 예상하고
+  기존 serializer·envelope·오류 계약을 재사용한다. 총괄이 파일 수정과 runner를 직렬화한다.
+
+최신 base의 독립 preflight 판정은 **READY**다. reviewer는 실제 decorator·portable boundary·loop 취소 경로와
+두 버전의 probe를 읽었고 구현을 막는 지적은 없었다. 신규 회귀를 작성하는 동안 production source는 base와 동일했다.
+
+**수정 전 red:** 신규 수용 회귀 74개 중 **59 failed, 15 passed / 4.87s**.
+중첩 타입 손실·입력 serializer 실행·반환 모델 거부·제어 예외 손실이 의도한 assertion에서 드러났다.
+기존 dict/ToolResult 및 거부해야 할 중첩 모델의 대조 경로는 통과했다. 원본 출력은 `.tmp/v025/dx1-red.log`다.
+
+```powershell
+& $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py -k 'typed or serializer or validated_inputs or input_validation or top_level_models or model_serialization or model_conversion or existing_return or model_dump_preserves' --tb=short
+```
+
+신규 회귀와 이 preflight를 먼저 커밋한 뒤 decorator의 최소 수정을 적용한다.
+
+수정 전 회귀 commit은 `59b27ef1b08f22aa2542d516de57916a17d9dfde`다. production source는 base와 동일하다.
+decorator 구현은 입력 필드 추출과 최상위 모델 반환 경계에 한정했다. 같은 신규 회귀는 **74 passed / 3.93s**다.
+단위·실제 loop·도구 envelope·예제·public/compat·기존 도구 회귀는 **277 passed, 1 skipped / 13.18s**였다.
+skip은 Windows 환경의 symlink 생성 제한이다. 원본 출력은 `.tmp/v025/dx1-green.log`, `dx1-focused.log`다.
+
+```powershell
+& $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py tests/test_tool_result_envelope.py tests/test_loop.py tests/test_examples.py tests/test_public_surface.py tests/test_compatibility_ledger.py tests/test_tools.py --tb=short --durations=8
+```
+
+Python 3.12.11/Pydantic **2.6.0** 격리 환경에서는 decorator·async tool·envelope·예제 **128 passed / 10.14s**였다.
+예제의 모델 annotation은 명시적 타입을 사용해 파일 경로로 로드하는 기존 example harness에서도 같은 계약을 검증한다.
+하한 환경의 명령은 동일 pytest prefix에 `tests/test_tool_decorator.py tests/test_async_tools.py
+tests/test_tool_result_envelope.py tests/test_examples.py --tb=short --durations=6`이며 로그는 `dx1-floor.log`다.
+
+`uv build --wheel --out-dir .tmp/v025/dist`와 `tools/release_wheel_audit.py`가 통과했다.
+새 Python 3.12.11/Pydantic 2.13.4 환경에 해당 wheel을 설치하고, 예제를 `.tmp/v025/wheel-smoke`에 복사해
+`python -I`로 실행했다. import 위치가 새 환경의 site-packages 내부임을 먼저 확인했고,
+`completed`와 `{"ok":true,"result":{"customer":"Ada","title":"Weekly report"}}` observation assertion이 통과했다.
+wheel SHA256: `C95B5A179C116A4B70FD4116CA035C80F3351642BD44517AFB58F0712573C4A2`.
+wheel은 검증용 로컬 산출물이며 패키지 버전·배포는 변경하지 않았다. 원본 출력은 `dx1-wheel.log`다.
+
+최종 테스트 SHA256: decorator `09920C7546E7FF08419D2323467529E7CE6281F1DF276810215673BBD77AA6C0`,
+async tools `BA653829B9099138CAB3878BA904E4F26A6E8927396A493E2B9EABF4AE05D546`.
+ruff 0.15.6의 `src tests tools/v023_ci.py examples/custom_tool_quickstart.py`와 diff 공백 검사도 통과했다.
+기능 source는 28줄 추가/4줄 제거, 회귀는 약 470줄, 순수 typed 예제와 마이그레이션 안내가 동반된다.
+누적 구현 비용은 S 범위다. 독립 코드 리뷰·최종 head CI·develop 병합 결과는 DX1 PR에 연결해 기록한다.
