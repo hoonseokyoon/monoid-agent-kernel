@@ -9,6 +9,11 @@ out in commit messages and here.
 
 ### Fixed
 
+- Preserve validated Python values in `@tool` inputs, including nested Pydantic models, without
+  running input serializers. Serialize top-level model returns in JSON mode using the existing
+  tool observation envelope; serialization failures remain controlled tool errors and available
+  cancellation causes retain their classification. Handlers with model annotations should use
+  attribute access. See the typed custom tool quickstart and compatibility migration notes.
 - Fence each streamed model delta and buffered Unicode suffix before delivery to a standalone
   `ModelCallRunner` consumer, including when drain is configured but has not started. Lease loss
   during one callback prevents the remaining normalized pieces from reaching the consumer.

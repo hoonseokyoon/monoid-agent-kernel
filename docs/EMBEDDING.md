@@ -25,6 +25,63 @@ python -m pytest -q tests/test_examples.py
 Both scripts use `FakeModelAdapter`, require no credentials, make no network requests, and create
 all state under a temporary directory.
 
+## Use domain models in tools
+
+`@tool` validates JSON arguments and passes Python values to the handler, including nested
+Pydantic models, models inside lists or dictionaries, enums, and defaults. Input handling calls
+no serializers. Both synchronous and async functions use this boundary.
+
+```python
+from pydantic import BaseModel
+from monoid_agent_kernel import AgentLoop, tool
+
+class Customer(BaseModel):
+    name: str
+
+class ReportDraft(BaseModel):
+    customer: Customer
+    title: str
+
+class ReportSummary(BaseModel):
+    customer: str
+    title: str
+
+@tool
+def summarize_report(draft: ReportDraft) -> ReportSummary:
+    return ReportSummary(customer=draft.customer.name, title=draft.title)
+
+# spec and adapter are the application's existing run spec and model adapter.
+loop = AgentLoop.from_tools(spec, adapter, tools=[summarize_report])
+```
+
+A call with `{"draft":{"customer":{"name":"Ada"},"title":"Weekly report"}}` produces
+`{"ok":true,"result":{"customer":"Ada","title":"Weekly report"}}` for the next model request.
+The [offline custom tool quickstart](../examples/custom_tool_quickstart.py) executes this flow
+with a scripted adapter and asserts the observation. Run `python examples/custom_tool_quickstart.py`.
+
+A top-level `BaseModel` return uses `model_dump(mode="json")`, including JSON conversion of
+datetime, UUID, and enum fields. A dictionary dump becomes `ToolResult.content`; other dump shapes
+use `content={"result": value}`. For example, `RootModel[list[int]]([1, 2])` produces the observation
+`{"ok":true,"result":{"result":[1,2]}}`. Custom model serializers follow their actual output shape.
+Explicit `ToolResult`, dictionaries, and scalar returns retain their existing envelopes. Models
+inside an arbitrary dictionary or explicit `ToolResult.content` must be converted by the author.
+
+The returned model's exclusion and `SecretStr` rules apply. Choose a result type containing the
+data the model should see: the actual returned subclass is serialized, and the return annotation
+does not filter its fields or validate the result.
+
+Ordinary serialization failures produce a failed tool observation with `tool_result_unportable`,
+category `tool`, `retryable=true`, and a fixed diagnostic. The retryable flag is information for
+the model; it does not invoke the tool again automatically. Direct run-control exceptions and
+control causes retained by `PydanticSerializationError` preserve their original classification.
+Handler-local `asyncio.CancelledError` becomes `tool_handler_cancelled`; host/run cancellation
+stops the run through its existing boundary.
+
+Pydantic 2.6.0 and 2.13.4 preserve these causes for ordinary nested model fields. A custom serializer
+that calls another model's `model_dump()` can discard the original cause upstream. Once that
+information is gone, the decorator can report only a serialization failure. Use nested model
+fields with Pydantic's normal serialization to preserve the original control cause.
+
 ## Preserve the authority boundary
 
 Each deployment assigns these responsibilities explicitly:

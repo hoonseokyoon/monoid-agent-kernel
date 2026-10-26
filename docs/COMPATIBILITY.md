@@ -31,6 +31,26 @@ lists every identifier this release can emit; most artifacts contain only `curre
 `Missing id accepted` records an existing compatibility behavior. New producers write
 `current_writer` unless a documented variant selects another active writer.
 
+## Typed tool source compatibility (v0.25)
+
+`@tool` now delivers validated Python values to handlers. A parameter annotated with a Pydantic
+model receives that model, including nested fields and models in lists or dictionaries. Handlers
+that kept a model annotation but accessed `draft["title"]` should use `draft.title`, or choose a
+dictionary annotation when dictionary access is intended. Input serializers are no longer called.
+Validation errors retain `invalid_tool_args` and skip the handler.
+
+Top-level model returns are serialized in JSON mode before entering the existing `ToolResult`
+envelope. The actual dump shape determines object versus scalar/list wrapping. Existing dictionaries,
+scalars, explicit `ToolResult`, and domain keys such as `ok`, `error`, and `result` keep their existing
+envelopes. Automatic conversion is limited to the top-level model. The return annotation adds no
+validation or field filtering; standard serialization rules of the returned instance apply.
+
+This change uses the existing tool observation wire format and requires no durable-data migration.
+To run a newly typed tool on an older kernel, accept dictionary arguments, validate them explicitly
+with `Model.model_validate()`, and return `result.model_dump(mode="json")`. Deploy that compatibility
+version of the tool together with a kernel rollback. See [the embedding example](EMBEDDING.md#use-domain-models-in-tools)
+for the current API, serialization failures, and control-exception limits.
+
 ## Versioned artifact inventory
 
 <!-- compatibility-registry:start -->

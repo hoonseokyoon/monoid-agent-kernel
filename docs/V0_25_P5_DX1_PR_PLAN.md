@@ -1,7 +1,7 @@
 # v0.25 P5·DX1 PR 계획
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
-상태: **2026-10-26 실행 착수 — P5 사전조사, DX1 후속**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
+상태: **2026-10-27 P5 #148 병합 / DX1 구현·로컬 검증 완료**. 사용자는 최신 develop에서 수정 전 실패하는 회귀를
 고정하고 P5 독립 PR, 이후 DX1 별도 PR을 진행하도록 요청했다. 현재 실행 상태와 증거는 §9에 기록한다.
 
 범위의 기준은 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)이다. [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)는
@@ -19,7 +19,7 @@ P5는 실행 권한 결함이므로 먼저 착수한다. DX1은 별도 소스 �
 후속 P1/P2/P4가 `model_call.py`를 수정할 때 P5의 전달 경계를 유지하도록 최신 develop에 재기준화한다.
 이는 공유 파일의 통합 순서이며 새 API를 기다리는 의존성이 아니다.
 
-예정 브랜치는 `codex/v0.25-p5-stream-authority`, `codex/v0.25-dx1-typed-tools`다. 구현 착수 때 생성한다.
+구현 브랜치는 `codex/v0.25-p5-stream-authority`, `codex/v0.25-dx1-typed-tools`다. 각 PR 착수 때 생성했다.
 현재 두 PR에는 캠페인 전용 통합 브랜치가 필요하지 않다. P3·P1/P2·P4는 각각 독립 작업군을 유지한다.
 
 ```mermaid
@@ -470,3 +470,30 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 ```
 
 신규 회귀와 이 preflight를 먼저 커밋한 뒤 decorator의 최소 수정을 적용한다.
+
+수정 전 회귀 commit은 `59b27ef1b08f22aa2542d516de57916a17d9dfde`다. production source는 base와 동일하다.
+decorator 구현은 입력 필드 추출과 최상위 모델 반환 경계에 한정했다. 같은 신규 회귀는 **74 passed / 3.93s**다.
+단위·실제 loop·도구 envelope·예제·public/compat·기존 도구 회귀는 **277 passed, 1 skipped / 13.18s**였다.
+skip은 Windows 환경의 symlink 생성 제한이다. 원본 출력은 `.tmp/v025/dx1-green.log`, `dx1-focused.log`다.
+
+```powershell
+& $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py tests/test_tool_result_envelope.py tests/test_loop.py tests/test_examples.py tests/test_public_surface.py tests/test_compatibility_ledger.py tests/test_tools.py --tb=short --durations=8
+```
+
+Python 3.12.11/Pydantic **2.6.0** 격리 환경에서는 decorator·async tool·envelope·예제 **128 passed / 10.14s**였다.
+예제의 모델 annotation은 명시적 타입을 사용해 파일 경로로 로드하는 기존 example harness에서도 같은 계약을 검증한다.
+하한 환경의 명령은 동일 pytest prefix에 `tests/test_tool_decorator.py tests/test_async_tools.py
+tests/test_tool_result_envelope.py tests/test_examples.py --tb=short --durations=6`이며 로그는 `dx1-floor.log`다.
+
+`uv build --wheel --out-dir .tmp/v025/dist`와 `tools/release_wheel_audit.py`가 통과했다.
+새 Python 3.12.11/Pydantic 2.13.4 환경에 해당 wheel을 설치하고, 예제를 `.tmp/v025/wheel-smoke`에 복사해
+`python -I`로 실행했다. import 위치가 새 환경의 site-packages 내부임을 먼저 확인했고,
+`completed`와 `{"ok":true,"result":{"customer":"Ada","title":"Weekly report"}}` observation assertion이 통과했다.
+wheel SHA256: `C95B5A179C116A4B70FD4116CA035C80F3351642BD44517AFB58F0712573C4A2`.
+wheel은 검증용 로컬 산출물이며 패키지 버전·배포는 변경하지 않았다. 원본 출력은 `dx1-wheel.log`다.
+
+최종 테스트 SHA256: decorator `09920C7546E7FF08419D2323467529E7CE6281F1DF276810215673BBD77AA6C0`,
+async tools `BA653829B9099138CAB3878BA904E4F26A6E8927396A493E2B9EABF4AE05D546`.
+ruff 0.15.6의 `src tests tools/v023_ci.py examples/custom_tool_quickstart.py`와 diff 공백 검사도 통과했다.
+기능 source는 28줄 추가/4줄 제거, 회귀는 약 470줄, 순수 typed 예제와 마이그레이션 안내가 동반된다.
+누적 구현 비용은 S 범위다. 독립 코드 리뷰·최종 head CI·develop 병합 결과는 DX1 PR에 연결해 기록한다.
