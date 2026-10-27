@@ -50,6 +50,11 @@ from typing import Any
 
 from monoid_agent_kernel.core import _deadline as deadline_clock
 from monoid_agent_kernel.core._deadline import _MonotonicDeadline
+from monoid_agent_kernel.core.termination_budget import (
+    TerminationBudgetSnapshot,
+    _CallBudget,
+    _CallBudgetRegistry,
+)
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     abandon_unwaited_call,
@@ -844,13 +849,9 @@ class ModelCallRunner:
     ``current_cancel_grace_s`` exists: ``AgentLoop.async_model_abort_drain_s`` is a public mutable
     field. A budget that cannot be read, or is not a positive finite number, means no drain."""
 
-    _open_drain_budgets: list[float] = field(
-        default_factory=list, init=False, repr=False, compare=False
+    _termination_budgets: _CallBudgetRegistry = field(
+        default_factory=_CallBudgetRegistry, init=False, repr=False, compare=False
     )
-    """The drain budget each streamed call now open on this runner read as it opened.
-
-    What a stop of that call will drain for, whatever the knob says by then; ``AgentLoop``'s
-    ``RunStream`` sizes its early-exit wait from it (:meth:`_open_abort_drain_s`)."""
 
     def _effective_model(
         self,
@@ -937,15 +938,13 @@ class ModelCallRunner:
             )
         )
 
-    def _open_abort_drain_s(self) -> float:
-        """The largest drain budget a streamed call now open on this runner committed to; 0 if none.
+    def termination_budget(self) -> TerminationBudgetSnapshot:
+        """Copy the model calls this runner currently owns, without invoking host getters.
 
-        The budget is read once as a stream opens (:meth:`_abort_drain_s`), so a knob lowered
-        afterwards does not shorten the drain a stop of that call starts. Anything that must
-        outlast that drain has to size from this, not from the knob.
+        Calls remain visible through receipt settlement. An empty tuple describes this
+        runner's model waits; tools, child runs and host resource cleanup have their own owners.
         """
-
-        return max(self._open_drain_budgets, default=0.0)
+        return self._termination_budgets.snapshot()
 
     def _check_cancel_or_deadline(self, deadline: float | None) -> None:
         """Check only terminal run boundaries while model I/O is in flight.
@@ -1031,6 +1030,31 @@ class ModelCallRunner:
         """
 
         deadline = (_deadline if _deadline is not None else _MonotonicDeadline.from_epoch(deadline)).cutoff_s
+        budget = self._termination_budgets.open(deadline, logical_call_id)
+        try:
+            return await self._acall_owned(
+                request, context=context, deadline=deadline, should_abort=should_abort,
+                delta_consumer=delta_consumer, before_dispatch=before_dispatch,
+                before_settlement=before_settlement, logical_call_id=logical_call_id,
+                abort_after_recovery_probe=abort_after_recovery_probe, budget=budget,
+            )
+        finally:
+            budget.retire()
+
+    async def _acall_owned(
+        self,
+        request: ModelRequest,
+        *,
+        context: InvocationContext | None,
+        deadline: float | None,
+        should_abort: ShouldAbort | None,
+        delta_consumer: DeltaConsumer | None,
+        before_dispatch: BeforeDispatch | None,
+        before_settlement: BeforeSettlement | None,
+        logical_call_id: str,
+        abort_after_recovery_probe: bool,
+        budget: _CallBudget,
+    ) -> tuple[ModelTurn, ModelCallReceipt]:
         started = time.monotonic()
         lifecycle_hook = self.lifecycle_hook
         adapter = self._current_adapter()
@@ -1227,6 +1251,7 @@ class ModelCallRunner:
                         error_code="durable_invocation_unkeyable",
                     )
                 if lifecycle_hook is not None:
+                    budget.set_phase("settling")
                     try:
                         recovered = recover_model_dispatch(
                             lifecycle_hook,
@@ -1320,7 +1345,9 @@ class ModelCallRunner:
                             )
                             recovered_failure_receipt = None
                             backoff_started = time.monotonic()
+                            budget.set_phase("backoff")
                             await self._abackoff(delay, deadline)
+                            budget.set_phase("preparing")
                             pending_backoff_ms = (
                                 self._ms_since(backoff_started) if delay > 0 else 0
                             )
@@ -1343,6 +1370,7 @@ class ModelCallRunner:
                                     recovery_error, receipt,
                                 ) or receipt.with_error(recovery_error)
                                 raise recovery_error
+                            budget.set_phase("settling")
                             settled = self._publish(
                                 request,
                                 turn,
@@ -1351,6 +1379,7 @@ class ModelCallRunner:
                                 request_preimage=request_preimage,
                             )
                             return turn, settled
+                budget.set_phase("preparing")
                 # Check immediately before any path can reserve or enter the adapter. Digesting and
                 # probing durable recovery above are local/idempotent work; every new provider
                 # dispatch remains barred once cancellation or the deadline has won.
@@ -1427,6 +1456,7 @@ class ModelCallRunner:
                         lifecycle_hook.dispatch_started(reservation)
                         self._assert_write_authority()
                     attempts_made = next_attempt
+                    budget.set_attempt(next_attempt)
                     durable_outcome_receipt = None
                     reports_before = progress.count
                     attempt_started = time.monotonic()
@@ -1434,7 +1464,7 @@ class ModelCallRunner:
                         with collect_usage_reports() as usage_progress:
                             try:
                                 turn = await self._adrive(
-                                    request, deadline, should_abort, consumer, adapter
+                                    request, deadline, should_abort, consumer, adapter, budget
                                 )
                             except BaseException as dispatch_error:
                                 usage, observation = select_usage_snapshot(
@@ -1454,6 +1484,7 @@ class ModelCallRunner:
                             turn = normalize_model_turn(turn)
                         break
                     except BaseException as exc:
+                        budget.set_phase("settling")
                         # Every fact the entry needs, read through `with_error` on a throwaway
                         # receipt -- the one census-pinned reader of what an exception carries,
                         # so the log cannot drift from the receipt built beside it. Probed HERE,
@@ -1588,13 +1619,16 @@ class ModelCallRunner:
                         # schedule the boundary check is not a backoff, and timing it would
                         # stamp scheduler noise onto a wait that never ran.
                         backoff_started = time.monotonic()
+                        budget.set_phase("backoff")
                         await self._abackoff(delay, deadline)
+                        budget.set_phase("preparing")
                         pending_backoff_ms = (
                             self._ms_since(backoff_started) if delay > 0 else 0
                         )
                 if lifecycle_hook is None:
                     turn = normalize_model_turn(turn)
             except BaseException as exc:
+                budget.set_phase("settling")
                 # Any lifecycle mutation above may be the operation that observes concurrent lease
                 # loss. Authority supersedes the exception taxonomy before passive publication.
                 self._assert_write_authority()
@@ -1777,6 +1811,7 @@ class ModelCallRunner:
             # the call returns. Honoured only on failure, it would be a reporting seam that
             # silently stops working for adapters that retry and then succeed -- which is most of
             # the time a retry loop runs.
+            budget.set_phase("settling")
             completed = replace(
                 self._completed(receipt, turn, retried=progress.retried),
                 attempts=attempts_made,
@@ -2018,6 +2053,7 @@ class ModelCallRunner:
         should_abort: ShouldAbort | None,
         delta_consumer: DeltaConsumer | None,
         adapter: Any,
+        budget: _CallBudget,
     ) -> ModelTurn:
         # The pre-dispatch boundary check that used to open this method now sits in `acall`, before
         # the optional synchronous lifecycle reserve/start commits. This method is called only after
@@ -2026,23 +2062,26 @@ class ModelCallRunner:
         astream_turn = getattr(adapter, "astream_turn", None)
         if delta_consumer is not None and astream_turn is not None:
             return await self._astream(
-                astream_turn, request, deadline, delta_consumer, should_abort
+                astream_turn, request, deadline, delta_consumer, should_abort, budget
             )
+        budget.set_stream_budget(0.0)
+        budget.set_phase("waiting")
         anext_turn = getattr(adapter, "anext_turn", None)
         if anext_turn is not None:
             return await self._aawait(
-                anext_turn(request), deadline, adapter=adapter, request=request
+                anext_turn(request), deadline, adapter=adapter, request=request, budget=budget
             )
         next_turn = adapter.next_turn
         if is_async_callable(next_turn):
             return await self._aawait(
-                next_turn(request), deadline, adapter=adapter, request=request
+                next_turn(request), deadline, adapter=adapter, request=request, budget=budget
             )
         turn = await self._aawait(
             start_abandonable_sync_call(lambda: next_turn(request), thread_name=self.thread_name),
             deadline,
             adapter=adapter,
             request=request,
+            budget=budget,
         )
         # Second line of defence, the same one the tool half keeps: an adapter can be synchronous
         # and still hand back something awaitable -- it delegates to an async client, or its
@@ -2051,7 +2090,7 @@ class ModelCallRunner:
         # reads are all defensive, so it recorded a *successful* call for a provider that was never
         # invoked, and the caller got an object whose every turn field was missing.
         if inspect.isawaitable(turn):
-            return await self._aawait(turn, deadline, adapter=adapter, request=request)
+            return await self._aawait(turn, deadline, adapter=adapter, request=request, budget=budget)
         return turn
 
     async def _astream(
@@ -2061,6 +2100,7 @@ class ModelCallRunner:
         deadline: float | None,
         delta_consumer: DeltaConsumer,
         should_abort: ShouldAbort | None,
+        budget: _CallBudget,
     ) -> ModelTurn:
         """Drive `astream_turn`, relaying each chunk and folding them into one `ModelTurn`.
 
@@ -2078,6 +2118,8 @@ class ModelCallRunner:
         """
 
         budget_s = self._abort_drain_s()
+        budget.set_stream_budget(budget_s)
+        budget.set_phase("streaming")
         agen = astream_turn(request)
         retried = False
         # Cleared the moment this call stops driving the stream, and read before every delivery.
@@ -2248,10 +2290,11 @@ class ModelCallRunner:
                 # The grace is the same one an abandoned call gets, and outliving it means being
                 # abandoned the same way: detached and warned about, not waited on. See
                 # `_aclose_within_grace` for why the bound cannot be `asyncio.wait_for`.
+                budget.set_phase("closing")
                 aclose = getattr(agen, "aclose", None)
                 if aclose is not None:
                     with contextlib.suppress(Exception):
-                        await self._aclose_within_grace(aclose)
+                        await self._aclose_within_grace(aclose, budget)
             turn = _assemble_normalized_streamed_turn(chunks)
             mark_read_end(turn, "provider_terminal" if saw_terminal else "provider_eof")
             return turn
@@ -2261,17 +2304,17 @@ class ModelCallRunner:
                 with contextlib.suppress(Exception):
                     deliver_remainder()
 
-        if drain is not None:
-            self._open_drain_budgets.append(budget_s)
         try:
             run_token = self._token()
             if drain is None:
                 return await self._aawait(
                     consume(), deadline, boundary=(run_token, self._check_cancel_or_deadline),
                     first_requester=accepted_requester,
+                    budget=budget,
                 )
             return await self._await_draining_stream(
                 consume, drain, deadline, settle_cancelled_remainder, accepted_requester, run_token,
+                budget,
             )
         except BaseException as exc:
             # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
@@ -2300,8 +2343,6 @@ class ModelCallRunner:
             # handler, or reorder those two statements, and an abandoned stream starts talking to a
             # finished call again. A `finally` costs nothing and survives all three.
             driving = False
-            if drain is not None:
-                self._open_drain_budgets.remove(budget_s)
 
     async def _await_draining_stream(
         self,
@@ -2311,6 +2352,7 @@ class ModelCallRunner:
         settle_cancelled_remainder: Callable[[], None],
         first_requester: Callable[[], str | None],
         run_token: CancellationToken | None,
+        budget: _CallBudget,
     ) -> ModelTurn:
         """Race one stream task in two phases: streaming, then -- after a stop -- draining.
 
@@ -2334,6 +2376,7 @@ class ModelCallRunner:
         began: asyncio.Future[None] = loop.create_future()
 
         def signal_began() -> None:
+            budget.begin_drain(drain.abort_at, drain.budget_s)
             def resolve() -> None:
                 if not began.done():
                     began.set_result(None)
@@ -2444,6 +2487,7 @@ class ModelCallRunner:
                 streamed = await self._aawait(
                     follow(True), deadline, boundary=(view, streaming_boundary),
                     on_caller_cancelled=observe_caller_cancelled,
+                    budget=budget,
                 )
             except RunTimeout:
                 # The deadline fired in the tick the stop was decided, before phase one saw it.
@@ -2480,6 +2524,7 @@ class ModelCallRunner:
                 await self._aawait(
                     follow(False), window_end, boundary=(view, draining_boundary),
                     on_caller_cancelled=observe_caller_cancelled,
+                    budget=budget,
                 )
             except RunTimeout:
                 # The window closed; `draining_boundary` never raises a timeout of its own.
@@ -2500,6 +2545,7 @@ class ModelCallRunner:
             # A stream that finished in the tick its stop became a drain is still that stop.
             raise drain.outcome()
         finally:
+            budget.end_drain()
             remove_cancel_callback()
             remove_revoke_callback()
             if task is not None and not task.done() and not released:
@@ -2510,12 +2556,17 @@ class ModelCallRunner:
                 except Exception:
                     grace_s = self.cancel_grace_s
                 try:
-                    await detach_unfinished_call(task, None, grace_s=grace_s)
+                    with budget.grace("drain_detach", grace_s) as start_cleanup:
+                        await detach_unfinished_call(
+                            task, None, grace_s=grace_s, _on_cleanup_started=start_cleanup,
+                        )
                 except asyncio.CancelledError as exc:
                     observe_caller_cancelled(exc)
                     raise
 
-    async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
+    async def _aclose_within_grace(
+        self, aclose: Callable[[], Any], budget: _CallBudget,
+    ) -> None:
         """Close a provider's stream, spending at most the grace interval on its cleanup.
 
         `asyncio.wait_for` is the obvious spelling and does **not** bound this. On timeout it
@@ -2538,7 +2589,10 @@ class ModelCallRunner:
         closing = asyncio.ensure_future(aclose())
         try:
             grace_s = self._grace_s()
-            done, _pending = await asyncio.wait({closing}, timeout=max(0.0, grace_s))
+            with budget.grace("stream_close", grace_s) as start_cleanup:
+                timeout = max(0.0, grace_s)
+                start_cleanup(timeout)
+                done, _pending = await asyncio.wait({closing}, timeout=timeout)
             if closing in done:
                 return
             _LOGGER.warning(
@@ -2589,6 +2643,7 @@ class ModelCallRunner:
         pending: Any,
         deadline: float | None,
         *,
+        budget: _CallBudget,
         adapter: Any = None,
         request: ModelRequest | None = None,
         boundary: tuple[CancellationToken | None, Callable[[float | None], None]] | None = None,
@@ -2643,25 +2698,29 @@ class ModelCallRunner:
             grace_s = self._grace_s()
         except BaseException:
             try:
-                await abandon_unwaited_call(
-                    pending,
-                    grace_s=self.cancel_grace_s,
-                    on_discarded=_discard_hook(adapter, request),
-                )
+                with budget.grace("wait_cancel", self.cancel_grace_s) as start_cleanup:
+                    await abandon_unwaited_call(
+                        pending,
+                        grace_s=self.cancel_grace_s,
+                        on_discarded=_discard_hook(adapter, request),
+                        _on_cleanup_started=start_cleanup,
+                    )
             except asyncio.CancelledError as exc:
                 on_caller_cancelled(exc)
                 raise
             raise
         try:
-            return await await_abandonable_call(
-                pending,
-                deadline=deadline,
-                token=token,
-                grace_s=grace_s,
-                check_boundary=check_boundary,
-                on_discarded=_discard_hook(adapter, request),
-                on_caller_cancelled=on_caller_cancelled,
-            )
+            with budget.grace("wait_cancel", grace_s) as start_cleanup:
+                return await await_abandonable_call(
+                    pending,
+                    deadline=deadline,
+                    token=token,
+                    grace_s=grace_s,
+                    check_boundary=check_boundary,
+                    on_discarded=_discard_hook(adapter, request),
+                    on_caller_cancelled=on_caller_cancelled,
+                    _on_cleanup_started=start_cleanup,
+                )
         except CalleeCancelled as exc:
             cancelled = ModelAdapterError(
                 "model adapter cancelled its own call",

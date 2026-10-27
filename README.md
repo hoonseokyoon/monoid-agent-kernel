@@ -158,6 +158,10 @@ your own `ModelAdapter`. Author tools from typed functions with the `@tool` deco
 (see [`examples/custom_tools/word_count_tool.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/custom_tools/word_count_tool.py));
 `generated_tool_bindings(...)` then turns a set of `ToolSpec`s into bindings.
 
+For Stop progress, `loop.termination_budget()` and `stream.termination_budget()` expose active
+model-call deadlines, drain and cleanup windows. The [offline example](examples/termination_budget.py)
+shows a separate progress task reading them while the stream exits and then reads the final receipt.
+
 ## Memory and default tools
 
 `monoid_agent_kernel.memory` provides an optional provider-backed Memory tool surface. The

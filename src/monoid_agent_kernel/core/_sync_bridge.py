@@ -312,6 +312,7 @@ async def await_abandonable_call(
     check_boundary: Callable[[float | None], None],
     on_discarded: Callable[[Any], None] | None = None,
     on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> Any:
     """Await a call while propagating run cancellation and the run deadline.
 
@@ -418,7 +419,8 @@ async def await_abandonable_call(
         if not task.done():
             try:
                 await detach_unfinished_call(
-                    task, sync_call, grace_s=grace_s, on_discarded=on_discarded
+                    task, sync_call, grace_s=grace_s, on_discarded=on_discarded,
+                    _on_cleanup_started=_on_cleanup_started,
                 )
             except asyncio.CancelledError as exc:
                 observe_caller_cancelled(exc)
@@ -435,7 +437,8 @@ async def await_abandonable_call(
 
 
 async def abandon_unwaited_call(
-    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None
+    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> None:
     """Release a call that was started but whose wait will never be entered.
 
@@ -462,7 +465,10 @@ async def abandon_unwaited_call(
         # Both halves, not just the detach: a blocking worker still inside the provider delivers
         # through `deliver`, which reads this hook and never the argument below.
         sync_call.set_discard_hook(on_discarded)
-    await detach_unfinished_call(task, sync_call, grace_s=grace_s, on_discarded=on_discarded)
+    await detach_unfinished_call(
+        task, sync_call, grace_s=grace_s, on_discarded=on_discarded,
+        _on_cleanup_started=_on_cleanup_started,
+    )
 
 
 async def detach_unfinished_call(
@@ -471,6 +477,7 @@ async def detach_unfinished_call(
     *,
     grace_s: float,
     on_discarded: Callable[[Any], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> None:
     """Release the awaiter's hold on a call that outlived a run boundary.
 
@@ -492,7 +499,11 @@ async def detach_unfinished_call(
 
     task.cancel()
     watched: asyncio.Future[Any] = task if sync_call is None else sync_call.settled
-    done, _pending = await asyncio.wait({watched}, timeout=max(0.0, grace_s))
+    timeout = max(0.0, grace_s)
+    if _on_cleanup_started is not None:
+        with contextlib.suppress(Exception):
+            _on_cleanup_started(timeout)
+    done, _pending = await asyncio.wait({watched}, timeout=timeout)
     if watched not in done:
         if sync_call is not None:
             sync_call.warn_if_unsettled()

@@ -232,7 +232,7 @@ stalled provider thread가 외부에서 계속 실행되는 경우도 기존 det
 
 ## 5. 통합 개발자가 쓸 API 예시
 
-아래는 **구현 전 제안**이다. P4-02에서 공개 export·docstring·설치 wheel 예제를 함께 검증한다.
+아래 API를 P4-02에서 구현한다. 공개 export·docstring·설치 wheel 예제를 함께 검증하며 실행 결과는 §9.3에 기록한다.
 
 ```python
 def on_stop(loop, cancellation_token):
@@ -441,3 +441,48 @@ root는 그 뒤 private carrier·16개 시간 계산·public 소비자 연결과
 
 추가 exact cutoff·drain 동률·서로 다른 monotonic 원점의 실제 park/restore 10개도 **PASS (5.93s)**:
 `.tmp/v025/p4-01-boundary-green.txt`. P4-01 신규 행동 회귀는 81개다. ruff 0.15.6·diff check와 wheel audit가 통과했다.
+
+01 [PR #163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)은 final head `4818e06`에서
+서로 독립적인 코드 reviewer A/B **PASS**, 필수 지적 0건이다. checkout 밖 설치 wheel은 Python 3.11 /
+Pydantic 2.14.1과 최소 2.6.4에서 각각 **736 passed**다. source AST census 2개는 앞선 source 검증에 포함했다.
+wheel SHA256 `BA76B1D0ECCFA9ACEEB2AE384186E15A6355F16B2182696F3101B8D7B439AE04`.
+[L1 40548876259](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40548876259)와
+[required L2 combined 40548898276](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40548898276)는 **SUCCESS**다.
+Python 3.11/3.12 core와 실제 combined services가 모두 통과했다. Draft/label 전환의 취소된 dormant run은 제외했다.
+통합 merge는 `3beb8057367779fce86efd5e087a926730e65e7e`이며 fetch 뒤 reviewed head와 tree 동일성을 확인했다.
+01 delta는 기능 코드 98줄, 전체 churn 950줄이다. 계획·00 비용과 합산하여 다음 PR의 추정에 유지한다.
+
+### 9.3 P4-02 사전조사 — 2026-10-28
+
+최신 develop은 `22aae18`, actual integration base는 01 merge `3beb805`다. 새 branch는 `codex/v0.25-p4-budget-snapshot`.
+root가 source 변경을 통합하고 공유 runner를 소유한다. 읽기 전용 `p4_02_research`의 조사와 actual-base 대조를
+`.tmp/v025/p4-02-research.md`, `p4-02-preflight.md`에 기록했다. 별도 독립 reviewer가 구현 전 검토한다.
+
+기존 public acall을 소유권 wrapper로 유지하고 runner의 registry 하나로 drain 전용 목록을 대체한다.
+phase·grace·drain 갱신은 실제 wait owner에서 수행한다. 임의의 grace 객체에 관측용 변환·비교를 추가하지 않고,
+이미 읽은 내장 숫자 예약과 실제 wait에서 계산된 timeout을 기록한다. 표현할 수 없는 예약은 생략하며 기존 오류·fallback을 유지한다.
+managed RunStream은 실제 owner snapshot으로 최초 cutoff를 고정하고 raw callback 경로를 보존한다.
+
+[gRPC의 소유 call registry 변경](https://github.com/grpc/grpc/commit/72694561276a1d492b0f5c08fd870825b31fe90f),
+[AnyIO 4.15.1 cancellation 문서](https://anyio.readthedocs.io/en/stable/cancellation.html),
+[Python 3.11 wait 문서](https://docs.python.org/3.11/library/asyncio-task.html#asyncio.wait)를 10/28 재확인했다.
+실제 소유 상태 조회와 finally 퇴역을 적용하고 기존 asyncio cancellation·bridge·thread 접근 계약을 유지한다.
+기능 450–600줄과 테스트·문서·예제 650–850줄을 예상한다. 구현 전 기존 consumer에서 exit sizing 실패부터 고정한다.
+
+독립 `p4_02_preflight_review`는 actual base `3beb805`에서 **READY**, blocker 0건이다.
+같은 base에 테스트만 추가한 `b42fa4c`에서 **2 failed / 2 passed (2.76s)**를 확인했다.
+활성 호출이 없어도 11.5초를 주는 경로와 이미 drain 3초를 사용했는데도 13.5초를 다시 주는 경로가 실패했다.
+기대값은 각각 기본 8초와 10.5초다. `.tmp/v025/p4-02-red.txt`에 원본을 보존했다.
+
+root는 model/loop/bridge 연결·공개 export·문서·예제를, `p4_02_research`는 core DTO/registry와 RunStream을,
+`p4_01_research`는 새 관측·RunStream·public surface 테스트를 맡는다. 파일 소유권과 단일 runner를 분리했다.
+첫 구현에서 호출 관측·기존 streaming consumer·export **77 passed (5.23s)**와 pinned ruff가 통과했다.
+외부 취소 thread의 on_begin이 wait 종료 뒤 도착할 수 있어, drain owner 종료를 별도로 기록하고 실제 경합 회귀를 추가한다.
+실제 aopen→astream→Stop→진행 조회→receipt offline 예제도 source에서 성공했다. 전체 영향군·wheel·두 리뷰·CI는 이어서 확인한다.
+
+15개 영향 모듈 **1,060 passed (29.14s)**: 종료 관측·실제 exit 경합·공개 export·기존 model/validated/loop/tool/
+checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했다. 원본 `.tmp/v025/p4-02-related-green.txt`.
+외부 thread의 늦은 on_begin이 settling 중 종료된 drain을 다시 만들지 않는 회귀도 포함한다.
+02 기능 churn은 약 601줄이며 테스트·문서·예제 포함 약 1,690줄이다. 00 계획/CI와 01을 합한 전체는 약 3,200줄로
+최초 2,450줄의 약 1.3배다. 기능 합계는 약 701줄이다. 추가 비용은 실제 경합을 제어하는 fixture와 공개 예제에 사용했다.
+기존 drain 목록을 제거하고 하나의 registry와 기존 wait 경계의 hook을 선택해 중복 소유권과 새 timer service를 피했다.

@@ -1182,6 +1182,58 @@ call still cuts it at once and reports no usage for that call; passing the knob 
 follow-up. `interrupt_turn()` never reaches a child: the child streams its call to completion and
 bills it in full, unchanged from earlier releases.
 
+**Termination budget observation (v0.25).** `ModelCallRunner.termination_budget()`,
+`AgentLoop.termination_budget()` and `RunStream.termination_budget()` synchronously return a
+frozen `TerminationBudgetSnapshot`. The four DTOs are exported from the package root and
+`contracts`. A query samples process-monotonic time once, copies owned state under a lock,
+and invokes no host configuration getter. It starts no wait and requests no cancellation.
+
+| Snapshot field | Meaning |
+|---|---|
+| `observed_at_monotonic_s` | Process-local observation time; portable records use the existing receipt/checkpoint formats |
+| `run_deadline_remaining_s` | Remaining active run time; None for a standalone runner, unbounded run or absent run resources |
+| `calls` | Immutable tuple of the root runner's currently owned logical model calls |
+| `stream_exit` | `StreamExitBudget` on RunStream; None on a runner or loop |
+
+Each `CallTerminationBudget` has an ephemeral unique `call_id`, optional existing `logical_call_id`,
+and `attempt_index` for the current or latest kernel dispatch. Provider-free recovery has no local
+dispatch index. Retries retain the call ID; separate validated repair calls receive separate IDs.
+`phase` is `preparing`, `waiting`, `streaming`, `draining`, `backoff`, `closing` or `settling`.
+Calls remain visible through durable settlement and receipt publication, and retire in the call's
+finally. The tuple covers model calls; tools, child runs and host-resource cleanup have separate owners.
+
+`deadline_remaining_s` reads the call cutoff. `drain_budget_s` is None until the dispatch shape is
+known, zero for a one-shot or drain-disabled stream, and the committed budget for an enabled stream.
+`drain_remaining_s` exists from accepted stop until its wait owner releases, including time when the
+stream is closing. A delayed stop callback cannot reopen a released window.
+
+`grace_windows` is a tuple of `GraceBudget(source, budget_s, remaining_s)` for independent
+`wait_cancel`, `stream_close` and `drain_detach` owners. Finite budget with remaining=None means
+reserved at wait entry; a started window reports its remaining seconds. None/None means unbounded
+grace. Negative and NaN grace retain their effective zero timeout. Unrepresentable/custom reservations
+are omitted until the actual wait produces a safely representable timeout; existing errors and
+fallbacks keep their timing. Queries never perform user-defined numeric operations. Phase-specific
+getter sampling stays intact, and overlapping cleanup windows retain separate entries.
+
+Managed RunStream exit freezes one allowance after requesting cooperative cancellation. For each call,
+drain contributes its remaining window in `draining`, or its committed budget capped by the remaining
+deadline in `streaming`; other phases contribute zero drain. Cleanup contributes the maximum of
+started finite grace remaining, unstarted finite reservations, and one current exit-policy grace
+candidate for `waiting`/`streaming`/`draining`. Concurrent calls use the largest drain-plus-cleanup
+allowance. The stream adds its base wait (8 seconds for AgentLoop); no active calls adds nothing.
+Unbounded grace adds no finite allowance. Future drain configuration adds nothing, and later knob
+changes or repeated Stop do not extend the frozen cutoff. Raw `current_extra_grace_s` keeps its
+legacy calculation and fallback behavior.
+
+`StreamExitBudget` reports `idle`, `cooperative_wait`, `wait_interrupted`,
+`hard_cancel_requested` or `settled`. `wait_budget_s` records the first selected finite wait.
+`hard_cancel_remaining_s` counts down only while that waiter owns its timer; cancelling or failing
+the waiter changes it to None and `wait_interrupted`. Direct exit re-entry uses the original cutoff.
+Once hard cancellation was requested, remaining stays zero through settlement. Cooperative completion
+uses settled/None. Legacy nonfinite waits expose numeric None while preserving their execution;
+an actual hard-cancel request still reports zero. The driver is awaited after cancellation, so host
+resource cleanup and durable settlement can continue while remaining is zero.
+
 Independently of the drain, a `should_abort` stop observed after the terminal chunk was delivered
 now carries that chunk's usage (previously discarded); a run-token cancel with the drain off still
 carries none. This is the one v0.24 change to the default path.

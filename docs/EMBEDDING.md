@@ -891,14 +891,44 @@ Read the bill where you already read it:
   not substitute an estimate for it.
 
 Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
-with `user_cancel`, which drains a streamed call in flight. `RunStream` then waits
-`async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (8 s with the drain off) before it
-hard-cancels the drive, so that drain finishes and keeps its bill. Both knobs are read when that
-wait starts, not when `astream()` is called, and the drain term is never less than the budget the
-in-flight call opened with, so setting them inside the `async with` before the first call, or
-lowering them mid-call, cannot leave the wait shorter than the drain. The drain keeps the connection and the provider's generation alive for up to the budget;
-durable lifecycle calls still end `dispatch_unknown` with the usage on the exception stamp; it is
-not journalled, though the failed receipt delivered to `settled_sink` still carries it.
+with `user_cancel`, which drains a streamed call in flight. RunStream freezes its exit wait from
+the calls actually owned at that moment: 8 seconds plus the largest remaining drain-and-cleanup
+allowance. An active one-shot call contributes its cleanup reservation; no active call adds zero.
+Already consumed drain time and future configured drain add no extra time. Phase-specific cleanup
+continues to sample its own grace, while later settings changes leave the stream's first cutoff fixed.
+After that cutoff, RunStream requests driver cancellation and awaits its cleanup and settlement.
+
+### Showing Stop progress
+
+Keep the `RunStream` handle in the host and poll it from a separate progress task while the context
+manager exits. The same read-only `termination_budget()` API is available on AgentLoop and a
+standalone ModelCallRunner. It exposes frozen DTOs and performs no cancellation or getter calls.
+
+```python
+snapshot = stream.termination_budget()
+for call in snapshot.calls:
+    print(call.call_id, call.phase, call.deadline_remaining_s, call.drain_remaining_s)
+    for window in call.grace_windows:
+        print(window.source, window.budget_s, window.remaining_s)
+exit_wait = snapshot.stream_exit
+print(exit_wait.phase, exit_wait.hard_cancel_remaining_s)
+```
+
+A finite grace budget with remaining=None is reserved but has not begun. None/None denotes an
+unbounded grace window. Closing can coexist with a live outer drain window. Empty `calls` describes
+the root runner's model calls; tool, child and resource cleanup remain separate.
+
+Before exit, `stream_exit.phase` is idle. During its wait, the phase is cooperative_wait. If the
+exit waiter is cancelled, wait_interrupted/None says that timer has stopped; directly re-entering
+exit reuses the original cutoff. After hard cancellation is requested, remaining is zero and
+cleanup may still be running. The final phase is settled; zero preserves an earlier hard-cancel
+request, while None denotes completion without that request. Read the final bill from receipts.
+
+Run [the offline termination example](../examples/termination_budget.py) with
+`python examples/termination_budget.py`. It opens a real AgentLoop, streams a response, presses
+Stop, polls during exit, and verifies the final termination facts and reported usage.
+
+### Resuming event delivery
 
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
