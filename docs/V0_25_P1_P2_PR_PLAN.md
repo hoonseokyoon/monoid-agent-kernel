@@ -1,8 +1,9 @@
 # v0.25 P1·P2: 종료 사실·사용량 관측·저장·복구 PR 계획
 
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`.
-P5·DX1·P3가 병합된 상태다. 현재 작업 브랜치는 `codex/v0.25-p1-p2-plan`이다.
-**현재 범위는 사전조사와 계획이다. 구현·PR 게시·병합·릴리스는 시작하지 않았다.**
+P5·DX1·P3가 병합된 상태다. 계획은 로컬 `94ea35a`에 기록했다.
+**2026-10-27 사용자가 P1P2-00·01 구현과 리뷰·CI 후 02·03·04 순차 진행을 승인했다.**
+00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·CSP 변경은 별도다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#51-p1p2-종료-사실과-사용량-증거)의 G1을 구체화한다.
 기존 [API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)의 P1·P2 예시는 아래 계약을 따른다.
@@ -394,3 +395,35 @@ canonical state의 중복 없는 회계와 복구 진단 span의 재관측을 �
 실제 DB·ObjectStore·Temporal 이행과 배포 worker inventory는 구현·활성화 gate이며 이번 단계에서 통과했다고 주장하지 않는다.
 이번 단계는 문서와 ignored probe만 작성했다. 구현·tracked 회귀 테스트 추가·서비스 실행·PR 게시를 수행하지 않았다.
 구현 요청 이후 첫 행동은 최신 develop 재조회와 P1P2-00/01 사전조사 갱신이다.
+
+### 9.1 P1P2-00 구현 전 사전조사
+
+2026-10-27 fetch한 `origin/develop`은 계속 `4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`이다.
+독립 PR 브랜치는 `codex/v0.25-p1-p2-ci`. 계획 commit `94ea35a`도 이 준비 PR로 추적 문서에 반영한다.
+root가 조사·구현·runner를 소유하고 `p1p2_01_research`는 후속 01의 읽기 전용 조사를 맡는다.
+00은 CI 선택 신뢰를 다루므로 B 등급으로 독립 preflight와 코드 reviewer 한 명을 배정한다.
+
+현재 `.github/workflows/ci.yml`은 push branch allowlist에 P3까지 등록돼 있다.
+`tools/v023_ci.py:CAMPAIGN_TERMINAL_PROFILES`에는 v0.23과 develop만 있으며 신규 G1 head의 기본 profile은 core다.
+실제 소비자는 integration push workflow와 `pr-full.yml`의 `Resolve plan-owned service profile` 단계다.
+현재 ruleset 수는 0, develop protection 조회는 `Branch not protected`(404)였다. 서버 설정은 변경하지 않는다.
+
+수정은 정확한 `codex/v0.25-p1-p2-call-facts` 한 항목을 workflow allowlist와 terminal profile map에 추가한다.
+기존 resolve_profile의 explicit weaker label/manual-profile 거부를 재사용한다. wildcard 등록이나 별도 CI 엔진은 필요하지 않다.
+`tests/test_v023_ci_foundation.py`의 기존 성공·거부 parameter와 workflow gate 검사를 확장한다.
+기존 integration CI가 combined actual services를 실행하는 사실은 workflow body에서 확인했다.
+
+검증: 해당 foundation tests, `ruff check src tests tools/v023_ci.py`, `validate-lock`,
+CLI의 새 branch default=combined·weaker explicit 거부·기존 unrelated default=core를 확인한다.
+PR L1/L2(core) 통과와 independent 코드 PASS 후 develop에 merge commit으로 병합하고,
+새 integration branch를 그 develop에서 생성해 첫 push의 full CI를 확인한다.
+00의 변경 예산은 기능 20줄/총 80줄이며, 이미 검토한 계획 문서 428 변경 줄은 계획 비용으로 별도 집계한다.
+
+독립 `p1p2_00_review` preflight는 READY였다. 검토 대상은 source `4e14618`, 문서 `94ea35a`와 §9.1,
+문서 SHA-256 `1EC6BC7D4FBB41E9B06DEBB533B37DE104DE4DFB9D2E9647578C61AD01E2F06A`다.
+테스트부터 추가한 실행은 **4 failed / 19 passed in 5.82s**였다. 새 branch 기본 core, label/manual로 core 허용,
+push allowlist 누락의 네 관찰점에서 실패했다. 이후 정확한 branch 두 항목을 등록했다.
+수정 뒤 foundation은 **23 passed in 5.60s**, lock 검증과 CLI default=combined 확인이 통과했다.
+정확한 branch에서 `--requested-profile core`는 예상한 `requires ci:combined` 오류로 거부됐다.
+공유 Python에는 ruff module이 없어 CI 고정 버전 `uv tool run --from ruff==0.15.6 ruff check src tests tools/v023_ci.py`를
+사용했고 통과했다. final candidate의 독립 코드 리뷰와 원격 L1/L2는 다음 단계다.

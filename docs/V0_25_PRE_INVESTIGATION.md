@@ -4,7 +4,7 @@
 
 구현 기록: **P5 #148·DX1 #149·P3 #150–155 develop 병합**.
 P3-I #155의 develop 반영은 `4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`이다.
-현재 요청은 이 기준의 **P1·P2 조사·계획이며 구현은 보류**다.
+현재 요청은 이 기준의 **P1P2-00·01 구현 및 리뷰·CI 후 02·03·04 순차 진행**이다.
 구체적인 정책·외부 근거·PR 범위는 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
@@ -321,7 +321,7 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 P1/P2는 receipt·attempt·종료 분류를 함께 검토해야 한다. 공동 설계는 필수지만 단일 거대 PR은 요구하지 않는다.
 독립적으로 유효한 reader·writer·회계 상태를 만들 수 있는 지점에서 PR을 나눈다.
 G1의 구체적인 순서는 [P1P2-00 → 01 reader → 02 producer/observer → 03 writer/recovery → 04 소비자 → I](V0_25_P1_P2_PR_PLAN.md#6-pr별-범위의존성우선순위)다.
-통합 브랜치 `codex/v0.25-p1-p2-call-facts`와 combined profile 등록은 구현 승인 후 P1P2-00에서 수행한다.
+통합 브랜치 `codex/v0.25-p1-p2-call-facts`와 combined profile 등록은 P1P2-00에서 수행한다.
 착수 순서는 **P5 → DX1**, 다음 우선군은 P3·P1/P2·P4다. P5와 DX1 사이에는 기술적 선행 의존성이 없다.
 P3·P4·P5·DX1은 G1을 기다리는 전역 의존성이 없다. P8도 기존 계약으로 구현할 수 있으며, 새 API를 실제로 소비할 때
 그 관계만 선행 조건으로 추가한다.
@@ -384,7 +384,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 |---|---|---|
 | D01 | P3 포함, P7 후속 | 사용자 결정 |
 | D02 | 독립 작업군 → develop → 적정 시점 릴리스 | 사용자 방향 반영 |
-| D03 | P1/P2 타입·저장 형식 | P1·P2 PR 계획: 기존 숫자+희소 증거, invocation/model-calls v2·dual-reader, 원본 hash 보존 복구, reader 유지 rollback; unknown 증거 slot 후속. 구현 보류 |
+| D03 | P1/P2 타입·저장 형식 | P1·P2 PR 계획: 기존 숫자+희소 증거, invocation/model-calls v2·dual-reader, 원본 hash 보존 복구, reader 유지 rollback; unknown 증거 slot 후속. 구현 승인 |
 | D04 | P3 주입·권한·수명 | P3-02/03 구현: 선택적 확장 Protocol, call별 lease, fresh child adapter와 parent lineage, restore 재주입 |
 | D05 | P4 clock·집계·조회 | G3 내부 monotonic 제어 정렬 → snapshot 공개 권고; wall snapshot 대안은 보장 범위 변경을 기록 |
 | D06 | P5 | 10/25 재현에 따라 일반 delta·terminal 정규화·잔여 flush의 전달 경계로 보완; PR-01 |

@@ -27,6 +27,7 @@ PROFILE_LABELS = frozenset(f"ci:{profile}" for profile in ALLOWED_PROFILES)
 BRANCH_PATTERN = re.compile(r"(?:^|/)v0[.]23-pr(?P<number>[0-9]{2})(?:-|$)")
 CAMPAIGN_TERMINAL_PROFILES = {
     "codex/v0.23-production-adapters": "combined",
+    "codex/v0.25-p1-p2-call-facts": "combined",
     "develop": "combined",
 }
 SDK_IMPORT_MODULES = {

@@ -10,7 +10,7 @@ P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)�
 DX1의 순수 typed 도구는 [실행 예제](../examples/custom_tool_quickstart.py)에 반영했다.
 P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)와 함께 구현했다.
 P1/P2 종료·사용량 및 P4 예산 조회의 신규 API 명칭과 후속 릴리스 배치는 설계 제안이다.
-현재 P1·P2의 구현은 보류하며 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 정책·저장 호환성·PR 순서를 구체화했다.
+현재 P1·P2 구현은 승인됐으며 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 정책·저장 호환성·PR 순서와 실행 기록을 둔다.
 
 ## 1. 제품 방향과 릴리스 경계
 
