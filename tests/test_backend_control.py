@@ -1289,8 +1289,12 @@ def test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump
     monkeypatch.setattr(session_boundary, "_ack_cancel_on_drive_loop", observe_cancel_ack)
 
     # The exact marker the pump clears synchronously at entry, before its first await —
-    # from any shared-loop callable's view this IS "a pump owns the state now".
-    record.loop._session.last_suspension = None
+    # from any shared-loop callable's view this IS "a pump owns the state now". Queue this
+    # fixture mutation after the driver's pending park snapshot: AWAITING_INPUT is published
+    # before that snapshot, so a test-thread write could corrupt the checkpoint under test.
+    backend._run_on_shared_loop(
+        lambda: setattr(record.loop._session, "last_suspension", None)
+    )
 
     ack = backend.cancel_run(run_id, token)
     assert ack["cancel_requested"] is True

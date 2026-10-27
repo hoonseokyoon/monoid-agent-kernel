@@ -557,3 +557,25 @@ discard가 그 인스턴스만 닫도록 수정했다. 정상 EventBus.close 계
 같은 focused 검사에 두 회귀를 더한 결과는 **339 passed / 17.75s**다
 (`.tmp/v025/p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
 최종 후보를 두 reviewer가 표적 재검토한 뒤 독립 PR의 L1/L2를 확인한다.
+
+### 통합 CI fixture 보완 — 2026-10-27
+
+P3-01 #151은 최종 head `47ff2cf`의 두 독립 review와 L1/L2를 통과해 develop `4539296`으로 병합됐다.
+이후 develop CI `40427565429`와 새 P3 통합 branch CI `40427573024`가 기존
+`test_cancel_ack_does_not_clobber_a_committed_park_when_the_drive_is_mid_pump`에서 실패했다.
+coverage 수치는 80.67%로 기준을 충족했다. 실패 원인은 해당 테스트의 동시성 조건이다.
+
+원래 base `61865ef`와 병합 head `4539296` 모두에서 driver의 park snapshot 직전 barrier를 삽입하면
+fixture가 `last_suspension=None`을 먼저 써서 같은 sequence의 checkpoint를 오염시킨다.
+`AWAITING_INPUT` 상태는 최종 snapshot보다 먼저 게시된다. backend/drive/test source는 두 revision에서 같다.
+원본 probe는 P3 worktree `.tmp/v025/p3-01-cancel-triage/`에 있으며, 양쪽 revision에서 원래 실패와
+직렬화 대조를 확인하는 2개 probe가 각각 3.39s/3.12s에 통과했다.
+
+선택: fixture의 인위적인 marker 변경을 기존 `_run_on_shared_loop`로 보낸다. 앞선 driver snapshot 완료 후
+변경하고 cancel ack를 실행하므로 원래 quiescence·checkpoint 보존 검증을 유지한다.
+production 변경은 0줄이다. 독립 B 등급 reviewer `p3_01_code_review_a`의 사전 판정은 READY다.
+별도 `codex/v0.25-p3-ci-ordering` PR로 develop에 적용하고 통합 branch가 이를 포함한다.
+예상 test 변경 6줄과 이 기록; 기존 focused/module 검사·L1/L2·최종 full CI로 검증한다.
+
+수정 뒤 `tests/test_backend_control.py` 전체는 **56 passed / 5.48s**다. 표준 4-worker pytest,
+ruff0.15.6 및 diff 공백 검사를 통과했다. production source diff는 없다.
