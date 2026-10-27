@@ -427,3 +427,75 @@ push allowlist 누락의 네 관찰점에서 실패했다. 이후 정확한 bran
 정확한 branch에서 `--requested-profile core`는 예상한 `requires ci:combined` 오류로 거부됐다.
 공유 Python에는 ruff module이 없어 CI 고정 버전 `uv tool run --from ruff==0.15.6 ruff check src tests tools/v023_ci.py`를
 사용했고 통과했다. final candidate의 독립 코드 리뷰와 원격 L1/L2는 다음 단계다.
+
+00 최종 `5d99863bc7aebf8a214c1e81e0605624078626c4`의 독립 코드 리뷰는 PASS였다.
+[PR #156](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/156)의
+[L1 40449464064](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40449464064)와
+[required L2 40449476412](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40449476412)가 성공했다.
+expected head를 고정해 merge commit `d4e659c860ca40b8c62a9527dbda1aea9701dc50`으로 develop에 병합했다.
+통합 브랜치를 그 commit에서 생성·push했고 첫 full CI는 `40450049327`이다.
+00의 기능 변경은 workflow/map 두 항목, 테스트·실행 문서 포함 후속 commit 변경은 68줄이다.
+최초 계획 문서 428줄은 별도 계획 비용으로 유지한다.
+
+### 9.2 P1P2-01 구현 전 사전조사
+
+실제 base는 최신 develop/통합 head `d4e659c860ca40b8c62a9527dbda1aea9701dc50`이다.
+작업 브랜치는 `codex/v0.25-p1-p2-readers`. `git diff 4e14618..d4e659c -- src`는 비어 있어 조사한 runtime과 동일하다.
+root가 구현·runner를 소유한다. `p1p2_01_research`의 읽기 전용 조사와 독립 `p1p2_01_preflight_review`를 분리했다.
+A 등급으로 구현 최종 head의 서로 다른 두 코드 리뷰·combined 서비스 CI·설치 wheel 검증이 필요하다.
+
+**관측한 기준선.** 실제 `FencedModelCallLifecycle.recover`와 deterministic fenced host에 원래 payload hash를 심은
+메모리 probe는 canonical v1 failure만 복구했다. namespace alias, legacy `requires_evidence`, 생략된 policy/result_ref는
+decode=loaded 뒤 `durable_invocation_conflict`, digest-generation alias는 request conflict였다.
+checkpoint의 nested 재직렬화도 원래 hash를 바꿨다. v2는 unsupported였다.
+원본 코드·출력은 ignored `.tmp/v025/p1p2-01-baseline-probe.py`, `p1p2-01-baseline-probe-output.txt`다.
+이 probe는 passive failed settlement만 실행했다. success·required/outbox·PostgreSQL·subscription은 구현 검증에서 추가한다.
+
+**선택한 최소 구조.**
+
+- `DurableCodec` 두 인스턴스로 v1 retained aliases와 canonical v2를 분리한다. v1을 v2로 migration하지 않는다.
+  기존 `MODEL_INVOCATION_SCHEMA_VERSION` 기본 writer는 v1로 유지한다. 일반 codec API는 바꾸지 않는다.
+- invocation의 private `init=False/compare=False/repr=False` source envelope가 원래 canonical JSON과 의미 fingerprint를 보관한다.
+  기존 canonical `to_json()`과 저장용 `model_invocation_payload_for_write()`를 분리한다. 기존 encoder/hash를 사용한다.
+  원본 반환 전에 현재 전체 의미·receipt facts를 비교해 nested mutation을 거부한다. 반환 map은 detached다.
+- 같은 좌표의 invocation/evidence 재게시와 ambiguous reconciliation, loop checkpoint capture, nested checkpoint writer에서
+  저장 serializer를 사용한다. 새 revision의 네 lifecycle `replace()`는 source envelope를 버리고 현재 writer=v1을 명시한다.
+- 이미 허용한 digest-generation alias는 reader의 의미 표현에서 canonical domain으로 바꾼다. 원래 spelling은 envelope에 남긴다.
+  request digest와 logical/dispatch identity는 바꾸지 않는다.
+- PostgreSQL의 invocation/evidence 전용 typed projection은 legacy policy/default를 처리하며 raw schema/digest binding을 유지한다.
+  원래 hash를 먼저 검증하고 future `unsupported_version` 분류를 보존한다. event/checkpoint/terminal의 공통 검사를 완화하지 않는다.
+
+**공개 사실·reader 연결.** 작은 leaf `core/model_facts.py`에 `ModelCallTermination`, `UsageObservation`,
+`UsageEvidenceAttempt(index, observation)`, `UsageEvidence(attempts)`를 둔다. 마지막 타입의 reported/completeness는 순서 있는
+observation 목록에서 파생하고, wire reader는 저장된 aggregate와 파생값의 일치를 검증한다. JSON attempt는 평면 index/report/source/collection이다.
+counter 11개·enum은 닫힌 어휘를 사용한다. 확인된 합계는 기존 numeric usage 이하이며 complete counter는 같아야 한다.
+optional zero는 `usage.get(counter, 0)`과 비교한다. 새로운 optional receipt/attempt/outcome 필드는 끝에 추가하고 None이면 생략한다.
+attempt의 기존 required-wire-key 예외 목록도 갱신한다. 실제 producer 생성은 02에 남긴다.
+
+v2 invocation safe receipt와 v2 model-calls schema를 함께 읽되 두 기본 writer는 v1을 유지한다.
+ledger semantic evidence 검사는 empty/absent attempt_log의 조기 반환 전에 수행한다.
+`_recovered_receipt`와 공개 subscription까지 v2 facts를 연결한다. compatibility registry의 writer는 v1, reader는 v1/v2다.
+packaged historical/v2 fixture와 nested checkpoint, current/minimum Pydantic wheel 소비를 검증한다.
+
+**독립 검토에서 고친 retry 경계.** recovered 실패를 재시도할 때 기존 코드가 usage만 비우면 새 evidence와 충돌한다.
+01은 retry cycle 진입 시 working receipt의 termination/evidence도 함께 비운다. 새 v1 revision의 사실은 unavailable이며,
+이전 v2 immutable record의 사실/hash와 이미 쓴 numeric usage는 보존한다. backoff 중 취소도 같은 규칙이다.
+순수 settled 재전달은 v2 사실을 그대로 복구한다. recovered observation prefix와 새 시도의 합성은 02가 소유한다.
+이 중간 규칙은 01의 rollback reader 범위이며 G1 최종 provenance 보장을 줄이지 않는다.
+
+**회귀부터 고정할 항목.** historical payload의 success/failure×passive/required/outbox 실제 lifecycle 복구,
+checkpoint nested hash, v2 fixture의 공개 receipt 복원, mixed ledger와 malformed/future 거부를 먼저 실패시킨다.
+v2 nonzero-evidence retry와 backoff cancel은 attempts·누적 숫자·새 v1 revision·옛 v2 hash를 관측한다.
+source mutation, replace(new revision), stale fence, PostgreSQL typed-row/hash/evidence·ObjectStore·Temporal은 해당 기존 suite에 추가한다.
+
+독립 preflight 판정은 **READY**다. 검토 원문은 ignored `.tmp/v025/p1p2-01-preflight.md`,
+SHA-256 `00A70152A16E64801F33E67F0ABADE2D3B0878BB2CB2FFB7D871BB220B8A99D5`다.
+reviewer는 source·원본 probe를 확인했으며 별도 runner를 사용하지 않았다.
+01 초기 400 기능/1,300 총 변경 줄 추정을 유지해 기록하고, 추가로 확인한 경계를 포함한 작업 예산은 500/1,700줄로 갱신한다.
+캠페인 누적 예상은 1,970 기능/6,980 총 변경 줄이다. 실제 구현 규모가 soft limit에 닿으면 후속 범위를 다시 평가한다.
+
+첫 integration full CI `40450049327`은 성공했다. 01 수정 전 실제 consumer 회귀는
+**33 failed / 7 passed in 3.05s**였다. canonical v1의 세 evidence policy×성공/실패와 기존 retry는 통과했다.
+historical spelling/default의 같은 좌표 재게시, v2 reader, 공개 receipt/subscription, mixed ledger에서 실패했다.
+테스트 초기 stale-fence 기대 예외를 기존 `WriteAuthorityRevoked` 계약에 맞춘 뒤 다시 실행한 수치다.
+이 시점 `git diff -- src`는 비어 있다. 원본 출력은 ignored `.tmp/v025/p1p2-01-red.txt`에 보관한다.

@@ -95,6 +95,21 @@ def _errors(record: dict[str, object]) -> list[str]:
     ]
 
 
+def test_mixed_v1_v2_ledger_reads_facts_without_an_itemized_attempt_log(tmp_path: Path) -> None:
+    from support.model_facts import facts
+
+    old = _record()
+    new = {**old, "schema_version": "monoid.model-calls.v2", **facts(old["usage"])}
+    path = tmp_path / MODEL_CALLS_FILENAME
+    path.write_text(json.dumps(old) + "\n" + json.dumps(new) + "\n", encoding="utf-8")
+    assert not [issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)]
+    # The semantic pass must run even when durable recovery cannot restore the private log.
+    new["usage_evidence"]["reported"]["input_tokens"] = 99
+    path.write_text(json.dumps(new) + "\n", encoding="utf-8")
+    issues = [issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)]
+    assert any("usage_evidence" in issue.message for issue in issues)
+
+
 # --- what the record must never carry ------------------------------------------------------
 
 
