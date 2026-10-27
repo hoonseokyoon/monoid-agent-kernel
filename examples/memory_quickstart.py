@@ -6,22 +6,19 @@ file in one run, then reads it from a second run.
 
 Run it::
 
+    python -m pip install .
     python examples/memory_quickstart.py
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-# Make the example runnable from a checkout without installing the package.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig  # noqa: E402
-from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig
+from monoid_agent_kernel.memory import LocalFilesystemMemoryProvider
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 def _config(provider: LocalFilesystemMemoryProvider) -> AgentRuntimeConfig:

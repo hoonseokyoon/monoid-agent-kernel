@@ -13,12 +13,52 @@ deployment choices to your platform. Models, tools, workspace storage, checkpoin
 stores, event sinks, capability brokers, memory, and gateway services are all
 replaceable contracts.
 
+## Quickstart (no servers)
+
+Run a typed tool and inspect the result delivered to the model. From this checkout's root,
+use a Python 3.11+ virtual environment:
+
+```bash
+python -m pip install .
+python examples/custom_tool_quickstart.py
+```
+
+This checkout contains v0.25 development examples. Install this revision with the command above,
+or install a wheel built from the same revision. For editable development, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+Expected output:
+
+```text
+status     : completed
+final_text : Prepared Ada's weekly report.
+tool_result: {'ok': True, 'result': {'customer': 'Ada', 'title': 'Weekly report'}}
+```
+
+The [complete example](examples/custom_tool_quickstart.py) defines nested Pydantic input and
+a typed result, decorates `summarize_report` with `@tool`, and calls
+`AgentLoop.from_tools(spec, adapter, [summarize_report]).run_once(...)`. Its scripted
+`FakeModelAdapter` invokes the tool, then receives the serialized result in the next request's
+observations. The example checks that result and runs offline without credentials.
+
+Choose the next integration step:
+
+| What you need | Run after installing this checkout | What to inspect |
+|---|---|---|
+| Builtin tools and a local session | `python examples/embedding_local_product.py` | Written release note, checked checkpoint, completed run |
+| Stop and request stream ownership | `python examples/termination_budget.py` | Stream exit progress, final termination facts, reported usage |
+| Tool resources, approval and restore | `python -m monoid_agent_kernel.reference.host_tool_report` | Park/release, fresh loop restoration, approved read, separate child resources |
+
+The approval recipe restores into a fresh loop in the same process. The
+[embedding handbook](docs/EMBEDDING.md) explains resource lifetime, permissions and recovery.
+For individual seams, read the [builtin configuration](examples/minimal_quickstart.py),
+[custom model adapter](examples/custom_model_adapter.py),
+[call facts](examples/model_call_facts.py), and
+[in-memory receipt recovery](examples/recover_model_call_facts.py) examples.
+
 > Throughout these docs, **"your gateway" / "your backend platform"** refers to the
 > backend you operate — the credential boundary that hosts the LLM and Web gateways. The
 > kernel never holds provider keys; it calls your gateway with a short-lived, scoped token.
-
-**New here?** Run the [Quickstart](#quickstart-no-servers) (no servers, no API key),
-then follow the [Documentation map](#documentation) to the path for your role.
 
 ## See it run
 
@@ -65,9 +105,15 @@ For the dynamic binding-based tool surface, see
 
 ## Install
 
+Install the published package for its released API and examples:
+
 ```bash
-pip install monoid-agent-kernel
+python -m pip install monoid-agent-kernel
 ```
+
+For this checkout's development examples, use the same-revision installation in the
+[quickstart](#quickstart-no-servers). Optional extras can also be installed from the checkout,
+for example `python -m pip install ".[http-async]"`.
 
 The Studio UI ships as precompiled static assets. Running Studio does not install or require
 Node.js, Svelte, Vite, or Tailwind CSS; those tools are confined to frontend development and the
@@ -101,66 +147,6 @@ The default package keeps these platform SDKs optional. Follow
 [docs/EMBEDDING.md](docs/EMBEDDING.md) for composition and
 [docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md) for migration, readiness, drain,
 metrics, backup/restore, and garbage collection.
-
-## Quickstart (no servers)
-
-The smallest kernel run needs three of your objects — a spec, a model adapter, and a runtime
-config — and `from_config` wires them in one call. `FakeModelAdapter` (a scripted model)
-makes the first turn run offline, with no gateway or API key:
-
-```python
-from pathlib import Path
-
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, AgentRuntimeConfig, RegistryToolRef, ToolBinding
-from monoid_agent_kernel.providers.base import ModelTurn
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
-
-workspace = Path("workspace")
-run_root = Path("runs")
-workspace.mkdir(exist_ok=True)
-run_root.mkdir(exist_ok=True)
-(workspace / "notes.md").write_text("alpha\nbeta\n", encoding="utf-8")
-
-spec = AgentRunSpec(workspace_root=workspace, run_root=run_root, mode="apply")
-config = AgentRuntimeConfig(
-    definition_id="quickstart",
-    tools=(
-        ToolBinding(binding_id="fs.read", ref=RegistryToolRef("fs.read")),
-        ToolBinding(binding_id="fs.write", ref=RegistryToolRef("fs.write")),
-    ),
-)
-adapter = FakeModelAdapter(
-    turns=[
-        ModelTurn(tool_calls=(fake_tool_call("fs_read", {"path": "notes.md"}, "read1"),)),
-        ModelTurn(
-            tool_calls=(
-                fake_tool_call(
-                    "fs_write",
-                    {"path": "SUMMARY.md", "content": "alpha and beta\n"},
-                    "write1",
-                ),
-            )
-        ),
-        ModelTurn(final_text="Wrote SUMMARY.md."),
-    ]
-)
-
-result = AgentLoop.from_config(spec, adapter, config).run_once("Summarize notes.md")
-print(result.final_text)
-print((workspace / "SUMMARY.md").read_text(encoding="utf-8"))
-```
-
-`from_config`'s `runtime_config` accepts a bare `AgentRuntimeConfig`, a
-`RuntimeConfigProvider`, or a `callable(run_id) -> AgentRuntimeConfig` (hot-reload). See
-[`examples/minimal_quickstart.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/minimal_quickstart.py) for a complete file and
-[`examples/custom_model_adapter.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/custom_model_adapter.py) for implementing
-your own `ModelAdapter`. Author tools from typed functions with the `@tool` decorator
-(see [`examples/custom_tools/word_count_tool.py`](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/examples/custom_tools/word_count_tool.py));
-`generated_tool_bindings(...)` then turns a set of `ToolSpec`s into bindings.
-
-For Stop progress, `loop.termination_budget()` and `stream.termination_budget()` expose active
-model-call deadlines, drain and cleanup windows. The [offline example](examples/termination_budget.py)
-shows a separate progress task reading them while the stream exits and then reads the final receipt.
 
 ## Memory and default tools
 

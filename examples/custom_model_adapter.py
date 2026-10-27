@@ -6,23 +6,21 @@ Keep provider credentials inside the adapter; the core never sees them.
 
 Run it::
 
+    python -m pip install .
     python examples/custom_model_adapter.py
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel import (  # noqa: E402
+from monoid_agent_kernel import (
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
 )
-from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn
 
 
 class EchoModelAdapter:

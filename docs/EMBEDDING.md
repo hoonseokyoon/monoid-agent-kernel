@@ -1,7 +1,27 @@
 # Production embedding handbook
 
-This handbook defines portable production responsibilities for two product topologies and supplies
-one offline executable path for each:
+## Start with an executable recipe
+
+Use a Python 3.11+ virtual environment and install this checkout with `python -m pip install .`,
+or install a wheel built from the same revision. The v0.25 development examples use that revision's
+API. Start with the [typed tool quickstart](../README.md#quickstart-no-servers).
+
+| Integration task | Run from the checkout root | Observable result |
+|---|---|---|
+| Type a tool's inputs and result | `python examples/custom_tool_quickstart.py` | Nested model access and the result in the next model request |
+| Own a local session | `python examples/embedding_local_product.py` | File content, checked checkpoint and completed session |
+| Stop a request stream | `python examples/termination_budget.py` | Exit phase and final receipt with reported usage |
+| Inject resources and restore after approval | `python -m monoid_agent_kernel.reference.host_tool_report` | Committed park, released resources and approved read in a fresh loop |
+
+These examples run offline with temporary state. The approval recipe currently creates its fresh
+loop in the same process. [Call facts](../examples/model_call_facts.py) shows explicit zero and
+unknown counters; [receipt recovery](../examples/recover_model_call_facts.py) shows an in-memory
+lifecycle-hook round trip. The local session recipe also shows failure cleanup that preserves the
+last checkpoint and original exception. The sections below define production responsibilities.
+
+## Choose a product topology
+
+Choose the composition that fits your product:
 
 - [`embedding_local_product.py`](../examples/embedding_local_product.py) embeds `AgentLoop`
   directly in one trusted process through the stable contracts and Core Helper Kit.
@@ -14,16 +34,15 @@ orchestration and storage implementations, and verify observable behavior with c
 profiles. Reference packages provide runnable examples and smoke targets outside the supported
 stable surface. See [REFERENCE.md](REFERENCE.md).
 
-Run both paths from a checkout:
+Run `python examples/embedding_hosted_product.py` for tenant isolation, command inbox and historical
+reads. It uses `FakeModelAdapter`, requires no credentials, makes no network requests, and creates
+state under a temporary directory. Its fresh backend reads completed history.
 
-```bash
-python examples/embedding_local_product.py
-python examples/embedding_hosted_product.py
-python -m pytest -q tests/test_examples.py
-```
-
-Both scripts use `FakeModelAdapter`, require no credentials, make no network requests, and create
-all state under a temporary directory.
+The advanced [full-stack](../examples/full_stack_integration.py) and
+[workspace cleanup](../examples/messy_workspace_cleanup.py) harnesses cover gateway assembly and
+proposal/apply scenarios. Their `--mode fake` paths use the base install; `--mode real` uses
+`python -m pip install ".[openai]"` plus the credentials described in each file. For local span
+output, install `.[otel-export]` and run [otel_tracing.py](../examples/otel_tracing.py).
 
 ## Inject host resources into tools (v0.25)
 
