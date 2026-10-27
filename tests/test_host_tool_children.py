@@ -210,6 +210,7 @@ def test_inherited_workspace_enforces_computed_scope_and_operator_policy(
             assert caught.value.error_code == code
         digest = view.write_bytes("reports/allowed.txt", b"child", create_dirs=True)
         assert view.read_bytes("reports/allowed.txt") == (b"child", digest)
+        checked.append("allowed_read_completed")
         return ToolResult(ok=True)
 
     loop = _loop(
@@ -222,7 +223,7 @@ def test_inherited_workspace_enforces_computed_scope_and_operator_policy(
         permission_policy=PermissionPolicy(deny_patterns=("reports/secret.txt",)),
     )
     assert loop.run_once("go").status == "completed"
-    assert checked == ["tool_scope_denied", "permission_denied"]
+    assert checked == ["tool_scope_denied", "permission_denied", "allowed_read_completed"]
     assert not (loop.spec.workspace_root / "reports/allowed.txt").exists()
     assert len(resources) == 2 and all(r.closed == 1 for r in resources)
 
@@ -234,7 +235,6 @@ def test_child_cleanup_preserves_parent_and_sibling_resources(tmp_path: Path, co
     def handler(ctx: Any, args: Any) -> ToolResult:
         role = args["role"]
         view = require_host_tool_binding(ctx, FILES)
-        seen.append(role)
         assert resources[0].closed == 0
         if role == "root-before":
             view.write_bytes("shared.txt", b"parent")
@@ -251,6 +251,7 @@ def test_child_cleanup_preserves_parent_and_sibling_resources(tmp_path: Path, co
                 retained[0].exists("shared.txt")
             assert caught.value.error_code == "tool_call_not_in_flight"
         assert len(loop.write_authority._callbacks) == 1
+        seen.append(role)
         return ToolResult(ok=True)
 
     loop = _loop(
@@ -387,6 +388,9 @@ def test_parent_retirement_during_child_factory_disposes_returned_adapter(
         loop.discard_uncommitted()
     assert calls == [] and len(resources) == 2
     assert all(r.closed == 1 for r in resources)
+    if boundary == "end":
+        # Only the parent spawn and its continuation reach the model after factory retirement.
+        assert len(loop.model_adapter.requests) == 2
 
 
 @pytest.mark.parametrize("boundary", ["end", "revoke"])

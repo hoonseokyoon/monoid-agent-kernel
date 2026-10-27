@@ -766,3 +766,12 @@ Python3.11.9/Pydantic2.14.1과 최소 계열2.6.4 모두 승인·복구 및 fres
 현재 P3-03 변경은 production 약 160줄, 총 약 910줄이다. 원래 총량 상한800보다 약14% 늘어난 부분은
 실제 policy 회귀, nested/barrier/committed release 검증과 실행 기록이다. 누적 구현 diff는 약3,550줄로
 기능2,000줄 soft limit·총비용1.5배 재계획 기준 이내다. 범용 추상화와 새 runner는 추가하지 않았다.
+
+첫 후보 `293a712`의 reviewer A는 PASS였고, reviewer B는 P2 테스트 관찰점 결함을 재현했다.
+computed allowed write 및 parent read가 거부돼도 앞서 기록한 표식 때문에 두 테스트가 통과했다.
+성공 표식을 실제 read/check 완료 뒤로 옮기고 handler 밖에서 확인한다. factory 중 parent end 검사도
+parent 두 요청만 model에 도달했음을 확인한다. production 변경은 없다.
+보완 뒤 같은 positive-operation 거부 변이는 **4 failed / 1.48s**, parent token 제거 변이는 barrier와
+factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tmp/v025/p3-03-success-oracle-negative.log`,
+`p3-03-parent-guard-negative-final.log`다. 원래 구현의 새 35개 검사는 **35 passed / 12.21s**이며
+`.tmp/v025/p3-03-final-green.log`에 기록했다. 최종 head를 두 reviewer가 표적 재검토한다.
