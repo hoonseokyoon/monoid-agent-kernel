@@ -12,6 +12,39 @@ export type ModelStreamStatus =
 export type ModelStreamResetReason = "generation_changed" | "cursor_gap" | "cursor_ahead";
 export type ModelContentStatus = "running" | ModelStreamStatus | "abandoned";
 
+export const MODEL_USAGE_COUNTERS = [
+  "audio_input_tokens", "audio_output_tokens", "audio_tokens", "cached_input_tokens",
+  "cache_creation_tokens", "cache_read_tokens", "cache_write_tokens", "input_tokens",
+  "output_tokens", "reasoning_tokens", "total_tokens",
+] as const;
+type ModelUsageCounter = typeof MODEL_USAGE_COUNTERS[number];
+type ModelUsageReported = Partial<Record<ModelUsageCounter, number>>;
+type ModelUsageCoverage = "complete" | "partial" | "unknown" | "no_dispatch";
+const STOP_REQUESTERS = [
+  "user_cancel", "turn_interrupt", "graceful_drain", "deadline", "host_shutdown", "caller_cancel",
+] as const;
+const READ_ENDS = [
+  "provider_terminal", "provider_eof", "provider_error", "provider_cancelled", "stop_request",
+  "deadline", "drain_timeout", "lease_lost", "local_failure",
+] as const;
+
+export interface ModelCallTermination {
+  outcome: ModelStreamStatus;
+  requested_by: typeof STOP_REQUESTERS[number] | null;
+  ended_by: typeof READ_ENDS[number];
+}
+
+export interface ModelUsageEvidence {
+  reported: ModelUsageReported;
+  completeness: Record<ModelUsageCounter, ModelUsageCoverage>;
+  attempts: {
+    index: number;
+    reported: ModelUsageReported;
+    source: "provider" | "adapter" | "legacy_ambiguous" | null;
+    collection: "normal" | "drain" | null;
+  }[];
+}
+
 export interface ModelContentSnapshot {
   root_run_id: string;
   run_id: string;
@@ -78,6 +111,8 @@ export interface ModelStreamClosedFrame extends ModelStreamCallFrameBase {
   retryable?: boolean;
   partial?: boolean;
   content_omitted?: boolean;
+  termination?: ModelCallTermination;
+  usage_evidence?: ModelUsageEvidence;
 }
 
 export interface ModelStreamResetFrame extends ModelStreamFrameBase {
@@ -116,6 +151,8 @@ export interface LiveModelCallState {
   finalText?: string;
   partial: boolean;
   retryable: boolean;
+  termination?: ModelCallTermination;
+  usageEvidence?: ModelUsageEvidence;
 }
 
 export interface ModelStreamViewState {
@@ -240,6 +277,62 @@ const MODEL_CONTENT_STATUSES = new Set<ModelContentStatus>([
   "abandoned",
 ]);
 
+function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return isRecord(value)
+    && Object.keys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isTermination(value: unknown): value is ModelCallTermination {
+  return hasExactKeys(value, ["outcome", "requested_by", "ended_by"])
+    && MODEL_STREAM_STATUSES.has(value.outcome as ModelStreamStatus)
+    && (value.requested_by === null
+      || STOP_REQUESTERS.includes(value.requested_by as typeof STOP_REQUESTERS[number]))
+    && READ_ENDS.includes(value.ended_by as typeof READ_ENDS[number]);
+}
+
+function isReportedUsage(value: unknown): value is ModelUsageReported {
+  return isRecord(value) && Object.entries(value).every(([key, count]) => (
+    MODEL_USAGE_COUNTERS.includes(key as ModelUsageCounter)
+    && Number.isSafeInteger(count) && Number(count) >= 0
+  ));
+}
+
+function isUsageEvidence(value: unknown): value is ModelUsageEvidence {
+  if (!hasExactKeys(value, ["reported", "completeness", "attempts"])
+    || !isReportedUsage(value.reported)
+    || !hasExactKeys(value.completeness, MODEL_USAGE_COUNTERS)
+    || !Array.isArray(value.attempts)) return false;
+  const { reported, completeness, attempts } = value;
+  const sums: ModelUsageReported = {};
+  const counts: ModelUsageReported = {};
+  for (const [index, attempt] of attempts.entries()) {
+    if (!hasExactKeys(attempt, ["index", "reported", "source", "collection"])
+      || attempt.index !== index + 1
+      || !isReportedUsage(attempt.reported)) return false;
+    const entries = Object.entries(attempt.reported) as [ModelUsageCounter, number][];
+    if (entries.length > 0) {
+      if ((attempt.source !== "provider" && attempt.source !== "adapter")
+        || (attempt.collection !== "normal" && attempt.collection !== "drain")) return false;
+    } else if ((attempt.source !== null && attempt.source !== "legacy_ambiguous")
+      || attempt.collection !== null) return false;
+    for (const [key, count] of entries) {
+      const sum = (sums[key] ?? 0) + count;
+      if (!Number.isSafeInteger(sum)) return false;
+      sums[key] = sum;
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+  }
+  // The live frame's numeric usage can cover only the final provider turn. Verify the aggregate
+  // against its own observations, preserving explicit zero and each counter's dispatch coverage.
+  return MODEL_USAGE_COUNTERS.every((key) => {
+    const coverage = attempts.length === 0 ? "no_dispatch"
+      : counts[key] === attempts.length ? "complete"
+      : counts[key] ? "partial" : "unknown";
+    return reported[key] === sums[key] && completeness[key] === coverage;
+  });
+}
+
 /** Validate the renderer-required live protocol fields while allowing additive fields. */
 export function decodeModelStreamFrame(payload: unknown): ModelStreamFrame | null {
   if (!isRecord(payload)
@@ -283,6 +376,9 @@ export function decodeModelStreamFrame(payload: unknown): ModelStreamFrame | nul
       || (payload.error_code !== undefined && typeof payload.error_code !== "string")
       || (payload.retryable !== undefined && typeof payload.retryable !== "boolean")
       || (payload.partial !== undefined && typeof payload.partial !== "boolean")
+      || (payload.termination !== undefined
+        && (!isTermination(payload.termination) || payload.termination.outcome !== payload.status))
+      || (payload.usage_evidence !== undefined && !isUsageEvidence(payload.usage_evidence))
       || (payload.content_omitted !== undefined && typeof payload.content_omitted !== "boolean")) {
       return null;
     }
@@ -356,6 +452,18 @@ function callFromFrame(
     partial: false,
     retryable: false,
   };
+}
+
+function sameCallIdentity(
+  call: LiveModelCallState,
+  incoming: ModelStreamCallFrameBase | ModelContentSnapshot,
+): boolean {
+  return call.rootRunId === incoming.root_run_id
+    && call.runId === incoming.run_id
+    && call.turnId === incoming.turn_id
+    && call.streamId === incoming.stream_id
+    && call.step === incoming.step
+    && call.startedAt === incoming.started_at;
 }
 
 function withCursor(
@@ -437,11 +545,6 @@ export function reduceModelStreamFrame(
     // refusing every late content frame from the exact attempt that was reissued.
     return base;
   }
-  if (frame.kind === "closed" && frame.content_omitted) {
-    // The broker deliberately retained this small terminal marker while the complete content was
-    // flushed to the private sidecar. Resume after the marker so hydration cannot replay-loop.
-    return requireHydration(base, "content_omitted", frame.cursor);
-  }
   const incomingFloor: ModelStreamCallFloor = {
     step: frame.step,
     startedAt: frame.started_at,
@@ -463,6 +566,7 @@ export function reduceModelStreamFrame(
   const rootCall = frame.run_id === frame.root_run_id;
   const identity = modelStreamCallKey(frame.run_id, frame.stream_id);
   let call = base.calls[identity];
+  if (call && !sameCallIdentity(call, frame)) return base;
 
   if (frame.kind === "opened") {
     if (call) return base;
@@ -531,10 +635,22 @@ export function reduceModelStreamFrame(
     };
   }
 
-  if (call.status !== "running") return base;
+  const withFacts: LiveModelCallState = {
+    ...call,
+    termination: call.termination ?? frame.termination,
+    usageEvidence: call.usageEvidence ?? frame.usage_evidence,
+  };
+  calls[identity] = withFacts;
+  // A retained close can fill facts after terminal hydration. Content and terminal actions remain
+  // owned by the already-closed call; repeated frames cannot replace previously received facts.
+  if (call.status !== "running") return { ...base, calls };
+  if (frame.content_omitted) {
+    // Keep the marker's facts for exact-identity hydration while the private sidecar supplies text.
+    return requireHydration({ ...base, calls }, "content_omitted", frame.cursor);
+  }
   const finalText = frame.final_text;
   const updated: LiveModelCallState = {
-    ...call,
+    ...withFacts,
     status: frame.status,
     finishedAt: frame.finished_at,
     finalText,
@@ -852,7 +968,14 @@ export function seedModelStreamSnapshot(
   let activeRoot: LiveModelCallState | null = null;
   for (const snapshot of response.streams) {
     const call = callFromSnapshot(snapshot);
-    calls[modelStreamCallKey(call.runId, call.streamId)] = call;
+    const identity = modelStreamCallKey(call.runId, call.streamId);
+    const prior = state.calls[identity];
+    // Snapshots carry content only. Facts survive solely from a live close for this exact call.
+    if (prior && sameCallIdentity(prior, snapshot)) {
+      call.termination = prior.termination;
+      call.usageEvidence = prior.usageEvidence;
+    }
+    calls[identity] = call;
     floors[call.runId] = {
       step: call.step,
       startedAt: call.startedAt ?? "",

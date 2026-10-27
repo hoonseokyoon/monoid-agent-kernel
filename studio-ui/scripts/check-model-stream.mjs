@@ -1594,6 +1594,7 @@ const factChecks = [
     const invalid = [
       { termination: null },
       { termination: { ...factTermination, outcome: "stopped" } },
+      { termination: { ...factTermination, outcome: "cancelled" } },
       { termination: { ...factTermination, requested_by: "provider" } },
       { termination: { ...factTermination, ended_by: "stop_reason" } },
       { termination: { ...factTermination, private_detail: "secret" } },

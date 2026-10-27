@@ -735,3 +735,13 @@ PG16/18·ObjectStore·Temporal combined CI다. 릴리스·배포·CSP 변경은 
 실제 retry OTel 속성 누락이다. 기존 비용·malformed metadata 유지 검증 4개는 통과했다.
 Studio의 실제 모듈·RunView SSR·App 연결 검증 8그룹도 모두 실패했다
 (`.tmp/v025/p1p2-04-studio-red.txt`). 이때 Python·Studio 제품 source diff는 비어 있다.
+
+**04 첫 구현 후보.** red commit은 `878196c`다. 관련 기존 계약까지 537개 통과 후 새 optional error
+observation의 census 등록 한 건을 보완했다. 확장 runner·receipt·consumer·OTel·census는 676개 통과했고,
+추가 proof-refusal 테스트의 잘못된 `on_unsupported="error"`를 실제 vocabulary `fail`로 고친 2개도
+통과했다(2.78s). 원본은 `p1p2-04-candidate1.txt`, `p1p2-04-candidate2.txt`다.
+Studio status/outcome 불일치도 별도 red 후 거부하도록 수정했다. 전체 npm check는 오류·경고 0,
+기존 모든 script와 새 8개 facts 그룹 PASS였고 build 결과를 함께 저장했다.
+Python lint/diff check 통과. 현재 제품 source/Studio 추가 315·삭제 15줄(공백·주석 포함)로
+최초 기능 추정 400 이내다. 두 독립 코드 리뷰, 실제 구형 client binary와 새 wire, 설치 wheel,
+최종 combined CI는 계속 진행한다.

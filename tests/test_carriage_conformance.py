@@ -1415,6 +1415,7 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_exact_gateway_int",
         "_gateway_usage",
         "_gateway_observation",
+        "_stamp_gateway_observation",
         "_gateway_http_status_hint",
         "usage_reported_by",
         "_portable_gateway_payload",
@@ -1527,6 +1528,7 @@ GATEWAY_MAPPING_READ_HELPERS = frozenset(
         "_gateway_string",
         "usage_reported_by",
         "_gateway_observation",
+        "_stamp_gateway_observation",
     }
 )
 # The registered helpers no mapping scan can reach: they validate an already-extracted
@@ -2401,6 +2403,7 @@ def test_1d_the_terminal_failure_record_keeps_the_classification_its_twin_carrie
 # --------------------------------------------------------------------------------------
 
 SERVER_ERROR_BODY_KEYS = frozenset(TRANSPORTABLE_ERROR_WIRE_ALIASES)
+SERVER_ERROR_OPTIONAL_BODY_KEYS = frozenset({"usage_evidence"})
 
 # ``_error_body``'s own signature, pinned. Every parameter carries one wire key: the two
 # positionals become ``http_status``/``error``, the keyword-only ones keep their names. So the
@@ -2425,7 +2428,7 @@ def test_2a_the_error_body_signature_and_the_wire_key_set_determine_each_other()
     }
     assert positional == SERVER_ERROR_BODY_POSITIONALS
     accounted = keyword_only | SERVER_ERROR_BODY_POSITIONAL_WIRE_KEYS
-    assert accounted == SERVER_ERROR_BODY_KEYS, {
+    assert accounted == SERVER_ERROR_BODY_KEYS | SERVER_ERROR_OPTIONAL_BODY_KEYS, {
         "parameters_without_a_wire_key": sorted(accounted - SERVER_ERROR_BODY_KEYS),
         "wire_keys_without_a_parameter": sorted(SERVER_ERROR_BODY_KEYS - accounted),
         "hint": "a new parameter must reach BOTH writers and the alias table, or fail here",
@@ -2930,7 +2933,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
     # ``usage`` is read for it by ``usage_reported_by``, not named at the call site.
     "providers/gateway.py:_error_from_status_body": frozenset(
-        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
+        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage", "usage_evidence"}
     ),
 }
 
@@ -4536,7 +4539,7 @@ GATEWAY_SUCCESS_BODY_KEYS = frozenset(
         "turn_handle",
         "final_text",
         "tool_calls",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
         "generation_applied",
@@ -4558,7 +4561,7 @@ GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
     {
         "type",
         "turn_handle",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
         "generation_applied",
@@ -4690,13 +4693,13 @@ GATEWAY_MINIMAL_BODY_KEYS = frozenset(
         "turn_handle",
         "final_text",
         "tool_calls",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
     }
 )
 GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
-    {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
+    {"type", "turn_handle", "usage", "usage_evidence", "stop_reason", "provider_retried"}
 )
 # The keys that ride the wire only sometimes. THREE conditionalities, deliberately unified into
 # one set because the *wire* property is the same one: the three echoes appear only when the
@@ -4971,7 +4974,6 @@ TURN_COMPLETE_READS_R2 = frozenset(
 # Reads with no writer, each one accounted for.
 SUCCESS_DANGLING_READS: dict[str, str] = {
     "http_status": "lenient status hint shared with the error branch",
-    "usage_evidence": "P1P2-02 reads optional new-peer observations; reference gateway writers join in P1P2-04",
     "error": "the envelope discriminator: one parser serves both shapes and tests this key "
     "before branching, so it is read on the success path and written only on the error one",
     "response_id": "alias: the gateway writes turn_handle, and the same parser also serves a "
@@ -5046,9 +5048,9 @@ def test_7c_the_client_reads_the_terminal_frame_the_server_writes() -> None:
     pre_branch = _literal_wire_keys(_function_node("providers/gateway.py", "_chunk_from_event"))
     assert {"type", "provider_retried"} <= pre_branch
     unwritten = read - GATEWAY_TERMINAL_FRAME_KEYS
-    assert unwritten == {"response_id", "usage_evidence"}, {
+    assert unwritten == {"response_id"}, {
         "read_but_never_written": sorted(unwritten),
-        "hint": "response_id is an alias; usage_evidence is reader preparation for P1P2-04",
+        "hint": "response_id is an alias of turn_handle",
     }
     assert GATEWAY_TERMINAL_FRAME_KEYS - read - {"type", "provider_retried"} == set()
 
@@ -5322,13 +5324,17 @@ UNPROBED_ERROR_ENVELOPE_READS: dict[str, dict[str, str]] = {
     "providers/gateway.py:_parse_gateway_response": {
         "usage": "the stamp's own source: when IT is the malformed key there is nothing "
         "trustworthy left to stamp, and the lenient read is the declared behavior",
+        "usage_evidence": "optional malformed diagnostics are omitted while preserving the original "
+        "error and usage; all three readers are probed in test_model_fact_consumers",
     },
     "providers/gateway.py:_chunk_from_event": {
         "usage": "same as the body reader's",
+        "usage_evidence": "same lenient diagnostic policy, covered by test_model_fact_consumers",
     },
     "providers/gateway.py:_error_from_status_body": {
         "usage": "same as the body reader's; this reader names the key only through "
         "``usage_reported_by``, which is the stamp itself",
+        "usage_evidence": "same lenient diagnostic policy, covered by test_model_fact_consumers",
     },
 }
 

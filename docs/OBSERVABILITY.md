@@ -228,6 +228,15 @@ that subscriber. Provider generation, durable recording, Stop, interrupt, and ca
 owned by the run. Live frames enter the chat and subagent activity projections directly and never
 enter `events.jsonl`, the run event reducer, Trace, or raw trace export.
 
+Studio's expandable model-call details show received termination facts and counter coverage for
+the latest root and descendant calls, including failures with empty output. Reported zero is shown
+as zero; unreported counters and unavailable facts have separate labels. Evidence totals cover the
+logical call's kernel dispatches; the run token meter keeps its existing numeric accounting.
+Facts survive in-page hydration only for an exact call identity. Private snapshots contain no new
+facts, and the durable terminal event closes the live subscription. A close frame that loses that
+delivery race leaves facts unavailable. The broker can also omit optional facts to retain existing
+content within its byte budget; receipt and ledger consumers retain the durable facts.
+
 The `/api/chat-transcript` response is `studio.chat.v2`. It requires `event_log_error`, which is
 empty after a complete read and carries the failure reason when Studio returns only the committed
 prefix of a corrupt `events.jsonl`. This member is the wire-format change from v1.
@@ -398,6 +407,15 @@ Treat those two modes as content-bearing exports and configure collector access 
 accordingly. Capture never changes `events.jsonl`, and raw delta events are not mirrored into span
 attributes. Model-stream observers are a separate live/private content channel and do not add
 content to OTel spans unless an integrating observer explicitly exports it.
+
+Receipt capture adds bounded `monoid.model.termination.{outcome,requested_by,ended_by}` attributes
+and JSON `monoid.model.usage.{reported,completeness}` maps over the eleven supported counters.
+Absent legacy facts produce no attributes. Existing attempt children additionally expose
+`monoid.model.attempt.usage.{reported,source,collection}` from their own observations. The parent
+keeps aggregate coverage without an unbounded attempt array. Numeric `gen_ai.usage.*`, span
+lifetime, child inclusion and duplicate-delivery rules retain their existing behavior.
+Recovery can repeat diagnostic spans; consumers use durable invocation identity for accounting.
+This projection adds no usage counter or histogram and makes no exactly-once exporter guarantee.
 
 **Per-attempt spans (W7-2).** When the kernel retry layer dispatched a call more than once, the
 model-I/O facet synthesizes one `model.attempt {index}` INTERNAL child under that call's `chat`

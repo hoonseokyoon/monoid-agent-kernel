@@ -110,7 +110,7 @@ from monoid_agent_kernel.providers.base import (
     ModelStreamChunk,
     ModelTurn,
     TurnComplete,
-    assemble_streamed_turn,
+    _assemble_normalized_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
     mark_provider_usage,
@@ -2185,7 +2185,7 @@ class ModelCallRunner:
                 if aclose is not None:
                     with contextlib.suppress(Exception):
                         await self._aclose_within_grace(aclose)
-            turn = assemble_streamed_turn(chunks)
+            turn = _assemble_normalized_streamed_turn(chunks)
             mark_read_end(turn, "provider_terminal" if saw_terminal else "provider_eof")
             return turn
 

@@ -47,7 +47,9 @@ class UsageProgress:
         self, usage: Mapping[str, int], observation: UsageObservation, *, preserve: bool,
     ) -> UsageObservation:
         with self.lock:
-            if observation.reported and not preserve:
+            if observation.reported and not preserve and observation is not self.snapshot[1]:
+                # A gateway parser has already captured a relayed observation with its
+                # remote collection phase. Immediate ingress preserves that same object.
                 observation = replace(observation, collection=self.collection)
             if not self.closed:
                 self.snapshot = select_usage_snapshot(self.snapshot, (dict(usage), observation))

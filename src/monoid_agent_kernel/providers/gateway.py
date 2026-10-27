@@ -21,7 +21,7 @@ from monoid_agent_kernel.core.json_ingress import (
 )
 from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.model_facts import UsageObservation
-from monoid_agent_kernel.providers._usage import capture_usage
+from monoid_agent_kernel.providers._usage import capture_usage, mark_usage_observation
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -356,6 +356,8 @@ class GatewayModelAdapter:
                         )
                     except ModelAdapterError as unproven:
                         mark_provider_usage(unproven, turn.usage)
+                        if turn.usage_evidence is not None:
+                            mark_usage_observation(unproven, turn.usage_evidence)
                         raise
                     return turn
                 except ModelAdapterError as exc:
@@ -573,6 +575,8 @@ class GatewayModelAdapter:
                                         )
                                     except ModelAdapterError as unproven:
                                         mark_provider_usage(unproven, chunk.usage)
+                                        if chunk.usage_evidence is not None:
+                                            mark_usage_observation(unproven, chunk.usage_evidence)
                                         raise
                                 yield chunk
                         if not saw_terminal:
@@ -995,6 +999,18 @@ def _gateway_observation(
         ) from exc
 
 
+def _stamp_gateway_observation(error: BaseException, payload: dict[str, Any]) -> None:
+    """Retain valid diagnostic facts without replacing an existing classified failure."""
+    usage = usage_reported_by(payload)
+    if "usage_evidence" in payload:
+        try:
+            observation = UsageObservation.from_json(payload.get("usage_evidence"))
+            observation = capture_usage(usage, observation, preserve=True)
+        except (TypeError, ValueError):
+            return
+        mark_usage_observation(error, observation)
+
+
 def _portable_gateway_payload(
     value: Any,
     *,
@@ -1354,6 +1370,7 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
         )
     except ModelAdapterError as malformed:
         mark_provider_usage(malformed, usage_reported_by(data))
+        _stamp_gateway_observation(malformed, data)
         raise
     if "error" in data:
         # The whole construction is inside the guard, not just the stamp that ends it: an
@@ -1421,10 +1438,12 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
             )
         except ModelAdapterError as malformed:
             mark_provider_usage(malformed, usage_reported_by(data))
+            _stamp_gateway_observation(malformed, data)
             raise
         # Third error reader on this wire, and the rule is the same on all three: a failure
         # that reports what it cost is recorded as having cost it.
         mark_provider_usage(envelope_error, usage_reported_by(data))
+        _stamp_gateway_observation(envelope_error, data)
         raise envelope_error
     try:
         _exact_gateway_bool(
@@ -1572,6 +1591,7 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
         )
     except ModelAdapterError as malformed:
         mark_provider_usage(malformed, usage_reported_by(data))
+        _stamp_gateway_observation(malformed, data)
         raise
 
 
@@ -1664,6 +1684,7 @@ def _chunk_from_event(
         )
     except ModelAdapterError as malformed:
         mark_provider_usage(malformed, usage_reported_by(event))
+        _stamp_gateway_observation(malformed, event)
         raise
     if event_type == "text_delta":
         return TextDelta(
@@ -1803,6 +1824,7 @@ def _chunk_from_event(
             # leniently -- a second malformation in ``usage`` must not replace the failure
             # being reported.
             mark_provider_usage(malformed, usage_reported_by(event))
+            _stamp_gateway_observation(malformed, event)
             raise
     if event_type == "error":
         # Guarded like the terminal frame above and like the body reader's error branch: these
@@ -1863,8 +1885,10 @@ def _chunk_from_event(
             )
         except ModelAdapterError as malformed:
             mark_provider_usage(malformed, usage_reported_by(event))
+            _stamp_gateway_observation(malformed, event)
             raise
         mark_provider_usage(stream_error, usage_reported_by(event))
+        _stamp_gateway_observation(stream_error, event)
         raise stream_error
     # The ``*_delta`` branches above are deliberately unguarded, and that is a registered
     # exclusion rather than an omission: a delta is the content channel and the shipped server
@@ -1964,6 +1988,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         )
     except ModelAdapterError as malformed:
         mark_provider_usage(malformed, usage_reported_by(error_payload))
+        _stamp_gateway_observation(malformed, error_payload)
         raise
     error = ModelAdapterError(
         f"LLM gateway returned HTTP {status}: {message}",
@@ -1977,6 +2002,7 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         provider_retried=provider_retried,
     )
     mark_provider_usage(error, usage_reported_by(error_payload))
+    _stamp_gateway_observation(error, error_payload)
     return error
 
 

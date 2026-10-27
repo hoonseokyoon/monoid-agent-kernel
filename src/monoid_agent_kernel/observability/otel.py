@@ -431,6 +431,14 @@ class OtelEventSink:
         if receipt.stop_reason:
             attrs["gen_ai.response.finish_reasons"] = (receipt.stop_reason,)
         usage = receipt.usage
+        if receipt.termination is not None:
+            attrs.update({
+                f"monoid.model.termination.{key}": value
+                for key, value in receipt.termination.to_json().items()
+            })
+        if receipt.usage_evidence is not None:
+            attrs["monoid.model.usage.reported"] = _json_attribute(receipt.usage_evidence.reported)
+            attrs["monoid.model.usage.completeness"] = _json_attribute(receipt.usage_evidence.completeness)
         if usage.get("input_tokens") is not None:
             attrs["gen_ai.usage.input_tokens"] = int(usage["input_tokens"])
         if usage.get("output_tokens") is not None:
@@ -506,6 +514,12 @@ class OtelEventSink:
                 attrs["monoid.model.attempt.provider_error_code"] = entry.provider_error_code
             if entry.usage:
                 attrs["monoid.model.attempt.usage"] = _json_attribute(dict(entry.usage))
+            if entry.usage_evidence is not None:
+                attrs.update({
+                    "monoid.model.attempt.usage.reported": _json_attribute(dict(entry.usage_evidence.reported)),
+                    "monoid.model.attempt.usage.source": entry.usage_evidence.source,
+                    "monoid.model.attempt.usage.collection": entry.usage_evidence.collection,
+                })
             span = self._start_span(
                 f"model.attempt {entry.index}",
                 context=context,

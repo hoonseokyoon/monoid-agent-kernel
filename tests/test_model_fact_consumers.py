@@ -12,7 +12,7 @@ from monoid_agent_kernel.core.model_facts import (
     ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamContext, ModelStreamOutcome
-from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
+from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ModelRetryConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.providers._usage import mark_usage_observation, usage_observation_of
@@ -125,6 +125,54 @@ def test_gateway_real_http_failure_carries_observation(stream):
     assert backend.tenant_usage("tenant")["output_tokens"] == 3
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_gateway_applied_proof_refusal_preserves_observation_without_a_runner(stream):
+    pytest.importorskip("httpx")
+    observed = UsageObservation(reported={"input_tokens": 0}, source="adapter", collection="drain")
+
+    class Adapter:
+        def next_turn(self, request):
+            return ModelTurn(final_text="billed", usage={"input_tokens": 0}, usage_evidence=observed)
+
+    server, _, token = _server(Adapter())
+    with serving(server) as url:
+        adapter = GatewayModelAdapter(ModelConfig(
+            generation=GenerationConfig(max_output_tokens=17, on_unsupported="fail"),
+        ), gateway_url=f"{url}/internal/llm/turns", token=token)
+        with pytest.raises(ModelAdapterError) as caught:
+            if stream:
+                async def consume():
+                    return [chunk async for chunk in adapter.astream_turn(REQUEST)]
+                asyncio.run(consume())
+            else:
+                adapter.next_turn(REQUEST)
+    assert caught.value.config_recoverable
+    assert usage_observation_of(caught.value) == observed
+
+
+def test_chained_gateway_failure_keeps_observation_and_each_hop_meters_once():
+    observed = UsageObservation(reported={"output_tokens": 3}, source="adapter", collection="drain")
+
+    class Adapter:
+        def next_turn(self, request):
+            error = ModelAdapterError("billed refusal", provider_error_code="upstream_refused")
+            mark_provider_usage(error, {"output_tokens": 3})
+            mark_usage_observation(error, observed)
+            raise error
+
+    inner, inner_backend, inner_token = _server(Adapter())
+    with serving(inner) as inner_url:
+        upstream = GatewayModelAdapter(ModelConfig(), gateway_url=f"{inner_url}/internal/llm/turns", token=inner_token)
+        outer, outer_backend, token = _server(upstream)
+        with serving(outer) as url:
+            adapter = GatewayModelAdapter(ModelConfig(), gateway_url=f"{url}/internal/llm/turns", token=token)
+            with pytest.raises(ModelAdapterError) as caught:
+                adapter.next_turn(REQUEST)
+    assert usage_observation_of(caught.value) == observed
+    assert inner_backend.tenant_usage("tenant")["output_tokens"] == 3
+    assert outer_backend.tenant_usage("tenant")["output_tokens"] == 3
+
+
 @pytest.mark.parametrize("last", [0, 5])
 def test_gateway_withheld_terminal_then_error_uses_last_snapshot_once(last):
     pytest.importorskip("httpx")
@@ -210,6 +258,12 @@ def test_live_compact_marker_retains_facts_when_they_fit():
 def test_live_optional_facts_do_not_displace_fitting_legacy_content():
     frame, _ = _live_close(budget=2000, attempts=100)
     assert frame.kind == "closed" and frame.final_text == "answer" and not frame.content_omitted
+    assert "usage_evidence" not in frame.to_json()
+
+
+def test_live_oversized_facts_still_leave_the_existing_compact_marker():
+    frame, _ = _live_close(budget=2000, attempts=100, text="answer" * 1000)
+    assert frame.kind == "closed" and frame.content_omitted and frame.final_text is None
     assert "usage_evidence" not in frame.to_json()
 
 
