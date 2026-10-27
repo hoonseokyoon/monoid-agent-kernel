@@ -474,7 +474,7 @@ def test_checkpoint_writer_refuses_a_cyclic_container_at_its_boundary(tmp_path: 
         write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1", messages=[cyclic]))
 
 
-def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: Path) -> None:
+def test_checkpoint_writer_preserves_nested_invocation_storage_identity(tmp_path: Path) -> None:
     invocation = DurableModelInvocation(
         run_id="run_1",
         logical_call_id="call_1",
@@ -495,9 +495,7 @@ def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: P
     )
     payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
 
-    assert payload["last_model_invocation"]["schema_version"] == (
-        "monoid.model-invocation.v1"
-    )
+    assert payload["last_model_invocation"] == invocation_payload
 
 
 @pytest.mark.parametrize(

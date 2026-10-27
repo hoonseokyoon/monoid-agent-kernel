@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from monoid_agent_kernel.core._util import canonical_sha256
+from monoid_agent_kernel.core._util import CANONICAL_JSON_ENCODER, canonical_sha256
 from monoid_agent_kernel.core.durable_codec import DurableCodec, DurableLoadResult
 from monoid_agent_kernel.core.json_ingress import (
     is_finite_json_number,
@@ -15,6 +15,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
 )
 from monoid_agent_kernel.core.model_io import is_recorded_digest, is_valid_idempotency_key
+from monoid_agent_kernel.core.model_facts import ModelCallTermination, USAGE_COUNTERS, UsageEvidence
 from monoid_agent_kernel.core.safe_evidence import (
     is_safe_opaque_address,
     is_safe_opaque_id,
@@ -31,7 +32,10 @@ from monoid_agent_kernel.core.wire_validation import (
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
 MODEL_INVOCATION_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
-ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = accepted_namespaced_ids("model-invocation.v1")
+MODEL_INVOCATION_V2_SCHEMA_VERSION = namespaced_id("model-invocation.v2")
+ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = (
+    *accepted_namespaced_ids("model-invocation.v1"), MODEL_INVOCATION_V2_SCHEMA_VERSION,
+)
 MODEL_REQUEST_DIGEST_GENERATION = namespaced_id("model-request-digest.v1")
 ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS = accepted_namespaced_ids("model-request-digest.v1")
 LOGICAL_MODEL_CALL_GENERATION = namespaced_id("logical-model-call.v1")
@@ -112,19 +116,7 @@ _RECEIPT_BOOLEAN_FIELDS = frozenset(
     {"config_recoverable", "provider_retried", "retryable", "stream_committed"}
 )
 _RECEIPT_DURATION_FIELDS = frozenset({"duration_ms", "latency_ms"})
-_USAGE_FIELDS = {
-    "audioinputtokens": "audio_input_tokens",
-    "audiooutputtokens": "audio_output_tokens",
-    "audiotokens": "audio_tokens",
-    "cachedinputtokens": "cached_input_tokens",
-    "cachecreationtokens": "cache_creation_tokens",
-    "cachereadtokens": "cache_read_tokens",
-    "cachewritetokens": "cache_write_tokens",
-    "inputtokens": "input_tokens",
-    "outputtokens": "output_tokens",
-    "reasoningtokens": "reasoning_tokens",
-    "totaltokens": "total_tokens",
-}
+_USAGE_FIELDS = {key.replace("_", ""): key for key in USAGE_COUNTERS}
 
 MODEL_INVOCATION_RECEIPT_FIELDS = frozenset(_RECEIPT_FIELDS.values())
 """Canonical public fields accepted by the durable model-invocation receipt."""
@@ -234,7 +226,9 @@ def _require_positive_int(value: object, field_name: str) -> None:
         raise ValueError(f"model invocation {field_name} must be a positive integer")
 
 
-def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _normalized_receipt(
+    receipt: Mapping[str, Any] | None, *, allow_facts: bool = False,
+) -> dict[str, Any] | None:
     if receipt is None:
         return None
     if not isinstance(receipt, Mapping):
@@ -252,6 +246,8 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
     canonical: dict[str, Any] = {}
     for key, value in normalized.items():
         canonical_key = _RECEIPT_FIELDS.get(_collapsed_receipt_key(key))
+        if allow_facts and key in {"termination", "usage_evidence"}:
+            canonical_key = key
         if canonical_key is None:
             raise ValueError(
                 f"model invocation receipt cannot contain private field {key!r}; "
@@ -259,7 +255,11 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
             )
         if canonical_key in canonical:
             raise ValueError("model invocation receipt fields collide after canonicalization")
-        if canonical_key == "usage":
+        if canonical_key == "termination":
+            canonical[canonical_key] = ModelCallTermination.from_json(value).to_json()
+        elif canonical_key == "usage_evidence":
+            canonical[canonical_key] = UsageEvidence.from_json(value).to_json()
+        elif canonical_key == "usage":
             if not isinstance(value, dict):
                 raise ValueError("model invocation receipt usage must be an object")
             usage: dict[str, int] = {}
@@ -321,6 +321,10 @@ def _normalized_receipt(receipt: Mapping[str, Any] | None) -> dict[str, Any] | N
             canonical[canonical_key] = value
         else:  # pragma: no cover - every canonical field belongs to one group above
             raise AssertionError(f"unclassified receipt field {canonical_key}")
+    if "usage_evidence" in canonical:
+        UsageEvidence.from_json(canonical["usage_evidence"]).validate_usage(
+            canonical.get("usage", {}), canonical.get("attempts", 0),
+        )
     return canonical
 
 
@@ -342,6 +346,7 @@ class DurableModelInvocation:
     receipt: Mapping[str, Any] | None = None
     result_ref: str = ""
     failure_code: str = ""
+    _source_envelope: tuple[str, str] | None = field(default=None, init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.schema_version not in ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS:
@@ -382,7 +387,9 @@ class DurableModelInvocation:
             )
         if self.failure_code and not is_safe_taxonomy_code(self.failure_code):
             raise ValueError("model invocation failure_code must be empty or a bounded code")
-        receipt = _normalized_receipt(self.receipt)
+        receipt = _normalized_receipt(
+            self.receipt, allow_facts=self.schema_version == MODEL_INVOCATION_V2_SCHEMA_VERSION,
+        )
         object.__setattr__(self, "receipt", receipt)
         if receipt is not None and receipt.get("request_digest", self.request_digest) != (
             self.request_digest
@@ -413,7 +420,9 @@ class DurableModelInvocation:
         """Return the canonical writer shape with a detached receipt mapping."""
 
         return {
-            "schema_version": MODEL_INVOCATION_SCHEMA_VERSION,
+            "schema_version": (MODEL_INVOCATION_V2_SCHEMA_VERSION
+                               if self.schema_version == MODEL_INVOCATION_V2_SCHEMA_VERSION
+                               else MODEL_INVOCATION_SCHEMA_VERSION),
             "run_id": self.run_id,
             "logical_call_id": self.logical_call_id,
             "revision": self.revision,
@@ -424,7 +433,9 @@ class DurableModelInvocation:
             "request_digest": self.request_digest,
             "digest_generation": MODEL_REQUEST_DIGEST_GENERATION,
             "evidence_policy": self.evidence_policy,
-            "receipt": _normalized_receipt(self.receipt),
+            "receipt": _normalized_receipt(
+                self.receipt, allow_facts=self.schema_version == MODEL_INVOCATION_V2_SCHEMA_VERSION,
+            ),
             "result_ref": self.result_ref,
             "failure_code": self.failure_code,
         }
@@ -460,7 +471,7 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
     raw_receipt = payload.get("receipt")
     if raw_receipt is not None and not isinstance(raw_receipt, Mapping):
         raise ValueError("model invocation receipt must be an object or null")
-    return DurableModelInvocation(
+    invocation = DurableModelInvocation(
         schema_version=parse_str(payload, "schema_version"),
         run_id=parse_str(payload, "run_id"),
         logical_call_id=parse_str(payload, "logical_call_id"),
@@ -478,12 +489,36 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
         result_ref=parse_str(payload, "result_ref"),
         failure_code=parse_str(payload, "failure_code"),
     )
+    object.__setattr__(invocation, "digest_generation", MODEL_REQUEST_DIGEST_GENERATION)
+    object.__setattr__(invocation, "_source_envelope", (
+        CANONICAL_JSON_ENCODER.encode(payload), canonical_sha256(invocation.to_json()),
+    ))
+    return invocation
 
 
 MODEL_INVOCATION_CODEC = DurableCodec[DurableModelInvocation](
     family="model-invocation",
     current_schema=MODEL_INVOCATION_SCHEMA_VERSION,
 )
+MODEL_INVOCATION_V2_CODEC = DurableCodec[DurableModelInvocation](
+    family="model-invocation", current_schema=MODEL_INVOCATION_V2_SCHEMA_VERSION,
+    accepted_namespaces=("monoid",),
+)
+
+
+def model_invocation_payload_for_write(invocation: DurableModelInvocation) -> dict[str, Any]:
+    """Preserve a checked record's submitted identity when reposting the same revision.
+
+    A new revision built with ``replace`` has no source envelope and uses its selected schema.
+    A changed nested receipt on a loaded record cannot silently reuse the original hash.
+    """
+    canonical = invocation.to_json()
+    source = invocation._source_envelope
+    if source is None:
+        return canonical
+    if canonical_sha256(canonical) != source[1]:
+        raise ValueError("loaded model invocation was mutated; create a new revision")
+    return json.loads(source[0])
 
 
 def decode_model_invocation(payload: object) -> DurableLoadResult[DurableModelInvocation]:
@@ -497,11 +532,15 @@ def decode_model_invocation(payload: object) -> DurableLoadResult[DurableModelIn
         json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError, OverflowError, RecursionError):
         return MODEL_INVOCATION_CODEC.corrupt("model invocation payload is not portable JSON")
-    return MODEL_INVOCATION_CODEC.decode(normalized, _model_invocation_from_payload)
+    codec = (MODEL_INVOCATION_V2_CODEC if isinstance(normalized, dict)
+             and normalized.get("schema_version") == MODEL_INVOCATION_V2_SCHEMA_VERSION
+             else MODEL_INVOCATION_CODEC)
+    return codec.decode(normalized, _model_invocation_from_payload)
 
 
 __all__ = [
     "MODEL_INVOCATION_SCHEMA_VERSION",
+    "MODEL_INVOCATION_V2_SCHEMA_VERSION",
     "ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS",
     "MODEL_REQUEST_DIGEST_GENERATION",
     "ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS",
@@ -515,4 +554,5 @@ __all__ = [
     "logical_model_call_id",
     "model_dispatch_id",
     "model_invocation_receipt",
+    "model_invocation_payload_for_write",
 ]

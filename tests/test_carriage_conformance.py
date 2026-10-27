@@ -6754,9 +6754,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     ),
     "reasoning_tokens": frozenset(
         {
-            # v0.22's safe receipt usage vocabulary can preserve the billed sub-count while the
-            # private reasoning payload stays in the result blob.
-            "core/model_invocation.py",
+            # Shared closed counter vocabulary now lives beside explicit observation types;
+            # the durable invocation reader imports this same vocabulary.
+            "core/model_facts.py",
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",

@@ -728,7 +728,10 @@ def test_recovered_receipt_keeps_whole_call_usage_across_kernel_retry(tmp_path: 
     assert len(adapter.requests) == 2
 
 
-def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("with_v2_facts", "cancel_backoff"), [(False, False), (True, False), (True, True)])
+def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_v2_facts: bool, cancel_backoff: bool,
+) -> None:
     harness = DeterministicFencedRunHarness()
     refusal = ModelDispatchRefused("transient overload", retryable=True)
     mark_provider_usage(
@@ -762,6 +765,28 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: 
         model=model,
     )
 
+    historical_coordinate = (RUN_ID, LOGICAL_CALL_ID, failed.revision)
+    if with_v2_facts:
+        from support.fenced_hosting import _record_digest
+        from support.model_facts import facts
+        from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+
+        payload = failed.invocation.to_json()
+        payload["schema_version"] = "monoid.model-invocation.v2"
+        payload["receipt"].update(facts(dict(failed.invocation.receipt["usage"]), outcome="failed"))
+        checked = decode_model_invocation(payload)
+        assert checked.status == "loaded"
+        failed = replace(failed, invocation=checked.value)
+        harness.sink._invocations[historical_coordinate] = (_record_digest(payload), failed)
+    historical_digest = harness.sink._invocations[historical_coordinate][0]
+    if cancel_backoff:
+        from monoid_agent_kernel.errors import RunCancelled
+
+        async def cancelled_wait(self, delay_s, deadline):
+            raise RunCancelled("cancelled during recovered backoff")
+
+        monkeypatch.setattr(ModelCallRunner, "_abackoff", cancelled_wait)
+
     suspension, checkpoint = _restore(
         tmp_path,
         harness,
@@ -769,6 +794,15 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: 
         baseline,
         model=model,
     )
+
+    if cancel_backoff:
+        assert suspension.reason == "terminal"
+        assert suspension.error_code == "cancelled"
+        assert checkpoint.total_usage == failed.invocation.receipt["usage"]
+        assert len(adapter.requests) == 1
+        assert harness.sink._invocation_heads[(RUN_ID, LOGICAL_CALL_ID)] == failed.revision
+        assert harness.sink._invocations[historical_coordinate][0] == historical_digest
+        return
 
     expected_usage = {
         "input_tokens": 5,
@@ -792,6 +826,39 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(tmp_path: 
     assert loaded.value.invocation.receipt is not None
     assert loaded.value.invocation.receipt["attempts"] == 2
     assert loaded.value.invocation.receipt["usage"] == expected_usage
+    assert loaded.value.invocation.schema_version == "monoid.model-invocation.v1"
+    assert harness.sink._invocations[historical_coordinate][0] == historical_digest
+
+
+def test_recovered_v2_facts_reach_the_public_receipt_and_subscription() -> None:
+    from support.model_facts import facts
+    from monoid_agent_kernel.core.model_io import CapturePolicy, ModelIOSubscription
+
+    usage = {"input_tokens": 2, "output_tokens": 0}
+    wire_facts = facts(usage)
+    hook = _RecoveredResultHook(
+        result_blob=durable_model_result_blob(ModelTurn(final_text="answer", stop_reason="stop")),
+        receipt={"attempts": 1, "stop_reason": "stop", "usage": usage, **wire_facts},
+    )
+    received = []
+
+    class Observer:
+        def on_model_call(self, capture):
+            received.append(capture)
+
+    adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
+    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook, subscriptions=(
+        ModelIOSubscription(observer=Observer(), policy=CapturePolicy(mode="none")),
+    ))
+    _, receipt = asyncio.run(runner.acall(
+        ModelRequest(instruction="hello", system_prompt="system", tools=()),
+        logical_call_id=LOGICAL_CALL_ID,
+    ))
+    assert receipt.to_json().get("termination") == wire_facts["termination"]
+    assert receipt.to_json().get("usage_evidence") == wire_facts["usage_evidence"]
+    assert received[0].receipt.usage_evidence == receipt.usage_evidence
+    assert receipt.attempt_log == ()
+    assert adapter.requests == []
 
 
 def test_required_evidence_retries_only_projection_and_deduplicates_usage(
@@ -2497,8 +2564,9 @@ def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> No
         ),
     ],
 )
+@pytest.mark.parametrize("with_v2_facts", [False, True])
 def test_recovered_result_integrity_failure_carries_authoritative_usage(
-    result_blob: bytes,
+    result_blob: bytes, with_v2_facts: bool,
 ) -> None:
     usage = {
         "input_tokens": 5,
@@ -2510,8 +2578,13 @@ def test_recovered_result_integrity_failure_carries_authoritative_usage(
         result_blob=result_blob,
         receipt={"attempts": 1, "stop_reason": "stop", "usage": usage},
     )
+    if with_v2_facts:
+        from support.model_facts import facts
+
+        hook.receipt = {**hook.receipt, **facts(usage)}
+    received = []
     adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
-    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook)
+    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook, settled_sink=received.append)
 
     with pytest.raises(DurableModelCallError) as caught:
         asyncio.run(
@@ -2524,6 +2597,11 @@ def test_recovered_result_integrity_failure_carries_authoritative_usage(
     assert caught.value.error_code == "durable_invocation_result_corrupt"
     assert provider_usage_of(caught.value) == usage
     assert adapter.requests == []
+    assert received[0].receipt.usage == usage
+    if with_v2_facts:
+        assert received[0].receipt.attempts == 1
+        assert received[0].receipt.attempt_log == ()
+        assert received[0].receipt.usage_evidence.to_json() == hook.receipt["usage_evidence"]
 
 
 @pytest.mark.parametrize(

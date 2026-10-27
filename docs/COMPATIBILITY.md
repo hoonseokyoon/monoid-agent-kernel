@@ -94,12 +94,12 @@ for the current API, serialization failures, and control-exception limits.
 | `web-context` | wire | `monoid.web-context.v1` | permissive; missing id accepted | `monoid.web-context.v1`<br>`native-agent-runner.web-context.v1` |
 | `web-context-result` | wire | `monoid.web-context-result.v1` | permissive; missing id accepted | `monoid.web-context-result.v1`<br>`native-agent-runner.web-context-result.v1` |
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
-| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1` |
+| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1`<br>`monoid.model-invocation.v2` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
-| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
+| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1`<br>`monoid.model-calls.v2` |
 | `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
@@ -193,6 +193,25 @@ the first reservation through every later revision and retry. The checked reader
 v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `true` to `required`;
 the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
 writer because the earlier prerelease reader used a closed top-level vocabulary.
+
+The P1/P2 reader rollout also accepts canonical `monoid.model-invocation.v2` and
+`monoid.model-calls.v2`. Both default writers remain v1 during this stage. V2 adds optional
+`termination` and `usage_evidence` metadata; v1 retains its closed vocabulary. New Python types
+`ModelCallTermination`, `UsageObservation`, `UsageEvidenceAttempt`, and `UsageEvidence` are
+exported from the package root and `core.model_io`. Receipt/attempt JSON omits unavailable facts.
+Explicit zero reports survive, and per-counter coverage is derived from ordered dispatch observations.
+Known counts agree with numeric usage; numeric usage remains the accounting input.
+
+Recovery preserves the original submitted invocation payload for a committed revision, including
+accepted namespace/digest aliases, omitted defaults, and the legacy evidence flag. The storage helper
+`model_invocation_payload_for_write` verifies that its checked semantic value has not changed before
+returning a detached original payload. Canonical `to_json()` remains available for semantic projection.
+New revisions explicitly select the current writer. Nested checkpoints preserve the invocation payload
+while keeping their own checkpoint.v1 envelope. No database schema or request digest changes are required.
+
+Settled v2 redelivery restores facts through the public receipt and subscriptions. During the reader-only
+stage, resuming a failed call into a new attempt clears working facts and preserves cumulative numeric
+usage and the immutable earlier record. The runtime rollout adds recovered-prefix observation composition.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
 `pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
@@ -319,7 +338,7 @@ compatibility window, settled text is written to both it and `transcript.jsonl`;
 the sidecar first and falls back to the transcript for any unresolved digest.
 
 `model_calls.jsonl` is optional in the same way, and single-namespace: it has never existed under
-`native-agent-runner.*`, so `monoid.model-calls.v1` is the only accepted reader version. A record
+`native-agent-runner.*`; its readers accept canonical v1 and v2. A record
 is a declared projection of the in-process `ModelCallReceipt` rather than its serialization, so
 the two shapes are deliberately not interchangeable — a recorded line does not round-trip through
 `ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.

@@ -38,6 +38,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_json_ingress,
 )
 from monoid_agent_kernel.core.model_invocation import (
+    model_invocation_payload_for_write,
     MODEL_INVOCATION_CODEC,
     DurableModelInvocation,
     decode_model_invocation,
@@ -170,6 +171,29 @@ def _is_ambiguous_database_error(exc: Exception) -> bool:
     except ImportError:  # pragma: no cover - a database operation already requires psycopg
         return False
     return isinstance(exc, (InterfaceError, OperationalError))
+
+
+def _invocation_typed_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project retained reader defaults onto typed columns after checking the original hash.
+
+    Schema and digest generation keep their original spellings. Version classification belongs
+    to the checked reader, so a future schema with intact binding remains unsupported.
+    """
+    projected = dict(payload)
+    if "evidence_policy" not in projected:
+        legacy = projected.get("requires_evidence", False)
+        projected["evidence_policy"] = ("required" if legacy else "passive") if type(legacy) is bool else None
+    projected.setdefault("result_ref", "")
+    projected.setdefault("failure_code", "")
+    return projected
+
+
+def _invocation_payload_matches_typed_values(
+    payload: object, fields: tuple[str, ...], typed_values: tuple[object, ...],
+) -> bool:
+    return isinstance(payload, dict) and _payload_matches_typed_values(
+        _invocation_typed_payload(payload), fields, typed_values,
+    )
 
 
 class PostgresFencedRunSink:
@@ -332,6 +356,7 @@ class PostgresFencedRunSink:
         sequence: int | None,
         typed_fields: tuple[str, ...],
         expected_typed_values: tuple[object, ...],
+        invocation_payload: bool = False,
     ) -> CommitResult | None:
         if row is None:
             return None
@@ -346,7 +371,8 @@ class PostgresFencedRunSink:
         if (
             _checked_stored_digest(stored_payload, row[2], row[0]) is None  # type: ignore[index]
             or stored_typed_values != expected_typed_values
-            or not _payload_matches_typed_values(
+            or not (_invocation_payload_matches_typed_values if invocation_payload
+                    else _payload_matches_typed_values)(
                 stored_payload,
                 typed_fields,
                 stored_typed_values,
@@ -921,7 +947,8 @@ class PostgresFencedRunSink:
             content_digest,
             sequence=invocation.revision,
             typed_fields=_INVOCATION_TYPED_FIELDS,
-            expected_typed_values=tuple(payload[field] for field in _INVOCATION_TYPED_FIELDS),
+            expected_typed_values=tuple(_invocation_typed_payload(payload).get(field) for field in _INVOCATION_TYPED_FIELDS),
+            invocation_payload=True,
         )
 
     def _invocation_head(self, cursor: object, run_id: str, logical_call_id: str) -> object:
@@ -960,7 +987,7 @@ class PostgresFencedRunSink:
         if (
             content_digest is None
             or stored_typed_values[:3] != (run_id, logical_call_id, revision)
-            or not _payload_matches_typed_values(
+            or not _invocation_payload_matches_typed_values(
                 row[2],
                 _INVOCATION_TYPED_FIELDS,
                 stored_typed_values,
@@ -1004,7 +1031,8 @@ class PostgresFencedRunSink:
             content_digest,
             sequence=invocation.revision,
             typed_fields=_EVIDENCE_TYPED_FIELDS,
-            expected_typed_values=tuple(payload[field] for field in _EVIDENCE_TYPED_FIELDS),
+            expected_typed_values=tuple(_invocation_typed_payload(payload).get(field) for field in _EVIDENCE_TYPED_FIELDS),
+            invocation_payload=True,
         )
 
     def _commit_evidence_locked(
@@ -1024,7 +1052,7 @@ class PostgresFencedRunSink:
         ):
             return CommitResult(status="conflict", sequence=sequence), "", None
         try:
-            payload = invocation.to_json()
+            payload = model_invocation_payload_for_write(invocation)
             content_digest = _record_only_digest(payload)
         except (TypeError, ValueError, OverflowError, RecursionError):
             return CommitResult(status="conflict", sequence=sequence), "", None
@@ -1104,7 +1132,7 @@ class PostgresFencedRunSink:
         if (
             _checked_stored_digest(head_row[2], head_row[3], head_row[1]) is None
             or int(head_row[0]) != stored_typed_values[2]
-            or not _payload_matches_typed_values(
+            or not _invocation_payload_matches_typed_values(
                 head_row[2],
                 _INVOCATION_TYPED_FIELDS,
                 stored_typed_values,
@@ -1178,7 +1206,7 @@ class PostgresFencedRunSink:
             stored_typed_values = tuple(row[3:])
             if _checked_stored_digest(
                 row[1], row[2], row[0]
-            ) is None or not _payload_matches_typed_values(
+            ) is None or not _invocation_payload_matches_typed_values(
                 row[1],
                 _INVOCATION_TYPED_FIELDS,
                 stored_typed_values,
@@ -1226,7 +1254,7 @@ class PostgresFencedRunSink:
         if submitted is None:
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         try:
-            payload = invocation.to_json()
+            payload = model_invocation_payload_for_write(invocation)
         except (TypeError, ValueError, OverflowError, RecursionError):
             return CommitResult(status="conflict", sequence=invocation.revision), ""
         references = (
@@ -1343,7 +1371,7 @@ class PostgresFencedRunSink:
                 result = self._invocation_coordinate(
                     cursor,
                     invocation,
-                    invocation.to_json(),
+                    model_invocation_payload_for_write(invocation),
                     content_digest,
                 )
                 if (
@@ -1352,7 +1380,7 @@ class PostgresFencedRunSink:
                     or result.status not in {"committed", "already_committed"}
                 ):
                     return result
-                payload = invocation.to_json()
+                payload = model_invocation_payload_for_write(invocation)
                 staged = self._evidence_coordinate(
                     cursor,
                     invocation,
@@ -1621,7 +1649,7 @@ class PostgresFencedRunSink:
             row[1] is None
             or _checked_stored_digest(row[2], row[3], row[1]) is None
             or stored_typed_values[:3] != (run_id, logical_call_id, revision)
-            or not _payload_matches_typed_values(
+            or not _invocation_payload_matches_typed_values(
                 row[2],
                 _INVOCATION_TYPED_FIELDS,
                 stored_typed_values,

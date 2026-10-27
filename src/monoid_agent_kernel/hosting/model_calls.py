@@ -12,6 +12,7 @@ from monoid_agent_kernel.core.authority import (
     WriteAuthorityRevoked,
 )
 from monoid_agent_kernel.core.model_invocation import (
+    MODEL_INVOCATION_SCHEMA_VERSION,
     DurableModelInvocation,
     ModelEvidencePolicy,
 )
@@ -262,6 +263,7 @@ class FencedModelCallLifecycle:
     def _unknown_started(self, invocation: DurableModelInvocation) -> None:
         unknown = replace(
             invocation,
+            schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
             revision=invocation.revision + 1,
             dispatch_state="unknown",
             failure_code="dispatch_unknown",
@@ -457,6 +459,7 @@ class FencedModelCallLifecycle:
         self._commit(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="dispatch_started",
             )
@@ -485,6 +488,7 @@ class FencedModelCallLifecycle:
         self._commit_settled(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="settled",
                 receipt=dict(settlement.receipt),
@@ -511,6 +515,7 @@ class FencedModelCallLifecycle:
         self._commit(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="unknown",
                 failure_code=unknown.failure_code,

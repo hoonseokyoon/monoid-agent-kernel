@@ -66,6 +66,7 @@ from monoid_agent_kernel.core.model_io import (
     close_model_io_subscriptions,
 )
 from monoid_agent_kernel.core.model_invocation import (
+    model_invocation_payload_for_write,
     DurableModelInvocation,
     decode_model_invocation,
     logical_model_call_id,
@@ -3631,7 +3632,7 @@ class AgentLoop:
                 dict(replay) for replay in state.pending_tool_approval_replays
             ],
             last_model_invocation=(
-                session.last_model_invocation.to_json()
+                model_invocation_payload_for_write(session.last_model_invocation)
                 if session.last_model_invocation is not None
                 else None
             ),
