@@ -33,6 +33,7 @@ from monoid_agent_kernel.tools.host_bindings import (
     HostToolKey,
     _HostToolCall,
     _HostToolRegistry,
+    _ResourceLifetime,
     _validate_host_tool_bindings,
 )
 from monoid_agent_kernel.model_call import (
@@ -1495,6 +1496,7 @@ class AgentLoop:
     capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
     _host_tool_registry: _HostToolRegistry | None = field(default=None, init=False, repr=False)
+    _host_tool_parent: _ResourceLifetime | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     # Monotonic "this activation was torn down" fact. Set at exactly the sites that null
     # ``_session`` on a teardown path — ``close()``, ``release_parked()``,
@@ -4206,7 +4208,7 @@ class AgentLoop:
             mode=self.spec.mode if is_fork else (definition.mode or self.spec.mode),
             workspace_backend="overlay",
             limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
-            permission_policy=self.spec.permission_policy,
+            permission_policy=self.permission_policy,
             metadata={
                 **subagent.child_metadata(),
             },
@@ -4215,6 +4217,16 @@ class AgentLoop:
         child_step = f"subagent:{subagent.task_id}"
         if parent_invocation.step_id:
             child_step = f"{parent_invocation.step_id}/{child_step}"
+        child_bindings = tuple(b for b in self.host_tool_bindings if b.inherit_to_children)
+        parent_lifetime = None
+        if child_bindings:
+            registry = self._host_tool_registry
+            if registry is None:
+                raise ToolExecutionError(
+                    "host tool resources are closed", error_code="host_tool_resource_closed"
+                )
+            parent_lifetime = registry.lifetime
+            parent_lifetime.assert_active()
         child = AgentLoop(
             spec=child_spec,
             model_adapter=self.model_adapter,
@@ -4237,8 +4249,9 @@ class AgentLoop:
             # Inherit the parent's tool providers so MCP/custom tools are in the child's
             # registry (the inherited bindings reference them).
             tool_providers=self.tool_providers,
+            host_tool_bindings=child_bindings,
             dynamic_tool_providers=self.dynamic_tool_providers,
-            permission_policy=self.spec.permission_policy,
+            permission_policy=self.permission_policy,
             cancellation_token=self.cancellation_token,
             shell_approval_provider=self.shell_approval_provider,
             web_gateway_client=self.web_gateway_client,
@@ -4260,6 +4273,9 @@ class AgentLoop:
             model_payload_file=self.model_payload_file,
             model_stream_observer_factories=self.model_stream_observer_factories,
         )
+        # Carry only the original lifetime token. Each child opens its own registry/adapters;
+        # parent restoration creates a new token and cannot revive an old descendant's lease.
+        child._host_tool_parent = parent_lifetime
         child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
@@ -6313,7 +6329,9 @@ class AgentLoop:
                     runtime=bound_tool.runtime,
                 )
             )
-            host_call.assert_active()
+            # General tool dispatch retains its child-local policy. Parent lineage fences only
+            # host resource factories/lookups/views; child-wide cancellation belongs to P8.
+            registry.lifetime.assert_local_active()
             self.write_authority.assert_active()
             handler = spec.handler
             async_call = is_async_callable(handler)

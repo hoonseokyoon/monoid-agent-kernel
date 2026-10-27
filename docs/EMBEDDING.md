@@ -77,6 +77,22 @@ Call views expire on return, failure, cancellation, timeout and abandonment. A r
 keeps its original call identity even when another call starts. Pass a context explicitly to any
 joined helper thread. Child and fork activations receive no bindings by default.
 
+Opt in per binding to create fresh adapters for each child and fork:
+
+```python
+HostToolBinding(
+    REPORTS, open=lambda activation: activation.workspace_resource(),
+    inherit_to_children=True,
+)
+```
+
+Each hop carries opted-in factories and creates its own adapters and call views. Resource operations
+check the child and every original ancestor's activation lifetime and writer authority. Parent close,
+committed release or revoke stops new descendant resource access. Child cleanup leaves parent and
+sibling adapters open; a restored parent creates a new lineage. Child and fork workspaces inherit
+the effective operator policy, including the `AgentLoop` constructor keyword. General child tool
+dispatch retains its existing policy; model-call cancellation and draining are separate controls.
+
 Keys, clients and adapters remain process-local. Configure fresh factories on a restored loop.
 Ordinary factory, binder, type-check and close failures use safe fixed diagnostics; direct control
 signals retain their classification. Runtime errors include `host_tool_binding_missing`,
@@ -85,7 +101,8 @@ signals retain their classification. Runtime errors include `host_tool_binding_m
 
 The [complete typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes
 a scoped proposal, parks for approval, releases its activation, restores with fresh resources and
-reads the proposal after approval. It runs offline from an installed wheel:
+reads the proposal after approval. It also delegates reports through fresh and fork children and
+uses the parent's independent resource after child cleanup. It runs offline from an installed wheel:
 
 ```bash
 python -m monoid_agent_kernel.reference.host_tool_report

@@ -2,7 +2,7 @@
 
 작성·조사일: 2026-10-27 KST. 기준: 최신 `origin/develop`
 `5b08b10d82a948268d1a95b51112b1508e233e3d` (P5 #148, DX1 #149 병합).
-상태: **2026-10-27 구현 승인·P3-00/01 사전조사 갱신 중.** 사용자는 P3-00·01부터 진행하고,
+상태: **2026-10-27 P3-00/01 develop 병합, P3-02 통합 branch 병합, P3-03 사전조사.** 사용자는 P3-00·01부터 진행하고,
 P3-01은 실패 회귀를 먼저 고정한 독립 PR로 구현한 뒤 리뷰·CI를 확인하도록 요청했다.
 이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·CSP 변경은 범위 밖이다.
 
@@ -207,7 +207,7 @@ P3-03에서 `HostToolBinding(..., inherit_to_children=True)`를 추가한다. �
 
 상속한 view는 child-local guard와 모든 parent activation/authority lineage를 검사한다.
 parent revoke 또는 parent activation 종료 후 자식의 새 접근을 거부한다.
-child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 각 child 종료에 제거한다.
+child 종료는 parent/sibling adapter를 닫지 않는다. lineage는 수명 token 검사로 연결하며 새 callback을 등록하지 않는다.
 복구된 parent가 새 child를 만들면 새 lineage에 연결한다. 끝난 parent의 child를 자동 재연결하지 않는다.
 
 이 보장은 신규 상속 자원의 사용 권한이다. 자식 모델 호출 강제 취소·drain/usage 합산은 P8에서 다룬다.
@@ -226,7 +226,7 @@ child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 �
 
 ## 5. PR별 변경 범위·의존성·완료 기준
 
-예정 통합 브랜치: `codex/v0.25-p3-host-resources`. 아직 생성하지 않았다.
+통합 브랜치: `codex/v0.25-p3-host-resources`. P3-00/01 병합 후 생성했다.
 계획 보존 브랜치는 `codex/v0.25-p3-plan`이다. 현재 실행 브랜치·증거는 §9에 기록한다.
 `pr-fast.yml`/`pr-full.yml`은 base 필터가 없지만 `ci.yml` push는 main/develop/v0.23만 등록한다.
 운영 규칙에 따라 P3-00에서 새 통합 base를 먼저 등록한다.
@@ -663,3 +663,115 @@ PR #152의 최종 head `bfff4b7`은 독립 B 등급 review PASS, L1 `40430303690
 L2 `40430303478`을 통과했다. 자동 GitHub review도 동일 head에 finding 없이 완료됐다.
 develop merge는 `336cb4cb59d78e9bc083cfbbdd9500817f6065da`다. 통합 branch와 P3-02가
 이 prerequisite를 포함한다. P3-02 production diff는 최초 검토 후보 `9df07fb`와 동일하다.
+
+P3-02 최종 head `73f1c3995f9ebefa42f8183dbef58fe3263a5d26`의 독립 reviewer
+`p3_02_code_review_a/b`는 모두 PASS다. 추가 probe에서 bind 진행 중 종료한 call의 winner/waiter 거부,
+취소를 삼킨 native async handler의 late write 거부를 각각 확인했다. 별도 installed-wheel 환경의
+**Pydantic 2.6.4**에서도 같은 report recipe 결과를 확인했다. 새 의존성·버전 변경은 없다.
+[PR #153](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/153)은
+L1 `40431097973`, L2 `40431098042`를 통과했고 자동 review도 동일 head에 finding 없이 완료됐다.
+통합 merge는 `78cd610aac3f27b02de09ad3e2136bf84e1e2583`이다. 전체 diff는 1,824 추가/28 제거,
+production은 480줄 registry와 156줄 소비 예제, 기존 loop/bootstrap 연결로 계획 범위 안이다.
+
+### P3-03 사전조사 — 2026-10-27
+
+- 최신 fetch: develop `336cb4cb59d78e9bc083cfbbdd9500817f6065da`, 실제 구현 base는
+  P3 통합 `78cd610aac3f27b02de09ad3e2136bf84e1e2583`이다. 실행 branch는
+  `codex/v0.25-p3-03-child-resources`. root가 소스 조사·구현·runner를 소유하고 fresh reviewer가
+  아래 설계와 실제 소비자 연결을 독립 검토한다. P3-02 integration full CI를 확인한 뒤 구현한다.
+- 실제 생산 지점은 `AgentLoop._run_subagent_child` 하나다. fresh/fork 모두 이곳에서 새 loop를 만들고
+  `arun_once`를 실행한다. `SubagentRuntimeContext.create`는 검증된 root/parent/task lineage를 제공한다.
+  fresh는 tool allow/deny와 mode/limits를 좁히고, fork는 parent config를 복사한다. 이 정책은 유지한다.
+- `HostToolBinding`에 keyword-only bool `inherit_to_children=False`를 추가한다. constructor가 정확한 bool을
+  검사한다. 매 hop에서 True 등록만 자식 생성자에 전달한다. factory closure/key는 공유하고 반환 adapter,
+  workspace resource, call view는 해당 자식 activation에서 새로 생성한다. public WriterToken 전달은 없다.
+- 자식 생성 전에 현재 parent registry의 수명 token을 확보하고, private init=False loop 필드로 전달한다.
+  registry의 `_ResourceLifetime`은 parent의 같은 수명 token만 참조한다. parent registry/workspace/adapter는
+  보관하지 않는다. 연결된 token chain의 assert가 root부터 child까지 closed 상태와 writer를 검사한다.
+  parent 복구 시 새 registry/token을 만들므로 이전 child가 새 activation에 연결되지 않는다.
+- 사전 reviewer가 실제 공통 handler 진입의 무조건 `host_call.assert_active()`를 확인했다. 여기에 parent
+  chain을 그대로 적용하면 P3 자원을 사용하지 않는 기존 child tool까지 정책이 확대된다. 수명 token의
+  `assert_local_active()`로 현재 local closed+writer 검사를 분리하고 handler 진입은 이 검사를 유지한다.
+  full lineage 검사는 factory·lookup·bind·lease·workspace에 적용한다. 실제 parent P3 종료 후에도 일반
+  child tool은 실행되고 자원 접근은 거부되는 대조를 둔다. 기존 builtin 권한 연동 정책은 P8에 유지한다.
+- 독립 실제 child/fork probe는 operator policy 전달 결함도 확인했다. 부모 생성자의 명시적
+  `permission_policy`가 spec과 다르면 부모는 deny하지만 자식 생성의 두 지점은 spec policy를 다시 사용한다.
+  상속 자원도 이 누락을 받으므로 child spec/constructor 모두 부모의 해석된 `self.permission_policy`를
+  전달하도록 선행 보완한다. bootstrap의 기존 policy 우선순위는 유지한다. 기존 fs.write → agent.spawn
+  consumer의 loop keyword/spec/override × fresh/fork 회귀를 수정 전에 고정하고, 신규 computed workspace
+  path에도 같은 policy가 적용됨을 검증한다. policy 모델·병합 규칙 전체를 바꾸는 작업은 포함하지 않는다.
+- callback 전파 대신 매 접근의 lineage 검사와 기존 RLock guard를 조합한다. 새 revoke callback을 등록하지
+  않으므로 child 종료 시 callback 해제 장치를 추가할 필요가 없다. parent 종료·revoke는 sticky Event를 먼저
+  게시한다. local 연산은 **call → root activation → root writer → ... → child activation → child writer**
+  순서로 재귀 guard에 진입하고 반대로 빠져나온다. parent end는 자신의 activation lock만 기다린다.
+  writer의 기존 revoke callback은 writer lock 밖에서 실행된다. 다른 call lock을 획득하지 않는다.
+- open은 lineage 전체의 external pre/post guard를 사용한다. callback 반환 즉시 P3-02와 같은 closer 등록을
+  완료한 다음 postcheck로 나가므로 parent가 factory 중 종료해도 fresh child adapter를 회수한다.
+  bind/accepts/general client guard도 같은 lineage assert를 사용한다. 임의 host callback을 잠근 채 실행하지 않는다.
+- parent 정상 close/committed release/discard는 기존 P3 lifetime만 끝낸다. child cleanup은 child adapter만
+  닫으며 parent·sibling writer를 revoke하지 않는다. 부모 종료 뒤 child의 이미 진입한 local write는 끝날 수 있지만
+  결과를 성공으로 발급하지 않고 후속 write를 막는다. P8의 모델 호출 취소·drain·과금 합산은 이 변경과 독립이다.
+- 외부 근거를 다시 확인했다. [LangGraph #5707](https://github.com/langchain-ai/langgraph/pull/5707)은
+  parent runtime 전달 누락을 고친 merged 수정이며 runtime context는 durable state와 별도다.
+  이는 실제 child 진입점을 검증할 근거다. Monoid의 fresh adapter와 parent authority 회수는 우리 제품의 추가 계약이다.
+  표준 RLock/context-manager 중첩과 기존 guard를 사용하고 DI graph·새 scheduler·callback registry는 추가하지 않는다.
+- 첫 consumer는 패키지 offline report 예제의 자식 report 실행이다. 실제 `agent.spawn`을 사용해 fresh/fork를
+  모두 실행하고 root·child descriptor, 서로 다른 adapter, child close 후 parent 접근, sibling 독립을 관찰한다.
+  기존 report 승인·release·restore 예제를 유지하고 installed-wheel CI에서 child consumer도 실행한다.
+- 검증은 실제 nested child/grandchild와 fork 기본 거부/opt-in, root 및 중간 parent 종료·writer revoke 뒤
+  현재 call의 view/helper 거부, 새 factory 중 parent 종료의 partial cleanup, 들어간 local write와 parent end/revoke
+  barrier, parent 복구 후 새 child freshness, async·explicit-thread call 보장, callback 수/역순 close를 포함한다.
+  handler 반환 뒤 call 종료만으로 통과하는 검사를 lineage 증거로 사용하지 않는다. 기존 subagent·root P3·
+  cleanup·checkpoint·cancellation·public/compat 회귀와 wheel current/minimum Pydantic 검사를 재사용한다.
+- 예상 production 150–300줄, 총 450–800줄을 유지한다. 현재까지 구현 PR의 전체 diff 합계는 약 2,634줄
+  (P3-01 752, P3-02 1,852, CI fixture 30; 최초 계획 문서 비용 별도)다. 새 기능·테스트/문서도 누적에 포함한다.
+  A 등급 독립 preflight → 두 fresh code review → L1/L2 → 통합 full CI 후 P3-I로 연결한다.
+
+독립 reviewer `p3_03_preflight_review`는 두 보완을 반영한 preflight
+SHA256 `5F1AEE882658BE31DEBA24AFB21783A26E6B1BF8D7B03F6EED3E19C049D9551A`에 **READY**다.
+정책 probe 원본/결과는 `.tmp/v025/p3-03-preflight-review-policy.py`와 같은 이름의 `.json`에 있다.
+해당 probe는 미구현 상속 전달만 메모리에서 모사했으며 production 완료 증거로 사용하지 않는다.
+CI fixture 보완 뒤 develop `40430925138` 및 integration `40430979676` 전체 CI는 모두 성공했다.
+
+수정 전 `tests/test_host_tool_children.py`는 **6 failed, 4 passed / 3.13s**다.
+4개 실패는 명시적 loop policy/override의 fresh·fork에서 실제 `fs.write`가 허용되는 기존 결함이다.
+나머지 2개 실패는 `inherit_to_children` 신규 API가 아직 없어 생긴 TypeError다.
+기본 상속 거부와 spec policy 경로 4개는 통과 대조다. 초기 fixture의 reports directory를 준비한 뒤
+실제 child write 성공을 관찰해 고정했다. production source는 base와 동일하다.
+원본은 `.tmp/v025/p3-03-red.log`. 표준 4-worker pytest로 새 test module만 실행했다.
+
+수정 전 회귀 commit은 `f10f6de`다. P3-02 integration 전체 CI `40431588835`의 14개 job 성공을
+확인한 뒤 production을 변경했다. opt-in field, fresh child factory, parent lifetime chain,
+effective policy 전달과 handler의 local/resource 검사를 연결했다. 초기 10개 회귀는 **10 passed / 2.87s**다.
+
+실제 child/fork/nested 실행, 호출 중 root·중간 parent 종료/revoke, callback 전후, 진입한 child write barrier,
+sibling/parent 독립, mixed opt-in, fresh restore 및 packaged consumer까지 **35 passed / 5.96s**다.
+원본은 `.tmp/v025/p3-03-green.log`. 초기 restore fixture는 공유 FakeModelAdapter의 소비된 turn list를
+복사하도록 수정했고, 중간 parent revoke의 기존 `TurnNotSettled(interruption_cause=lease_lost)`도 보존했다.
+기존 `snapshot()`은 실행 중인 in-process resume job을 durable park로 허용하지 않는다.
+공개 committed release 회귀는 `create_task(..., resume_on_exit=False)`의 host-driven child를 사용해
+정상 committed 경계에서 parent를 release하고, 아직 살아 있는 child call의 접근 거부를 검증한다.
+새로운 background-task 복구 정책은 추가하지 않았다.
+
+최종 focused 검사는 **647 passed, 1 platform skip / 20.31s**다
+(`.tmp/v025/p3-03-focused.log`). 기존 P3-02 focused 목록에 새 child tests와 기존
+`test_subagent.py`/`test_subagent_runtime_context.py`를 추가했다. ruff0.15.6과 diff 공백 검사도 통과했다.
+메모리에서 parent token 연결만 제거한 음성 대조는 child write 도중 parent end가 즉시 반환하여
+barrier 회귀가 **1 failed / 0.66s**로 검출했다. production은 변경하지 않았고 원본은
+`.tmp/v025/p3-03-parent-guard-negative.py`/`.log`다.
+
+현재 source wheel audit 및 PYTHONPATH 없는 checkout 밖 installed-wheel recipe를 다시 실행했다.
+Python3.11.9/Pydantic2.14.1과 최소 계열2.6.4 모두 승인·복구 및 fresh/fork report를 완료했다.
+각 흐름의 activation은 2개이고 proposal-only 결과를 확인했다. 기존 minimal install CI가 같은 module을 실행한다.
+현재 P3-03 변경은 production 약 160줄, 총 약 910줄이다. 원래 총량 상한800보다 약14% 늘어난 부분은
+실제 policy 회귀, nested/barrier/committed release 검증과 실행 기록이다. 누적 구현 diff는 약3,550줄로
+기능2,000줄 soft limit·총비용1.5배 재계획 기준 이내다. 범용 추상화와 새 runner는 추가하지 않았다.
+
+첫 후보 `293a712`의 reviewer A는 PASS였고, reviewer B는 P2 테스트 관찰점 결함을 재현했다.
+computed allowed write 및 parent read가 거부돼도 앞서 기록한 표식 때문에 두 테스트가 통과했다.
+성공 표식을 실제 read/check 완료 뒤로 옮기고 handler 밖에서 확인한다. factory 중 parent end 검사도
+parent 두 요청만 model에 도달했음을 확인한다. production 변경은 없다.
+보완 뒤 같은 positive-operation 거부 변이는 **4 failed / 1.48s**, parent token 제거 변이는 barrier와
+factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tmp/v025/p3-03-success-oracle-negative.log`,
+`p3-03-parent-guard-negative-final.log`다. 원래 구현의 새 35개 검사는 **35 passed / 12.21s**이며
+`.tmp/v025/p3-03-final-green.log`에 기록했다. 최종 head를 두 reviewer가 표적 재검토한다.

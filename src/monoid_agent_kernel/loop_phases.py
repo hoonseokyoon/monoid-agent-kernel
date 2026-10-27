@@ -100,15 +100,9 @@ class LoopBootstrapper:
     def bootstrap(self) -> _RunResources:
         loop = self._loop
         loop._assert_write_authority()
-        # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
-        # class-exact, so a deployment's extension subclass with both pattern tuples empty read
-        # as "the caller configured this" and the operator's spec policy was silently not
-        # adopted -- leaving the loop enforcing the empty policy at every
-        # ``self.permission_policy`` site while the subagent sites read
-        # ``self.spec.permission_policy`` directly, so half the run honoured the operator's
-        # lists and half did not. Such a subclass reaches here intact by design (the spec
-        # validator gates on ``isinstance``). Same gate the two model configs use, spelled the
-        # same way: see ``PermissionPolicy.is_default``.
+        # Resolve the effective policy before constructing services, resources and children.
+        # is_default inspects fields, so extension subclasses with empty settings also adopt
+        # the operator's spec policy. A configured constructor policy takes precedence.
         if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
@@ -189,6 +183,7 @@ class LoopBootstrapper:
                 workspace=workspace,
                 policy=loop.permission_policy,
                 writer=loop.write_authority,
+                parent=loop._host_tool_parent,
             )
             loop._host_tool_registry.open(loop.host_tool_bindings)
             started = time.time()

@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from monoid_agent_kernel import AgentLoop, AgentRunSpec, ToolContext, tool
-from monoid_agent_kernel.core.agents import AgentRuntimeConfig, ToolBinding
+from monoid_agent_kernel.core.agents import AgentRuntimeConfig, SubagentDefinition, ToolBinding
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
 from monoid_agent_kernel.core.tool_surface import ToolScope
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, ModelTurn, fake_tool_call
@@ -147,9 +147,110 @@ def run_report(root: Path) -> dict[str, Any]:
     }
 
 
+def run_child_reports(root: Path, *, context: str = "fresh") -> dict[str, Any]:
+    """Delegate a report, then use the parent's independent resource after child cleanup."""
+    workspace = root / "workspace"
+    workspace.mkdir(parents=True)
+    opened: list[HostToolActivation] = []
+    adapters: list[HostToolResource[ToolWorkspace]] = []
+
+    def open_reports(activation: HostToolActivation) -> HostToolResource[ToolWorkspace]:
+        opened.append(activation)
+        adapter = activation.workspace_resource()
+        adapters.append(adapter)
+        return adapter
+
+    def save(name: str) -> ModelTurn:
+        return ModelTurn(
+            tool_calls=(
+                fake_tool_call(
+                    "report_save",
+                    {"draft": {"name": name, "title": name, "body": f"{name} report"}},
+                    f"save-{name}",
+                ),
+            )
+        )
+
+    def read(name: str) -> ModelTurn:
+        return ModelTurn(
+            tool_calls=(
+                fake_tool_call(
+                    "report_read",
+                    {"path": f"reports/{name}.md"},
+                    f"read-{name}",
+                ),
+            )
+        )
+
+    model = FakeModelAdapter(
+        turns=[
+            ModelTurn(
+                tool_calls=(
+                    fake_tool_call(
+                        "agent_spawn",
+                        {"subagent_type": "reporter", "prompt": "Write the child report."},
+                        "spawn",
+                    ),
+                )
+            ),
+            save("child"),
+            read("child"),
+            ModelTurn(final_text="Child report ready."),
+            save("parent"),
+            read("parent"),
+            ModelTurn(final_text="Both reports ready."),
+        ]
+    )
+    scope = ToolScope(allowed_paths=("reports/**",))
+    loop = AgentLoop.from_config(
+        AgentRunSpec(workspace_root=workspace, run_root=root / "runs", mode="propose"),
+        model,
+        AgentRuntimeConfig(
+            definition_id="report-delegation",
+            tools=(
+                ToolBinding.for_tool("agent.spawn"),
+                ToolBinding.for_tool("report.save", scope=scope),
+                ToolBinding.for_tool("report.read", scope=scope),
+            ),
+        ),
+        tool_providers=(FunctionToolProvider(lambda _ctx: (save_report, read_report)),),
+        subagent_definitions={
+            "reporter": SubagentDefinition(
+                context=context,
+                tools=("report.save", "report.read"),
+            )
+        },
+        host_tool_bindings=(
+            HostToolBinding(
+                REPORTS,
+                open=open_reports,
+                inherit_to_children=True,
+            ),
+        ),
+    )
+    result = loop.run_once("Delegate one report, then write the parent report.")
+    observations = {
+        obs.call_id: obs.output for request in model.requests for obs in request.observations
+    }
+    for name in ("child", "parent"):
+        read_result = observations[f"read-{name}"]
+        assert read_result["ok"] and f"{name} report" in read_result["result"]["body"]
+    assert len(opened) == 2 and adapters[0] is not adapters[1]
+    assert opened[1].parent_run_id == opened[0].run_id == opened[1].root_run_id
+    assert not (workspace / "reports").exists()
+    return {"status": result.status, "context": context, "activations": 2, "proposal_only": True}
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="monoid-host-report-") as directory:
-        print(json.dumps(run_report(Path(directory)), sort_keys=True))
+        root = Path(directory)
+        output = {
+            "approval": run_report(root / "approval"),
+            "delegation": [
+                run_child_reports(root / mode, context=mode) for mode in ("fresh", "fork")
+            ],
+        }
+        print(json.dumps(output, sort_keys=True))
 
 
 if __name__ == "__main__":

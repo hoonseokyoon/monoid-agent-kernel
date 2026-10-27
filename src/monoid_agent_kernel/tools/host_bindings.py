@@ -58,6 +58,7 @@ class HostToolResource(Protocol[_T_co]):
 class HostToolBinding(Generic[_T]):
     key: HostToolKey[_T]
     open: Callable[[HostToolActivation], HostToolResource[_T]] = field(repr=False, kw_only=True)
+    inherit_to_children: bool = field(default=False, kw_only=True)
 
 
 @runtime_checkable
@@ -183,6 +184,8 @@ def _validate_host_tool_bindings(
     for binding in snapshot:
         if not isinstance(binding, HostToolBinding) or not isinstance(binding.key, HostToolKey):
             raise AgentConfigError("host_tool_bindings must contain HostToolBinding values")
+        if type(binding.inherit_to_children) is not bool:
+            raise AgentConfigError("inherit_to_children must be a boolean")
         key = binding.key
         if type(key.name) is not str or not key.name.strip():
             raise AgentConfigError("host tool key name must be a non-empty string")
@@ -196,12 +199,20 @@ def _validate_host_tool_bindings(
 
 
 class _ResourceLifetime:
-    def __init__(self, writer: ActivationWriteAuthority) -> None:
+    def __init__(
+        self, writer: ActivationWriteAuthority, parent: _ResourceLifetime | None = None
+    ) -> None:
         self.writer = writer
+        self.parent = parent
         self.lock = threading.RLock()
         self.closed = threading.Event()
 
     def assert_active(self) -> None:
+        if self.parent is not None:
+            self.parent.assert_active()
+        self.assert_local_active()
+
+    def assert_local_active(self) -> None:
         if self.closed.is_set():
             raise ToolExecutionError(
                 "host tool resources are closed", error_code="host_tool_resource_closed"
@@ -214,12 +225,26 @@ class _ResourceLifetime:
             pass  # Join only an entered local workspace operation; arbitrary callbacks hold no lock.
 
     def guard_local(self, operation: Callable[[], _T]) -> _T:
+        # Every descendant enters ancestor activation/writer guards before its own guards.
+        # An ancestor's sticky end/revoke request suppresses the result of an entered write.
+        if self.parent is not None:
+            return self.parent.guard_local(lambda: self._guard_local(operation))
+        return self._guard_local(operation)
+
+    def _guard_local(self, operation: Callable[[], _T]) -> _T:
         with self.lock:
-            self.assert_active()
+            self.assert_local_active()
             try:
                 return self.writer.guard_local_mutation(operation)
             finally:
-                self.assert_active()
+                self.assert_local_active()
+
+    def guard_external(self, operation: Callable[[], _T]) -> _T:
+        self.assert_active()
+        try:
+            return operation()
+        finally:
+            self.assert_active()
 
 
 class _HostToolCall:
@@ -302,8 +327,9 @@ class _HostToolRegistry:
         workspace: Workspace,
         policy: PermissionPolicy,
         writer: ActivationWriteAuthority,
+        parent: _ResourceLifetime | None = None,
     ) -> None:
-        self.lifetime = _ResourceLifetime(writer)
+        self.lifetime = _ResourceLifetime(writer, parent)
         self.policy = policy
         self.workspace: Workspace | None = workspace
         self.resources: dict[HostToolKey[Any], HostToolResource[Any]] = {}
@@ -350,7 +376,7 @@ class _HostToolRegistry:
                 return resource
 
             self.lifetime.assert_active()
-            resource = self.lifetime.writer.guard_external_call(
+            resource = self.lifetime.guard_external(
                 lambda: _safe_callback(acquire, "open", config=True)
             )
             with self.close_lock:

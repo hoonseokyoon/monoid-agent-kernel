@@ -3241,7 +3241,13 @@ host still applies ownership fencing before resuming or settling a run.
 
 ## Run Artifacts
 
-Host tool bindings are process-local activation resources. The optional extension in
+Host tool bindings are process-local activation resources. `inherit_to_children=True` opts a binding
+into fresh adapter creation at every child/fork hop. Resource access checks the original parent
+lifetime and writer chain; normal parent termination leaves the host writer active while ending
+descendant resource access. Child cleanup affects its own adapters. Restored parents create fresh
+lineage tokens. Child workspaces inherit the parent's effective operator policy. These resource
+checks leave general child dispatch and model cancellation/drain under their existing controls.
+The optional extension in
 `monoid_agent_kernel.tools.host_bindings` keeps required `ToolContext` members unchanged.
 Factories return fresh synchronous adapters; views are bound to one admitted call and expire
 on every call exit. Local workspace operations serialize with call/activation end and writer
