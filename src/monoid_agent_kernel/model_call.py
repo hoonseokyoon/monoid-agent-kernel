@@ -48,6 +48,8 @@ from copy import copy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
+from monoid_agent_kernel.core._deadline import _MonotonicDeadline
 from monoid_agent_kernel.core._sync_bridge import (
     CalleeCancelled,
     abandon_unwaited_call,
@@ -668,7 +670,7 @@ class _AbortDrain:
         with self._lock:
             if self.started or (cancel_cause is not None and not self.entered):
                 return False
-            self.abort_at = time.time()
+            self.abort_at = deadline_clock.monotonic()
             self.cancel_cause = cancel_cause
             self.started = True
             if self.usage_progress is not None:
@@ -959,7 +961,7 @@ class ModelCallRunner:
                 "run cancelled",
                 interruption_cause=token.cause or InterruptionCause.USER_CANCEL,
             )
-        if deadline is not None and time.time() >= deadline:
+        if deadline is not None and deadline_clock.monotonic() >= deadline:
             raise RunTimeout("run exceeded max duration")
 
     def _assert_write_authority(self) -> None:
@@ -988,10 +990,14 @@ class ModelCallRunner:
         before_settlement: BeforeSettlement | None = None,
         logical_call_id: str = "",
         abort_after_recovery_probe: bool = False,
+        _deadline: _MonotonicDeadline | None = None,
     ) -> tuple[ModelTurn, ModelCallReceipt]:
         """Run one call and return the turn with the receipt that describes it.
 
-        `deadline` is absolute and run-scoped; exceeding it raises `RunTimeout`. Cancellation raises
+        `deadline` is an absolute Unix epoch in seconds, converted once to a process-local
+        monotonic cutoff for all attempts. None/+inf is unbounded; past values/-inf expire
+        immediately. NaN, bool and nonnumeric values raise ValueError before call effects.
+        Exceeding the cutoff raises `RunTimeout`. Cancellation raises
         `RunCancelled`. Both are terminal run boundaries and are raced against the call itself, so a
         wedged provider cannot outlast them.
 
@@ -1024,6 +1030,7 @@ class ModelCallRunner:
         one-shot calls never poll the streamed-call abort predicate before provider entry.
         """
 
+        deadline = (_deadline if _deadline is not None else _MonotonicDeadline.from_epoch(deadline)).cutoff_s
         started = time.monotonic()
         lifecycle_hook = self.lifecycle_hook
         adapter = self._current_adapter()
@@ -1283,7 +1290,7 @@ class ModelCallRunner:
                                 retry_plan.backoff_multiplier,
                                 retry_plan.jitter_s,
                             )
-                            if deadline is not None and time.time() + delay >= deadline:
+                            if deadline is not None and deadline_clock.monotonic() + delay >= deadline:
                                 raise recovered_error
                             attempts_made = receipt.attempts
                             spent_usage = dict(receipt.usage)
@@ -1558,7 +1565,7 @@ class ModelCallRunner:
                         # already spent and then mask the provider failure with a
                         # `RunTimeout` that names nothing; the transient error itself is
                         # the better answer.
-                        if deadline is not None and time.time() + delay >= deadline:
+                        if deadline is not None and deadline_clock.monotonic() + delay >= deadline:
                             raise
                         # What the absorbed attempt already cost, recorded only once the loop
                         # has committed to absorbing it -- which is here, past every `raise`
@@ -2380,7 +2387,7 @@ class ModelCallRunner:
                         interruption_cause=cause or InterruptionCause.USER_CANCEL,
                     )
             # Once the stop is decided the deadline only shortens the drain window below.
-            if not drain.started and boundary is not None and time.time() >= boundary:
+            if not drain.started and boundary is not None and deadline_clock.monotonic() >= boundary:
                 raise RunTimeout("run exceeded max duration")
 
         def draining_boundary(boundary: float | None) -> None:

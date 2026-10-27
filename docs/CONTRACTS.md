@@ -1094,6 +1094,24 @@ node configured differently records differently from there on. The CLI exposes t
 switches on both shapes, as `monoid run --model-calls-file` / `monoid run --model-payload-file`
 and `monoid backend serve --model-calls-file` / `monoid backend serve --model-payload-file`.
 
+**Deadline clocks.** Public `ModelCallRunner.acall(deadline=...)` and
+`ValidatedCallRunner.acall(deadline=...)` accept absolute Unix epoch seconds. They convert
+once at call entry to a process-monotonic cutoff shared by retries and validated repairs.
+`None` and positive infinity mean unbounded; past values, zero and negative infinity
+expire immediately. NaN, booleans, nonnumeric values and unrepresentably large integers
+raise `ValueError` before adapter access, invocation creation, attempt callbacks or receipts.
+A valid expired deadline preserves authoritative recovery and evidence publication before
+the existing boundary check; it does not permit a new dispatch.
+
+An `AgentLoop` starts its monotonic duration budget after workspace and host resources open.
+Run guards, model/tool waits, drain windows, turn remaining time and duration metrics use
+that clock. Wall-clock changes during a run cannot replenish or exhaust those budgets.
+Checkpoint `remaining_duration_s` keeps its existing format: restore creates a new local
+cutoff and excludes parked downtime. Bounded elapsed time is reconstructed from the configured
+duration and remaining budget; historical `None`/zero values carry their existing information
+limits. Process-monotonic timestamps are never persisted as portable deadlines. Capability
+expiry, host leases and provider I/O timeouts retain their own clock contracts.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn` — except a `user_cancel` of a streamed call that has entered the
 provider under a positive `abort_drain_s`, which drains first (below). Stream cancellation closes

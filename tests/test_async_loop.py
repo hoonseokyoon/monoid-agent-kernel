@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -63,6 +64,51 @@ def _loop(
         model_adapter=adapter,  # type: ignore[arg-type]
         runtime_config_provider=runtime_provider(runtime_config(*(tool_ids or ("fs.write",)))),
     )
+
+
+@pytest.mark.parametrize("opening", ["sync", "async"])
+@pytest.mark.parametrize("shift", [0.0, 3600.0, -3600.0])
+def test_open_run_keeps_its_budget_metrics_and_public_call_seam_after_wall_jump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opening: str, shift: float,
+) -> None:
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+    adapter = FakeModelAdapter(turns=[ModelTurn(final_text="answer")])
+    loop = _loop(tmp_path, adapter, limits=RunLimits(max_duration_s=60))
+    public_calls = []
+    if opening == "sync":
+        loop.open()  # This budget begins outside any running event loop.
+
+    async def run():
+        try:
+            if opening == "async":
+                await loop.aopen()  # Bootstrap executes on the lifecycle thread.
+            assert loop._session is not None
+            runner = loop._session.res.model_runner
+            original = runner.acall
+
+            async def intercepted(*args, **kwargs):
+                public_calls.append(kwargs)
+                return await original(*args, **kwargs)
+
+            runner.acall = intercepted
+            offset[0] = shift
+            turn = await asyncio.wait_for(loop.asubmit("go"), 5)
+            checkpoint = loop.snapshot()
+            return turn, checkpoint
+        finally:
+            if loop._session is not None:
+                await loop.aclose()
+
+    turn, checkpoint = asyncio.run(run())
+    assert turn.status == "completed"
+    assert turn.final_text == "answer"
+    assert len(adapter.requests) == 1
+    assert len(public_calls) == 1
+    assert 0 <= turn.metrics["duration_s"] < 60
+    assert checkpoint is not None
+    assert 0 < checkpoint.remaining_duration_s <= 60
 
 
 def test_arun_once_writes_and_completes(tmp_path: Path) -> None:

@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
+from monoid_agent_kernel.core._deadline import _MonotonicDeadline
 from monoid_agent_kernel.core.invocation import InvocationContext
 from monoid_agent_kernel.core.json_ingress import loads_json_ingress
 from monoid_agent_kernel.core.model_io import ModelCallReceipt
@@ -147,6 +148,7 @@ class ValidatedCallRunner:
         should_abort: ShouldAbort | None = None,
         delta_consumer: AttemptDeltaConsumer | None = None,
     ) -> ValidatedCallResult:
+        call_deadline = _MonotonicDeadline.from_epoch(deadline)
         receipts: list[ModelCallReceipt] = []
         history: list[dict[str, Any]] = []
         try:
@@ -156,6 +158,7 @@ class ValidatedCallRunner:
                 history,
                 context=context,
                 deadline=deadline,
+                call_deadline=call_deadline,
                 should_abort=should_abort,
                 delta_consumer=delta_consumer,
             )
@@ -177,6 +180,7 @@ class ValidatedCallRunner:
         *,
         context: InvocationContext | None,
         deadline: float | None,
+        call_deadline: _MonotonicDeadline,
         should_abort: ShouldAbort | None,
         delta_consumer: AttemptDeltaConsumer | None,
     ) -> ValidatedCallResult:
@@ -191,6 +195,7 @@ class ValidatedCallRunner:
                 current,
                 context=context,
                 deadline=deadline,
+                _deadline=call_deadline,
                 should_abort=should_abort,
                 delta_consumer=_attempt_scoped(delta_consumer, repair_calls),
             )
