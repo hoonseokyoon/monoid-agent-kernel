@@ -208,6 +208,62 @@ def test_p1p2_requester_capture_reuses_the_stream_owners_token() -> None:
     assert [chunk.text for chunk in seen] == ["visible"]
 
 
+@pytest.mark.parametrize("replace_token", [False, True])
+def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token) -> None:
+    captures = []
+
+    async def run():
+        current = [CancellationToken()]
+        entered, accepted, cleanup, release, stopped = (asyncio.Event() for _ in range(5))
+
+        class Adapter:
+            async def anext_turn(self, request):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup.set()
+                    try:
+                        await release.wait()
+                    finally:
+                        stopped.set()
+
+        class Runner(ModelCallRunner):
+            def _check_cancel_or_deadline(self, deadline):
+                try:
+                    super()._check_cancel_or_deadline(deadline)
+                except RunCancelled as exc:
+                    assert exc.interruption_cause is InterruptionCause.USER_CANCEL
+                    accepted.set()
+                    raise
+
+        runner = Runner(
+            adapter=Adapter(), current_cancellation_token=lambda: current[0],
+            cancel_grace_s=0.5, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, deadline=time.time() + 0.08))
+        await asyncio.wait_for(entered.wait(), 1)
+        if replace_token:
+            current[0] = CancellationToken()
+        current[0].cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.wait_for(accepted.wait(), 1)
+        await asyncio.wait_for(cleanup.wait(), 1)
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            release.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        facts, _evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", requested_by="user_cancel", ended_by="stop_request",
+        )
+        assert captures[0].receipt.termination == facts
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("chunk", [TextDelta(42), ReasoningDelta(42), ToolCallDelta(index=-1)])
 def test_p1p2_malformed_fragments_end_at_local_validation(chunk):
     outcome = _drain_call(_DrainStream(chunk), drain_s=0)
