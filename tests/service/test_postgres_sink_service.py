@@ -2100,6 +2100,7 @@ def _assert_runtime_invocation_facts(
     armed = False
     lost_replies = 0
     original_transaction = harness.database.transaction
+    original_commit = harness.sink.commit_invocation
 
     @contextmanager
     def transaction(**kwargs: Any) -> Iterator[Any]:
@@ -2111,16 +2112,21 @@ def _assert_runtime_invocation_facts(
             lost_replies += 1
             raise psycopg.OperationalError("injected settlement response loss after commit")
 
+    def commit_invocation(
+        invocation: DurableModelInvocation, blobs: Mapping[str, bytes], **kwargs: Any,
+    ) -> CommitResult:
+        nonlocal armed
+        # load_invocation also opens a default transaction. Arm only at the actual
+        # settlement write so the sink can reconcile a committed, lost response.
+        armed = not success and invocation.dispatch_state == "settled" and lost_replies == 0
+        return original_commit(invocation, blobs, **kwargs)
+
     class Adapter:
         calls = 0
 
         def next_turn(self, request: ModelRequest) -> ModelTurn:
-            nonlocal armed
             del request
             self.calls += 1
-            # The inline failure has no blob preparation transaction before settlement.
-            # External success exercises ordinary object preparation and association.
-            armed = not success
             if success:
                 return ModelTurn(
                     final_text="stored runtime answer", stop_reason="stop",
@@ -2142,6 +2148,7 @@ def _assert_runtime_invocation_facts(
     request = ModelRequest(instruction="persist runtime facts", system_prompt="service", tools=())
     with monkeypatch.context() as patch:
         patch.setattr(harness.database, "transaction", transaction)
+        patch.setattr(harness.sink, "commit_invocation", commit_invocation)
         call = runner.acall(
             request, context=InvocationContext(run_id=run_id), logical_call_id="facts-call",
         )

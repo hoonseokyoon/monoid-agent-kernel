@@ -693,3 +693,10 @@ PyPI v0.24.0의 별도 설치 reader는 v2를 unsupported_version으로 거부�
 두 코드 리뷰가 같은 mixed-ledger fixture 누락을 지적했다. `_record()`가 새 writer를 따르면서 두 행 모두
 v2가 된 검증 결함이었다. 과거 행을 명시적 v1으로 고정하고 실제 AgentLoop/recorder 재개 시 원래 v1
 bytes를 보존하며 v2를 append하는 회귀까지 보완했다(2 passed/2.46s). 제품 코드는 그대로다.
+
+`6cb2a36`은 두 최종 코드 리뷰 PASS와 L1 `40464755363` SUCCESS였다. combined L2
+`40465167666`의 두 Python 코어 job은 통과했고 실제 서비스는 226 passed/8 failed였다.
+새 PG 회귀의 응답 유실 주입이 settlement 전 `load_invocation()`의 default transaction에서 먼저
+발동했다. 주입을 실제 settled invocation commit 진입에 한정해 저장 완료 후 응답 유실과
+sink의 canonical readback을 검증하도록 고쳤다. 제품 binary와 기존 wheel 근거는 유지한다.
+테스트 delta를 두 리뷰가 재검토하고 새 head의 전체 combined CI를 다시 검증한다.
