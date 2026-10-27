@@ -13,13 +13,16 @@ from support.runtime import runtime_config, tool_binding
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.interruption import InterruptionCause
 from monoid_agent_kernel.core.spec import AgentRunSpec, RunLimits
 from monoid_agent_kernel.core.tool_surface import DefaultToolSurfaceResolver, ToolScope
 from monoid_agent_kernel.errors import (
     AgentConfigError,
     NativeAgentError,
     RunCancelled,
+    RunTimeout,
     ToolExecutionError,
+    TurnNotSettled,
 )
 from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.permissions import PermissionPolicy
@@ -240,6 +243,32 @@ def test_partial_factory_cleanup_is_reverse_and_once(tmp_path: Path, failure: st
     assert loop._session is None and loop._bootstrap_resources is None
     loop.discard_uncommitted()
     assert first.closed == 1 and second.closed == (failure in {"revoke", "invalid_bind"})
+
+
+@pytest.mark.parametrize("duplicate", [True, False])
+def test_factory_return_after_public_discard_disposes_each_adapter_once(
+    tmp_path: Path, duplicate: bool
+) -> None:
+    first, second = Resource(), Resource()
+
+    def open_second(_activation: Any) -> Resource:
+        loop.discard_uncommitted()
+        return first if duplicate else second
+
+    loop = _loop(
+        tmp_path,
+        bindings=(
+            HostToolBinding(HostToolKey("first", accepts=lambda _: True), open=lambda _: first),
+            HostToolBinding(HostToolKey("second", accepts=lambda _: True), open=open_second),
+        ),
+    )
+    with pytest.raises(ToolExecutionError) as caught:
+        loop.open()
+    assert caught.value.error_code == "host_tool_resource_closed"
+    assert first.closed == 1 and second.closed == (not duplicate)
+    assert loop._session is None and loop._host_tool_registry is None
+    loop.discard_uncommitted()
+    assert first.closed == 1 and second.closed == (not duplicate)
 
 
 @pytest.mark.parametrize("stage", ["bind", "accepts", "type", "async_bind", "async_accepts"])
@@ -719,6 +748,66 @@ def test_external_guard_postcheck_and_original_control_survive_cleanup(tmp_path:
     with pytest.raises(RunCancelled) as caught:
         failed.open()
     assert caught.value is primary and other.closed == 1
+
+
+@pytest.mark.parametrize("boundary", ["cancel", "timeout", "model_failure", "host_shutdown"])
+@pytest.mark.parametrize("disposal", ["ok", "error", "revoke"])
+def test_disposer_preserves_recorded_failure_and_existing_unwind_priority(
+    tmp_path: Path, boundary: str, disposal: str
+) -> None:
+    authority = ActivationWriteAuthority()
+    token = CancellationToken()
+
+    def cleanup() -> None:
+        if disposal == "revoke":
+            authority.revoke()
+        elif disposal == "error":
+            raise ValueError("SECRET_CLOSE")
+
+    def handler(_ctx: Any, _args: Any) -> ToolResult:
+        if boundary == "timeout":
+            raise RunTimeout("original timeout")
+        if boundary == "host_shutdown":
+            raise RunCancelled("original shutdown", interruption_cause=InterruptionCause.HOST_SHUTDOWN)
+        return ToolResult(ok=True, content={"ok": True})
+
+    class Model(FakeModelAdapter):
+        def next_turn(self, request: Any) -> ModelTurn:
+            if boundary == "model_failure":
+                raise ValueError("original model failure")
+            return super().next_turn(request)
+
+    resource = Resource(close=cleanup)
+    loop = AgentLoop.from_tools(
+        _spec(tmp_path),
+        Model(turns=[ModelTurn(tool_calls=(fake_tool_call("test_action", {}),))]),
+        [_tool(handler)],
+        cancellation_token=token,
+        write_authority=authority,
+        host_tool_bindings=(
+            HostToolBinding(HostToolKey("client", accepts=lambda _: True), open=lambda _: resource),
+        ),
+    )
+    if boundary == "cancel":
+        token.cancel()
+    if boundary == "host_shutdown":
+        with pytest.raises(TurnNotSettled) as caught:
+            loop.run_once("go")
+        assert caught.value.suspension.interruption_cause is InterruptionCause.HOST_SHUTDOWN
+    elif disposal == "revoke":
+        with pytest.raises(WriteAuthorityRevoked):
+            loop.run_once("go")
+    else:
+        result = loop.run_once("go")
+        expected = {
+            "cancel": ("limited", "cancelled"),
+            "timeout": ("limited", "run_timeout"),
+            "model_failure": ("failed", "model_error"),
+        }[boundary]
+        assert (result.status, result.error_code) == expected
+    assert resource.closed == 1 and loop._session is None and loop._host_tool_registry is None
+    loop.discard_uncommitted()
+    assert resource.closed == 1
 
 
 @pytest.mark.parametrize("stage", ["open", "close"])
