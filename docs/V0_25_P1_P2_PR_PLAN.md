@@ -630,3 +630,12 @@ required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함
 확장 검증 604개에서 새 recovery carrier의 config_recoverable census 등록 누락과 기존 30ms backoff의
 Windows 타이밍 하한 assertion이 한 번 실패했다(602 passed). 등록을 보완했고 같은 timing case를 포함한
 census 196개는 통과했다(10.23s). retry 대기 코드는 변경하지 않았다. 최종 원격 CI로 전체 계약을 확인한다.
+
+`b8f2bd3` 설치 wheel은 current/minimum 각각 153 tests PASS였다. 재검토에서 변경된 모델 설정도
+과거 사용량에 귀속되는 반례를 확인했다. journal에는 과거 ModelConfig가 없으므로 targeted preflight로
+정책을 확정했다(READY). query digest가 다른 required-evidence 실패는 예외·journal의 검증된 사용량과
+facts를 유지하고, 재구성한 subscription/ledger receipt 게시를 생략한다. 현재 routing으로 열린 stream은
+failed/evidence_uncommitted로 정상 close하며 text·usage·termination·evidence를 비워 둔다. 같은 query의
+복구 게시와 기존 회계 증분은 유지한다. 새 placeholder 모델이나 wire 형식은 추가하지 않는다.
+실제 host의 모델·provider·destination 변경 회귀는 수정 전 실패했고, 동일/변경 요청 5개는 수정 후
+통과했다(2.55s; `p1p2-02-recovery-attribution-{red,green}.txt`). 기존 content-only 억제를 이 정책으로 대체한다.

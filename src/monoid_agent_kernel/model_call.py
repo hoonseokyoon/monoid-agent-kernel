@@ -1186,10 +1186,12 @@ class ModelCallRunner:
                         )
                         if checked_receipt is not None and checked_receipt.request_digest != receipt.request_digest:
                             # Required evidence can fail before recovery checks request identity.
-                            # The current prompt cannot be attributed to that historical call.
+                            # The journal has no historical model/routing configuration. Retain
+                            # its checked facts on the exception for accounting, but do not
+                            # publish a receipt reconstructed from the current request.
                             recovery_request = None
                             request_preimage = None
-                            checked_receipt = replace(checked_receipt, prompt_digest="")
+                            recovery_error._checked_recovery_request_mismatch = True
                         if isinstance(recovery_error, ModelEvidenceUncommitted):
                             durable_outcome_receipt = checked_receipt
                         else:
@@ -1599,22 +1601,24 @@ class ModelCallRunner:
                             durable_outcome_receipt.usage_evidence,
                         )
                         mark_provider_usage(exc, durable_outcome_receipt.usage)
+                        if recovery_request is not None:
+                            self._publish_best_effort(
+                                recovery_request,
+                                None,
+                                durable_outcome_receipt,
+                                elapsed_ms=durable_outcome_receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
+                    raise
+                if recovered_failure_receipt is not None:
+                    if recovery_request is not None:
                         self._publish_best_effort(
                             recovery_request,
                             None,
-                            durable_outcome_receipt,
-                            elapsed_ms=durable_outcome_receipt.latency_ms,
+                            recovered_failure_receipt,
+                            elapsed_ms=recovered_failure_receipt.latency_ms,
                             request_preimage=request_preimage,
                         )
-                    raise
-                if recovered_failure_receipt is not None:
-                    self._publish_best_effort(
-                        recovery_request,
-                        None,
-                        recovered_failure_receipt,
-                        elapsed_ms=recovered_failure_receipt.latency_ms,
-                        request_preimage=request_preimage,
-                    )
                     if recovered_failure_receipt.usage:
                         mark_provider_usage(exc, recovered_failure_receipt.usage)
                     mark_call_facts(
@@ -1858,7 +1862,7 @@ class ModelCallRunner:
 
     def _publish(
         self,
-        request: ModelRequest | None,
+        request: ModelRequest,
         turn: ModelTurn | None,
         receipt: ModelCallReceipt,
         *,
@@ -1885,7 +1889,7 @@ class ModelCallRunner:
         try:
             self._assert_write_authority()
             if self.subscriptions:
-                content = _call_content(request, turn) if request is not None else {}
+                content = _call_content(request, turn)
                 self._assert_write_authority()
                 settled = dispatch_model_call(
                     receipt=timed,
@@ -1901,7 +1905,7 @@ class ModelCallRunner:
 
     def _publish_best_effort(
         self,
-        request: ModelRequest | None,
+        request: ModelRequest,
         turn: ModelTurn | None,
         receipt: ModelCallReceipt,
         *,

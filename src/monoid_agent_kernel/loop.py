@@ -3192,6 +3192,7 @@ class AgentLoop:
         outcome_termination = None
         outcome_evidence = None
         escaped: BaseException | None = None
+        recovery_identity_mismatch = False
         try:
             turn, receipt = await runner.acall(
                 request,
@@ -3246,9 +3247,16 @@ class AgentLoop:
             raise
         except ModelEvidenceUncommitted as exc:
             escaped = exc
+            recovery_identity_mismatch = getattr(exc, "_checked_recovery_request_mismatch", False) is True
             settled_stream = _settled_model_stream_outcome(exc)
             recovered_termination, _ = call_facts_of(exc)
-            if settled_stream is None and recovered_termination is not None:
+            if recovery_identity_mismatch:
+                # This observer opened under the current routing. Historical facts remain
+                # on the exception for accounting and cannot be attributed to that routing.
+                outcome_status = "failed"
+                outcome_error_code = exc.error_code
+                outcome_retryable = exc.retryable is True
+            elif settled_stream is None and recovered_termination is not None:
                 outcome_status = recovered_termination.outcome
                 if outcome_status != "completed":
                     outcome_error_code = exc.error_code
@@ -3305,7 +3313,7 @@ class AgentLoop:
             outcome_termination = receipt.termination
             outcome_evidence = receipt.usage_evidence
         finally:
-            if escaped is not None:
+            if escaped is not None and not recovery_identity_mismatch:
                 outcome_termination, outcome_evidence = call_facts_of(escaped)
                 if outcome_usage is None and outcome_status != "completed":
                     outcome_usage = provider_usage_of(escaped) or None

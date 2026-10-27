@@ -2562,7 +2562,7 @@ def test_changed_request_is_blocked_before_provider_reentry(tmp_path: Path) -> N
     assert len(adapter.requests) == 1
 
 
-@pytest.mark.parametrize("fault", ["integrity", "evidence_success", "evidence_refusal", "evidence_changed_request"])
+@pytest.mark.parametrize("fault", ["integrity", "evidence_success", "evidence_refusal", "evidence_changed_request", "evidence_changed_model"])
 def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path, fault, monkeypatch) -> None:
     from support.fenced_hosting import _record_digest
     from support.model_facts import facts
@@ -2572,6 +2572,7 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
     projection_only = fault != "integrity"
     refusal = fault == "evidence_refusal"
     changed_request = fault == "evidence_changed_request"
+    changed_model = fault == "evidence_changed_model"
     recorded = []
     original_record = ModelCallRunner._record
 
@@ -2631,6 +2632,7 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
         adapter,
         baseline,
         user_input="different new input" if changed_request else "hello",
+        model=ModelConfig(provider="openai", model="replacement-model", gateway_url="https://replacement.invalid") if changed_model else None,
         sink=_RejectModelEvidence(harness.sink) if projection_only else _TamperInvocationResultLoad(harness.sink),
         model_evidence_policy="required" if projection_only else "passive",
         model_stream_observer_factories=(Observer,),
@@ -2642,13 +2644,24 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
     assert suspension.error_code == ("evidence_uncommitted" if projection_only else "durable_invocation_result_corrupt")
     assert checkpoint is not None and checkpoint.total_usage == turn.usage
     assert len(adapter.requests) == 1
+    assert len(outcomes) == 1
+    assert harness.sink._invocations[coord][0] == _record_digest(payload)
+    if changed_request or changed_model:
+        # Current routing cannot describe the historical call. The close still
+        # reports the evidence barrier while accounting retains the checked bill.
+        assert outcomes[0].status == "failed"
+        assert outcomes[0].error_code == "evidence_uncommitted"
+        assert outcomes[0].final_text is None and outcomes[0].usage is None
+        assert outcomes[0].termination is None and outcomes[0].usage_evidence is None
+        assert captures == []
+        assert recorded == []
+        return
     assert outcomes[0].status == ("completed" if projection_only and not refusal else "failed")
     assert outcomes[0].error_code == ("evidence_uncommitted" if refusal else None if projection_only else "durable_invocation_result_corrupt")
     assert outcomes[0].usage == (None if projection_only and not refusal else turn.usage)
     assert outcomes[0].final_text is None
     assert outcomes[0].termination.ended_by == ("provider_error" if refusal else "provider_terminal" if projection_only else "local_failure")
     assert outcomes[0].usage_evidence.to_json() == payload["receipt"]["usage_evidence"]
-    assert harness.sink._invocations[coord][0] == _record_digest(payload)
     assert len(captures) == 1
     receipt = captures[0].receipt
     assert receipt.usage == turn.usage and receipt.attempts == 1
@@ -2657,12 +2670,7 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
     assert receipt.idempotency_key == payload["idempotency_key"]
     assert receipt.request_digest == payload["request_digest"]
     assert receipt.error_code == ("rate_limited" if refusal else "" if projection_only else "durable_invocation_result_corrupt")
-    if changed_request:
-        assert captures[0].content == {}
-        assert receipt.prompt_digest == ""
-        assert recorded[-1][1] is None
-    else:
-        assert recorded[-1][1] is not None
+    assert recorded[-1][1] is not None
 
 
 def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> None:
