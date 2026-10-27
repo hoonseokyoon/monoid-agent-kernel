@@ -865,3 +865,16 @@ non-merge commit의 반복 수정을 포함한 runtime·UI 변경량은 이번 8
 기존 관찰 callback과 frozen observer를 재사용해 단발·stream·backoff를 함께 처리했다. 승인된 보장을
 완성하는 이 경계를 유지한다. 모든 파일의 누적 변경은 이 기록 직전 5,859줄로 최초 총 6,580줄 추정 안이다.
 최종 wheel과 필수 CI는 이 source에서 갱신하고, 정확한 head·결과·merge SHA를 통합 PR과 memory에 기록한다.
+
+`8a2f923` 설치 wheel은 current/minimum 각각 **453 passed / 4 Windows skip**(10.54/11.38s),
+공개 예제·audit을 통과했다. 두 독립 리뷰에서 추가 token accessor 호출이 기존 positive drain을 중단하는
+P2와, 기존 live boundary가 수락한 교체 token의 요청자가 cleanup의 caller 취소로 바뀌는 P2를 확인했다.
+실제 runner 비교에서 앞선 후보의 drain usage 5가 빈 usage로 바뀌었고, 두 번째 문제는 실제
+RunCancelled 수락 → provider cleanup → caller 취소 순서로 재현했다.
+
+실패 회귀를 `87b61c7`(1 failed/8.13s), `10c5805`(1 failed/1 passed/9.25s)로 먼저 고정했다.
+독립 구조 검토 READY에 따라 stream owner가 이미 확보한 token을 공유하고, 기존 boundary가 실제로
+던진 RunCancelled의 요청자를 cleanup 전에 보존한다. 같은 예외를 다시 던지며 기존 wake·grace·회수 순서는
+유지한다. 공통 private helper를 `_aawait`·`_abackoff`에서 재사용한다. 관련 순서·accessor 회귀는
+**27 passed / 7.55s**, lint/diff check PASS다(`p1p2-i-final-owner-green.txt`).
+runtime·UI 누적 수정은 2,109줄, 전체는 이 기록 직전 6,004줄이다. 최종 두 targeted 리뷰·설치 wheel·CI를 갱신한다.

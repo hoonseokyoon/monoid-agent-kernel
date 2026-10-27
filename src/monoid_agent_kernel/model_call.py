@@ -269,6 +269,26 @@ def _caller_cancellation_observer(
     return observe
 
 
+def _model_wait_handlers(
+    check_boundary: Callable[[float | None], None],
+    first_requester: Callable[[], str | None],
+) -> tuple[Callable[[float | None], None], Callable[[asyncio.CancelledError], None]]:
+    accepted_requester: str | None = None
+
+    def check(deadline: float | None) -> None:
+        nonlocal accepted_requester
+        try:
+            check_boundary(deadline)
+        except RunCancelled as exc:
+            # A live boundary may accept a different token from the one that wakes this wait.
+            # Keep that accepted fact before cleanup can replace the exception with caller cancel.
+            if accepted_requester is None:
+                accepted_requester = first_requester() or _termination_for(exc).requested_by
+            raise
+
+    return check, _caller_cancellation_observer(lambda: accepted_requester or first_requester())
+
+
 def _settled_model_stream_outcome(
     error: ModelEvidenceUncommitted,
 ) -> ModelStreamOutcome | None:
@@ -2169,7 +2189,7 @@ class ModelCallRunner:
                         (drain is None or not drain.started)
                         and abort_requested()
                     ):
-                        accepted_stream_requester = _token_requester(self._token()) or "turn_interrupt"
+                        accepted_stream_requester = _token_requester(run_token) or "turn_interrupt"
                         deliver_remainder()
                         if drain is not None:
                             # A no-op when a user cancel landed while `should_abort` was answering
@@ -2234,10 +2254,14 @@ class ModelCallRunner:
         if drain is not None:
             self._open_drain_budgets.append(budget_s)
         try:
+            run_token = self._token()
             if drain is None:
-                return await self._aawait(consume(), deadline, first_requester=accepted_requester)
+                return await self._aawait(
+                    consume(), deadline, boundary=(run_token, self._check_cancel_or_deadline),
+                    first_requester=accepted_requester,
+                )
             return await self._await_draining_stream(
-                consume, drain, deadline, settle_cancelled_remainder, accepted_requester
+                consume, drain, deadline, settle_cancelled_remainder, accepted_requester, run_token,
             )
         except BaseException as exc:
             # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
@@ -2276,6 +2300,7 @@ class ModelCallRunner:
         deadline: float | None,
         settle_cancelled_remainder: Callable[[], None],
         first_requester: Callable[[], str | None],
+        run_token: CancellationToken | None,
     ) -> ModelTurn:
         """Race one stream task in two phases: streaming, then -- after a stop -- draining.
 
@@ -2290,7 +2315,6 @@ class ModelCallRunner:
         cannot tell these phases apart and does not need to.
         """
 
-        run_token = self._token()
         authority = None if self.current_write_authority is None else self.current_write_authority()
         # What each phase's race observes: every run cancel except one the drain absorbed. Lease
         # loss is forwarded here too, because a cancel that became the drain already spent the
@@ -2538,13 +2562,16 @@ class ModelCallRunner:
             self._check_cancel_or_deadline(deadline)
             return
         token = self._token()
+        check_boundary, on_caller_cancelled = _model_wait_handlers(
+            self._check_cancel_or_deadline, lambda: _token_requester(token),
+        )
         await await_abandonable_call(
             asyncio.sleep(delay_s),
             deadline=deadline,
             token=token,
             grace_s=0.0,
-            check_boundary=self._check_cancel_or_deadline,
-            on_caller_cancelled=_caller_cancellation_observer(lambda: _token_requester(token)),
+            check_boundary=check_boundary,
+            on_caller_cancelled=on_caller_cancelled,
         )
 
     async def _aawait(
@@ -2594,8 +2621,10 @@ class ModelCallRunner:
         # exits of this function carry it, and
         # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
         token: CancellationToken | None = None
+        check_boundary = self._check_cancel_or_deadline if boundary is None else boundary[1]
         if on_caller_cancelled is None:
-            on_caller_cancelled = _caller_cancellation_observer(
+            check_boundary, on_caller_cancelled = _model_wait_handlers(
+                check_boundary,
                 lambda: (first_requester() if first_requester is not None else None) or _token_requester(token),
             )
         try:
@@ -2618,9 +2647,7 @@ class ModelCallRunner:
                 deadline=deadline,
                 token=token,
                 grace_s=grace_s,
-                check_boundary=(
-                    self._check_cancel_or_deadline if boundary is None else boundary[1]
-                ),
+                check_boundary=check_boundary,
                 on_discarded=_discard_hook(adapter, request),
                 on_caller_cancelled=on_caller_cancelled,
             )
