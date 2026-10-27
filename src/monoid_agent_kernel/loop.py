@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import sys
+from monoid_agent_kernel.core.model_facts import call_facts_of, mark_call_facts
 import threading
 import time
 import uuid
@@ -3188,6 +3189,8 @@ class AgentLoop:
         outcome_error_code: str | None = None
         outcome_retryable = False
         outcome_config_recoverable = False
+        outcome_termination = None
+        outcome_evidence = None
         try:
             turn, receipt = await runner.acall(
                 request,
@@ -3286,7 +3289,14 @@ class AgentLoop:
             outcome_status = "completed"
             outcome_final_text = turn.final_text
             outcome_usage = turn.usage
+            outcome_termination = receipt.termination
+            outcome_evidence = receipt.usage_evidence
         finally:
+            escaped = sys.exception()
+            if escaped is not None:
+                outcome_termination, outcome_evidence = call_facts_of(escaped)
+                if outcome_usage is None:
+                    outcome_usage = provider_usage_of(escaped) or None
             lifecycle = runner.lifecycle_hook
             if session is not None and lifecycle is not None:
                 latest_invocation = getattr(lifecycle, "last_invocation", None)
@@ -3302,6 +3312,8 @@ class AgentLoop:
                         error_code=outcome_error_code,
                         retryable=outcome_retryable,
                         config_recoverable=outcome_config_recoverable,
+                        termination=outcome_termination,
+                        usage_evidence=outcome_evidence,
                     )
                 except Exception:
                     # Outcome capture is diagnostic too. Preserve the terminal status even if a
@@ -7354,6 +7366,7 @@ def _carrying_stamps(replacement: BaseException, original: BaseException) -> Bas
 
     probe = ModelCallReceipt().with_error(original)
     mark_provider_usage(replacement, probe.usage)
+    mark_call_facts(replacement, *call_facts_of(original))
     if probe.provider_retried:
         mark_provider_retried(replacement)
     return replacement

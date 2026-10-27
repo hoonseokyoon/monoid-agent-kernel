@@ -445,6 +445,40 @@ adapter still counts as 1: the kernel did begin the call there. Under the kernel
 layer each re-dispatch adds one, so N means N adapter calls for one logical request. A payload that omits the field reads
 as 1, which is what older records mean.
 
+`ModelCallReceipt.termination` separates the logical outcome, the first accepted stop request
+(`requested_by`), and the actual end of reading (`ended_by`). A cancelled call that drains to a
+valid terminal and EOF has `cancelled / user_cancel / provider_terminal`; a deadline ending that
+drain changes `ended_by` to `deadline`. A terminal received before a later read error remains
+`provider_error`. An elapsed deadline has no requester; an accepted deadline token names `deadline`.
+Provider self-cancellation is `provider_cancelled`; caller task cancellation names `caller_cancel`.
+Authority loss continues to block observer and durable publication by the stale owner.
+
+`UsageObservation` carries explicitly reported canonical counters, including zero, plus source
+and collection. An adapter can append it as `ModelTurn.usage_evidence` or
+`TurnComplete.usage_evidence`, with `source="adapter"`. First-party raw ingress records
+`source="provider"`. A custom adapter or old gateway without this metadata is `legacy_ambiguous`;
+its numeric usage continues to count. New observations must agree with the numeric projection.
+The built-in normalizer's supported input/output/total/cache/reasoning/audio fields retain their
+existing aliases; the larger durable counter vocabulary can remain unknown for a given adapter.
+
+`ModelCallReceipt.usage_evidence` covers every kernel dispatch, including recovered history.
+Its `reported` contains known sums; `completeness` is counter-specific: `no_dispatch`, `complete`,
+`partial`, or `unknown`. A repeated snapshot replaces the prior snapshot within one dispatch.
+An explicit zero can replace a positive count; a usage-less terminal preserves the last report.
+Only distinct dispatch contributions are added. SDK-internal HTTP retries are outside this
+coverage guarantee. The numeric `usage` remains the accounting input.
+
+OpenAI captures usage before response/client cleanup while preserving cleanup-before-terminal
+delivery. A bounded dispatch collector carries already-received reports through cancellation.
+Collection records the original receipt phase (`normal` or `drain`), including a terminal
+delivered later. Escaping runner exceptions carry `model_call_termination` and
+`model_usage_evidence`; existing numeric `provider_usage` stamps continue to serve accounting.
+`ValidatedCallRunner.receipts` contains completed calls; the failed call keeps its own exception facts.
+
+See the offline [subscription example](../examples/model_call_facts.py). In the P1P2-02 preparation
+stage, invocation/model-calls writers remain v1 and omit these facts. P1P2-03 activates v2 writers;
+P1P2-04 completes gateway-server, live/Studio and OTel projections.
+
 `ModelCallReceipt.attempt_log` itemizes what `attempts` counts: per dispatch, the index, the
 elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
 the adapter's loop reported *during that dispatch* (the receipt's `provider_retried` stays the
@@ -806,7 +840,9 @@ recovery correctness.
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
 This keeps token-boundary interruption responsive while durable events remain compact. With
 `async_model_abort_drain_s` set, an interrupted stream is drained for its usage before the turn
-parks; the observer outcome stays `interrupted` with no usage (see the stopped-stream drain above).
+parks; the observer outcome stays `interrupted` and carries the recovered usage and call facts.
+Successful stream `usage` describes the final provider turn, while failure `usage` describes the
+logical call. `usage_evidence` always covers the logical call, including prior retries.
 `emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
 `model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
 execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes

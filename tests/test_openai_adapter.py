@@ -87,6 +87,54 @@ def test_p1p2_openai_terminal_before_hung_eof_keeps_usage_on_deadline(
     assert captures[-1].receipt.usage_evidence.reported == _BILLED_RESPONSE_USAGE
 
 
+def test_p1p2_delayed_openai_terminal_retains_its_original_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.errors import RunCancelled
+    from monoid_agent_kernel.model_call import ModelCallRunner
+
+    token = CancellationToken()
+
+    class CancelAfterTerminal(_FakeAsyncStream):
+        async def __anext__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                token.cancel()
+                await asyncio.sleep(0.01)
+                raise StopAsyncIteration from None
+
+    _stub_async_openai(monkeypatch, CancelAfterTerminal([_terminal_event()]))
+    captures = []
+    runner = ModelCallRunner(
+        adapter=_adapter(), current_cancellation_token=lambda: token,
+        abort_drain_s=1, settled_sink=captures.append,
+    )
+    with pytest.raises(RunCancelled):
+        asyncio.run(runner.acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()),
+            delta_consumer=lambda chunk: None,
+        ))
+    receipt = captures[-1].receipt
+    assert receipt.termination.ended_by == "provider_terminal"
+    assert receipt.usage_evidence.attempts[0].observation.collection == "normal"
+
+
+def test_p1p2_closed_dispatch_collector_rejects_late_worker_reports() -> None:
+    from contextvars import copy_context
+    from monoid_agent_kernel.providers._usage import collect_usage_reports, provider_snapshot
+
+    with collect_usage_reports() as original:
+        provider_snapshot({"input_tokens": 5})
+        worker_context = copy_context()
+    with collect_usage_reports() as following:
+        provider_snapshot({"input_tokens": 0})
+        worker_context.run(provider_snapshot, {"input_tokens": 99})
+    assert original.snapshot[0]["input_tokens"] == 5
+    assert following.snapshot[0]["input_tokens"] == 0
+
+
 class _FakeApiError(Exception):
     """Mimics an OpenAI SDK exception: optional status_code, optional body dict."""
 

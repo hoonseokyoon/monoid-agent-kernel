@@ -6,7 +6,7 @@ import inspect
 import json
 import os
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -20,10 +20,10 @@ from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import (
     build_generation_payload,
     build_reasoning_payload,
-    normalize_usage,
     reasoning_replay_window_start,
-    usage_reported_by,
 )
+from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end, read_end_of
+from monoid_agent_kernel.providers._usage import provider_snapshot, mark_usage_observation
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelStreamChunk,
@@ -368,6 +368,7 @@ class OpenAIModelAdapter:
         # reached a body, which :func:`usage_reported_by` reads as "nothing reported".
         response: Any = None
         data: dict[str, Any] | None = None
+        observed: UsageObservation | None = None
         try:
             payload = self._classified_payload(request)
             client, call_owned = self._sync_client(OpenAI, key)
@@ -420,6 +421,7 @@ class OpenAIModelAdapter:
                         if hasattr(response, "model_dump")
                         else _coerce_response(response)
                     )
+                    _, observed = provider_snapshot(data.get("usage"), lenient=True)
                 except ModelAdapterError:
                     # ``_coerce_response`` keeps its own voice; the outer completion arm
                     # backfills the code and the cost onto it exactly as before.
@@ -449,7 +451,8 @@ class OpenAIModelAdapter:
             # that DO name themselves (``_classified_payload``'s ``unserializable_request``, the
             # by-reference ``unsupported_request_shape``) pass through untouched.
             _complete_billed_refusal(
-                refused, _readable_payload(data, response), provider_retried=retried
+                refused, _readable_payload(data, response), provider_retried=retried,
+                observed=observed,
             )
             raise
         except Exception as exc:
@@ -468,7 +471,7 @@ class OpenAIModelAdapter:
             # ledger behind it. The classification is untouched: a dropped connection is honestly
             # retryable, and only the lost cost was the defect.
             failed = _model_error_from_openai(exc, known_provider_retried=retried)
-            mark_provider_usage(failed, usage_reported_by(_readable_payload(data, response)))
+            _stamp_openai_usage(failed, _readable_payload(data, response), observed=observed)
             raise failed from exc
         return _parse_response(data, provider_retried=retried)
 
@@ -493,6 +496,7 @@ class OpenAIModelAdapter:
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}
+        observed: UsageObservation | None = None
         # Whether a terminal response was CAPTURED, asked as a fact about the stream rather than
         # about the contents of ``final_data``: a terminal payload that happens to be empty is
         # still a stream that ended properly, and the two questions must not be conflated. The
@@ -627,6 +631,7 @@ class OpenAIModelAdapter:
                                 else _coerce_response(response)
                             )
                             saw_terminal_response = True
+                            _, observed = provider_snapshot(final_data.get("usage"), lenient=True)
 
                 # A body that simply STOPS is not a settled turn. Without this, a stream that
                 # ended by clean EOF with no ``response.completed``/``response.incomplete`` left
@@ -641,12 +646,14 @@ class OpenAIModelAdapter:
                 # ``GeneratorExit`` at a yield above and never arrives here, which is right --
                 # that call has an outcome of its own.
                 if not saw_terminal_response:
-                    raise ModelAdapterError(
+                    incomplete = ModelAdapterError(
                         "OpenAI stream ended without a terminal response",
                         provider_error_code="openai_bad_response",
                         retryable=False,
                         provider_retried=provider_retried,
                     )
+                    mark_read_end(incomplete, "provider_eof")
+                    raise incomplete
             finally:
                 # The response is released per call, whether or not this call owns the client.
                 # Leaving an `async for` does not close the iterator it drove, and closing the
@@ -668,7 +675,9 @@ class OpenAIModelAdapter:
             # source when the terminal frame already arrived -- the reachable billed case, since
             # a stream can go on emitting frames after ``response.completed`` -- and reads as
             # nothing when it did not, because mid-stream usage is genuinely unknowable.
-            _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
+            _complete_billed_refusal(
+                refused, final_data, provider_retried=provider_retried, observed=observed,
+            )
             raise
         except Exception as exc:
             # The raw arm of the same ``try``, and it reads the same cost source. A stream can
@@ -683,7 +692,7 @@ class OpenAIModelAdapter:
             # terminal frame reads as nothing, because mid-stream usage is genuinely unknowable.
             # Retryability is untouched -- waiting really is the remedy for a dropped socket.
             dropped = _model_error_from_openai(exc, known_provider_retried=provider_retried)
-            mark_provider_usage(dropped, usage_reported_by(final_data))
+            _stamp_openai_usage(dropped, final_data, observed=observed)
             raise dropped from exc
 
         # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
@@ -692,7 +701,7 @@ class OpenAIModelAdapter:
         # it keeps the reference. The build is a named seam so its refusals carry their cost the
         # way the one-shot reader's do; the ``yield`` stays out of it, so a consumer throwing into
         # this generator is not mistaken for the payload being refused.
-        yield _terminal_chunk(final_data, provider_retried=provider_retried)
+        yield _terminal_chunk(final_data, provider_retried=provider_retried, observed=observed)
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
         """Build the request body **and prove it serializes**, naming a failure what it is.
@@ -1234,8 +1243,18 @@ def _stop_reason_from_response(data: dict[str, Any], *, tool_calls_present: bool
     return "stop"
 
 
+def _stamp_openai_usage(
+    error: BaseException, payload: Any, *, observed: UsageObservation | None = None,
+) -> None:
+    raw = payload.get("usage") if isinstance(payload, Mapping) else None
+    usage, observation = provider_snapshot(raw, lenient=True, observed=observed)
+    mark_provider_usage(error, usage)
+    mark_usage_observation(error, observation)
+
+
 def _complete_billed_refusal(
-    refused: ModelAdapterError, payload: Any, *, provider_retried: bool
+    refused: ModelAdapterError, payload: Any, *, provider_retried: bool,
+    observed: UsageObservation | None = None,
 ) -> None:
     """Finish classifying a refusal that was already minted, and stamp what it cost.
 
@@ -1279,7 +1298,9 @@ def _complete_billed_refusal(
     mark_provider_error_code(refused, "openai_bad_response")
     if provider_retried:
         mark_provider_retried(refused)
-    mark_provider_usage(refused, usage_reported_by(payload))
+    _stamp_openai_usage(refused, payload, observed=observed)
+    if read_end_of(refused) is None:
+        mark_read_end(refused, "local_failure")
 
 
 def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> ModelTurn:
@@ -1318,6 +1339,7 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
         return _response_to_turn(data, provider_retried=provider_retried)
     except ModelAdapterError as refused:
         _complete_billed_refusal(refused, data, provider_retried=provider_retried)
+        mark_read_end(refused, "local_failure")
         raise
     except Exception as raw:
         refused = ModelAdapterError(
@@ -1326,7 +1348,8 @@ def _parse_response(data: dict[str, Any], *, provider_retried: bool = False) -> 
             retryable=False,
             provider_retried=provider_retried,
         )
-        mark_provider_usage(refused, usage_reported_by(data))
+        _stamp_openai_usage(refused, data)
+        mark_read_end(refused, "local_failure")
         raise refused from raw
 
 
@@ -1395,12 +1418,13 @@ def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelT
         elif item_type in {"output_text", "text"}:
             text_parts.append(_provider_string(item.get("text"), "output text") or "")
 
-    usage_out = normalize_usage(data.get("usage"), legacy_aliases=True)
+    usage_out, observation = provider_snapshot(data.get("usage"))
     return ModelTurn(
         response_id=_provider_string(data.get("id"), "response id"),
         final_text="".join(text_parts).strip() or None,
         tool_calls=tuple(tool_calls),
         usage=usage_out,
+        usage_evidence=observation,
         raw=data,
         reasoning=_capture_reasoning_items(output),
         stop_reason=_stop_reason_from_response(data, tool_calls_present=bool(tool_calls)),
@@ -1408,7 +1432,10 @@ def _response_to_turn(data: dict[str, Any], *, provider_retried: bool) -> ModelT
     )
 
 
-def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> TurnComplete:
+def _terminal_chunk(
+    final_data: dict[str, Any], *, provider_retried: bool,
+    observed: UsageObservation | None = None,
+) -> TurnComplete:
     """The streamed twin of :func:`_parse_response`: end-of-turn metadata, and its cost.
 
     The stream never runs the one-shot mapping -- it folds deltas as they arrive and reads the
@@ -1439,6 +1466,7 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
     """
 
     try:
+        usage, observation = provider_snapshot(final_data.get("usage"), observed=observed)
         output_items = final_data.get("output") or []
         has_tool_calls = any(item.get("type") == "function_call" for item in output_items)
         # Normalized INSIDE the guard, deliberately: ``TurnComplete`` itself validates nothing,
@@ -1450,7 +1478,8 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
         return normalize_model_stream_chunk(
             TurnComplete(
                 response_id=final_data.get("id"),
-                usage=normalize_usage(final_data.get("usage"), legacy_aliases=True),
+                usage=usage,
+                usage_evidence=observation,
                 # encrypted_content lives only on the final response object, so reasoning items
                 # are captured here (from response.completed) rather than the per-token deltas.
                 reasoning=_capture_reasoning_items(output_items),
@@ -1461,7 +1490,10 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
             )
         )
     except ModelAdapterError as refused:
-        _complete_billed_refusal(refused, final_data, provider_retried=provider_retried)
+        _complete_billed_refusal(
+            refused, final_data, provider_retried=provider_retried, observed=observed,
+        )
+        mark_read_end(refused, "local_failure")
         raise
     except Exception as raw:
         refused = ModelAdapterError(
@@ -1470,7 +1502,8 @@ def _terminal_chunk(final_data: dict[str, Any], *, provider_retried: bool) -> Tu
             retryable=False,
             provider_retried=provider_retried,
         )
-        mark_provider_usage(refused, usage_reported_by(final_data))
+        _stamp_openai_usage(refused, final_data, observed=observed)
+        mark_read_end(refused, "local_failure")
         raise refused from raw
 
 

@@ -231,3 +231,42 @@ class UsageEvidence:
         ):
             raise ValueError("usage_evidence aggregate must equal its observations")
         return value
+
+
+def mark_call_facts(
+    error: BaseException, termination: ModelCallTermination | None, evidence: UsageEvidence | None,
+) -> None:
+    """Carry the already-settled logical-call facts through exception translation."""
+    try:
+        error.model_call_termination = termination  # type: ignore[attr-defined]
+        error.model_usage_evidence = evidence  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def call_facts_of(error: BaseException) -> tuple[ModelCallTermination | None, UsageEvidence | None]:
+    try:
+        termination = getattr(error, "model_call_termination", None)
+        evidence = getattr(error, "model_usage_evidence", None)
+        return (
+            termination if isinstance(termination, ModelCallTermination) else None,
+            evidence if isinstance(evidence, UsageEvidence) else None,
+        )
+    except Exception:
+        return None, None
+
+
+def mark_read_end(value: Any, ended_by: ReadEnd) -> None:
+    """The provider/read owner records its known end before an error is translated."""
+    try:
+        object.__setattr__(value, "_model_read_end", ended_by)
+    except Exception:
+        pass
+
+
+def read_end_of(value: Any) -> ReadEnd | None:
+    try:
+        ended_by = getattr(value, "_model_read_end", None)
+        return ended_by if ended_by in get_args(ReadEnd) else None
+    except Exception:
+        return None

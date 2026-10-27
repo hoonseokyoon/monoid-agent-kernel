@@ -42,6 +42,9 @@ from monoid_agent_kernel.providers.base import (
     normalize_model_turn,
     unportable_usage_key,
 )
+from monoid_agent_kernel.core.model_facts import (
+    ModelCallTermination, UsageEvidence, mark_read_end, read_end_of, mark_call_facts,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -276,6 +279,8 @@ def raise_model_dispatch_unknown(
     *,
     failure_code: str = "dispatch_unknown",
     usage: Mapping[str, int] | None = None,
+    termination: ModelCallTermination | None = None,
+    usage_evidence: UsageEvidence | None = None,
 ) -> NoReturn:
     """Commit ambiguity when possible and always stop automatic paid-call retry."""
 
@@ -294,6 +299,9 @@ def raise_model_dispatch_unknown(
         )
         if usage:
             mark_provider_usage(failed, usage)
+        if read_end_of(cause) is not None:
+            mark_read_end(failed, read_end_of(cause))
+        mark_call_facts(failed, _unknown_termination(termination), usage_evidence)
         raise failed from persistence_error
     failed = DurableModelCallError(
         "model dispatch is unknown; automatic paid-call retry is forbidden",
@@ -301,7 +309,18 @@ def raise_model_dispatch_unknown(
     )
     if usage:
         mark_provider_usage(failed, usage)
+    if read_end_of(cause) is not None:
+        mark_read_end(failed, read_end_of(cause))
+    mark_call_facts(failed, _unknown_termination(termination), usage_evidence)
     raise failed from cause
+
+
+def _unknown_termination(termination: ModelCallTermination | None) -> ModelCallTermination | None:
+    if termination is None:
+        return None
+    return ModelCallTermination(
+        outcome="failed", requested_by=termination.requested_by, ended_by=termination.ended_by,
+    )
 
 
 def settle_model_dispatch(
@@ -328,9 +347,11 @@ def settle_model_dispatch(
                 failure_code=safe_failure,
             )
         )
-    except ModelEvidenceUncommitted:
+    except ModelEvidenceUncommitted as evidence_error:
         # The invocation is already authoritative. Reclassifying a projection failure as an
         # ambiguous paid dispatch would both lose that fact and invite the wrong recovery path.
+        mark_call_facts(evidence_error, receipt.termination, receipt.usage_evidence)
+        mark_provider_usage(evidence_error, receipt.usage)
         raise
     except Exception as persistence_error:
         raise_model_dispatch_unknown(
@@ -339,6 +360,8 @@ def settle_model_dispatch(
             persistence_error,
             failure_code="settlement_uncommitted",
             usage=receipt.usage,
+            termination=receipt.termination,
+            usage_evidence=receipt.usage_evidence,
         )
 
 

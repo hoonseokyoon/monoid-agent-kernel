@@ -334,6 +334,7 @@ def _loop(
     model_calls_file: bool = False,
     model_content_file: bool = False,
     model_stream_observer_factories: tuple[Any, ...] = (),
+    model_io_subscriptions: tuple[Any, ...] = (),
     tool_ids: tuple[str, ...] = (),
     cancellation_token: CancellationToken | None = None,
     write_authority: ActivationWriteAuthority | None = None,
@@ -351,6 +352,7 @@ def _loop(
         model_calls_file=model_calls_file,
         model_content_file=model_content_file,
         model_stream_observer_factories=model_stream_observer_factories,
+        model_io_subscriptions=model_io_subscriptions,
         cancellation_token=cancellation_token,
         write_authority=write_authority or ActivationWriteAuthority(),
     )
@@ -414,6 +416,7 @@ def _restore(
     context_providers: tuple[Any, ...] = (),
     model_calls_file: bool = False,
     tool_ids: tuple[str, ...] = (),
+    model_io_subscriptions: tuple[Any, ...] = (),
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -428,6 +431,7 @@ def _restore(
         context_providers=context_providers,
         model_calls_file=model_calls_file,
         tool_ids=tool_ids,
+        model_io_subscriptions=model_io_subscriptions,
     )
     loop.restore(baseline)
     try:
@@ -732,6 +736,14 @@ def test_recovered_receipt_keeps_whole_call_usage_across_kernel_retry(tmp_path: 
 def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_v2_facts: bool, cancel_backoff: bool,
 ) -> None:
+    from monoid_agent_kernel.core.model_io import CapturePolicy, ModelIOSubscription
+
+    captures = []
+
+    class Observer:
+        def on_model_call(self, capture):
+            captures.append(capture.receipt)
+
     harness = DeterministicFencedRunHarness()
     refusal = ModelDispatchRefused("transient overload", retryable=True)
     mark_provider_usage(
@@ -793,7 +805,20 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
         adapter,
         baseline,
         model=model,
+        model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="none")),),
     )
+
+    receipt = captures[-1]
+    assert receipt.usage_evidence.attempts[0].observation.source == (
+        "provider" if with_v2_facts else "legacy_ambiguous"
+    )
+    assert len(receipt.usage_evidence.attempts) == (1 if cancel_backoff else 2)
+    assert receipt.termination.outcome == ("cancelled" if cancel_backoff else "completed")
+    if with_v2_facts:
+        assert receipt.usage_evidence.reported == failed.invocation.receipt["usage"]
+        assert receipt.usage_evidence.completeness["input_tokens"] == (
+            "complete" if cancel_backoff else "partial"
+        )
 
     if cancel_backoff:
         assert suspension.reason == "terminal"
@@ -999,7 +1024,13 @@ def test_required_evidence_projection_failure_preserves_completed_model_stream(
     )
     assert evidence_park.error_code == "evidence_uncommitted"
     assert len(adapter.requests) == 1
-    assert writer.outcomes == [expected]
+    assert len(writer.outcomes) == 1
+    outcome = writer.outcomes[0]
+    assert replace(outcome, termination=None, usage_evidence=None) == expected
+    assert outcome.termination.to_json() == {
+        "outcome": "completed", "requested_by": None, "ended_by": "provider_terminal",
+    }
+    assert outcome.usage_evidence.completeness["input_tokens"] == "unknown"
     content_path = next((tmp_path / "runs").rglob("model-content.jsonl"))
     snapshots = read_model_content(content_path).snapshots
     assert len(snapshots) == 1

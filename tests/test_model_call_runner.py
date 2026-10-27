@@ -19,6 +19,7 @@ from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageObservation, call_facts_of
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
@@ -77,6 +78,104 @@ from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.tools.base import ToolSpec
 
 REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+
+@pytest.mark.parametrize("reported_zero", [False, True])
+def test_p1p2_retry_coverage_counts_dispatches_and_keeps_known_totals(reported_zero: bool) -> None:
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    class Adapter:
+        calls = 0
+
+        def next_turn(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                error = ModelAdapterError("retry", retryable=True)
+                mark_provider_usage(error, {"input_tokens": 5})
+                mark_usage_observation(error, UsageObservation(
+                    reported={"input_tokens": 5}, source="adapter", collection="normal",
+                ))
+                raise error
+            return ModelTurn(final_text="ok", usage={"input_tokens": 0}, usage_evidence=(
+                UsageObservation(reported={"input_tokens": 0}, source="adapter", collection="normal")
+                if reported_zero else None
+            ))
+
+    turn, receipt = asyncio.run(ModelCallRunner(adapter=Adapter()).acall(
+        replace(REQUEST, model=_kernel_model()),
+    ))
+    assert turn.usage["input_tokens"] == 0
+    assert receipt.usage["input_tokens"] == 5
+    assert receipt.usage_evidence.reported == {"input_tokens": 5}
+    assert receipt.usage_evidence.completeness["input_tokens"] == (
+        "complete" if reported_zero else "partial"
+    )
+    assert receipt.usage_evidence.completeness["output_tokens"] == "unknown"
+    assert len(receipt.attempt_log) == len(receipt.usage_evidence.attempts) == 2
+
+
+@pytest.mark.parametrize("boundary", ["user_cancel", "deadline_token", "elapsed"])
+def test_p1p2_refused_before_dispatch_has_no_observed_usage(boundary: str) -> None:
+    token = CancellationToken()
+    deadline = None
+    if boundary == "elapsed":
+        deadline = time.time() - 1
+    else:
+        token.cancel(InterruptionCause.DEADLINE if boundary == "deadline_token" else InterruptionCause.USER_CANCEL)
+    outcome = _drain_call(_DrainStream(TurnComplete()), token=token, deadline=deadline)
+    assert outcome.receipt.attempts == 0
+    assert set(outcome.receipt.usage_evidence.completeness.values()) == {"no_dispatch"}
+    assert outcome.receipt.termination.requested_by == (
+        None if boundary == "elapsed" else "deadline" if boundary == "deadline_token" else "user_cancel"
+    )
+
+
+@pytest.mark.parametrize("deadline_wins", [False, True])
+def test_p1p2_drain_window_and_deadline_keep_distinct_read_ends(deadline_wins: bool) -> None:
+    outcome = _drain_call(
+        _DrainStream(TextDelta("x"), _STALL), should_abort=_Polls(1),
+        drain_s=0.2 if deadline_wins else 0.03,
+        deadline=time.time() + 0.03 if deadline_wins else None,
+        grace_s=0.02,
+    )
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
+    assert outcome.receipt.termination.ended_by == ("deadline" if deadline_wins else "drain_timeout")
+
+
+def test_p1p2_explicit_zero_received_during_drain_replaces_prior_report() -> None:
+    def terminal(count):
+        return TurnComplete(usage={"output_tokens": count}, usage_evidence=UsageObservation(
+            reported={"output_tokens": count}, source="adapter", collection="normal",
+        ))
+
+    outcome = _drain_call(_DrainStream(terminal(5), terminal(0), TurnComplete()), should_abort=_Polls(1))
+    assert outcome.receipt.usage["output_tokens"] == 0
+    entry = outcome.receipt.usage_evidence.attempts[0]
+    assert entry.observation.reported == {"output_tokens": 0}
+    assert entry.observation.collection == "drain"
+    assert call_facts_of(outcome.error) == (outcome.receipt.termination, outcome.receipt.usage_evidence)
+
+
+def test_p1p2_caller_cancellation_is_distinct_from_provider_self_cancel() -> None:
+    captures = []
+
+    async def run():
+        entered = asyncio.Event()
+        runner = ModelCallRunner(
+            adapter=_DrainStream(entered.set, _STALL), settled_sink=captures.append,
+            cancel_grace_s=0.02,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert call_facts_of(caught.value)[0].requested_by == "caller_cancel"
+
+    asyncio.run(run())
+    assert captures[-1].receipt.termination.outcome == "cancelled"
+    assert captures[-1].receipt.termination.ended_by == "stop_request"
 
 
 @pytest.mark.parametrize("last", [None, 0, 5])
@@ -4087,7 +4186,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
         stamps = any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "mark_provider_usage"
+            and node.func.id == "_stamp_refused_turn"
             for node in ast.walk(handler)
         )
         if leaves and not stamps:
@@ -4095,7 +4194,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
 
     assert unstamped == {}, {
         "arms_that_leave_without_carrying_the_bill": unstamped,
-        "hint": "mark_provider_usage(<escaping error>, _refused_turn_usage(turn))",
+        "hint": "_stamp_refused_turn(<escaping error>, turn)",
     }
 
     # Both arms exist, so deleting one cannot pass by deleting the shape above.
@@ -4104,7 +4203,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
         for node in ast.walk(normalizer)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "mark_provider_usage"
+        and node.func.id == "_stamp_refused_turn"
     ]
     assert len(stamp_sites) == 2, {"stamp_sites": stamp_sites}
 
@@ -6422,6 +6521,18 @@ def test_a_drained_read_raising_a_process_exit_escapes_unmapped(failure: BaseExc
     assert outcome.error is failure, outcome.error
     assert outcome.texts == ["a"]
 
+
+def test_base_exception_unwinding_the_runner_keeps_observed_usage():
+    failure = _HardLifecycleCrash()
+    stream = _DrainStream(TextDelta("a"), TurnComplete(
+        usage={"input_tokens": 0}, usage_evidence=UsageObservation(
+            reported={"input_tokens": 0}, source="adapter", collection="normal",
+        ),
+    ), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+    assert outcome.error is failure
+    assert call_facts_of(failure)[1].reported == {"input_tokens": 0}
+
 @pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
 def test_a_stream_finished_at_the_abort_point_bills_what_it_already_reported(
     drain_s: float,
@@ -6577,6 +6688,11 @@ def test_durable_abort_drain_carries_usage_on_dispatch_unknown() -> None:
 
     assert caught.value.error_code == "dispatch_unknown"
     assert isinstance(caught.value.__cause__ or caught.value.__context__, ModelCallAborted)
+    termination, evidence = call_facts_of(caught.value)
+    assert termination == ModelCallTermination(
+        outcome="failed", requested_by="turn_interrupt", ended_by="provider_terminal",
+    )
+    assert len(evidence.attempts) == 1
     assert provider_usage_of(caught.value) == _BILL
     assert lifecycle.states == ["reserved", "dispatch_started", "unknown"]
     assert len(stream.yielded) == 3
@@ -6911,6 +7027,8 @@ def test_a_user_cancel_before_the_stream_is_entered_stays_an_ordinary_cancel(
     assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
     assert provider_usage_of(outcome.error) == {}
     assert outcome.receipt.usage == {}
+    assert outcome.receipt.attempts == 0
+    assert stream.yielded == []
 
 
 def test_the_drain_window_is_measured_from_the_stop_not_the_stream_opening() -> None:

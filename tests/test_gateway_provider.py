@@ -22,6 +22,25 @@ from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reported", [False, True])
+def test_gateway_optional_observation_preserves_zero_and_legacy_absence(stream, reported):
+    from monoid_agent_kernel.core.model_facts import UsageObservation
+    from monoid_agent_kernel.providers.gateway import _chunk_from_event
+
+    payload = {"type": "turn_complete", "usage": {"input_tokens": 0}}
+    observation = UsageObservation(
+        reported={"input_tokens": 0}, source="provider", collection="drain",
+    )
+    if reported:
+        payload["usage_evidence"] = observation.to_json()
+    turn = _chunk_from_event(payload) if stream else _parse_gateway_response(payload)
+    assert turn.usage_evidence == (
+        observation if reported else UsageObservation(source="legacy_ambiguous")
+    )
+    assert turn.usage["input_tokens"] == 0
+
+
 def _tool() -> ToolSpec:
     def handler(_context, _args):
         return ToolResult(ok=True)
@@ -1170,6 +1189,7 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
         _exact_gateway_bool,
         _exact_gateway_int,
         _gateway_fragment_string,
+        _gateway_observation,
         _gateway_reasoning_items,
         _gateway_string,
         _gateway_usage,
@@ -1198,6 +1218,9 @@ def test_every_gateway_validator_puts_the_status_it_was_given_on_the_error_it_ra
         ),
         "_gateway_usage": lambda: _gateway_usage(
             {"input_tokens": "many"}, context="c", http_status=400
+        ),
+        "_gateway_observation": lambda: _gateway_observation(
+            {"usage_evidence": "invalid"}, http_status=400
         ),
         # A non-string object key is what portable JSON cannot carry at all (a non-finite number
         # is substituted, not refused).

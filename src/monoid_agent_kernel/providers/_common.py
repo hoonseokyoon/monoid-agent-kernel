@@ -463,7 +463,7 @@ def _first_count(*candidates: tuple[dict[str, Any], str]) -> int | None:
 
 
 def normalize_usage(
-    usage: dict[str, Any] | None, *, legacy_aliases: bool = False
+    usage: dict[str, Any] | None, *, legacy_aliases: bool = False, sparse: bool = False
 ) -> dict[str, int]:
     """Validate provider usage as ``{input_tokens, output_tokens, total_tokens}`` plus
     optional priced sub-counts (``cache_read_tokens``, ``cache_creation_tokens``,
@@ -484,14 +484,18 @@ def normalize_usage(
         output_candidates.append((usage, "completion_tokens"))
     input_tokens = _first_count(*input_candidates)
     output_tokens = _first_count(*output_candidates)
-    normalized_input = input_tokens if input_tokens is not None else 0
-    normalized_output = output_tokens if output_tokens is not None else 0
     reported_total = _usage_count(usage, "total_tokens")
-    normalized = {
-        "input_tokens": normalized_input,
-        "output_tokens": normalized_output,
-        "total_tokens": reported_total if reported_total is not None else 0,
+    basic = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": reported_total,
     }
+    normalized = {}
+    for basic_key, value in basic.items():
+        if value is not None:
+            normalized[basic_key] = value
+        elif not sparse:
+            normalized[basic_key] = 0
     input_details = _usage_object(
         usage.get("input_tokens_details", usage.get("prompt_tokens_details")),
         "input_tokens_details",
@@ -523,9 +527,9 @@ def normalize_usage(
         ),
         "audio_tokens": _first_count((usage, "audio_tokens")),
     }
-    if details["audio_tokens"] is None and audio:
+    if details["audio_tokens"] is None and audio and not sparse:
         details["audio_tokens"] = audio
     for key, value in details.items():
-        if value:
+        if value is not None and (sparse or value):
             normalized[key] = value
     return normalized

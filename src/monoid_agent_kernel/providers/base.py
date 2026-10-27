@@ -17,6 +17,7 @@ from monoid_agent_kernel.core.spec import (
     validate_reasoning_config,
 )
 from monoid_agent_kernel.core.model_io import is_absent_or_valid, is_valid_idempotency_key
+from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end
 from monoid_agent_kernel.core.json_ingress import (
     loads_model_json_ingress,
     normalize_json_ingress,
@@ -25,6 +26,9 @@ from monoid_agent_kernel.core.json_ingress import (
 )
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
+from monoid_agent_kernel.providers._usage import (
+    capture_usage, mark_usage_observation, select_usage_snapshot,
+)
 from monoid_agent_kernel.tools.base import ToolSpec, normalize_tool_spec
 
 # Why a model turn ended, promoted from the raw provider payload onto the typed turn surface.
@@ -144,6 +148,7 @@ class ModelTurn:
     # audit record shows a call that failed twice and succeeded on the third try as a clean single
     # attempt. Adapters with no retry loop leave it False, which is exactly true of them.
     provider_retried: bool = False
+    usage_evidence: UsageObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -580,6 +585,7 @@ class TurnComplete:
     # a real proof (``effort="default"`` forwards an empty block), so only ``None`` means the
     # wire never mentioned it.
     reasoning_applied: dict[str, Any] | None = None
+    usage_evidence: UsageObservation | None = None
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -962,6 +968,8 @@ def _normalize_model_turn(turn: Any) -> Any:
     if not isinstance(usage, dict):
         raise ValueError("model turn usage must be an object")
     usage = normalize_usage(usage)
+    observation = getattr(turn, "usage_evidence", None)
+    observation = capture_usage(usage, observation, preserve=True)
     raw = getattr(turn, "raw", {})
     if not isinstance(raw, dict):
         raw = {}
@@ -973,6 +981,7 @@ def _normalize_model_turn(turn: Any) -> Any:
         "final_text": final_text,
         "tool_calls": tool_calls,
         "usage": usage,
+        "usage_evidence": observation,
         "raw": normalize_json_ingress(raw),
         "reasoning": reasoning,
         "stop_reason": stop_reason,
@@ -1032,12 +1041,25 @@ def normalize_model_turn(turn: Any) -> Any:
     try:
         return _normalize_model_turn(turn)
     except ModelAdapterError as already_classified:
-        mark_provider_usage(already_classified, _refused_turn_usage(turn))
+        _stamp_refused_turn(already_classified, turn)
+        mark_read_end(already_classified, "local_failure")
         raise
     except Exception as exc:
         refusal = ModelAdapterError("model adapter returned a non-portable response")
-        mark_provider_usage(refusal, _refused_turn_usage(turn))
+        _stamp_refused_turn(refusal, turn)
+        mark_read_end(refusal, "local_failure")
         raise refusal from exc
+
+
+def _stamp_refused_turn(error: BaseException, turn: Any) -> None:
+    usage = _refused_turn_usage(turn)
+    mark_provider_usage(error, usage)
+    try:
+        observation = getattr(turn, "usage_evidence", None)
+        observation = capture_usage(usage, observation, preserve=True)
+        mark_usage_observation(error, observation)
+    except Exception:
+        pass
 
 
 def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
@@ -1097,10 +1119,16 @@ def _normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
             usage = {}
         if not isinstance(usage, dict):
             raise ValueError("turn complete usage must be an object or null")
+        usage = normalize_usage(usage)
+        observation = capture_usage(
+            usage, chunk.usage_evidence,
+            preserve=chunk.usage_evidence is not None and chunk.usage_evidence.source == "provider",
+        )
         return _copy_with_fields(
             chunk,
             response_id=_normalize_optional_text(chunk.response_id, "turn complete response_id"),
-            usage=normalize_usage(usage),
+            usage=usage,
+            usage_evidence=observation,
             reasoning=reasoning,
             stop_reason=_normalize_optional_text(chunk.stop_reason, "turn complete stop_reason"),
             provider_retried=_require_bool(
@@ -1116,10 +1144,14 @@ def normalize_model_stream_chunk(chunk: ModelStreamChunk) -> ModelStreamChunk:
 
     try:
         return _normalize_model_stream_chunk(chunk)
-    except ModelAdapterError:
+    except ModelAdapterError as classified:
+        _stamp_refused_turn(classified, chunk)
         raise
     except Exception as exc:
-        raise ModelAdapterError("model adapter returned a non-portable stream fragment") from exc
+        failure = ModelAdapterError("model adapter returned a non-portable stream fragment")
+        _stamp_refused_turn(failure, chunk)
+        mark_read_end(failure, "local_failure")
+        raise failure from exc
 
 
 @dataclass
@@ -1444,6 +1476,7 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     order: list[int] = []
     response_id: str | None = None
     usage: dict[str, int] = {}
+    observation = UsageObservation(source="legacy_ambiguous")
     reasoning: tuple[dict[str, Any], ...] = ()
     stop_reason: StopReason | None = None
     provider_retried = False
@@ -1468,8 +1501,10 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         elif isinstance(chunk, TurnComplete):
             if chunk.response_id is not None:
                 response_id = chunk.response_id
-            if chunk.usage:
-                usage = chunk.usage
+            usage, observation = select_usage_snapshot(
+                (usage, observation),
+                (chunk.usage, chunk.usage_evidence or UsageObservation(source="legacy_ambiguous")),
+            )
             if chunk.reasoning:
                 reasoning = chunk.reasoning
             if chunk.stop_reason is not None:
@@ -1504,6 +1539,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 provider_retried=provider_retried,
             )
             mark_provider_usage(unparsable, usage)
+            mark_usage_observation(unparsable, observation)
+            mark_read_end(unparsable, "local_failure")
             raise unparsable from exc
         if not isinstance(arguments, dict):
             wrong_type = ModelAdapterError(
@@ -1513,6 +1550,8 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
                 provider_retried=provider_retried,
             )
             mark_provider_usage(wrong_type, usage)
+            mark_usage_observation(wrong_type, observation)
+            mark_read_end(wrong_type, "local_failure")
             raise wrong_type
         call_id = slot["id"] if slot["id"] is not None else ""
         name = slot["name"] if slot["name"] is not None else ""
@@ -1553,4 +1592,5 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
         reasoning=reasoning,
         stop_reason=stop_reason,
         provider_retried=provider_retried,
+        usage_evidence=observation,
     )

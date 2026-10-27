@@ -585,3 +585,17 @@ raw 출력은 `.tmp/v025/p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때
 01 실제 source 상한 529를 포함한 누적 예상은 2,249 기능 상한/약 7,500 총 변경 줄이다.
 범용 상태 머신·serializer·새 회계 경로는 추가하지 않고 기존 ingress·race·stamp·settlement에 수정을 제한한다.
 기능 2,000줄 soft limit에 접근한 원인과 이 대안을 검토했다. 최종 실제 diff·리뷰 비용을 계속 누적한다.
+
+**02 구현 후보.** 수정 전 회귀 commit은 `9e8c0ef`다. 최초 15개가 통과한 뒤 실제 observer,
+재시도·복구 prefix, 명시적 0과 drain provenance, gateway 선택 reader, unknown 오류 변환을 확장했다.
+준비 callback이 취소를 요청한 뒤 provider에 진입하는 기존 경계도 확인하여 진입 직전 취소 검사를 추가했다.
+`attempts=0`과 provider 진입 0회를 검증한다. unknown의 기존 failed 결과와 별도로 최초 stop·read end를 보존한다.
+
+최종 후보의 관련 suite는 **834 passed in 23.69s**였다. 원본은
+`.tmp/v025/p1p2-02-candidate-tests2.txt`다. 전체 ruff와 diff check, 오프라인
+`examples/model_call_facts.py`도 통과했다. 예제는 input=0의 complete와 total의 unknown을 출력한다.
+runner까지 unwind하는 BaseException은 관측을 보존하며, Python event loop 자체를 끝내는
+KeyboardInterrupt/SystemExit의 기존 원형 전파도 검사했다. 프로세스 종료 뒤 subscriber 실행 보장은 추가하지 않는다.
+carriage census는 새 observation helper·상태 전달·실패 시 비용 보존을 기존 검사에 등록했다.
+stream 종료 뒤 오류·취소·deadline 경합과 P5 권한 회귀도 같은 실행에 포함했다.
+01 병합 후 integration full CI `40454581400`은 성공했다. 02는 두 독립 코드 리뷰와 최종 CI를 진행한다.

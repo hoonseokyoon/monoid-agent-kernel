@@ -20,6 +20,8 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+from monoid_agent_kernel.core.model_facts import UsageObservation
+from monoid_agent_kernel.providers._usage import capture_usage
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -976,6 +978,23 @@ def _gateway_usage(
         ) from exc
 
 
+def _gateway_observation(
+    payload: dict[str, Any], *, known_provider_retried: bool = False,
+    http_status: int | None = None,
+) -> UsageObservation:
+    try:
+        observation = (
+            UsageObservation.from_json(payload.get("usage_evidence"))
+            if "usage_evidence" in payload else UsageObservation(source="legacy_ambiguous")
+        )
+        return capture_usage(normalize_usage(payload.get("usage")), observation, preserve=True)
+    except (TypeError, ValueError) as exc:
+        raise ModelAdapterError(
+            "LLM gateway returned invalid usage evidence", provider_error_code=GATEWAY_BAD_RESPONSE,
+            retryable=False, provider_retried=known_provider_retried, http_status=http_status,
+        ) from exc
+
+
 def _portable_gateway_payload(
     value: Any,
     *,
@@ -1515,6 +1534,9 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
                 known_provider_retried=provider_retried,
             ),
             tool_calls=tuple(tool_calls),
+            usage_evidence=_gateway_observation(
+                data, known_provider_retried=provider_retried, http_status=status_hint,
+            ),
             usage=_gateway_usage(
                 data.get("usage"),
                 context="response",
@@ -1725,6 +1747,9 @@ def _chunk_from_event(
             )
             # The gateway's opaque turn_handle is the continuation handle the core stores.
             return TurnComplete(
+                usage_evidence=_gateway_observation(
+                    event, known_provider_retried=retried, http_status=status_hint,
+                ),
                 generation_applied=applied,
                 schema_applied=schema_applied,
                 reasoning_applied=reasoning_applied,
