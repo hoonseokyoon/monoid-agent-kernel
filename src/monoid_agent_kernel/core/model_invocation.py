@@ -369,7 +369,6 @@ class DurableModelInvocation:
             or self.digest_generation not in ACCEPTED_MODEL_REQUEST_DIGEST_GENERATIONS
         ):
             raise ValueError("unsupported model invocation digest_generation")
-        object.__setattr__(self, "digest_generation", MODEL_REQUEST_DIGEST_GENERATION)
         if type(self.evidence_policy) is not str or self.evidence_policy not in get_args(
             ModelEvidencePolicy
         ):
@@ -490,6 +489,7 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
         result_ref=parse_str(payload, "result_ref"),
         failure_code=parse_str(payload, "failure_code"),
     )
+    object.__setattr__(invocation, "digest_generation", MODEL_REQUEST_DIGEST_GENERATION)
     object.__setattr__(invocation, "_source_envelope", (
         CANONICAL_JSON_ENCODER.encode(payload), canonical_sha256(invocation.to_json()),
     ))

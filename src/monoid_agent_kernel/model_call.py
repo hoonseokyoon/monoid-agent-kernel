@@ -1193,6 +1193,7 @@ class ModelCallRunner:
                                 turn = durable_model_turn(recovered.result_blob)
                             except DurableModelCallError as recovery_error:
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                recovered_failure_receipt = receipt.with_error(recovery_error)
                                 raise
                             if not _recovered_result_matches_evidence(turn, recovered.receipt):
                                 recovery_error = DurableModelCallError(
@@ -1200,6 +1201,7 @@ class ModelCallRunner:
                                     error_code="durable_invocation_result_corrupt",
                                 )
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                recovered_failure_receipt = receipt.with_error(recovery_error)
                                 raise recovery_error
                             settled = self._publish(
                                 request,

@@ -100,7 +100,8 @@ class ModelStreamOutcome:
         if self.usage_evidence is not None:
             if not isinstance(self.usage_evidence, UsageEvidence):
                 raise ValueError("stream usage_evidence must be a UsageEvidence")
-            self.usage_evidence.validate_usage(self.usage or {}, len(self.usage_evidence.attempts))
+            # Successful usage describes the last provider turn; evidence covers the logical call.
+            # The receipt owns the comparison against cumulative numeric accounting.
 
 
 @runtime_checkable

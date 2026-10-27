@@ -589,7 +589,7 @@ def _contract_checkpoint_canonical_alias_status(
     *,
     legacy_first: bool,
 ) -> str:
-    """Retry one checkpoint across either direction of every accepted alias location."""
+    """Outer checkpoint aliases normalize; nested committed invocation representations stay exact."""
 
     invocation_payload = _contract_invocation(
         run_id,
@@ -2723,7 +2723,7 @@ def _run_fenced_run_sink_contract(
                     *(
                         observation(
                             f"checkpoint_canonical_alias_{field_name}_{direction}",
-                            expected="already_committed",
+                            expected=("already_committed" if field_name == "schema_version" else "conflict"),
                             actual=status,
                         )
                         for (field_name, direction), status in (

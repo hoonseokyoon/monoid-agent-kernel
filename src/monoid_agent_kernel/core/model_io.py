@@ -1372,7 +1372,8 @@ class ModelCallReceipt:
         # guarded for that reason; the sum invariant added one more way to break the same promise.
         # The same rule the line below already follows for ``provider_retried``, one field wider:
         # a receipt that already carried the fact keeps what it carried.
-        if not usage and not self.attempt_log and isinstance(stamped_usage, Mapping):
+        if (not usage and not self.attempt_log and self.usage_evidence is None
+                and isinstance(stamped_usage, Mapping)):
             try:
                 usage = {
                     str(key): int(value)

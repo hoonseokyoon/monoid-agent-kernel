@@ -2564,8 +2564,9 @@ def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> No
         ),
     ],
 )
+@pytest.mark.parametrize("with_v2_facts", [False, True])
 def test_recovered_result_integrity_failure_carries_authoritative_usage(
-    result_blob: bytes,
+    result_blob: bytes, with_v2_facts: bool,
 ) -> None:
     usage = {
         "input_tokens": 5,
@@ -2577,8 +2578,13 @@ def test_recovered_result_integrity_failure_carries_authoritative_usage(
         result_blob=result_blob,
         receipt={"attempts": 1, "stop_reason": "stop", "usage": usage},
     )
+    if with_v2_facts:
+        from support.model_facts import facts
+
+        hook.receipt = {**hook.receipt, **facts(usage)}
+    received = []
     adapter = _ScriptedAdapter(ModelTurn(final_text="must not run"))
-    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook)
+    runner = ModelCallRunner(adapter=adapter, lifecycle_hook=hook, settled_sink=received.append)
 
     with pytest.raises(DurableModelCallError) as caught:
         asyncio.run(
@@ -2591,6 +2597,11 @@ def test_recovered_result_integrity_failure_carries_authoritative_usage(
     assert caught.value.error_code == "durable_invocation_result_corrupt"
     assert provider_usage_of(caught.value) == usage
     assert adapter.requests == []
+    assert received[0].receipt.usage == usage
+    if with_v2_facts:
+        assert received[0].receipt.attempts == 1
+        assert received[0].receipt.attempt_log == ()
+        assert received[0].receipt.usage_evidence.to_json() == hook.receipt["usage_evidence"]
 
 
 @pytest.mark.parametrize(

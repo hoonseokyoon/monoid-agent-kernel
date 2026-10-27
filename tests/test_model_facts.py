@@ -132,6 +132,17 @@ def test_stream_fact_outcome_agrees_with_existing_status() -> None:
         ModelCallTermination.from_json({**termination.to_json(), "ended_by": "provider_secret"})
 
 
+def test_stream_numeric_usage_keeps_final_turn_scope_with_whole_call_evidence() -> None:
+    evidence = UsageEvidence(attempts=tuple(
+        UsageEvidenceAttempt(index=index, observation=UsageObservation(
+            reported={"input_tokens": count}, source="provider", collection="normal",
+        )) for index, count in enumerate((2, 3), 1)
+    ))
+    outcome = ModelStreamOutcome(status="completed", usage={"input_tokens": 3}, usage_evidence=evidence)
+    assert outcome.usage == {"input_tokens": 3}
+    assert outcome.usage_evidence.reported == {"input_tokens": 5}
+
+
 def test_fact_input_and_output_mappings_are_detached() -> None:
     raw = facts({"input_tokens": 2})["usage_evidence"]
     expected = deepcopy(raw)
@@ -141,3 +152,39 @@ def test_fact_input_and_output_mappings_are_detached() -> None:
     exported["attempts"][0]["reported"]["input_tokens"] = 90
     exported["reported"]["input_tokens"] = 80
     assert evidence.to_json() == expected
+
+
+def test_with_error_preserves_an_explicit_zero_without_replacing_the_original_failure() -> None:
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    receipt = ModelCallReceipt(usage_evidence=UsageEvidence.from_json(
+        facts({"output_tokens": 0})["usage_evidence"],
+    ))
+    error = RuntimeError("later failure")
+    mark_provider_usage(error, {"output_tokens": 5})
+    failed = receipt.with_error(error)
+    assert failed.error_code == "RuntimeError"
+    assert failed.usage == {}
+    assert failed.usage_evidence.reported == {"output_tokens": 0}
+
+
+def test_observer_cannot_mutate_shared_facts_or_stop_later_receipt_delivery() -> None:
+    from monoid_agent_kernel.core.model_io import ModelIOSubscription, dispatch_model_call
+
+    evidence = UsageEvidence.from_json(facts({"input_tokens": 1})["usage_evidence"])
+    receipt = ModelCallReceipt(usage={"input_tokens": 1}, usage_evidence=evidence)
+    received = []
+
+    class Mutator:
+        def on_model_call(self, capture):
+            capture.receipt.usage_evidence.attempts[0].observation.reported["input_tokens"] = 9
+
+    class Reader:
+        def on_model_call(self, capture):
+            received.append(capture)
+
+    result = dispatch_model_call(receipt=receipt, content={}, subscriptions=(
+        ModelIOSubscription(Mutator()), ModelIOSubscription(Reader()),
+    ))
+    assert result.usage_evidence.reported == {"input_tokens": 1}
+    assert received[0].receipt.usage_evidence.reported == {"input_tokens": 1}

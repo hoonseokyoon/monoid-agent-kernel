@@ -507,3 +507,24 @@ historical spelling/default의 같은 좌표 재게시, v2 reader, 공개 receip
 기존 필드 완전성 테스트는 새 optional 필드의 최대/생략 모양을 모두 검사하도록 확장했다.
 PostgreSQL 16/18과 ObjectStore의 historical/v2 payload·원래 hash·typed binding·evidence 복구 테스트는
 combined 서비스 CI에서 실행한다. 두 독립 최종 코드 리뷰, current/minimum Pydantic 설치 wheel, 원격 L1/L2가 남아 있다.
+
+**01 첫 코드 리뷰와 수정.** `b2fdd29`에 대한 독립 a/b 리뷰는 NEEDS_FIX였다.
+명시적 0 evidence가 있는 receipt의 `with_error` 숫자 덮어쓰기, 구독자 간 mutable observation 공유,
+복구된 private result 손상 시 attempts=0으로 바뀌어 원래 오류가 가려지는 경로를 재현했다.
+수정 전 추가 회귀는 4 failed/2 passed, stream 마지막 turn usage와 전체 호출 evidence를 비교하는
+별도 회귀는 1 failed였다. 수정은 기존 값 보존·표준 읽기 전용 mapping·기존 복구 실패 게시 경로 재사용이며,
+stream의 숫자 비교는 §5.3 범위에 맞춰 receipt가 담당한다. 수정 후 관련 137 passed in 3.20s.
+
+공개 fenced-host conformance의 nested alias 기대값도 기존 정규화 정책이 남아 있었다.
+기존 suite의 10 failed/265 passed를 확인한 뒤, outer checkpoint 별칭은 정규화하고 nested invocation의
+다른 저장 표현은 conflict로 검사하도록 계약과 mutation test를 갱신했다. digest alias 의미 정규화는
+계획대로 reader에 한정해 직접 constructor의 기존 관찰 계약을 유지했다. 해당 conformance와 복구·facts
+회귀 **400 passed in 11.28s**. 첫 L1 `40452461088`은 public export/counter census 두 등록 누락으로 실패했고
+두 검사를 갱신했다. draft full workflow의 성공 표시는 실제 required L2 통과로 계산하지 않는다.
+
+`b2fdd29` wheel을 독립 환경에 설치하고 source 경로 없이 복사한 실제 소비자 테스트를 실행했다.
+import가 site-packages임을 검사했고 Pydantic 2.14.1은 120 passed/3.75s, 최소 2.6.4는 120 passed/3.77s였다.
+리뷰 수정 후 wheel을 다시 빌드해 같은 검증을 갱신한다. 기존 19개와 새 3개 fixture가 wheel에 포함된다.
+현재 source Python diff 상한은 525줄(주석·공백 포함), 총 변경은 약 1,500줄이다. 초기 400/1,300과
+사전조사 500/1,700 추정에 함께 기록한다. G1 source 상한 예상은 1,995줄로 soft limit에 가깝다.
+02 사전조사에서 누적 실제 비용과 남은 범위를 다시 점검하며, 새 범용 serializer나 상태 머신은 추가하지 않는다.

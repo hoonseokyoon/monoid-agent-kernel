@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal, get_args
 
 from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
@@ -107,7 +108,7 @@ class UsageObservation:
     collection: UsageCollection | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "reported", _reported(self.reported))
+        object.__setattr__(self, "reported", MappingProxyType(_reported(self.reported)))
         _literal(self.source, UsageSource, "usage source", nullable=True)
         _literal(self.collection, UsageCollection, "usage collection", nullable=True)
         if self.reported:
