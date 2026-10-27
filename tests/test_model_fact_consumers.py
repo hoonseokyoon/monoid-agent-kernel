@@ -36,7 +36,8 @@ REQUEST = ModelRequest(instruction="go", system_prompt="sys", tools=())
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("case", [
     "bad_observation", "bad_control", "invalid_json", "nonobject",
-    "proof_generation", "proof_schema", "proof_reasoning", "remote_error", "remote_http", "network",
+    "proof_generation", "proof_schema", "proof_reasoning", "remote_error", "remote_http",
+    "remote_bad_observation", "network",
 ])
 def test_gateway_runner_records_the_owner_of_local_refusals(monkeypatch, stream, case):
     payload = {
@@ -58,6 +59,8 @@ def test_gateway_runner_records_the_owner_of_local_refusals(monkeypatch, stream,
         request = ModelRequest(instruction="go", system_prompt="sys", tools=(), output_schema={"type": "object"})
     elif case == "proof_reasoning":
         config_args["reasoning"] = ReasoningConfig(effort="low", on_unsupported="fail")
+    if case == "remote_bad_observation":
+        payload["usage_evidence"]["collection"] = "bogus"
     body = "{" if case == "invalid_json" else "[]" if case == "nonobject" else json.dumps(payload)
 
     def sync_response(*args, **kwargs):
@@ -100,7 +103,7 @@ def test_gateway_runner_records_the_owner_of_local_refusals(monkeypatch, stream,
     )
     assert caught.value.provider_error_code == expected_code
     assert receipt.termination.ended_by == (
-        "provider_error" if case in {"remote_error", "remote_http", "network"} else "local_failure"
+        "provider_error" if case.startswith("remote_") or case == "network" else "local_failure"
     )
 
 

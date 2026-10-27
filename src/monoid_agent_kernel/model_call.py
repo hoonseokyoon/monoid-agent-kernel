@@ -2096,7 +2096,12 @@ class ModelCallRunner:
                         retried = True
                     if isinstance(piece, TurnComplete):
                         drain.saw_terminal = read_end_of(piece) != "provider_eof"
-                        drain.usage = _streamed_usage([*chunks, piece])
+                        # Ingress selected this dispatch's latest numeric/evidence pair,
+                        # including earlier drain pieces that were never delivered.
+                        drain.usage = (
+                            dict(drain.usage_progress.snapshot[0]) if drain.usage_progress is not None
+                            else _streamed_usage([*chunks, piece])
+                        )
 
             if first is not None:
                 fold(first)

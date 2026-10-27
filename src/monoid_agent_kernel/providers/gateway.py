@@ -20,7 +20,7 @@ from monoid_agent_kernel.core.json_ingress import (
     normalize_unicode_scalars,
 )
 from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
-from monoid_agent_kernel.core.model_facts import UsageObservation
+from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end
 from monoid_agent_kernel.providers._usage import capture_usage, mark_usage_observation
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
@@ -96,6 +96,12 @@ GATEWAY_REASONING_NOT_APPLIED = "gateway_reasoning_not_applied"
 GATEWAY_BAD_REQUEST = "gateway_bad_request"
 
 
+def _local_gateway_failure(error: ModelAdapterError) -> ModelAdapterError:
+    """Record the client validation boundary while preserving its classified error."""
+    mark_read_end(error, "local_failure")
+    return error
+
+
 def _encode_request_body(payload: dict[str, Any]) -> bytes:
     """Serialize one request payload, classifying what cannot be serialized.
 
@@ -122,12 +128,12 @@ def _encode_request_body(payload: dict[str, Any]) -> bytes:
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError, RecursionError) as exc:
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             f"model request is not JSON-serializable: {exc}",
             provider_error_code=GATEWAY_BAD_REQUEST,
             retryable=False,
             config_recoverable=True,
-        ) from exc
+        )) from exc
 
 
 def _adapter_layer_attempts(retry: Any) -> int:
@@ -302,10 +308,10 @@ class GatewayModelAdapter:
                     try:
                         data = loads_model_envelope_json_ingress(response_body.decode("utf-8"))
                     except ValueError as exc:
-                        raise ModelAdapterError(
+                        raise _local_gateway_failure(ModelAdapterError(
                             "LLM gateway returned invalid JSON",
                             provider_error_code=GATEWAY_BAD_RESPONSE,
-                        ) from exc
+                        )) from exc
                     # ``attempt > 1`` means this call only succeeded because *this client's* retry
                     # loop ran. The kernel counts it as one adapter call, so the receipt would
                     # otherwise show a twice-failed call as a clean single attempt.
@@ -423,10 +429,10 @@ class GatewayModelAdapter:
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
-            raise ModelAdapterError(
+            raise _local_gateway_failure(ModelAdapterError(
                 "httpx is required for gateway streaming; install monoid-agent-kernel[http-async]",
                 provider_error_code=GATEWAY_NETWORK_ERROR,
-            ) from exc
+            )) from exc
 
         config = request.model or self.config
         url = self._resolve_gateway_url(config).rstrip("/") + "/stream"
@@ -712,9 +718,9 @@ class GatewayModelAdapter:
             or getenv(DEFAULT_GATEWAY_URL_ENV)
         )
         if not url:
-            raise ModelAdapterError(
+            raise _local_gateway_failure(ModelAdapterError(
                 f"LLM gateway URL is required via --llm-gateway-url or {env_name_for_error(DEFAULT_GATEWAY_URL_ENV)}"
-            )
+            ))
         return url
 
     def _headers(self, *, idempotency_key: str = "") -> dict[str, str]:
@@ -851,13 +857,13 @@ def _exact_gateway_bool(
     value = payload[key]
     if type(value) is bool:
         return value
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway returned an invalid {context}: {key} must be a boolean",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _exact_gateway_int(
@@ -885,13 +891,13 @@ def _exact_gateway_int(
     requirement = f"an integer >= {minimum}"
     if maximum is not None:
         requirement = f"an integer from {minimum} through {maximum}"
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway returned an invalid {context}: {key} must be {requirement}",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _gateway_http_status_hint(payload: dict[str, Any]) -> int | None:
@@ -918,24 +924,24 @@ def _gateway_string(
             continue
         value = payload[key]
         if type(value) is not str:
-            raise ModelAdapterError(
+            raise _local_gateway_failure(ModelAdapterError(
                 f"LLM gateway returned an invalid {context}: {key} must be a string",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 retryable=False,
                 http_status=http_status,
                 provider_retried=known_provider_retried,
-            )
+            ))
         if value:
             return normalize_unicode_scalars(value)
     if required:
         names = " or ".join(keys)
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             f"LLM gateway returned an invalid {context}: {names} is required",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
             http_status=http_status,
             provider_retried=known_provider_retried,
-        )
+        ))
     return None
 
 
@@ -954,13 +960,13 @@ def _gateway_fragment_string(
     value = payload[key]
     if type(value) is str:
         return value
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway returned an invalid {context}: {key} must be a string",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _gateway_usage(
@@ -973,13 +979,13 @@ def _gateway_usage(
     try:
         return normalize_usage(value)
     except (TypeError, ValueError) as exc:
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             f"LLM gateway returned an invalid {context}: usage must contain token counts",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
             http_status=http_status,
             provider_retried=known_provider_retried,
-        ) from exc
+        )) from exc
 
 
 def _gateway_observation(
@@ -993,10 +999,10 @@ def _gateway_observation(
         )
         return capture_usage(normalize_usage(payload.get("usage")), observation, preserve=True)
     except (TypeError, ValueError) as exc:
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             "LLM gateway returned invalid usage evidence", provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False, provider_retried=known_provider_retried, http_status=http_status,
-        ) from exc
+        )) from exc
 
 
 def _stamp_gateway_observation(error: BaseException, payload: dict[str, Any]) -> None:
@@ -1021,13 +1027,13 @@ def _portable_gateway_payload(
     try:
         return normalize_json_ingress(value)
     except ValueError as exc:
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             f"LLM gateway returned an invalid {context}",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
             http_status=http_status,
             provider_retried=known_provider_retried,
-        ) from exc
+        )) from exc
 
 
 def _gateway_reasoning_items(
@@ -1073,13 +1079,13 @@ def _gateway_reasoning_items(
         return ()
     if isinstance(value, (list, tuple)) and all(isinstance(item, dict) for item in value):
         return tuple(dict(item) for item in value)
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway returned invalid {context} reasoning: expected an array of objects",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _readable_relayed_reasoning(
@@ -1139,13 +1145,13 @@ def _validated_generation_echo(
 
     if applied is None or isinstance(applied, dict):
         return applied
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         "LLM gateway returned an invalid generation_applied echo: expected an object",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=provider_retried,
-    )
+    ))
 
 
 def _validated_schema_echo(
@@ -1155,13 +1161,13 @@ def _validated_schema_echo(
 
     if applied is None or isinstance(applied, bool):
         return applied
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         "LLM gateway returned an invalid schema_applied echo: expected a boolean",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=provider_retried,
-    )
+    ))
 
 
 def _validated_reasoning_echo(
@@ -1173,13 +1179,13 @@ def _validated_reasoning_echo(
 
     if applied is None or isinstance(applied, dict):
         return applied
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         "LLM gateway returned an invalid reasoning_applied echo: expected an object",
         provider_error_code=GATEWAY_BAD_RESPONSE,
         retryable=False,
         http_status=http_status,
         provider_retried=provider_retried,
-    )
+    ))
 
 
 def _same_echoed_value(echoed: Any, requested: Any) -> bool:
@@ -1240,7 +1246,7 @@ def _check_generation_applied(
         if applied is None
         else "the generation_applied echo does not match the requested parameters"
     )
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway did not apply the requested generation parameters: {detail}; "
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_GENERATION_NOT_APPLIED,
@@ -1250,7 +1256,7 @@ def _check_generation_applied(
         # condition the same server would have reported recoverably as an HTTP 400.
         config_recoverable=True,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _check_schema_applied(
@@ -1285,14 +1291,14 @@ def _check_schema_applied(
         if applied is None
         else "the gateway's upstream does not enforce output schemas"
     )
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway did not apply the requested output schema: {detail}; "
         'set model.generation.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_SCHEMA_NOT_APPLIED,
         retryable=False,
         config_recoverable=True,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _check_reasoning_applied(
@@ -1325,14 +1331,14 @@ def _check_reasoning_applied(
         if applied is None
         else "the reasoning_applied echo does not match the requested configuration"
     )
-    raise ModelAdapterError(
+    raise _local_gateway_failure(ModelAdapterError(
         f"LLM gateway did not apply the requested reasoning configuration: {detail}; "
         'set model.reasoning.on_unsupported="omit" to accept best-effort transport',
         provider_error_code=GATEWAY_REASONING_NOT_APPLIED,
         retryable=False,
         config_recoverable=True,
         provider_retried=known_provider_retried,
-    )
+    ))
 
 
 def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) -> ModelTurn:
@@ -1341,11 +1347,11 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
     normalization. ``None`` (the default, and what a direct caller passes) gates nothing."""
 
     if not isinstance(data, dict):
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             "LLM gateway returned a non-object JSON response",
             provider_error_code=GATEWAY_BAD_RESPONSE,
             retryable=False,
-        )
+        ))
     # The best status this reader knows before any field of the payload has been validated: an
     # already-trustworthy ``http_status`` off an error envelope, and nothing at all otherwise.
     # Every validator below is handed it, so a malformed payload raises a classified failure that
@@ -1457,19 +1463,19 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
         if raw_calls is None:
             raw_calls = ()
         if not isinstance(raw_calls, (list, tuple)):
-            raise ModelAdapterError(
+            raise _local_gateway_failure(ModelAdapterError(
                 "LLM gateway returned invalid tool_calls: expected an array",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 provider_retried=provider_retried,
-            )
+            ))
         tool_calls: list[ToolCall] = []
         for raw in raw_calls:
             if not isinstance(raw, dict):
-                raise ModelAdapterError(
+                raise _local_gateway_failure(ModelAdapterError(
                     "LLM gateway returned an invalid tool call",
                     provider_error_code=GATEWAY_BAD_RESPONSE,
                     provider_retried=provider_retried,
-                )
+                ))
             args = raw.get("arguments")
             if args is None:
                 args = {}
@@ -1477,11 +1483,11 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
                 try:
                     args = loads_model_json_ingress(args)
                 except ValueError as exc:
-                    raise ModelAdapterError(
+                    raise _local_gateway_failure(ModelAdapterError(
                         f"invalid gateway tool call arguments for {raw.get('name')}",
                         provider_error_code=GATEWAY_BAD_RESPONSE,
                         provider_retried=provider_retried,
-                    ) from exc
+                    )) from exc
             else:
                 args = _portable_gateway_payload(
                     args,
@@ -1490,11 +1496,11 @@ def _parse_gateway_response(data: Any, *, declared_provider: str | None = None) 
                     known_provider_retried=provider_retried,
                 )
             if not isinstance(args, dict):
-                raise ModelAdapterError(
+                raise _local_gateway_failure(ModelAdapterError(
                     f"invalid gateway tool call arguments for {raw.get('name')}",
                     provider_error_code=GATEWAY_BAD_RESPONSE,
                     provider_retried=provider_retried,
-                )
+                ))
             tool_calls.append(
                 ToolCall(
                     id=_gateway_string(
@@ -1641,15 +1647,15 @@ def _decode_sse_chunk(
     try:
         event = loads_model_stream_envelope_json_ingress("\n".join(data_lines))
     except ValueError as exc:
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             "LLM gateway stream returned invalid JSON",
             provider_error_code=GATEWAY_BAD_RESPONSE,
-        ) from exc
+        )) from exc
     if not isinstance(event, dict):
-        raise ModelAdapterError(
+        raise _local_gateway_failure(ModelAdapterError(
             "LLM gateway stream returned a non-object frame",
             provider_error_code=GATEWAY_BAD_RESPONSE,
-        )
+        ))
     return _chunk_from_event(event, declared_provider=declared_provider)
 
 
@@ -1914,22 +1920,22 @@ def _error_from_status_body(status: int, detail: str) -> ModelAdapterError:
         if isinstance(parsed, dict):
             error_payload = parsed
         elif detail.lstrip().startswith(("{", "[")):
-            return ModelAdapterError(
+            return _local_gateway_failure(ModelAdapterError(
                 f"LLM gateway returned HTTP {status}: invalid JSON error response",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 retryable=False,
                 http_status=status,
                 provider_retried=False,
-            )
+            ))
     except json.JSONDecodeError:
         if detail.lstrip().startswith(("{", "[")):
-            return ModelAdapterError(
+            return _local_gateway_failure(ModelAdapterError(
                 f"LLM gateway returned HTTP {status}: invalid JSON error response",
                 provider_error_code=GATEWAY_BAD_RESPONSE,
                 retryable=False,
                 http_status=status,
                 provider_retried=False,
-            )
+            ))
     # Every per-key read is inside the guard, for the reason the two envelope readers give: this
     # function BUILDS the failure and stamps it at the end, so a malformed key refuses before the
     # stamp is reached -- and this reader is the one both transports land in for a non-200, which

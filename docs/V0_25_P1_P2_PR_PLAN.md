@@ -797,6 +797,11 @@ tracked Studio bundle 3개 파일의 byte 일치도 확인했다.
 첫 실행의 미보고 numeric 키 assertion을 기존 empty usage 계약에 맞게 고친 뒤 다시 실행했다.
 이 회귀를 테스트 전용 commit으로 먼저 고정하고 제품 수정을 진행한다.
 
+회귀 전용 commit은 `989feb6`이다. collector snapshot 재사용과 local gateway stamper를 적용한 뒤
+runner·gateway·stream observer·회계·carriage census **750 passed / 27.40s**였다
+(`.tmp/v025/p1p2-i-repair-green.txt`). 같은 오류 코드와 손상된 optional observation을 가진 원격 오류도
+provider_error로 유지하는 actual runner control을 추가했다. 최종 설치 wheel과 CI는 수정된 binary를 사용한다.
+
 비용은 최초 1,870 기능 / 6,580 전체 변경 줄 추정을 유지한다. 04까지의 non-merge commit을 모두 합산하면
 runtime·UI 추가 1,598/삭제 208(1,806줄), 예제 147, compatibility fixture 160, 테스트·script 2,528,
 문서 497, bundle 29로 총 5,167줄이다. 공백·주석과 같은 줄의 반복 수정을 포함한다. 최종 net runtime·UI는
