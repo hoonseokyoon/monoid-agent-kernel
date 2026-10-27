@@ -1004,6 +1004,13 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
         assert adapter.yielded == 3
         assert [delta.text for delta in observer.writers[0].deltas] == ["partial"]
         assert [outcome.status for outcome in observer.writers[0].outcomes] == ["cancelled"]
+        outcome = observer.writers[0].outcomes[0]
+        assert outcome.usage == _DRAINED_BILL
+        assert outcome.termination.to_json() == {
+            "outcome": "cancelled", "requested_by": "user_cancel",
+            "ended_by": "provider_terminal",
+        }
+        assert outcome.usage_evidence.completeness["input_tokens"] == "unknown"
         assert loop._session is not None
         assert dict(loop._session.state.total_usage) == _DRAINED_BILL
     finally:

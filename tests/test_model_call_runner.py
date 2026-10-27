@@ -79,6 +79,64 @@ from monoid_agent_kernel.tools.base import ToolSpec
 REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
 
 
+@pytest.mark.parametrize("last", [None, 0, 5])
+def test_p1p2_stream_selects_last_explicit_snapshot_without_zero_fill(last: int | None) -> None:
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    first = _terminal_chunk({"usage": {"input_tokens": 5}}, provider_retried=False)
+    final = _terminal_chunk(
+        {"usage": {} if last is None else {"input_tokens": last}}, provider_retried=False
+    )
+    outcome = _drain_call(_DrainStream(TextDelta("answer"), first, final))
+    assert outcome.error is None
+    expected = 5 if last is None else last
+    assert outcome.receipt.usage["input_tokens"] == expected
+    assert outcome.receipt.usage_evidence.reported == {"input_tokens": expected}
+    assert outcome.receipt.usage_evidence.completeness["input_tokens"] == "complete"
+    assert outcome.receipt.termination.ended_by == "provider_terminal"
+
+
+@pytest.mark.parametrize(
+    ("tail", "ended_by"),
+    [((), "provider_eof"), ((TurnComplete(),), "provider_terminal"),
+     ((ModelAdapterError("read failed"),), "provider_error"),
+     ((asyncio.CancelledError(),), "provider_cancelled")],
+)
+def test_p1p2_drain_keeps_first_stop_and_actual_read_end(tail: tuple, ended_by: str) -> None:
+    outcome = _drain_call(_DrainStream(TextDelta("partial"), *tail), should_abort=_Polls(1))
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert outcome.receipt.termination.to_json() == {
+        "outcome": "interrupted", "requested_by": "turn_interrupt", "ended_by": ended_by,
+    }
+    assert outcome.texts == ["partial"]
+    assert len(outcome.receipt.usage_evidence.attempts) == 1
+
+
+def test_p1p2_durable_retry_then_unknown_preserves_original_error_and_single_sum() -> None:
+    class Adapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            error = (
+                ModelDispatchRefused("refused", retryable=True, http_status=429)
+                if self.calls == 1 else ModelAdapterError("read failed")
+            )
+            mark_provider_usage(error, {"input_tokens": 5 if self.calls == 1 else 2})
+            raise error
+
+    captures = []
+    lifecycle = _JournalLifecycle(DeterministicFencedRunHarness())
+    with pytest.raises(DurableModelCallError, match="unknown") as caught:
+        asyncio.run(ModelCallRunner(
+            adapter=Adapter(), lifecycle_hook=lifecycle, settled_sink=captures.append,
+        ).acall(replace(REQUEST, model=_kernel_model()), logical_call_id="call-durable-1"))
+    assert caught.value.error_code == "dispatch_unknown"
+    assert provider_usage_of(caught.value) == {"input_tokens": 7}
+    assert captures[-1].receipt.usage == {"input_tokens": 7}
+    assert len(captures[-1].receipt.usage_evidence.attempts) == 2
+
+
 def _raises(self: Any, *args: Any, **kwargs: Any) -> Any:
     del self, args, kwargs
     raise RuntimeError("container hook exploded")

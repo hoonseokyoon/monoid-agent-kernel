@@ -534,3 +534,54 @@ import가 site-packages임을 검사했고 Pydantic 2.14.1은 120 passed/3.75s, 
 기존 stamped 후보를 evidence와 검증한 뒤 채택하도록 좁혀 unknown counter의 숫자와 확인된 0을 함께 보존한다.
 관련 receipt/facts **95 passed in 3.02s**. source 상한은 529줄, 누적 예상은 1,999줄이다.
 `e7bffea`의 갱신 wheel audit은 통과했고 독립 설치 환경은 current/minimum 각각 125 passed/2.96s·3.21s였다.
+
+01 최종 `74ff289431f203cb84595f90e0e09abfec12ee72`는 서로 다른 두 코드 reviewer의 PASS를 받았다.
+최종 wheel audit과 설치 환경 Pydantic 2.14.1/2.6.4가 각각 **127 passed / 3.09s·3.04s**였다.
+[L1 40453578644](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40453578644)와
+[required combined L2 40453679101](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40453679101)이
+성공했다. Python 3.11/3.12와 실제 PostgreSQL·ObjectStore·Temporal job을 확인했다.
+[PR #157](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/157)을 expected head로 고정해
+통합 브랜치에 merge commit `ec32ca8e2adc86354cfb9acd7cd5f3b9d657b537`으로 병합했다.
+
+### 9.3 P1P2-02 구현 전 사전조사
+
+실제 fetch한 integration base는 `ec32ca8e2adc86354cfb9acd7cd5f3b9d657b537`, develop은 계속 `d4e659c`다.
+검토한 01 head와 tree가 같다. 작업 브랜치는 `codex/v0.25-p1-p2-runtime`이다.
+root가 구현·runner, `p1p2_01_research`가 읽기 전용 조사, `p1p2_02_preflight_review`가 독립 검토를 맡았다.
+사전조사 `.tmp/v025/p1p2-02-preflight.md` SHA-256은
+`91F74B73941E3D206CFF629BDC25ABE8D68C0AE50780243458B4D5BC19F45B54`, 판정은 **READY**다.
+같은 날 확인한 §3의 pinned 외부 구현을 재사용하고, 현재 OpenAI Responses 경로를 직접 대조했다.
+
+**확인한 upstream 경계.** OpenAI는 raw terminal을 받은 뒤 EOF·cleanup을 마쳐야 TurnComplete를 내보낸다.
+terminal을 일찍 yield하면 direct consumer가 client 정리를 마치기 전에 멈출 수 있다.
+기존 wait bridge는 boundary가 이기면 callee의 결과·예외를 버리므로 예외 stamp만으로도 부족하다.
+기존 `collect_retry_reports`의 ContextVar·mutable carrier 패턴을 재사용하는 작은 **dispatch별 usage collector**를 둔다.
+숫자 snapshot·typed observation·normal/drain phase·closed만 보관하고 lock으로 update/phase/close를 보호한다.
+dispatch 종료 시 닫아 늦은 worker가 다음 관측을 바꾸지 못하게 한다. RetryProgress의 논리 호출 범위는 유지한다.
+원본 수신 시 만든 observation은 지연 terminal에서도 원래 collection을 유지한다.
+
+normalizer의 alias 선택을 sparse 추출에도 재사용하며 명시적 0과 미보고를 분리한다.
+숫자와 evidence를 한 snapshot으로 선택한다. 새 explicit report가 기존 pair를 교체하고,
+usage 없는 terminal·legacy numeric-only conduit는 이미 확인한 explicit snapshot을 덮지 않는다.
+OpenAI의 EOF refusal은 알려진 source 경계에서 provider_eof를 stamp한다. gateway의 기존 frameless EOF 허용은 유지한다.
+runner는 stop 요청과 실제 읽기 종료를 각각 기록하며, provider cancellation은 CalleeCancelled의 원래 cause에서 구별한다.
+
+**독립 검토에서 확정한 선행 수정.** malformed OpenAI 응답의 prompt_tokens/nested reasoning은 기존 실패 stamp에서
+canonical 예산 항목으로 전달되지 않는다. first-party raw failure 경계에서 유효한 sibling을 보존하며 alias를
+canonical로 한 번 선택한다. generic `usage_reported_by`의 임의 key 운반과 정상 parser의 엄격한 거부는 유지한다.
+또한 실제 lifecycle probe에서 refused 5 → ambiguous 2가 cumulative stamp를 다시 더해 attempt-log ValueError로
+바뀌었다. 기존 숫자 settlement에서 이미 합산한 dispatch와 현재 attempt를 구별하여 원래 dispatch_unknown과 합계 7을 보존한다.
+
+recovered v2 evidence prefix는 private attempt log와 따로 유지하고 v1의 과거 dispatch는 legacy_ambiguous로 채운다.
+backoff 취소는 호출 종료 사실만 바꾼다. loop failure observer·예외 translation·required evidence failure·ValidatedCallRunner까지
+동일 사실을 전달한다. invocation/ledger writer는 v1, 03이 영속화, 04가 gateway server·live·Studio·OTel을 담당한다.
+
+수정 전 테스트는 **14 failed / 1 skipped in 4.58s**였다. shared Python의 OpenAI 미설치로 생긴 skip은
+별도 Python 3.11 환경에 최소 지원 OpenAI 1.80.0을 설치해 다시 실행했고 **1 failed in 5.41s**였다.
+실제 terminal→hung EOF→deadline에서 이미 보고한 120/340/460이 빈 stamp로 나오는 실패다.
+raw 출력은 `.tmp/v025/p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때 `git diff -- src`는 비어 있다.
+
+02 최초 600 기능/1,900 총 변경 줄 추정은 유지하며, 숨은 수신 경계와 실패 전달을 반영한 예산은 850/2,300이다.
+01 실제 source 상한 529를 포함한 누적 예상은 2,249 기능 상한/약 7,500 총 변경 줄이다.
+범용 상태 머신·serializer·새 회계 경로는 추가하지 않고 기존 ingress·race·stamp·settlement에 수정을 제한한다.
+기능 2,000줄 soft limit에 접근한 원인과 이 대안을 검토했다. 최종 실제 diff·리뷰 비용을 계속 누적한다.
