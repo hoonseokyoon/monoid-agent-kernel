@@ -499,3 +499,11 @@ reviewer는 source·원본 probe를 확인했으며 별도 runner를 사용하�
 historical spelling/default의 같은 좌표 재게시, v2 reader, 공개 receipt/subscription, mixed ledger에서 실패했다.
 테스트 초기 stale-fence 기대 예외를 기존 `WriteAuthorityRevoked` 계약에 맞춘 뒤 다시 실행한 수치다.
 이 시점 `git diff -- src`는 비어 있다. 원본 출력은 ignored `.tmp/v025/p1p2-01-red.txt`에 보관한다.
+
+실패 회귀 commit은 `cc101b5def74e65e5a1d0affcb5a94f200c8dbd9`다. 구현 후 같은 40개는 통과했다.
+관측 타입의 닫힌 값·0·coverage·합계·private key 거부, source envelope의 nested mutation 거부,
+새 revision의 v1 선택, 복구 retry/backoff cancel, LocalFs·SQLite nested 기록, packaged fixture를 추가해
+관련 **608 passed in 7.32s**를 확인했다. raw 출력은 `.tmp/v025/p1p2-01-targeted.txt`다.
+기존 필드 완전성 테스트는 새 optional 필드의 최대/생략 모양을 모두 검사하도록 확장했다.
+PostgreSQL 16/18과 ObjectStore의 historical/v2 payload·원래 hash·typed binding·evidence 복구 테스트는
+combined 서비스 CI에서 실행한다. 두 독립 최종 코드 리뷰, current/minimum Pydantic 설치 wheel, 원격 L1/L2가 남아 있다.

@@ -728,9 +728,9 @@ def test_recovered_receipt_keeps_whole_call_usage_across_kernel_retry(tmp_path: 
     assert len(adapter.requests) == 2
 
 
-@pytest.mark.parametrize("with_v2_facts", [False, True])
+@pytest.mark.parametrize(("with_v2_facts", "cancel_backoff"), [(False, False), (True, False), (True, True)])
 def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
-    tmp_path: Path, with_v2_facts: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_v2_facts: bool, cancel_backoff: bool,
 ) -> None:
     harness = DeterministicFencedRunHarness()
     refusal = ModelDispatchRefused("transient overload", retryable=True)
@@ -779,6 +779,13 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
         failed = replace(failed, invocation=checked.value)
         harness.sink._invocations[historical_coordinate] = (_record_digest(payload), failed)
     historical_digest = harness.sink._invocations[historical_coordinate][0]
+    if cancel_backoff:
+        from monoid_agent_kernel.errors import RunCancelled
+
+        async def cancelled_wait(self, delay_s, deadline):
+            raise RunCancelled("cancelled during recovered backoff")
+
+        monkeypatch.setattr(ModelCallRunner, "_abackoff", cancelled_wait)
 
     suspension, checkpoint = _restore(
         tmp_path,
@@ -787,6 +794,15 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
         baseline,
         model=model,
     )
+
+    if cancel_backoff:
+        assert suspension.reason == "terminal"
+        assert suspension.error_code == "cancelled"
+        assert checkpoint.total_usage == failed.invocation.receipt["usage"]
+        assert len(adapter.requests) == 1
+        assert harness.sink._invocation_heads[(RUN_ID, LOGICAL_CALL_ID)] == failed.revision
+        assert harness.sink._invocations[historical_coordinate][0] == historical_digest
+        return
 
     expected_usage = {
         "input_tokens": 5,

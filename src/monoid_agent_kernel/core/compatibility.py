@@ -65,6 +65,7 @@ def _monoid_artifact(
     legacy_reader: bool,
     accepts_missing_version: bool = False,
     notes: str = "",
+    additional_readers: tuple[str, ...] = (),
 ) -> CompatibilityArtifact:
     current = namespaced_id(name)
     legacy = legacy_namespaced_id(name)
@@ -76,7 +77,7 @@ def _monoid_artifact(
         key=name.rsplit(".v", 1)[0],
         kind=kind,
         current_writer=current,
-        supported_readers=readers,
+        supported_readers=readers + additional_readers,
         namespace_aliases=aliases,
         reader_policy=reader_policy,
         source=source,
@@ -311,6 +312,7 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         reader_policy="checked",
         source=("core/model_invocation.py:MODEL_INVOCATION_CODEC",),
         legacy_reader=True,
+        additional_readers=("monoid.model-invocation.v2",),
     ),
     _monoid_artifact(
         "backend-run.v1",
@@ -366,6 +368,7 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         # No legacy namespace: this artifact has never existed under native-agent-runner.*, and
         # advertising a reader for records that cannot exist is a false compatibility claim.
         legacy_reader=False,
+        additional_readers=("monoid.model-calls.v2",),
         notes=(
             "Optional private run-dir ledger of settled model calls, one record per call including "
             "failed ones. Metadata and the replay key only: a record is a declared projection of "

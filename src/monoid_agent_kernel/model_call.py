@@ -297,6 +297,8 @@ def _recovered_receipt(
     """Combine current private routing context with authoritative public settlement evidence."""
 
     try:
+        from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageEvidence
+
         evidence = recovered.receipt
         reservation = recovered.reservation
         return replace(
@@ -316,6 +318,10 @@ def _recovered_receipt(
             config_recoverable=evidence.get("config_recoverable", False),
             http_status=evidence.get("http_status"),
             attempt_log=(),
+            termination=(ModelCallTermination.from_json(evidence["termination"])
+                         if "termination" in evidence else None),
+            usage_evidence=(UsageEvidence.from_json(evidence["usage_evidence"])
+                            if "usage_evidence" in evidence else None),
         )
     except Exception as exc:
         raise DurableModelCallError(
@@ -1173,6 +1179,8 @@ class ModelCallRunner:
                                 config_recoverable=False,
                                 http_status=None,
                                 attempt_log=(),
+                                termination=None,
+                                usage_evidence=None,
                             )
                             recovered_failure_receipt = None
                             backoff_started = time.monotonic()

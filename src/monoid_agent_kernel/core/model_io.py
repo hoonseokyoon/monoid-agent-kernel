@@ -58,6 +58,10 @@ from monoid_agent_kernel.core.json_ingress import (
     portable_type_name,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
+from monoid_agent_kernel.core.model_facts import (
+    ModelCallTermination, UsageEvidence, UsageObservation,
+    UsageEvidenceAttempt as UsageEvidenceAttempt,
+)
 from monoid_agent_kernel.core.wire_validation import (
     WireValidationError,
     parse_bool,
@@ -980,6 +984,7 @@ class ModelCallAttempt:
     # null no writer ever wrote or a 0 that claims a measurement never taken. Appended last
     # under the positional-stability rule the receipt states.
     backoff_ms: int | None = None
+    usage_evidence: UsageObservation | None = None
 
     def __post_init__(self) -> None:
         # Type before bounds: a comparison cannot tell an integer from a bool, so the bounds
@@ -1002,6 +1007,10 @@ class ModelCallAttempt:
                     f"model call attempt usage {key!r} must not be negative"
                 )
         object.__setattr__(self, "usage", dict(self.usage))
+        if self.usage_evidence is not None:
+            if not isinstance(self.usage_evidence, UsageObservation):
+                raise ValueError("attempt usage_evidence must be a UsageObservation")
+            self.usage_evidence.validate_usage(self.usage)
 
     @property
     def succeeded(self) -> bool:
@@ -1026,6 +1035,8 @@ class ModelCallAttempt:
         # unconditional key would refuse itself on the next read.
         if self.backoff_ms is not None:
             payload["backoff_ms"] = self.backoff_ms
+        if self.usage_evidence is not None:
+            payload["usage_evidence"] = self.usage_evidence.to_json()
         return payload
 
     @classmethod
@@ -1074,6 +1085,8 @@ class ModelCallAttempt:
             backoff_ms=(
                 None if "backoff_ms" not in payload else parse_int(payload, "backoff_ms")
             ),
+            usage_evidence=(UsageObservation.from_json(payload["usage_evidence"])
+                            if "usage_evidence" in payload else None),
         )
 
 
@@ -1088,7 +1101,7 @@ _ATTEMPT_WIRE_KEYS: tuple[str, ...] = tuple(
 # requiring it would refuse ledgers this same package wrote. Absence of a key in this set reads
 # as "written before the field existed", the record-level rule applied per key; everything not
 # named here stays required the moment it exists, which is the derivation above doing its job.
-_ATTEMPT_OPTIONAL_WIRE_KEYS: frozenset[str] = frozenset({"backoff_ms"})
+_ATTEMPT_OPTIONAL_WIRE_KEYS: frozenset[str] = frozenset({"backoff_ms", "usage_evidence"})
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1195,8 @@ class ModelCallReceipt:
     # the cancel/deadline check or by ingress normalization) or the record predates the field.
     # Appended after ``attempt_log`` under the same positional-stability rule it states.
     idempotency_key: str = ""
+    termination: ModelCallTermination | None = None
+    usage_evidence: UsageEvidence | None = None
 
     def __post_init__(self) -> None:
         # Type before bounds, for the reason the attempt record gives: ``True < 0`` is ``False``,
@@ -1265,6 +1280,16 @@ class ModelCallReceipt:
                     summed[key] = summed.get(key, 0) + value
             if summed != self.usage:
                 raise ValueError("model call attempt_log usage must sum to the receipt's usage")
+        if self.termination is not None and not isinstance(self.termination, ModelCallTermination):
+            raise ValueError("termination must be a ModelCallTermination")
+        if self.usage_evidence is not None:
+            if not isinstance(self.usage_evidence, UsageEvidence):
+                raise ValueError("usage_evidence must be a UsageEvidence")
+            self.usage_evidence.validate_usage(self.usage, self.attempts)
+            for entry, observed in zip(self.attempt_log, self.usage_evidence.attempts):
+                observed.observation.validate_usage(entry.usage)
+                if entry.usage_evidence is not None and entry.usage_evidence != observed.observation:
+                    raise ValueError("attempt_log observations must agree with usage_evidence")
 
     @property
     def succeeded(self) -> bool:
@@ -1412,6 +1437,10 @@ class ModelCallReceipt:
         # is the in-band empty string, so the key itself always travels.
         if self.attempt_log:
             payload["attempt_log"] = [entry.to_json() for entry in self.attempt_log]
+        if self.termination is not None:
+            payload["termination"] = self.termination.to_json()
+        if self.usage_evidence is not None:
+            payload["usage_evidence"] = self.usage_evidence.to_json()
         return payload
 
     @classmethod
@@ -1454,6 +1483,10 @@ class ModelCallReceipt:
             ),
             model=_parsed_model_config(model_payload),
             provider_name=parse_str(payload, "provider_name"),
+            termination=(ModelCallTermination.from_json(payload["termination"])
+                         if "termination" in payload else None),
+            usage_evidence=(UsageEvidence.from_json(payload["usage_evidence"])
+                            if "usage_evidence" in payload else None),
             prompt_digest=parse_str(payload, "prompt_digest"),
             request_digest=parse_str(payload, "request_digest"),
             stop_reason=parse_str(payload, "stop_reason"),

@@ -23,7 +23,7 @@ from monoid_agent_kernel.hosting.admission import (
 def test_packaged_compatibility_fixtures_have_stable_unique_ids() -> None:
     fixtures = load_compatibility_fixtures()
 
-    assert len(fixtures) == 19
+    assert len(fixtures) == 22
     assert len({fixture.fixture_id for fixture in fixtures}) == len(fixtures)
 
 

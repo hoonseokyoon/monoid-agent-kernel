@@ -16,6 +16,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
+from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageEvidence
+
 ModelStreamChannel: TypeAlias = Literal["output", "reasoning"]
 ModelStreamStatus: TypeAlias = Literal[
     "completed",
@@ -77,6 +79,8 @@ class ModelStreamOutcome:
     error_code: str | None = None
     retryable: bool = False
     config_recoverable: bool = False
+    termination: ModelCallTermination | None = None
+    usage_evidence: UsageEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _STATUSES:
@@ -90,6 +94,13 @@ class ModelStreamOutcome:
             raise ValueError("model stream retryable must be a boolean")
         if type(self.config_recoverable) is not bool:
             raise ValueError("model stream config_recoverable must be a boolean")
+        if self.termination is not None:
+            if not isinstance(self.termination, ModelCallTermination) or self.termination.outcome != self.status:
+                raise ValueError("stream termination must agree with status")
+        if self.usage_evidence is not None:
+            if not isinstance(self.usage_evidence, UsageEvidence):
+                raise ValueError("stream usage_evidence must be a UsageEvidence")
+            self.usage_evidence.validate_usage(self.usage or {}, len(self.usage_evidence.attempts))
 
 
 @runtime_checkable
