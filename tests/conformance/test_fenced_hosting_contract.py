@@ -2615,7 +2615,7 @@ def test_reusable_contract_accepts_both_canonical_alias_transition_directions(
     assert alias_observation.actual == "conflict"
 
 
-class _RawCheckpointAliasDigestSink(DeterministicFencedRunSink):
+class _WrongCheckpointAliasIdentitySink(DeterministicFencedRunSink):
     field_name = ""
     broken_direction = ""
 
@@ -2645,14 +2645,17 @@ class _RawCheckpointAliasDigestSink(DeterministicFencedRunSink):
                 and previous_is_legacy != incoming_is_legacy
                 and direction == self.broken_direction
             ):
-                return CommitResult(status="conflict", sequence=checkpoint.seq)
+                return CommitResult(
+                    status="conflict" if self.field_name == "schema_version" else "already_committed",
+                    sequence=checkpoint.seq,
+                )
         return super().commit_checkpoint(checkpoint, blobs, writer_token=writer_token)
 
 
-def _raw_checkpoint_alias_digest_factory(field_name: str, direction: str):
+def _wrong_checkpoint_alias_identity_factory(field_name: str, direction: str):
     def factory() -> DeterministicFencedRunHarness:
         harness = DeterministicFencedRunHarness()
-        sink = _RawCheckpointAliasDigestSink(harness._writers)
+        sink = _WrongCheckpointAliasIdentitySink(harness._writers)
         sink.field_name = field_name
         sink.broken_direction = direction
         harness.sink = sink
@@ -2673,12 +2676,12 @@ def _raw_checkpoint_alias_digest_factory(field_name: str, direction: str):
         for direction in ("current_to_legacy", "legacy_to_current")
     ],
 )
-def test_reusable_contract_normalizes_every_checkpoint_alias_location(
+def test_reusable_contract_distinguishes_outer_aliases_from_nested_storage_identity(
     field_name: str,
     direction: str,
 ) -> None:
     outcomes = run_fenced_run_sink_contract(
-        _raw_checkpoint_alias_digest_factory(field_name, direction)
+        _wrong_checkpoint_alias_identity_factory(field_name, direction)
     )
     checkpoint_rule = next(
         outcome
@@ -2692,8 +2695,8 @@ def test_reusable_contract_normalizes_every_checkpoint_alias_location(
     )
 
     assert checkpoint_rule.status == "failed"
-    assert alias_observation.expected == "already_committed"
-    assert alias_observation.actual == "conflict"
+    assert alias_observation.expected == ("already_committed" if field_name == "schema_version" else "conflict")
+    assert alias_observation.actual == ("conflict" if field_name == "schema_version" else "already_committed")
 
 
 class _RawTerminalAliasDigestSink(DeterministicFencedRunSink):

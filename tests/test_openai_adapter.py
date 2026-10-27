@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -29,6 +30,113 @@ from monoid_agent_kernel.providers.openai import (
     _model_error_from_openai,
     _stream_output_index,
 )
+
+
+@pytest.mark.parametrize("raw", [None, {}, {"input_tokens": 0}, {"output_tokens_details": {"reasoning_tokens": 0}}])
+def test_p1p2_openai_presence_is_captured_before_numeric_normalization(raw: Any) -> None:
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    turn = _parse_response({"usage": raw})
+    expected = (
+        {"input_tokens": 0} if raw == {"input_tokens": 0}
+        else {"reasoning_tokens": 0} if raw else {}
+    )
+    assert turn.usage_evidence.reported == expected
+    assert turn.usage_evidence.source == ("provider" if expected else None)
+
+
+@pytest.mark.parametrize("bad_shape", [
+    {"input_tokens": True, "output_tokens_details": {"reasoning_tokens": 2}},
+    {"input_tokens": {}, "output_tokens_details": 0, "reasoning_tokens": 2},
+    {"input_tokens_details": 7, "reasoning_tokens": 2},
+])
+def test_p1p2_openai_malformed_body_retains_valid_canonical_alias_usage(bad_shape) -> None:
+    from monoid_agent_kernel.providers.base import provider_usage_of
+    from monoid_agent_kernel.providers.openai import _parse_response
+
+    with pytest.raises(ModelAdapterError) as caught:
+        _parse_response({"output": 4, "usage": {
+            "prompt_tokens": 5, **bad_shape,
+        }})
+    usage = provider_usage_of(caught.value)
+    assert usage["input_tokens"] == 5
+    assert usage["reasoning_tokens"] == 2
+    assert caught.value.provider_error_code == "openai_bad_response"
+
+
+def test_p1p2_openai_terminal_before_hung_eof_keeps_usage_on_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.errors import RunTimeout
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    class StallingStream(_FakeAsyncStream):
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._it)
+            except StopIteration:
+                await asyncio.Event().wait()
+
+    _stub_async_openai(monkeypatch, StallingStream([_terminal_event()]))
+    captures = []
+    runner = ModelCallRunner(adapter=_adapter(), settled_sink=captures.append, cancel_grace_s=0.01)
+    with pytest.raises(RunTimeout) as caught:
+        asyncio.run(runner.acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()),
+            deadline=time.time() + 0.15, delta_consumer=lambda chunk: None,
+        ))
+    assert provider_usage_of(caught.value) == _BILLED_RESPONSE_USAGE
+    assert captures[-1].receipt.termination.ended_by == "deadline"
+    assert captures[-1].receipt.usage_evidence.reported == _BILLED_RESPONSE_USAGE
+
+
+def test_p1p2_delayed_openai_terminal_retains_its_original_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.errors import RunCancelled
+    from monoid_agent_kernel.model_call import ModelCallRunner
+
+    token = CancellationToken()
+
+    class CancelAfterTerminal(_FakeAsyncStream):
+        async def __anext__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                token.cancel()
+                await asyncio.sleep(0.01)
+                raise StopAsyncIteration from None
+
+    _stub_async_openai(monkeypatch, CancelAfterTerminal([_terminal_event()]))
+    captures = []
+    runner = ModelCallRunner(
+        adapter=_adapter(), current_cancellation_token=lambda: token,
+        abort_drain_s=1, settled_sink=captures.append,
+    )
+    with pytest.raises(RunCancelled):
+        asyncio.run(runner.acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()),
+            delta_consumer=lambda chunk: None,
+        ))
+    receipt = captures[-1].receipt
+    assert receipt.termination.ended_by == "provider_terminal"
+    assert receipt.usage_evidence.attempts[0].observation.collection == "normal"
+
+
+def test_p1p2_closed_dispatch_collector_rejects_late_worker_reports() -> None:
+    from contextvars import copy_context
+    from monoid_agent_kernel.providers._usage import collect_usage_reports, provider_snapshot
+
+    with collect_usage_reports() as original:
+        provider_snapshot({"input_tokens": 5})
+        worker_context = copy_context()
+    with collect_usage_reports() as following:
+        provider_snapshot({"input_tokens": 0})
+        worker_context.run(provider_snapshot, {"input_tokens": 99})
+    assert original.snapshot[0]["input_tokens"] == 5
+    assert following.snapshot[0]["input_tokens"] == 0
 
 
 class _FakeApiError(Exception):

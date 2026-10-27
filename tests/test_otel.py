@@ -930,6 +930,39 @@ def test_otel_duplicate_delivery_does_not_duplicate_children() -> None:
     assert len(_attempt_children(exporter.get_finished_spans())) == 2
 
 
+@pytest.mark.parametrize("keep_log", [False, True])
+def test_otel_recovered_facts_survive_redelivery_without_inventing_attempt_children(keep_log):
+    from dataclasses import replace
+    from monoid_agent_kernel.core.model_facts import (
+        ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
+    )
+
+    original = _attempt_receipt()
+    observations = tuple(UsageObservation(
+        reported=entry.usage, source="provider", collection="normal",
+    ) for entry in original.attempt_log)
+    evidence = UsageEvidence(attempts=tuple(UsageEvidenceAttempt(index=i, observation=value)
+                                          for i, value in enumerate(observations, 1)))
+    receipt = replace(
+        original, termination=ModelCallTermination(outcome="completed", ended_by="provider_terminal"),
+        usage_evidence=evidence,
+        attempt_log=tuple(replace(entry, usage_evidence=value)
+                          for entry, value in zip(original.attempt_log, observations)) if keep_log else (),
+    )
+    provider, exporter = _provider_and_exporter()
+    preset = _mode_preset("agent", provider)
+    _deliver(preset, receipt, "agent")
+    preset.on_model_call(ModelCallCapture(receipt=receipt))
+    preset.close()
+    spans = exporter.get_finished_spans()
+    assert len(_attempt_children(spans)) == (2 if keep_log else 0)
+    parent = next(span for span in spans if span.name.startswith("chat"))
+    assert json.loads(parent.attributes["monoid.model.usage.reported"]) == evidence.reported
+    assert json.loads(parent.attributes["monoid.model.usage.completeness"]) == evidence.completeness
+    assert parent.attributes["monoid.model.termination.ended_by"] == "provider_terminal"
+    assert "monoid.model.usage.attempts" not in parent.attributes
+
+
 def test_otel_receipt_without_an_open_chat_span_synthesizes_no_orphans() -> None:
     """No matching chat span (the existing enrich no-op) means no children either -- attempt
     spans annotate a call the trace already shows, they do not invent one."""

@@ -125,6 +125,7 @@ import pytest
 
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
 from monoid_agent_kernel.core.lifecycle import REASON_TO_STATE
+from monoid_agent_kernel.core.model_facts import UsageObservation
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.manifest import _tool_spec_payload as _manifest_tool_spec_payload
 from monoid_agent_kernel.core.result import (
@@ -1413,6 +1414,8 @@ GATEWAY_WIRE_READ_HELPERS = frozenset(
         "_exact_gateway_bool",
         "_exact_gateway_int",
         "_gateway_usage",
+        "_gateway_observation",
+        "_stamp_gateway_observation",
         "_gateway_http_status_hint",
         "usage_reported_by",
         "_portable_gateway_payload",
@@ -1524,6 +1527,8 @@ GATEWAY_MAPPING_READ_HELPERS = frozenset(
         "_gateway_http_status_hint",
         "_gateway_string",
         "usage_reported_by",
+        "_gateway_observation",
+        "_stamp_gateway_observation",
     }
 )
 # The registered helpers no mapping scan can reach: they validate an already-extracted
@@ -1587,7 +1592,7 @@ def _literal_wire_keys(function: ast.AST) -> frozenset[str]:
 _HELPER_INTERNAL_READS: dict[str, frozenset[str]] = {}
 
 
-def _wire_keys_read_in(function: _FunctionNode) -> frozenset[str]:
+def _wire_keys_read_in(function: ast.AST) -> frozenset[str]:
     """Every wire key ``function`` reads, including the ones a helper reads on its behalf.
 
     ``usage_reported_by(payload)`` names no key at the call site -- the ``"usage"`` literal
@@ -2398,6 +2403,7 @@ def test_1d_the_terminal_failure_record_keeps_the_classification_its_twin_carrie
 # --------------------------------------------------------------------------------------
 
 SERVER_ERROR_BODY_KEYS = frozenset(TRANSPORTABLE_ERROR_WIRE_ALIASES)
+SERVER_ERROR_OPTIONAL_BODY_KEYS = frozenset({"usage_evidence"})
 
 # ``_error_body``'s own signature, pinned. Every parameter carries one wire key: the two
 # positionals become ``http_status``/``error``, the keyword-only ones keep their names. So the
@@ -2422,7 +2428,7 @@ def test_2a_the_error_body_signature_and_the_wire_key_set_determine_each_other()
     }
     assert positional == SERVER_ERROR_BODY_POSITIONALS
     accounted = keyword_only | SERVER_ERROR_BODY_POSITIONAL_WIRE_KEYS
-    assert accounted == SERVER_ERROR_BODY_KEYS, {
+    assert accounted == SERVER_ERROR_BODY_KEYS | SERVER_ERROR_OPTIONAL_BODY_KEYS, {
         "parameters_without_a_wire_key": sorted(accounted - SERVER_ERROR_BODY_KEYS),
         "wire_keys_without_a_parameter": sorted(SERVER_ERROR_BODY_KEYS - accounted),
         "hint": "a new parameter must reach BOTH writers and the alias table, or fail here",
@@ -2879,6 +2885,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "provider_retried",
             "usage",
             # success half
+            "usage_evidence",
             "tool_calls",
             "arguments",
             "id",
@@ -2903,6 +2910,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
             "http_status",
             "provider_retried",
             "usage",
+            "usage_evidence",
             "type",
             "text",
             "index",
@@ -2925,7 +2933,7 @@ GATEWAY_READER_WIRE_KEYS: dict[str, frozenset[str]] = {
     # Reads no ``http_status``: the status line it was handed wins (registered quirk above).
     # ``usage`` is read for it by ``usage_reported_by``, not named at the call site.
     "providers/gateway.py:_error_from_status_body": frozenset(
-        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage"}
+        {"error", "error_code", "retryable", "config_recoverable", "provider_retried", "usage", "usage_evidence"}
     ),
 }
 
@@ -3238,6 +3246,7 @@ def test_2c_round_trip_through_the_hop_loses_exactly_the_registered_facts() -> N
 
 
 GATEWAY_STATUS_FORWARDING_VALIDATORS = (
+    "_gateway_observation",
     "_exact_gateway_bool",
     "_gateway_string",
     "_exact_gateway_int",
@@ -4530,7 +4539,7 @@ GATEWAY_SUCCESS_BODY_KEYS = frozenset(
         "turn_handle",
         "final_text",
         "tool_calls",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
         "generation_applied",
@@ -4552,7 +4561,7 @@ GATEWAY_TERMINAL_FRAME_KEYS = frozenset(
     {
         "type",
         "turn_handle",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
         "generation_applied",
@@ -4600,6 +4609,9 @@ class _EverythingAdapter:
             reasoning=({"type": "reasoning", "id": "rs_1"},),
             stop_reason="stop",
             provider_retried=True,
+            usage_evidence=UsageObservation(
+                reported={"input_tokens": 5}, source="adapter", collection="normal",
+            ),
         )
 
 
@@ -4681,13 +4693,13 @@ GATEWAY_MINIMAL_BODY_KEYS = frozenset(
         "turn_handle",
         "final_text",
         "tool_calls",
-        "usage",
+        "usage", "usage_evidence",
         "stop_reason",
         "provider_retried",
     }
 )
 GATEWAY_MINIMAL_FRAME_KEYS = frozenset(
-    {"type", "turn_handle", "usage", "stop_reason", "provider_retried"}
+    {"type", "turn_handle", "usage", "usage_evidence", "stop_reason", "provider_retried"}
 )
 # The keys that ride the wire only sometimes. THREE conditionalities, deliberately unified into
 # one set because the *wire* property is the same one: the three echoes appear only when the
@@ -4926,6 +4938,8 @@ def _field_default(field: dataclasses.Field) -> Any:
 # the two halves of one function cannot cover for each other.
 SUCCESS_READS_R1 = frozenset(
     {
+        "http_status",
+        "usage_evidence",
         "error",
         "provider_retried",
         "retryable",
@@ -4945,6 +4959,7 @@ SUCCESS_READS_R1 = frozenset(
 )
 TURN_COMPLETE_READS_R2 = frozenset(
     {
+        "usage_evidence",
         "turn_handle",
         "response_id",
         "usage",
@@ -4958,6 +4973,7 @@ TURN_COMPLETE_READS_R2 = frozenset(
 )
 # Reads with no writer, each one accounted for.
 SUCCESS_DANGLING_READS: dict[str, str] = {
+    "http_status": "lenient status hint shared with the error branch",
     "error": "the envelope discriminator: one parser serves both shapes and tests this key "
     "before branching, so it is read on the success path and written only on the error one",
     "response_id": "alias: the gateway writes turn_handle, and the same parser also serves a "
@@ -4982,7 +4998,7 @@ def _success_branch_reads() -> frozenset[str]:
         body=[statement for statement in parser.body if statement is not error_branch],
         type_ignores=[],
     )
-    return _literal_wire_keys(outside)
+    return _wire_keys_read_in(outside)
 
 
 def _turn_complete_branch_reads() -> frozenset[str]:
@@ -4996,7 +5012,7 @@ def _turn_complete_branch_reads() -> frozenset[str]:
         and isinstance(node.test.comparators[0], ast.Constant)
         and node.test.comparators[0].value == "turn_complete"
     )
-    return _literal_wire_keys(branch)
+    return _wire_keys_read_in(branch)
 
 
 def test_7c_the_client_reads_the_success_wire_the_server_writes() -> None:
@@ -5034,7 +5050,7 @@ def test_7c_the_client_reads_the_terminal_frame_the_server_writes() -> None:
     unwritten = read - GATEWAY_TERMINAL_FRAME_KEYS
     assert unwritten == {"response_id"}, {
         "read_but_never_written": sorted(unwritten),
-        "hint": "the same turn_handle/response_id alias the sync parser carries",
+        "hint": "response_id is an alias of turn_handle",
     }
     assert GATEWAY_TERMINAL_FRAME_KEYS - read - {"type", "provider_retried"} == set()
 
@@ -5072,6 +5088,7 @@ TERMINAL_FRAME_PRE_BRANCH_READS = frozenset({"type", "provider_retried"})
 # ``turn_handle`` first) and not on the body reader (which reads ``response_id`` first).
 SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
     "providers/gateway.py:_parse_gateway_response": {
+        "usage_evidence": {"usage_evidence": {"reported": {"input_tokens": True}}},
         "provider_retried": {"provider_retried": "yes"},
         "retryable": {"retryable": "yes"},
         "tool_calls": {"tool_calls": {"not": "an array"}},
@@ -5087,6 +5104,7 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
         "provider": {"provider": 7},
     },
     "providers/gateway.py:_chunk_from_event": {
+        "usage_evidence": {"usage_evidence": {"reported": {"input_tokens": True}}},
         "type": {"type": 7},
         "provider_retried": {"provider_retried": "yes"},
         "turn_handle": {"turn_handle": 7},
@@ -5102,6 +5120,7 @@ SUCCESS_ENVELOPE_REFUSAL_PROBES: dict[str, dict[str, dict[str, Any]]] = {
 # Reads with no probe, each one accounted for, like ``SUCCESS_DANGLING_READS`` above.
 UNPROBED_SUCCESS_ENVELOPE_READS: dict[str, dict[str, str]] = {
     "providers/gateway.py:_parse_gateway_response": {
+        "http_status": "the lenient status hint ignores malformed values and raises no refusal",
         "error": "the discriminator: a body carrying it selects the ERROR branch, whose own "
         "reads are censused by family 7f below. The first version of this entry said that "
         "branch 'builds and stamps its own failure' and treated that as covering it -- true "
@@ -5305,13 +5324,17 @@ UNPROBED_ERROR_ENVELOPE_READS: dict[str, dict[str, str]] = {
     "providers/gateway.py:_parse_gateway_response": {
         "usage": "the stamp's own source: when IT is the malformed key there is nothing "
         "trustworthy left to stamp, and the lenient read is the declared behavior",
+        "usage_evidence": "optional malformed diagnostics are omitted while preserving the original "
+        "error and usage; all three readers are probed in test_model_fact_consumers",
     },
     "providers/gateway.py:_chunk_from_event": {
         "usage": "same as the body reader's",
+        "usage_evidence": "same lenient diagnostic policy, covered by test_model_fact_consumers",
     },
     "providers/gateway.py:_error_from_status_body": {
         "usage": "same as the body reader's; this reader names the key only through "
         "``usage_reported_by``, which is the stamp itself",
+        "usage_evidence": "same lenient diagnostic policy, covered by test_model_fact_consumers",
     },
 }
 
@@ -6598,6 +6621,7 @@ def test_future_family_status_json_is_already_wider_than_its_own_schema() -> Non
 CARRIER_FILES: dict[str, frozenset[str]] = {
     "config_recoverable": frozenset(
         {
+            "model_lifecycle.py",
             # Joined in the burn-down: the immutable record of one call, the live stream lane
             # (outcome type, sidecar writer/reader) that used to classify with half the
             # vocabulary.
@@ -6742,6 +6766,7 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
             # already-reported paid usage on the escaping durable boundary error.
             "model_lifecycle.py",
             "providers/base.py",
+            "providers/_usage.py",
             "providers/gateway.py",
             # Joined in the burn-down's round-two pass: the SOURCE reader. Every carrier in
             # this set could only report a cost the adapter that first saw the provider's
@@ -6754,9 +6779,9 @@ CARRIER_FILES: dict[str, frozenset[str]] = {
     ),
     "reasoning_tokens": frozenset(
         {
-            # v0.22's safe receipt usage vocabulary can preserve the billed sub-count while the
-            # private reasoning payload stays in the result blob.
-            "core/model_invocation.py",
+            # Shared closed counter vocabulary now lives beside explicit observation types;
+            # the durable invocation reader imports this same vocabulary.
+            "core/model_facts.py",
             "core/schemas.py",
             "loop.py",
             "providers/_common.py",

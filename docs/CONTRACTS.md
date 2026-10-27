@@ -445,6 +445,54 @@ adapter still counts as 1: the kernel did begin the call there. Under the kernel
 layer each re-dispatch adds one, so N means N adapter calls for one logical request. A payload that omits the field reads
 as 1, which is what older records mean.
 
+`ModelCallReceipt.termination` separates the logical outcome, the first accepted stop request
+(`requested_by`), and the actual end of reading (`ended_by`). A cancelled call that drains to a
+valid terminal and EOF has `cancelled / user_cancel / provider_terminal`; a deadline ending that
+drain changes `ended_by` to `deadline`. A terminal received before a later read error remains
+`provider_error`. An elapsed deadline has no requester; an accepted deadline token names `deadline`.
+Provider self-cancellation is `provider_cancelled`; caller task cancellation names `caller_cancel`.
+Authority loss continues to block observer and durable publication by the stale owner.
+
+`UsageObservation` carries explicitly reported canonical counters, including zero, plus source
+and collection. An adapter can append it as `ModelTurn.usage_evidence` or
+`TurnComplete.usage_evidence`, with `source="adapter"`. First-party raw ingress records
+`source="provider"`. A custom adapter or old gateway without this metadata is `legacy_ambiguous`;
+its numeric usage continues to count. New observations must agree with the numeric projection.
+The built-in normalizer's supported input/output/total/cache/reasoning/audio fields retain their
+existing aliases; the larger durable counter vocabulary can remain unknown for a given adapter.
+
+`ModelCallReceipt.usage_evidence` covers every kernel dispatch, including recovered history.
+Its `reported` contains known sums; `completeness` is counter-specific: `no_dispatch`, `complete`,
+`partial`, or `unknown`. A repeated snapshot replaces the prior snapshot within one dispatch.
+An explicit zero can replace a positive count; a usage-less terminal preserves the last report.
+Only distinct dispatch contributions are added. SDK-internal HTTP retries are outside this
+coverage guarantee. The numeric `usage` remains the accounting input.
+
+OpenAI captures usage before response/client cleanup while preserving cleanup-before-terminal
+delivery. A bounded dispatch collector carries already-received reports through cancellation.
+Collection records the original receipt phase (`normal` or `drain`), including a terminal
+delivered later. Escaping runner exceptions carry `model_call_termination` and
+`model_usage_evidence`; existing numeric `provider_usage` stamps continue to serve accounting.
+`ValidatedCallRunner.receipts` contains completed calls; the failed call keeps its own exception facts.
+
+Recovery verification failures report a current `failed` / `local_failure` outcome while keeping
+checked historical attempts, numeric usage and usage evidence. The immutable stored settlement
+retains its original termination and hash. A required-evidence projection failure retains the
+checked provider outcome; when no private turn has been loaded, the stream observer leaves final
+text and successful final-turn usage unavailable. Refusal replay preserves its facts alongside
+the existing accounting delta, which can be empty after the original usage was applied.
+Required-evidence recovery can precede request identity validation. If a failed projection belongs
+to a different stored request digest, checked historical usage and facts remain on the exception
+and journal for accounting. The journal has no historical model configuration, so the runner
+withholds reconstructed subscription and ledger receipts. The current stream observer closes as
+`failed` / `evidence_uncommitted` with final text, usage, termination and usage evidence unavailable.
+This keeps historical usage separate from the replacement request's model and routing metadata.
+
+See the offline [subscription example](../examples/model_call_facts.py) and
+[JSON recovery example](../examples/recover_model_call_facts.py). Fresh invocation revisions and
+model-call ledger entries use v2 and preserve these facts. Existing v1 history stays readable with
+unavailable observations. P1P2-04 completes gateway-server, live/Studio and OTel projections.
+
 `ModelCallReceipt.attempt_log` itemizes what `attempts` counts: per dispatch, the index, the
 elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
 the adapter's loop reported *during that dispatch* (the receipt's `provider_retried` stays the
@@ -806,7 +854,9 @@ recovery correctness.
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
 This keeps token-boundary interruption responsive while durable events remain compact. With
 `async_model_abort_drain_s` set, an interrupted stream is drained for its usage before the turn
-parks; the observer outcome stays `interrupted` with no usage (see the stopped-stream drain above).
+parks; the observer outcome stays `interrupted` and carries the recovered usage and call facts.
+Successful stream `usage` describes the final provider turn, while failure `usage` describes the
+logical call. `usage_evidence` always covers the logical call, including prior retries.
 `emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
 `model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
 execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes
@@ -823,7 +873,7 @@ remain side-effect free. A `stream_closed` record carries the boolean `retryable
 treat its absence as `false` for records written before that field was introduced.
 
 `AgentLoop.model_calls_file=True` writes the optional private `model_calls.jsonl` ledger: one
-`monoid.model-calls.v1` record of kind `model_call` per settled call, **including failed ones**.
+`monoid.model-calls.v2` record of kind `model_call` per settled call, **including failed ones**.
 Existing run directories may omit the file, and it is independent of `model_content_file` and
 `stream_model_calls` — a ledger of what was called selects no provider streaming. A subagent
 inherits the switch and records into its own run directory, so every record carries `root_run_id`
@@ -1832,6 +1882,21 @@ all validated descendant run ids. A delta includes separate output/reasoning-cha
 suffix without duplicating content. A `closed` frame and the corresponding Studio hydration
 snapshot carry the same optional boolean `retryable` signal, with absence interpreted as `false`.
 
+Live `closed` frames also carry optional `termination` and aggregate `usage_evidence` from the
+settled outcome. `termination` records outcome, first accepted stop requester, and read end;
+its outcome agrees with frame status. Evidence covers every kernel dispatch in the logical call,
+while a successful frame's numeric `usage` describes its final provider turn. Explicit zero is
+reported; absent counters remain unknown. Studio validates the closed vocabularies, portable
+integers, and evidence-derived sums/coverage before retaining these fields.
+
+The existing ring byte limit applies to facts. A fitting legacy closed frame retains its content
+when optional facts would exceed the limit. Oversized content uses the existing `content_omitted`
+marker, retaining facts when they fit and omitting them otherwise. Studio preserves received facts
+across hydration only for the same root/run/turn/stream/step/start identity. Private model-content
+snapshots keep their v1 projection and supply no new facts. Studio closes the live subscription on
+the durable terminal event; when that event wins the delivery race, snapshot-only facts display
+as unavailable. Late retained close metadata can enrich the same call without reopening content.
+
 Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
 least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
 oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
@@ -2194,6 +2259,18 @@ Successful response:
   "provider": "openai"
 }
 ```
+
+The optional `usage_evidence` key carries one dispatch observation on success bodies, terminal
+SSE frames, HTTP errors, and SSE errors: `{"reported":{"input_tokens":0},"source":"provider",
+"collection":"normal"}`. Gateway relays preserve its source and collection phase. The outer
+runner owns logical-call termination and aggregate evidence. Older peers omit the key and read as
+legacy ambiguous. The reference writer includes the normalized observation on success, including
+empty legacy observations; failure writers include it when the exception carries one.
+Malformed error observations are omitted while the original classified error and numeric usage
+remain readable. Malformed observations on a success response retain the existing bad-response
+refusal policy. A withheld terminal followed by a read error preserves the selected final snapshot,
+including explicit zero, and meters its numeric usage once. Applied-proof refusals carry the same
+observation through chained gateways. These fields preserve the existing v1 transport envelope.
 
 `reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim: the
 provider's output-item subsequence, adjacency-preserving — the `reasoning` items **plus the

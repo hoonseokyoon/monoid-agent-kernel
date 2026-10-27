@@ -1422,6 +1422,7 @@
             <RunView
               state={run}
               subagents={subagentList}
+              modelCalls={Object.values(modelStreamState.calls)}
               connected={streamConnected}
               onStop={stopTurn}
               onPause={pauseRun}

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn, Protocol
 
 from monoid_agent_kernel.core.json_ingress import (
@@ -41,6 +41,9 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_usage,
     normalize_model_turn,
     unportable_usage_key,
+)
+from monoid_agent_kernel.core.model_facts import (
+    ModelCallTermination, UsageEvidence, mark_read_end, read_end_of, mark_call_facts,
 )
 
 
@@ -181,21 +184,71 @@ def safe_failure_code(value: object, *, default: str) -> str:
 def mark_recovered_model_usage(
     error: BaseException,
     receipt: Mapping[str, Any],
+    *,
+    failure_code: str = "",
+    idempotency_key: str = "",
+    request_digest: str = "",
 ) -> None:
-    """Carry already-billed public usage when recovered result verification fails."""
+    """Carry checked settlement facts when its result or evidence projection fails."""
 
     raw_usage = receipt.get("usage")
-    if not isinstance(raw_usage, Mapping):
-        return
     usage = {
-        key: value
-        for key, value in raw_usage.items()
-        if type(key) is str
-        and key in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
-        and is_portable_json_integer(value)
-        and value >= 0
-    }
+        key: value for key, value in raw_usage.items()
+        if type(key) is str and key in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+        and is_portable_json_integer(value) and value >= 0
+    } if isinstance(raw_usage, Mapping) else {}
     mark_provider_usage(error, usage)
+    try:
+        termination = (
+            ModelCallTermination.from_json(receipt["termination"])
+            if "termination" in receipt else None
+        )
+        evidence = UsageEvidence.from_json(receipt["usage_evidence"]) if "usage_evidence" in receipt else None
+        if evidence is not None:
+            evidence.validate_usage(receipt.get("usage", {}), receipt.get("attempts", 0))
+        if not isinstance(error, ModelEvidenceUncommitted):
+            termination = ModelCallTermination(outcome="failed", ended_by="local_failure")
+        checked = ModelCallReceipt(
+            attempts=receipt["attempts"], usage=usage,
+            termination=termination, usage_evidence=evidence,
+            error_code=failure_code,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            stop_reason=receipt.get("stop_reason", ""),
+            latency_ms=receipt.get("latency_ms", 0),
+            provider_error_code=receipt.get("provider_error_code", ""),
+            provider_retried=receipt.get("provider_retried", False),
+            retryable=receipt.get("retryable", False),
+            config_recoverable=receipt.get("config_recoverable", False),
+            http_status=receipt.get("http_status"),
+        )
+        mark_call_facts(error, termination, evidence)
+        error._checked_recovery_receipt = checked  # type: ignore[attr-defined]
+    except Exception:
+        pass  # Corrupt recovery data must preserve the original verification failure.
+
+
+def recovered_model_failure_receipt(
+    error: BaseException, base: ModelCallReceipt,
+) -> ModelCallReceipt | None:
+    """Read checked recovery metadata only at the recovery hook/decoder boundary."""
+    checked = getattr(error, "_checked_recovery_receipt", None)
+    if not isinstance(checked, ModelCallReceipt):
+        return None
+    projected = base.with_error(error)
+    if isinstance(error, ModelEvidenceUncommitted):
+        projected = replace(
+            base, error_code=checked.error_code, stop_reason=checked.stop_reason,
+            latency_ms=checked.latency_ms, provider_error_code=checked.provider_error_code,
+            provider_retried=checked.provider_retried, retryable=checked.retryable,
+            config_recoverable=checked.config_recoverable, http_status=checked.http_status,
+        )
+    return replace(
+        projected, attempts=checked.attempts, usage=checked.usage,
+        termination=checked.termination, usage_evidence=checked.usage_evidence,
+        idempotency_key=checked.idempotency_key or base.idempotency_key,
+        request_digest=checked.request_digest or base.request_digest,
+    )
 
 
 def reserve_model_dispatch(
@@ -276,6 +329,8 @@ def raise_model_dispatch_unknown(
     *,
     failure_code: str = "dispatch_unknown",
     usage: Mapping[str, int] | None = None,
+    termination: ModelCallTermination | None = None,
+    usage_evidence: UsageEvidence | None = None,
 ) -> NoReturn:
     """Commit ambiguity when possible and always stop automatic paid-call retry."""
 
@@ -294,6 +349,9 @@ def raise_model_dispatch_unknown(
         )
         if usage:
             mark_provider_usage(failed, usage)
+        if read_end_of(cause) is not None:
+            mark_read_end(failed, read_end_of(cause))
+        mark_call_facts(failed, _unknown_termination(termination), usage_evidence)
         raise failed from persistence_error
     failed = DurableModelCallError(
         "model dispatch is unknown; automatic paid-call retry is forbidden",
@@ -301,7 +359,18 @@ def raise_model_dispatch_unknown(
     )
     if usage:
         mark_provider_usage(failed, usage)
+    if read_end_of(cause) is not None:
+        mark_read_end(failed, read_end_of(cause))
+    mark_call_facts(failed, _unknown_termination(termination), usage_evidence)
     raise failed from cause
+
+
+def _unknown_termination(termination: ModelCallTermination | None) -> ModelCallTermination | None:
+    if termination is None:
+        return None
+    return ModelCallTermination(
+        outcome="failed", requested_by=termination.requested_by, ended_by=termination.ended_by,
+    )
 
 
 def settle_model_dispatch(
@@ -328,9 +397,11 @@ def settle_model_dispatch(
                 failure_code=safe_failure,
             )
         )
-    except ModelEvidenceUncommitted:
+    except ModelEvidenceUncommitted as evidence_error:
         # The invocation is already authoritative. Reclassifying a projection failure as an
         # ambiguous paid dispatch would both lose that fact and invite the wrong recovery path.
+        mark_call_facts(evidence_error, receipt.termination, receipt.usage_evidence)
+        mark_provider_usage(evidence_error, receipt.usage)
         raise
     except Exception as persistence_error:
         raise_model_dispatch_unknown(
@@ -339,6 +410,8 @@ def settle_model_dispatch(
             persistence_error,
             failure_code="settlement_uncommitted",
             usage=receipt.usage,
+            termination=receipt.termination,
+            usage_evidence=receipt.usage_evidence,
         )
 
 

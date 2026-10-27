@@ -33,6 +33,7 @@ from monoid_agent_kernel.adapters.temporal.activity import (
     TemporalActivationActivity,
     TemporalActivityPolicy,
 )
+from monoid_agent_kernel.core.model_facts import UsageObservation
 from monoid_agent_kernel.core.model_invocation import DurableModelInvocation
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.hosting import (
@@ -54,7 +55,13 @@ class _FileCountingAdapter:
         del request
         current = int(self.counter_path.read_text("utf-8")) if self.counter_path.exists() else 0
         self.counter_path.write_text(str(current + 1), encoding="utf-8")
-        return ModelTurn(final_text="private paid model result before worker crash")
+        return ModelTurn(
+            final_text="private paid model result before worker crash",
+            usage={"input_tokens": 0},
+            usage_evidence=UsageObservation(
+                reported={"input_tokens": 0}, source="adapter", collection="normal",
+            ),
+        )
 
 
 @dataclass

@@ -12,6 +12,7 @@ from monoid_agent_kernel.core.authority import (
     WriteAuthorityRevoked,
 )
 from monoid_agent_kernel.core.model_invocation import (
+    MODEL_INVOCATION_SCHEMA_VERSION,
     DurableModelInvocation,
     ModelEvidencePolicy,
 )
@@ -158,7 +159,10 @@ class FencedModelCallLifecycle:
             raise
         except Exception as exc:
             failed = ModelEvidenceUncommitted()
-            mark_recovered_model_usage(failed, invocation.receipt or {})
+            mark_recovered_model_usage(
+                failed, invocation.receipt or {}, failure_code=invocation.failure_code,
+                idempotency_key=invocation.idempotency_key, request_digest=invocation.request_digest,
+            )
             raise failed from exc
 
     def _reject_evidence_policy_change(
@@ -262,6 +266,7 @@ class FencedModelCallLifecycle:
     def _unknown_started(self, invocation: DurableModelInvocation) -> None:
         unknown = replace(
             invocation,
+            schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
             revision=invocation.revision + 1,
             dispatch_state="unknown",
             failure_code="dispatch_unknown",
@@ -281,7 +286,10 @@ class FencedModelCallLifecycle:
             message,
             error_code="durable_invocation_result_corrupt",
         )
-        mark_recovered_model_usage(error, invocation.receipt or {})
+        mark_recovered_model_usage(
+            error, invocation.receipt or {},
+            idempotency_key=invocation.idempotency_key, request_digest=invocation.request_digest,
+        )
         return error
 
     def recover(
@@ -457,6 +465,7 @@ class FencedModelCallLifecycle:
         self._commit(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="dispatch_started",
             )
@@ -485,6 +494,7 @@ class FencedModelCallLifecycle:
         self._commit_settled(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="settled",
                 receipt=dict(settlement.receipt),
@@ -511,6 +521,7 @@ class FencedModelCallLifecycle:
         self._commit(
             replace(
                 invocation,
+                schema_version=MODEL_INVOCATION_SCHEMA_VERSION,
                 revision=invocation.revision + 1,
                 dispatch_state="unknown",
                 failure_code=unknown.failure_code,

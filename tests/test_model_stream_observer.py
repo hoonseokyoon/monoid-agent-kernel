@@ -20,6 +20,9 @@ from monoid_agent_kernel.core.model_stream import (
     ModelStreamStatus,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
+from monoid_agent_kernel.core.model_facts import (
+    ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
+)
 from monoid_agent_kernel.core.spec import AgentRunSpec
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.loop import AgentLoop
@@ -33,6 +36,34 @@ from monoid_agent_kernel.providers.base import (
     mark_provider_usage,
 )
 from monoid_agent_kernel.recorder import MemoryEventSink
+
+
+@pytest.mark.parametrize("stamped", [False, True])
+def test_successful_model_observer_ignores_callers_handled_exception(tmp_path, stamped):
+    from monoid_agent_kernel.core.model_facts import mark_call_facts
+
+    observer = _RecordingObserver()
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([
+        TextDelta("ok"), TurnComplete(usage={"input_tokens": 5}),
+    ]), observer_factories=(lambda: observer,))
+
+    async def run():
+        try:
+            previous = RuntimeError("previous attempt")
+            if stamped:
+                mark_call_facts(previous, ModelCallTermination(
+                    outcome="failed", ended_by="provider_error",
+                ), UsageEvidence())
+            raise previous
+        except RuntimeError:
+            return await loop.arun_once("hello")
+
+    assert asyncio.run(run()).final_text == "ok"
+    outcome = observer.writers[0].outcomes[0]
+    assert outcome.final_text == "ok"
+    assert outcome.usage["input_tokens"] == 5
+    assert outcome.termination.outcome == "completed"
+    assert len(outcome.usage_evidence.attempts) == 1
 
 
 class _RecordingWriter:
@@ -49,6 +80,18 @@ class _RecordingWriter:
 
     def close(self, outcome: ModelStreamOutcome) -> None:
         self.outcomes.append(outcome)
+
+
+def _legacy_outcome(*, ended_by="provider_terminal", requested_by=None, **fields):
+    return ModelStreamOutcome(
+        **fields,
+        termination=ModelCallTermination(
+            outcome=fields["status"], ended_by=ended_by, requested_by=requested_by,
+        ),
+        usage_evidence=UsageEvidence(attempts=(UsageEvidenceAttempt(
+            index=1, observation=UsageObservation(source="legacy_ambiguous"),
+        ),)),
+    )
 
 
 class _RecordingObserver:
@@ -162,7 +205,7 @@ def test_observer_gets_filtered_content_context_and_completed_outcome(tmp_path: 
     ]
     assert observer.writers[0].dispatches == 1
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status="completed",
             final_text="Hello",
             usage={"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
@@ -307,7 +350,7 @@ def test_one_shot_adapter_still_closes_observer_with_settled_output(tmp_path: Pa
     assert result.final_text == "whole answer"
     assert observer.writers[0].deltas == []
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status="completed",
             final_text="whole answer",
             usage={"input_tokens": 0, "output_tokens": 2, "total_tokens": 0},
@@ -519,8 +562,10 @@ def test_typed_run_cancellation_closes_the_model_stream_with_the_same_classifica
     assert suspension.reason == suspension_reason
     assert suspension.interruption_cause is cause
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status=stream_status,
+            requested_by=cause.value,
+            ended_by="deadline" if cause is InterruptionCause.DEADLINE else "stop_request",
             final_text="partial",
             error_code=stream_error_code,
         )
@@ -543,11 +588,12 @@ def test_partial_output_closes_observer_as_failed(tmp_path: Path) -> None:
     assert suspension.reason == "turn_failed"
     assert suspension.retryable is True
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status="failed",
             final_text="partial",
             error_code="model_error",
             retryable=True,
+            ended_by="provider_error",
         )
     ]
 
@@ -580,12 +626,13 @@ def test_a_config_fixable_stream_failure_says_so_on_the_outcome(tmp_path: Path) 
 
     assert (suspension.retryable, suspension.config_recoverable) == (False, True)
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status="failed",
             final_text="partial",
             error_code="model_error",
             retryable=False,
             config_recoverable=True,
+            ended_by="provider_error",
         )
     ]
 
@@ -904,7 +951,7 @@ def test_run_stream_interrupt_drains_the_call_then_surfaces_a_suspension(tmp_pat
         ModelStreamDelta(channel="output", text="after"),
     ]
     assert observer.writers[0].outcomes == [
-        ModelStreamOutcome(
+        _legacy_outcome(
             status="completed",
             final_text="before after",
             usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -964,8 +1011,9 @@ def test_interrupt_with_abort_drain_delivers_nothing_after_stop_to_observers_or_
         assert not [e for e in sink.events if e.type == "model.reasoning.delta"]
         assert [delta.text for delta in observer.writers[0].deltas] == ["part 1", "part 2"]
         assert observer.writers[0].outcomes == [
-            ModelStreamOutcome(
-                status="interrupted", final_text="part 1part 2", error_code="interrupted"
+            _legacy_outcome(
+                status="interrupted", final_text="part 1part 2", error_code="interrupted",
+                usage=_DRAINED_BILL, requested_by="turn_interrupt",
             )
         ]
         assert loop._session is not None
@@ -976,9 +1024,11 @@ def test_interrupt_with_abort_drain_delivers_nothing_after_stop_to_observers_or_
 
 def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) -> None:
     """The run's cancel token (the RunStream/host Stop) drains too, and stays a cancellation."""
+    from monoid_agent_kernel.reference.backend.model_stream import LiveModelStreamBroker
 
     token = CancellationToken()
     observer = _RecordingObserver()
+    broker = LiveModelStreamBroker()
 
     class CancellingAdapter(_ScriptedStreamAdapter):
         yielded = 0
@@ -994,7 +1044,10 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
                 yield chunk
 
     adapter = CancellingAdapter([])
-    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,), stream_model_calls=True)
+    loop = _loop(
+        tmp_path, adapter, observer_factories=(lambda: observer, broker.observer_factory()),
+        stream_model_calls=True,
+    )
     loop.cancellation_token = token
     loop.async_model_abort_drain_s = 5.0
     loop.open()
@@ -1004,6 +1057,16 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
         assert adapter.yielded == 3
         assert [delta.text for delta in observer.writers[0].deltas] == ["partial"]
         assert [outcome.status for outcome in observer.writers[0].outcomes] == ["cancelled"]
+        outcome = observer.writers[0].outcomes[0]
+        assert outcome.usage == _DRAINED_BILL
+        assert outcome.termination.to_json() == {
+            "outcome": "cancelled", "requested_by": "user_cancel",
+            "ended_by": "provider_terminal",
+        }
+        assert outcome.usage_evidence.completeness["input_tokens"] == "unknown"
+        live = broker.subscribe(observer.contexts[0].root_run_id).poll()[-1].to_json()
+        assert live["termination"] == outcome.termination.to_json()
+        assert live["usage_evidence"] == outcome.usage_evidence.to_json()
         assert loop._session is not None
         assert dict(loop._session.state.total_usage) == _DRAINED_BILL
     finally:

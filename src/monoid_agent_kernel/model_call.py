@@ -73,6 +73,10 @@ from monoid_agent_kernel.core.model_io import (
     dispatch_model_call,
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
+from monoid_agent_kernel.core.model_facts import (
+    ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
+    call_facts_of, mark_call_facts, mark_read_end, read_end_of,
+)
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.core.safe_evidence import is_safe_opaque_id
 from monoid_agent_kernel.core.spec import ModelConfig, ModelRetryConfig
@@ -93,6 +97,7 @@ from monoid_agent_kernel.model_lifecycle import (
     durable_model_result_blob,
     durable_model_turn,
     mark_recovered_model_usage,
+    recovered_model_failure_receipt,
     raise_model_dispatch_unknown,
     recover_model_dispatch,
     reserve_model_dispatch,
@@ -105,7 +110,7 @@ from monoid_agent_kernel.providers.base import (
     ModelStreamChunk,
     ModelTurn,
     TurnComplete,
-    assemble_streamed_turn,
+    _assemble_normalized_streamed_turn,
     collect_retry_reports,
     mark_provider_retried,
     mark_provider_usage,
@@ -117,6 +122,10 @@ from monoid_agent_kernel.providers.base import (
     resolved_provider_name,
 )
 from monoid_agent_kernel.providers._common import retry_delay_s
+from monoid_agent_kernel.providers._usage import (
+    collect_usage_reports, current_usage_progress, mark_usage_observation,
+    select_usage_snapshot, usage_observation_of,
+)
 from monoid_agent_kernel.providers._request_identity import (
     _REQUEST_DIGEST_GENERATION,
     _digest,
@@ -183,6 +192,7 @@ _SETTLED_MODEL_STREAM_OUTCOME = "_monoid_settled_model_stream_outcome"
 def _carry_settled_model_stream_outcome(
     error: ModelEvidenceUncommitted,
     turn: ModelTurn,
+    receipt: ModelCallReceipt,
 ) -> None:
     """Carry a successful provider stream across a required-evidence projection failure.
 
@@ -199,8 +209,87 @@ def _carry_settled_model_stream_outcome(
             status="completed",
             final_text=turn.final_text,
             usage=turn.usage,
+            termination=receipt.termination,
+            usage_evidence=receipt.usage_evidence,
         ),
     )
+    mark_call_facts(error, receipt.termination, receipt.usage_evidence)
+
+
+def _termination_for(error: BaseException) -> ModelCallTermination:
+    known, _ = call_facts_of(error)
+    if known is not None:
+        return known
+    ended_by = read_end_of(error)
+    requested_by = None
+    outcome = "failed"
+    if isinstance(error, RunCancelled):
+        cause = error.interruption_cause or InterruptionCause.USER_CANCEL
+        requested_by = cause.value if cause is not InterruptionCause.LEASE_LOST else None
+        outcome = (
+            "timed_out" if cause is InterruptionCause.DEADLINE else
+            "cancelled" if cause is InterruptionCause.USER_CANCEL else "interrupted"
+        )
+        ended_by = ended_by or (
+            "lease_lost" if cause is InterruptionCause.LEASE_LOST else
+            "deadline" if cause is InterruptionCause.DEADLINE else "stop_request"
+        )
+    elif isinstance(error, ModelCallAborted):
+        outcome, requested_by = "interrupted", "turn_interrupt"
+        ended_by = ended_by or "stop_request"
+    elif isinstance(error, RunTimeout):
+        outcome, ended_by = "timed_out", "deadline"
+    elif isinstance(error, asyncio.CancelledError):
+        outcome, requested_by, ended_by = "cancelled", "caller_cancel", "stop_request"
+    return ModelCallTermination(
+        outcome=outcome, requested_by=requested_by, ended_by=ended_by or "local_failure",
+    )
+
+
+def _token_requester(token: CancellationToken | None) -> str | None:
+    requested, cause = token.snapshot() if token is not None else (False, None)
+    if not requested or cause is InterruptionCause.LEASE_LOST:
+        return None
+    return (cause or InterruptionCause.USER_CANCEL).value
+
+
+def _caller_cancellation_observer(
+    first_requester: Callable[[], str | None],
+) -> Callable[[asyncio.CancelledError], None]:
+    """Freeze the accepted requester before cleanup can introduce another request."""
+    termination: ModelCallTermination | None = None
+
+    def observe(error: asyncio.CancelledError) -> None:
+        nonlocal termination
+        if termination is None:
+            termination = _termination_for(error)
+            termination = replace(termination, requested_by=first_requester() or termination.requested_by)
+        mark_call_facts(error, termination, call_facts_of(error)[1])
+
+    return observe
+
+
+def _model_wait_handlers(
+    check_boundary: Callable[[float | None], None],
+    fallback_requester: Callable[[], str | None],
+    *,
+    first_accepted_requester: Callable[[], str | None] | None = None,
+) -> tuple[Callable[[float | None], None], Callable[[asyncio.CancelledError], None]]:
+    accepted_requester: str | None = None
+
+    def check(deadline: float | None) -> None:
+        nonlocal accepted_requester
+        try:
+            check_boundary(deadline)
+        except RunCancelled as exc:
+            # A live boundary may accept a different token from the one that wakes this wait.
+            # Keep that accepted fact before cleanup can replace the exception with caller cancel.
+            if accepted_requester is None:
+                prior = first_accepted_requester() if first_accepted_requester is not None else None
+                accepted_requester = prior or _termination_for(exc).requested_by
+            raise
+
+    return check, _caller_cancellation_observer(lambda: accepted_requester or fallback_requester())
 
 
 def _settled_model_stream_outcome(
@@ -297,6 +386,8 @@ def _recovered_receipt(
     """Combine current private routing context with authoritative public settlement evidence."""
 
     try:
+        from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageEvidence
+
         evidence = recovered.receipt
         reservation = recovered.reservation
         return replace(
@@ -316,6 +407,10 @@ def _recovered_receipt(
             config_recoverable=evidence.get("config_recoverable", False),
             http_status=evidence.get("http_status"),
             attempt_log=(),
+            termination=(ModelCallTermination.from_json(evidence["termination"])
+                         if "termination" in evidence else None),
+            usage_evidence=(UsageEvidence.from_json(evidence["usage_evidence"])
+                            if "usage_evidence" in evidence else None),
         )
     except Exception as exc:
         raise DurableModelCallError(
@@ -498,19 +593,17 @@ def _streamed_usage(chunks: Sequence[ModelStreamChunk]) -> dict[str, int]:
 
     The last `TurnComplete` carrying usage wins. The chunks are ingress-normalized, so the counts
     are the provider's own report and nothing is estimated: an empty answer means "not reported".
-    The ingress zero-fills a terminal chunk that reported nothing, so "carrying" means a nonzero
-    count -- an all-zero fill stamped on a stop would record a report no provider made.
+    Explicit observations distinguish reported zero from ingress zero-fill. Numeric-only
+    legacy chunks retain the existing nonzero selection rule.
     """
 
-    usage: dict[str, int] = {}
+    snapshot = ({}, UsageObservation(source="legacy_ambiguous"))
     for chunk in chunks:
-        if isinstance(chunk, TurnComplete) and _reports_usage(chunk.usage):
-            usage = dict(chunk.usage)
-    return usage
-
-
-def _reports_usage(usage: Mapping[str, int] | None) -> bool:
-    return bool(usage) and any(usage.values())
+        if isinstance(chunk, TurnComplete):
+            snapshot = select_usage_snapshot(snapshot, (
+                chunk.usage, chunk.usage_evidence or UsageObservation(source="legacy_ambiguous"),
+            ))
+    return snapshot[0]
 
 
 def _positive_seconds(read: Callable[[], Any]) -> float:
@@ -561,6 +654,8 @@ class _AbortDrain:
         self.stop: ModelCallAborted | RunCancelled | None = None
         self.on_begin: Callable[[], None] = lambda: None
         self._lock = threading.Lock()
+        self.usage_progress = current_usage_progress()
+        self.saw_terminal = any(isinstance(chunk, TurnComplete) for chunk in delivered)
 
     def begin(self, cancel_cause: InterruptionCause | None) -> bool:
         """Start the drain; False when it already started or there is no stream to drain.
@@ -576,10 +671,14 @@ class _AbortDrain:
             self.abort_at = time.time()
             self.cancel_cause = cancel_cause
             self.started = True
+            if self.usage_progress is not None:
+                self.usage_progress.begin_drain()
         self.on_begin()
         return True
 
-    def outcome(self, failure: BaseException | None = None) -> ModelCallAborted | RunCancelled:
+    def outcome(
+        self, failure: BaseException | None = None, *, ended_by: str | None = None,
+    ) -> ModelCallAborted | RunCancelled:
         """The stop the drain ends as, carrying the bill it learned.
 
         Precedence: the usage a failing adapter stamped on its own exception (the gateway stamps
@@ -594,6 +693,10 @@ class _AbortDrain:
             stop = ModelCallAborted("model call aborted")
         usage = provider_usage_of(failure) if failure is not None else {}
         mark_provider_usage(stop, usage or self.usage or _streamed_usage(self.delivered))
+        mark_read_end(stop, ended_by or (
+            read_end_of(failure) or "provider_error" if failure is not None else
+            "provider_terminal" if self.saw_terminal else "provider_eof"
+        ))
         self.stop = stop
         return stop
 
@@ -965,6 +1068,8 @@ class ModelCallRunner:
             # Usage the loop's swallowed attempts already paid for; merged into whichever
             # receipt settles this call, success or failure, by the same helper.
             spent_usage: dict[str, int] = {}
+            spent_attempts = 0
+            observations: list[UsageEvidenceAttempt] = []
             # One entry per dispatch, appended at the same commit points the counters use:
             # absorbed attempts at the absorb line below, the terminal one at whichever exit
             # settles the call. Initialized beside `spent_usage` because the failure exit
@@ -981,11 +1086,12 @@ class ModelCallRunner:
             pending_backoff_ms = 0
             recovered_failure_receipt: ModelCallReceipt | None = None
             durable_outcome_receipt: ModelCallReceipt | None = None
+            recovery_request: ModelRequest | None = request
             elapsed_before_recovery_ms = 0
 
             def prepare_durable_stream_settlement(
                 reservation: ModelDispatchReservation,
-                usage: Mapping[str, int],
+                ready: ModelCallReceipt,
             ) -> None:
                 if before_settlement is None or lifecycle_hook is None:
                     return
@@ -1002,7 +1108,9 @@ class ModelCallRunner:
                         reservation,
                         preparation_error,
                         failure_code="stream_settlement_uncommitted",
-                        usage=usage,
+                        usage=ready.usage,
+                        termination=ready.termination,
+                        usage_evidence=ready.usage_evidence,
                     )
 
             try:
@@ -1023,6 +1131,7 @@ class ModelCallRunner:
                     # evidence barrier below; a stale owner may not attempt that mutation.
                     self._assert_write_authority()
                 request = normalize_model_request(request)
+                recovery_request = request
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
                 )
@@ -1111,11 +1220,29 @@ class ModelCallRunner:
                         error_code="durable_invocation_unkeyable",
                     )
                 if lifecycle_hook is not None:
-                    recovered = recover_model_dispatch(
-                        lifecycle_hook,
-                        logical_call_id=logical_call_id,
-                        request_digest=receipt.request_digest,
-                    )
+                    try:
+                        recovered = recover_model_dispatch(
+                            lifecycle_hook,
+                            logical_call_id=logical_call_id,
+                            request_digest=receipt.request_digest,
+                        )
+                    except (DurableModelCallError, ModelEvidenceUncommitted) as recovery_error:
+                        checked_receipt = recovered_model_failure_receipt(
+                            recovery_error, receipt,
+                        )
+                        if checked_receipt is not None and checked_receipt.request_digest != receipt.request_digest:
+                            # Required evidence can fail before recovery checks request identity.
+                            # The journal has no historical model/routing configuration. Retain
+                            # its checked facts on the exception for accounting, but do not
+                            # publish a receipt reconstructed from the current request.
+                            recovery_request = None
+                            request_preimage = None
+                            recovery_error._checked_recovery_request_mismatch = True
+                        if isinstance(recovery_error, ModelEvidenceUncommitted):
+                            durable_outcome_receipt = checked_receipt
+                        else:
+                            recovered_failure_receipt = checked_receipt
+                        raise
                     if recovered is not None:
                         # The recovery hook performs the fenced, idempotent settlement/evidence
                         # commit and invokes no provider. Let that commit barrier finish before a
@@ -1160,6 +1287,14 @@ class ModelCallRunner:
                                 raise recovered_error
                             attempts_made = receipt.attempts
                             spent_usage = dict(receipt.usage)
+                            spent_attempts = receipt.attempts
+                            observations = list(receipt.usage_evidence.attempts) if (
+                                receipt.usage_evidence is not None
+                            ) else [
+                                UsageEvidenceAttempt(index=index, observation=UsageObservation(
+                                    source="legacy_ambiguous",
+                                )) for index in range(1, receipt.attempts + 1)
+                            ]
                             elapsed_before_recovery_ms = receipt.latency_ms
                             attempt_log_complete = False
                             receipt = replace(
@@ -1173,6 +1308,8 @@ class ModelCallRunner:
                                 config_recoverable=False,
                                 http_status=None,
                                 attempt_log=(),
+                                termination=None,
+                                usage_evidence=None,
                             )
                             recovered_failure_receipt = None
                             backoff_started = time.monotonic()
@@ -1185,6 +1322,9 @@ class ModelCallRunner:
                                 turn = durable_model_turn(recovered.result_blob)
                             except DurableModelCallError as recovery_error:
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                recovered_failure_receipt = recovered_model_failure_receipt(
+                                    recovery_error, receipt,
+                                ) or receipt.with_error(recovery_error)
                                 raise
                             if not _recovered_result_matches_evidence(turn, recovered.receipt):
                                 recovery_error = DurableModelCallError(
@@ -1192,6 +1332,9 @@ class ModelCallRunner:
                                     error_code="durable_invocation_result_corrupt",
                                 )
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
+                                recovered_failure_receipt = recovered_model_failure_receipt(
+                                    recovery_error, receipt,
+                                ) or receipt.with_error(recovery_error)
                                 raise recovery_error
                             settled = self._publish(
                                 request,
@@ -1235,7 +1378,11 @@ class ModelCallRunner:
                         # `acall` docstring draws for `should_abort`.
                         nonlocal delivered
                         delivered = True
-                        inner_consumer(chunk)
+                        try:
+                            inner_consumer(chunk)
+                        except BaseException as exc:
+                            mark_read_end(exc, _termination_for(exc).ended_by)
+                            raise
 
                     consumer = _marking_consumer
                 reservation: ModelDispatchReservation | None = None
@@ -1263,6 +1410,7 @@ class ModelCallRunner:
                     if before_dispatch is not None:
                         before_dispatch()
                         self._assert_write_authority()
+                    self._check_cancel_or_deadline(deadline)
                     if lifecycle_hook is not None:
                         if reservation is None:  # pragma: no cover - reserved in the block above
                             raise AssertionError("durable model call has no dispatch reservation")
@@ -1272,12 +1420,26 @@ class ModelCallRunner:
                         lifecycle_hook.dispatch_started(reservation)
                         self._assert_write_authority()
                     attempts_made = next_attempt
+                    durable_outcome_receipt = None
                     reports_before = progress.count
                     attempt_started = time.monotonic()
                     try:
-                        turn = await self._adrive(
-                            request, deadline, should_abort, consumer, adapter
-                        )
+                        with collect_usage_reports() as usage_progress:
+                            try:
+                                turn = await self._adrive(
+                                    request, deadline, should_abort, consumer, adapter
+                                )
+                            except BaseException as dispatch_error:
+                                usage, observation = select_usage_snapshot(
+                                    usage_progress.snapshot, (
+                                        provider_usage_of(dispatch_error),
+                                        usage_observation_of(dispatch_error)
+                                        or UsageObservation(source="legacy_ambiguous"),
+                                    ),
+                                )
+                                mark_provider_usage(dispatch_error, usage)
+                                mark_usage_observation(dispatch_error, observation)
+                                raise
                         if lifecycle_hook is not None:
                             # Durable mode classifies a malformed terminal inside the started
                             # dispatch. The default path keeps its historical settle accounting
@@ -1291,6 +1453,12 @@ class ModelCallRunner:
                         # before the outer handler's whole-call `mark_provider_retried` can
                         # colour the exception: what this reads is attempt-scoped.
                         probe = ModelCallReceipt().with_error(exc)
+                        observation = usage_observation_of(exc) or UsageObservation(
+                            source="legacy_ambiguous",
+                        )
+                        observations.append(UsageEvidenceAttempt(
+                            index=attempts_made, observation=observation,
+                        ))
                         last_attempt_entry = ModelCallAttempt(
                             index=attempts_made,
                             elapsed_ms=self._ms_since(attempt_started),
@@ -1304,6 +1472,7 @@ class ModelCallRunner:
                             usage=probe.usage,
                             stream_committed=delivered,
                             backoff_ms=pending_backoff_ms,
+                            usage_evidence=observation,
                         )
                         # The provider exception records the interruption cause that existed when
                         # it was raised. Lease loss can become sticky while that exception unwinds;
@@ -1332,6 +1501,8 @@ class ModelCallRunner:
                                         if spent_usage
                                         else probe.usage
                                     ),
+                                    termination=_termination_for(exc),
+                                    usage_evidence=UsageEvidence(attempts=tuple(observations)),
                                 )
                             current_failure = receipt.with_error(exc)
                             durable_failure = replace(
@@ -1353,10 +1524,12 @@ class ModelCallRunner:
                                     if spent_usage
                                     else current_failure.usage
                                 ),
+                                termination=_termination_for(exc),
+                                usage_evidence=UsageEvidence(attempts=tuple(observations)),
                             )
                             prepare_durable_stream_settlement(
                                 reservation,
-                                durable_failure.usage,
+                                durable_failure,
                             )
                             durable_outcome_receipt = durable_failure
                             settle_model_dispatch(
@@ -1400,6 +1573,7 @@ class ModelCallRunner:
                         # the wait below reports itself, not the provider failure it
                         # interrupted.
                         spent_usage = _merged_usage(spent_usage, probe.usage)
+                        spent_attempts = attempts_made
                         if attempt_log_complete:
                             attempt_log.append(last_attempt_entry)
                         # Measured, not copied from the schedule -- a capped sleep must record
@@ -1437,6 +1611,7 @@ class ModelCallRunner:
                         if (
                             last_attempt_entry is not None
                             and last_attempt_entry.index == attempts_made
+                            and attempts_made > spent_attempts
                         ):
                             crash_usage = _merged_usage(crash_usage, last_attempt_entry.usage)
                         with contextlib.suppress(Exception):
@@ -1445,6 +1620,8 @@ class ModelCallRunner:
                                 attempts=attempts_made,
                                 attempt_log=(),
                                 usage=crash_usage,
+                                termination=_termination_for(exc),
+                                usage_evidence=UsageEvidence(attempts=tuple(observations)),
                             )
                     if crash_receipt is not None:
                         self._publish_best_effort(
@@ -1456,6 +1633,7 @@ class ModelCallRunner:
                         )
                         if crash_receipt.usage:
                             mark_provider_usage(exc, crash_receipt.usage)
+                        mark_call_facts(exc, crash_receipt.termination, crash_receipt.usage_evidence)
                     raise
                 if isinstance(exc, ModelEvidenceUncommitted):
                     # The paid dispatch and its canonical result/refusal are already settled.
@@ -1464,24 +1642,35 @@ class ModelCallRunner:
                     # original request/preimage is in hand; the projection failure itself never
                     # becomes a fabricated model-call failure and never enters the retry loop.
                     if durable_outcome_receipt is not None:
-                        self._publish_best_effort(
-                            request,
-                            None,
-                            durable_outcome_receipt,
-                            elapsed_ms=durable_outcome_receipt.latency_ms,
-                            request_preimage=request_preimage,
+                        mark_call_facts(
+                            exc, durable_outcome_receipt.termination,
+                            durable_outcome_receipt.usage_evidence,
                         )
+                        mark_provider_usage(exc, durable_outcome_receipt.usage)
+                        if recovery_request is not None:
+                            self._publish_best_effort(
+                                recovery_request,
+                                None,
+                                durable_outcome_receipt,
+                                elapsed_ms=durable_outcome_receipt.latency_ms,
+                                request_preimage=request_preimage,
+                            )
                     raise
                 if recovered_failure_receipt is not None:
-                    self._publish_best_effort(
-                        request,
-                        None,
-                        recovered_failure_receipt,
-                        elapsed_ms=recovered_failure_receipt.latency_ms,
-                        request_preimage=request_preimage,
-                    )
+                    if recovery_request is not None:
+                        self._publish_best_effort(
+                            recovery_request,
+                            None,
+                            recovered_failure_receipt,
+                            elapsed_ms=recovered_failure_receipt.latency_ms,
+                            request_preimage=request_preimage,
+                        )
                     if recovered_failure_receipt.usage:
                         mark_provider_usage(exc, recovered_failure_receipt.usage)
+                    mark_call_facts(
+                        exc, recovered_failure_receipt.termination,
+                        recovered_failure_receipt.usage_evidence,
+                    )
                     raise
                 # What the adapter managed to say before this call stopped producing outcomes. A
                 # boundary raised by the race is not something the adapter can stamp, and an
@@ -1496,6 +1685,20 @@ class ModelCallRunner:
                 # failure is classified. `Exception` and not `BaseException`: a KeyboardInterrupt
                 # arriving during delivery should still stop everything.
                 failed = replace(receipt.with_error(exc), attempts=attempts_made)
+                # A lifecycle replacement may carry whole-call usage. The current dispatch's
+                # entry owns its contribution; a backoff adds no further dispatch contribution.
+                current_usage = (
+                    last_attempt_entry.usage
+                    if last_attempt_entry is not None and last_attempt_entry.index == attempts_made
+                    else failed.usage
+                ) if attempts_made > spent_attempts else {}
+                if len(observations) < attempts_made:
+                    observations.append(UsageEvidenceAttempt(
+                        index=attempts_made,
+                        observation=usage_observation_of(exc) or UsageObservation(
+                            source="legacy_ambiguous",
+                        ),
+                    ))
                 # The terminal entry: the attempt whose outcome this exception is -- unless it
                 # interrupted the WAIT between attempts (a backoff boundary), in which case
                 # every dispatched attempt is already logged and the receipt alone carries the
@@ -1533,6 +1736,7 @@ class ModelCallRunner:
                                 usage=failed.usage,
                                 stream_committed=delivered,
                                 backoff_ms=pending_backoff_ms,
+                                usage_evidence=observations[-1].observation,
                             )
                         )
                 # One ``replace`` for the same reason the answering path takes one: the entries
@@ -1541,7 +1745,9 @@ class ModelCallRunner:
                 failed = replace(
                     failed,
                     attempt_log=tuple(attempt_log),
-                    usage=_merged_usage(spent_usage, failed.usage) if spent_usage else failed.usage,
+                    usage=_merged_usage(spent_usage, current_usage),
+                    termination=_termination_for(exc),
+                    usage_evidence=UsageEvidence(attempts=tuple(observations)),
                 )
                 self._publish_best_effort(
                     request,
@@ -1557,8 +1763,8 @@ class ModelCallRunner:
                 # cumulative stamp read back there would land the absorbed spend on the
                 # receipt twice (the exact double-count the absorb commit point exists to
                 # prevent).
-                if spent_usage:
-                    mark_provider_usage(exc, failed.usage)
+                mark_provider_usage(exc, failed.usage)
+                mark_call_facts(exc, failed.termination, failed.usage_evidence)
                 raise
             # Read on this path too, so `report_provider_retried` means the same thing whatever
             # the call returns. Honoured only on failure, it would be a reporting seam that
@@ -1581,7 +1787,12 @@ class ModelCallRunner:
                 usage=completed.usage,
                 stream_committed=delivered,
                 backoff_ms=pending_backoff_ms,
+                usage_evidence=turn.usage_evidence,
             )
+            observations.append(UsageEvidenceAttempt(
+                index=attempts_made,
+                observation=turn.usage_evidence or UsageObservation(source="legacy_ambiguous"),
+            ))
             # One ``replace``, not two. The log and the merged bill are the same fact stated two
             # ways, and the receipt refuses a log whose entries do not sum to its usage -- so a
             # receipt carrying the log beside the not-yet-merged usage is a state this record is
@@ -1595,6 +1806,10 @@ class ModelCallRunner:
                 usage=(
                     _merged_usage(spent_usage, completed.usage) if spent_usage else completed.usage
                 ),
+                termination=ModelCallTermination(
+                    outcome="completed", ended_by=read_end_of(turn) or "provider_terminal",
+                ),
+                usage_evidence=UsageEvidence(attempts=tuple(observations)),
             )
             if lifecycle_hook is not None:
                 if reservation is None:  # pragma: no cover - a started durable call reserves first
@@ -1605,7 +1820,7 @@ class ModelCallRunner:
                 )
                 prepare_durable_stream_settlement(
                     reservation,
-                    durable_completed.usage,
+                    durable_completed,
                 )
                 durable_outcome_receipt = durable_completed
                 try:
@@ -1617,6 +1832,8 @@ class ModelCallRunner:
                         result_error,
                         failure_code=result_error.error_code,
                         usage=durable_completed.usage,
+                        termination=durable_completed.termination,
+                        usage_evidence=durable_completed.usage_evidence,
                     )
                 try:
                     settle_model_dispatch(
@@ -1632,7 +1849,7 @@ class ModelCallRunner:
                     # Publish it here so passive observers and sidecars see the paid call even
                     # though required evidence parks the loop before the ordinary publish below.
                     self._assert_write_authority()
-                    _carry_settled_model_stream_outcome(evidence_error, turn)
+                    _carry_settled_model_stream_outcome(evidence_error, turn, durable_completed)
                     self._publish_best_effort(
                         request,
                         turn,
@@ -1868,15 +2085,28 @@ class ModelCallRunner:
         # that never produced it, which is worse than the leak the grace interval already accepts.
         driving = True
         chunks: list[ModelStreamChunk] = []
+        saw_terminal = False
         ingress = ModelStreamIngressNormalizer()
         drain = _AbortDrain(budget_s, chunks) if budget_s > 0 else None
+        accepted_stream_requester: str | None = None
+
+        def accepted_requester() -> str | None:
+            if accepted_stream_requester is not None:
+                return accepted_stream_requester
+            if drain is not None and drain.started:
+                return drain.cancel_cause.value if drain.cancel_cause is not None else "turn_interrupt"
+            return None
 
         def deliver(normalized_chunk: ModelStreamChunk) -> None:
-            nonlocal retried
+            nonlocal retried, saw_terminal
             if getattr(normalized_chunk, "provider_retried", False):
                 retried = True
             self._assert_write_authority()
             chunks.append(normalized_chunk)
+            if isinstance(normalized_chunk, TurnComplete):
+                saw_terminal = read_end_of(normalized_chunk) != "provider_eof"
+                if drain is not None:
+                    drain.saw_terminal = saw_terminal
             # A terminal or remainder flush can contain several logical channels. Fence each
             # piece and the arbitrary callback separately; one consumer can revoke the lease.
             self._assert_write_authority()
@@ -1890,6 +2120,15 @@ class ModelCallRunner:
             # ends, or is stopped, leaves that unit definitively lone and its replacement is due.
             for normalized_chunk in ingress.finish():
                 deliver(normalized_chunk)
+
+        def abort_requested() -> bool:
+            if should_abort is None:
+                return False
+            try:
+                return should_abort()
+            except BaseException as exc:
+                mark_read_end(exc, _termination_for(exc).ended_by)
+                raise
 
         async def drain_rest(drain: _AbortDrain, first: Any) -> ModelTurn:
             # Everything the provider still sends goes through a normalizer of its own and is
@@ -1909,8 +2148,14 @@ class ModelCallRunner:
                 for piece in pieces:
                     if getattr(piece, "provider_retried", False):
                         retried = True
-                    if isinstance(piece, TurnComplete) and _reports_usage(piece.usage):
-                        drain.usage = dict(piece.usage)
+                    if isinstance(piece, TurnComplete):
+                        drain.saw_terminal = read_end_of(piece) != "provider_eof"
+                        # Ingress selected this dispatch's latest numeric/evidence pair,
+                        # including earlier drain pieces that were never delivered.
+                        drain.usage = (
+                            dict(drain.usage_progress.snapshot[0]) if drain.usage_progress is not None
+                            else _streamed_usage([*chunks, piece])
+                        )
 
             if first is not None:
                 fold(first)
@@ -1923,7 +2168,7 @@ class ModelCallRunner:
             raise drain.outcome()
 
         async def consume() -> ModelTurn:
-            nonlocal retried
+            nonlocal retried, accepted_stream_requester
             if drain is not None:
                 drain.entered = True
             try:
@@ -1945,9 +2190,9 @@ class ModelCallRunner:
                         deliver(normalized_chunk)
                     if (
                         (drain is None or not drain.started)
-                        and should_abort is not None
-                        and should_abort()
+                        and abort_requested()
                     ):
+                        accepted_stream_requester = _token_requester(run_token) or "turn_interrupt"
                         deliver_remainder()
                         if drain is not None:
                             # A no-op when a user cancel landed while `should_abort` was answering
@@ -2000,7 +2245,9 @@ class ModelCallRunner:
                 if aclose is not None:
                     with contextlib.suppress(Exception):
                         await self._aclose_within_grace(aclose)
-            return assemble_streamed_turn(chunks)
+            turn = _assemble_normalized_streamed_turn(chunks)
+            mark_read_end(turn, "provider_terminal" if saw_terminal else "provider_eof")
+            return turn
 
         def settle_cancelled_remainder() -> None:
             if driving:
@@ -2010,10 +2257,14 @@ class ModelCallRunner:
         if drain is not None:
             self._open_drain_budgets.append(budget_s)
         try:
+            run_token = self._token()
             if drain is None:
-                return await self._aawait(consume(), deadline)
+                return await self._aawait(
+                    consume(), deadline, boundary=(run_token, self._check_cancel_or_deadline),
+                    first_requester=accepted_requester,
+                )
             return await self._await_draining_stream(
-                consume, drain, deadline, settle_cancelled_remainder
+                consume, drain, deadline, settle_cancelled_remainder, accepted_requester, run_token,
             )
         except BaseException as exc:
             # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
@@ -2022,6 +2273,10 @@ class ModelCallRunner:
             # provider had no opportunity to stamp.
             if retried:
                 mark_provider_retried(exc)
+            known, evidence = call_facts_of(exc)
+            requester = accepted_requester()
+            if known is None and requester is not None:
+                mark_call_facts(exc, replace(_termination_for(exc), requested_by=requester), evidence)
             raise
         finally:
             # A `finally` rather than a line in the handler above, and deliberately *not* because a
@@ -2047,6 +2302,8 @@ class ModelCallRunner:
         drain: _AbortDrain,
         deadline: float | None,
         settle_cancelled_remainder: Callable[[], None],
+        first_requester: Callable[[], str | None],
+        run_token: CancellationToken | None,
     ) -> ModelTurn:
         """Race one stream task in two phases: streaming, then -- after a stop -- draining.
 
@@ -2061,7 +2318,6 @@ class ModelCallRunner:
         cannot tell these phases apart and does not need to.
         """
 
-        run_token = self._token()
         authority = None if self.current_write_authority is None else self.current_write_authority()
         # What each phase's race observes: every run cancel except one the drain absorbed. Lease
         # loss is forwarded here too, because a cancel that became the drain already spent the
@@ -2140,6 +2396,9 @@ class ModelCallRunner:
 
         task: asyncio.Future[Any] | None = None
         released = False
+        observe_caller_cancelled = _caller_cancellation_observer(
+            lambda: first_requester() or _token_requester(run_token),
+        )
 
         async def follow(until_drain: bool) -> Any:
             # The raced awaitable in both phases. Cancelled by the race, it cancels the stream task
@@ -2176,7 +2435,8 @@ class ModelCallRunner:
                 )
             try:
                 streamed = await self._aawait(
-                    follow(True), deadline, boundary=(view, streaming_boundary)
+                    follow(True), deadline, boundary=(view, streaming_boundary),
+                    on_caller_cancelled=observe_caller_cancelled,
                 )
             except RunTimeout:
                 # The deadline fired in the tick the stop was decided, before phase one saw it.
@@ -2210,10 +2470,16 @@ class ModelCallRunner:
             if deadline is not None:
                 window_end = min(window_end, deadline)
             try:
-                await self._aawait(follow(False), window_end, boundary=(view, draining_boundary))
+                await self._aawait(
+                    follow(False), window_end, boundary=(view, draining_boundary),
+                    on_caller_cancelled=observe_caller_cancelled,
+                )
             except RunTimeout:
                 # The window closed; `draining_boundary` never raises a timeout of its own.
-                raise drain.outcome() from None
+                raise drain.outcome(ended_by=(
+                    "deadline" if deadline is not None and deadline <= drain.abort_at + drain.budget_s
+                    else "drain_timeout"
+                )) from None
             except Exception as exc:
                 if _is_provider_cancel(exc):
                     # The provider cancelled its own read (`CalleeCancelled`, translated): a
@@ -2236,7 +2502,11 @@ class ModelCallRunner:
                     grace_s = self._grace_s()
                 except Exception:
                     grace_s = self.cancel_grace_s
-                await detach_unfinished_call(task, None, grace_s=grace_s)
+                try:
+                    await detach_unfinished_call(task, None, grace_s=grace_s)
+                except asyncio.CancelledError as exc:
+                    observe_caller_cancelled(exc)
+                    raise
 
     async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
         """Close a provider's stream, spending at most the grace interval on its cleanup.
@@ -2294,12 +2564,17 @@ class ModelCallRunner:
         if delay_s <= 0:
             self._check_cancel_or_deadline(deadline)
             return
+        token = self._token()
+        check_boundary, on_caller_cancelled = _model_wait_handlers(
+            self._check_cancel_or_deadline, lambda: _token_requester(token),
+        )
         await await_abandonable_call(
             asyncio.sleep(delay_s),
             deadline=deadline,
-            token=self._token(),
+            token=token,
             grace_s=0.0,
-            check_boundary=self._check_cancel_or_deadline,
+            check_boundary=check_boundary,
+            on_caller_cancelled=on_caller_cancelled,
         )
 
     async def _aawait(
@@ -2310,6 +2585,8 @@ class ModelCallRunner:
         adapter: Any = None,
         request: ModelRequest | None = None,
         boundary: tuple[CancellationToken | None, Callable[[float | None], None]] | None = None,
+        on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
+        first_requester: Callable[[], str | None] | None = None,
     ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
 
@@ -2346,15 +2623,27 @@ class ModelCallRunner:
         # here leaves the slot spent and hands the following recording to the next caller. Both
         # exits of this function carry it, and
         # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
+        token: CancellationToken | None = None
+        check_boundary = self._check_cancel_or_deadline if boundary is None else boundary[1]
+        if on_caller_cancelled is None:
+            check_boundary, on_caller_cancelled = _model_wait_handlers(
+                check_boundary,
+                lambda: (first_requester() if first_requester is not None else None) or _token_requester(token),
+                first_accepted_requester=first_requester,
+            )
         try:
             token = self._token() if boundary is None else boundary[0]
             grace_s = self._grace_s()
         except BaseException:
-            await abandon_unwaited_call(
-                pending,
-                grace_s=self.cancel_grace_s,
-                on_discarded=_discard_hook(adapter, request),
-            )
+            try:
+                await abandon_unwaited_call(
+                    pending,
+                    grace_s=self.cancel_grace_s,
+                    on_discarded=_discard_hook(adapter, request),
+                )
+            except asyncio.CancelledError as exc:
+                on_caller_cancelled(exc)
+                raise
             raise
         try:
             return await await_abandonable_call(
@@ -2362,13 +2651,26 @@ class ModelCallRunner:
                 deadline=deadline,
                 token=token,
                 grace_s=grace_s,
-                check_boundary=(
-                    self._check_cancel_or_deadline if boundary is None else boundary[1]
-                ),
+                check_boundary=check_boundary,
                 on_discarded=_discard_hook(adapter, request),
+                on_caller_cancelled=on_caller_cancelled,
             )
         except CalleeCancelled as exc:
-            raise ModelAdapterError(
+            cancelled = ModelAdapterError(
                 "model adapter cancelled its own call",
                 error_code="model_adapter_cancelled",
-            ) from exc
+            )
+            if exc.__cause__ is not None:
+                mark_provider_usage(cancelled, provider_usage_of(exc.__cause__))
+                observation = usage_observation_of(exc.__cause__)
+                if observation is not None:
+                    mark_usage_observation(cancelled, observation)
+            mark_read_end(cancelled, "provider_cancelled")
+            raise cancelled from exc
+        except BaseException as exc:
+            if read_end_of(exc) is None:
+                if isinstance(exc, (RunCancelled, RunTimeout, ModelCallAborted, asyncio.CancelledError)):
+                    mark_read_end(exc, _termination_for(exc).ended_by)
+                else:
+                    mark_read_end(exc, "provider_error")
+            raise

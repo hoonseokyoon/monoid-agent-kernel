@@ -21,6 +21,7 @@ from monoid_agent_kernel.core.checkpoint import (
 from monoid_agent_kernel.core.durable_codec import DurableLoadResult
 from monoid_agent_kernel.core.events import AgentEvent
 from monoid_agent_kernel.core.model_invocation import (
+    model_invocation_payload_for_write,
     MODEL_INVOCATION_CODEC,
     DurableModelInvocation,
 )
@@ -383,7 +384,7 @@ class DeterministicFencedRunSink:
         if authoritative is None or authoritative[1].invocation != invocation:
             return CommitResult(status="conflict", sequence=invocation.revision)
         records = self._model_evidence_outbox if outbox else self._model_evidence
-        digest = _record_digest(invocation.to_json())
+        digest = _record_digest(model_invocation_payload_for_write(invocation))
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
         existing = self._stored_result(
             records,
@@ -415,7 +416,7 @@ class DeterministicFencedRunSink:
             return CommitResult(status="conflict", sequence=invocation.revision)
         if not self._invocation_references_resolve(invocation, blobs):
             return CommitResult(status="conflict", sequence=invocation.revision)
-        digest = _record_digest(invocation.to_json(), blobs)
+        digest = _record_digest(model_invocation_payload_for_write(invocation), blobs)
         key = (invocation.run_id, invocation.logical_call_id, invocation.revision)
         existing = self._stored_result(
             self._invocations,

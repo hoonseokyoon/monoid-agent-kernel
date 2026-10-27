@@ -44,7 +44,8 @@ from monoid_agent_kernel.core.model_io import (
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.identifiers import namespaced_id
 
-MODEL_CALLS_SCHEMA_VERSION = namespaced_id("model-calls.v1")
+MODEL_CALLS_V1_SCHEMA_VERSION = namespaced_id("model-calls.v1")
+MODEL_CALLS_SCHEMA_VERSION = namespaced_id("model-calls.v2")
 MODEL_CALLS_FILENAME = "model_calls.jsonl"
 
 # One record shape today, discriminated anyway: a discriminator retrofitted onto records that
@@ -155,6 +156,12 @@ def _recorded_attempt(entry: ModelCallAttempt) -> dict[str, Any]:
     }
     if entry.backoff_ms is not None:
         recorded["backoff_ms"] = entry.backoff_ms
+    if entry.usage_evidence is not None:
+        recorded["usage_evidence"] = {
+            "reported": dict(entry.usage_evidence.reported),
+            "source": entry.usage_evidence.source,
+            "collection": entry.usage_evidence.collection,
+        }
     return recorded
 
 
@@ -266,4 +273,21 @@ def model_call_record(
     # keeps certifying the directories they filled.
     if receipt.attempt_log:
         record["attempt_log"] = [_recorded_attempt(entry) for entry in receipt.attempt_log]
+    if receipt.termination is not None:
+        record["termination"] = {
+            "outcome": receipt.termination.outcome,
+            "requested_by": receipt.termination.requested_by,
+            "ended_by": receipt.termination.ended_by,
+        }
+    if receipt.usage_evidence is not None:
+        record["usage_evidence"] = {
+            "reported": dict(receipt.usage_evidence.reported),
+            "completeness": dict(receipt.usage_evidence.completeness),
+            "attempts": [{
+                "index": entry.index,
+                "reported": dict(entry.observation.reported),
+                "source": entry.observation.source,
+                "collection": entry.observation.collection,
+            } for entry in receipt.usage_evidence.attempts],
+        }
     return record

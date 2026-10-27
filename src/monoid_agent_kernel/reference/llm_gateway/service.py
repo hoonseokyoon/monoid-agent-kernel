@@ -20,6 +20,7 @@ from monoid_agent_kernel.core.wire_validation import (
 )
 from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ReasoningConfig
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress
+from monoid_agent_kernel.core.model_facts import UsageObservation
 from monoid_agent_kernel.errors import ModelAdapterError, PermissionDenied
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 from monoid_agent_kernel.providers._common import (
@@ -29,6 +30,7 @@ from monoid_agent_kernel.providers._common import (
 )
 from monoid_agent_kernel.providers.base import (
     generation_support,
+    mark_provider_usage,
     new_idempotency_key,
     provider_usage_of,
     reasoning_support,
@@ -46,8 +48,11 @@ from monoid_agent_kernel.providers.base import (
     ToolCallDelta,
     ToolObservation,
     TurnComplete,
-    assemble_streamed_turn,
+    _assemble_normalized_streamed_turn,
     normalize_model_turn,
+)
+from monoid_agent_kernel.providers._usage import (
+    mark_usage_observation, select_usage_snapshot, usage_observation_of,
 )
 from monoid_agent_kernel.providers.openai import OpenAIModelAdapter
 from monoid_agent_kernel.tools.base import ToolResult, ToolSpec
@@ -193,6 +198,7 @@ class LlmGatewayBackend:
                 for call in turn.tool_calls
             ],
             "usage": turn.usage,
+            "usage_evidence": turn.usage_evidence.to_json(),
             "stop_reason": turn.stop_reason,
             # The backend adapter's own retry evidence. Dropping it here recorded a call the
             # provider retried as a clean single attempt, since the client can only observe its
@@ -251,6 +257,7 @@ class LlmGatewayBackend:
         model_request: ModelRequest,
     ) -> Iterator[dict[str, Any]]:
         collected: list[ModelStreamChunk] = []
+        snapshot = ({}, UsageObservation(source="legacy_ambiguous"))
         try:
             astream_turn = getattr(adapter, "astream_turn", None)
             if astream_turn is not None:
@@ -259,6 +266,8 @@ class LlmGatewayBackend:
                     for provider_chunk in _pump_astream(astream_turn, model_request):
                         for chunk in ingress.normalize(provider_chunk):
                             collected.append(chunk)
+                            if isinstance(chunk, TurnComplete):
+                                snapshot = select_usage_snapshot(snapshot, (chunk.usage, chunk.usage_evidence))
                             frame = _chunk_to_frame(chunk)
                             if frame is not None:
                                 yield frame
@@ -305,6 +314,7 @@ class LlmGatewayBackend:
                     TurnComplete(
                         response_id=turn.response_id,
                         usage=turn.usage,
+                        usage_evidence=turn.usage_evidence,
                         # The reasoning artifacts ride the synthesized terminal chunk for the same
                         # reason the retry evidence does: this chunk stands in for a stream the
                         # provider could not produce, and ``assemble_streamed_turn`` reads
@@ -318,7 +328,7 @@ class LlmGatewayBackend:
                 )
             # Assemble once: the same usage drives both the meter and the outgoing frame, and the
             # assembled response id is what the opaque turn_handle maps to for continuation.
-            turn = normalize_model_turn(assemble_streamed_turn(collected))
+            turn = normalize_model_turn(_assemble_normalized_streamed_turn(collected))
         except Exception as failed:
             # The streaming twin of handle_turn's failure meter: a refusal can arrive *after*
             # the upstream produced and billed an answer (a chained hop's proof refusal is
@@ -331,6 +341,12 @@ class LlmGatewayBackend:
             # raw types. ``BaseException`` is deliberately NOT caught: a consumer closing this
             # generator raises ``GeneratorExit`` at the yields above, which is a cancelled read
             # rather than a failed call.
+            usage, observation = select_usage_snapshot(snapshot, (
+                provider_usage_of(failed),
+                usage_observation_of(failed) or UsageObservation(source="legacy_ambiguous"),
+            ))
+            mark_provider_usage(failed, usage)
+            mark_usage_observation(failed, observation)
             self._meter_failure(claims.tenant_id, failed)
             raise
         turn_handle = self._record_turn(claims, request, turn)
@@ -339,6 +355,7 @@ class LlmGatewayBackend:
             "type": "turn_complete",
             "turn_handle": turn_handle,
             "usage": turn.usage,
+            "usage_evidence": turn.usage_evidence.to_json(),
             "stop_reason": turn.stop_reason,
             "provider_retried": turn.provider_retried,
         }
