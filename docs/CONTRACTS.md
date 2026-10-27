@@ -3241,6 +3241,21 @@ host still applies ownership fencing before resuming or settling a run.
 
 ## Run Artifacts
 
+Host tool bindings are process-local activation resources. The optional extension in
+`monoid_agent_kernel.tools.host_bindings` keeps required `ToolContext` members unchanged.
+Factories return fresh synchronous adapters; views are bound to one admitted call and expire
+on every call exit. Local workspace operations serialize with call/activation end and writer
+revocation; entered effects may finish and subsequent success publication is fenced. Factories,
+binders, validators and local disposers run outside authority locks. Disposers run once in reverse
+order even after partial acquisition, close failure or committed park release. A fresh restore
+opens fresh adapters and reads workspace contents after rehydration. Ordinary callback diagnostics
+contain fixed messages. Shared host writer authority survives normal cleanup.
+
+Kernel persistence never serializes binding keys, resources or clients. Their introduction changes
+no artifact schema or model tool schema. General host client adapters enforce their own per-method
+lease checks and external fencing. The complete contract and runnable report are in
+[EMBEDDING](EMBEDDING.md#inject-host-resources-into-tools-v025).
+
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:
 
 - `manifest.json.agent_config`: definition id, config version, config hash

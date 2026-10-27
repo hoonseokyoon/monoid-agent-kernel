@@ -25,6 +25,72 @@ python -m pytest -q tests/test_examples.py
 Both scripts use `FakeModelAdapter`, require no credentials, make no network requests, and create
 all state under a temporary directory.
 
+## Inject host resources into tools (v0.25)
+
+Register process-local resources on `AgentLoop`, `from_tools` or `from_config` with the
+keyword `host_tool_bindings`. A shared identity key joins the host factory and the handler:
+
+```python
+from monoid_agent_kernel import AgentLoop, ToolContext, tool
+from monoid_agent_kernel.tools.host_bindings import (
+    HostToolBinding, HostToolKey, ToolWorkspace, require_host_tool_binding,
+)
+
+REPORTS = HostToolKey[ToolWorkspace](
+    "reports.workspace", accepts=lambda view: isinstance(view, ToolWorkspace),
+)
+
+@tool(id="report.save", side_effect="write")
+def save_report(ctx: ToolContext, title: str) -> dict:
+    workspace = require_host_tool_binding(ctx, REPORTS)
+    digest = workspace.write_bytes("reports/draft.md", title.encode(), create_dirs=True)
+    return {"sha256": digest}
+
+# spec and adapter belong to the embedding product.
+loop = AgentLoop.from_tools(
+    spec, adapter, [save_report],
+    host_tool_bindings=(HostToolBinding(REPORTS, open=lambda activation: activation.workspace_resource()),),
+)
+```
+
+Use `from_config` with `ToolBinding.scope` to restrict report paths and `authorization="ask"`
+to require approval. Each workspace operation checks both the binding and current surface scopes,
+operator `PermissionPolicy`, the original call, activation lifetime and writer authority.
+Workspace writes require an admitted `side_effect="write"` tool. Reads and existence checks also
+respect path scopes. Paths use the existing normalized lexical matching contract.
+
+Factories receive `HostToolActivation` metadata and a deferred `workspace_resource()` adapter.
+They run once per activation before checkpoint restoration. Read restored content inside handlers.
+The view's `read_bytes` returns `(bytes, sha256)`; `write_bytes` returns a digest and preserves
+`create_dirs`, `expected_sha256`, `overwrite` and backend mode behavior. Overlay proposals stay
+in the overlay; staging backends write to the host-provided staging directory.
+
+Custom adapters implement synchronous `bind_call(lease)` and local `close()`. Their methods must
+check `lease.assert_active()` or use `lease.guard_external_call(callback)` before and after client
+operations. Async client methods check before and after `await`. The host owns shared pools and
+external fencing/idempotency. Callbacks execute without kernel authority locks; callback duration
+and already-started external effects stay under host control.
+
+The kernel closes adapters in reverse order once on close, discard and committed park release,
+including partial factory failure. Normal cleanup leaves a shared host writer authority active.
+Call views expire on return, failure, cancellation, timeout and abandonment. A retained context
+keeps its original call identity even when another call starts. Pass a context explicitly to any
+joined helper thread. Child and fork activations receive no bindings by default.
+
+Keys, clients and adapters remain process-local. Configure fresh factories on a restored loop.
+Ordinary factory, binder, type-check and close failures use safe fixed diagnostics; direct control
+signals retain their classification. Runtime errors include `host_tool_binding_missing`,
+`host_tool_binding_type`, `host_tool_context_unavailable`, `tool_call_not_in_flight` and
+`host_tool_resource_closed`. Callback failures use `host_tool_binding_open/bind/accepts/close`.
+
+The [complete typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes
+a scoped proposal, parks for approval, releases its activation, restores with fresh resources and
+reads the proposal after approval. It runs offline from an installed wheel:
+
+```bash
+python -m monoid_agent_kernel.reference.host_tool_report
+```
+
 ## Use domain models in tools
 
 `@tool` validates JSON arguments and passes Python values to the handler, including nested

@@ -557,3 +557,82 @@ discard가 그 인스턴스만 닫도록 수정했다. 정상 EventBus.close 계
 같은 focused 검사에 두 회귀를 더한 결과는 **339 passed / 17.75s**다
 (`.tmp/v025/p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
 최종 후보를 두 reviewer가 표적 재검토한 뒤 독립 PR의 L1/L2를 확인한다.
+
+두 reviewer의 최종 판정은 `47ff2cf424b88189082202173601bb66b97910f3`에 대해 PASS다.
+[P3-01 PR #151](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/151)은
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40426994584)과
+[L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40426994558)를 통과했다.
+자동 GitHub review도 동일 head에 finding 없이 완료됐다. develop merge는
+`4539296dd9633743144d75a62a562a2d636d05a8`이다. 최종 전체 diff는 619 추가/133 제거이며
+bootstrap indentation과 테스트·문서가 대부분이다. 이 base에서 통합 branch
+`codex/v0.25-p3-host-resources`를 생성·push하고 P3-02 branch를 분기했다.
+
+### P3-02 사전조사 — 2026-10-27
+
+- 최신 develop·통합 base는 `4539296dd9633743144d75a62a562a2d636d05a8`이다.
+  실행 branch는 `codex/v0.25-p3-02-root-resources`. root가 구현/runner를 소유하고
+  `p3_02_preflight_research`가 독립적으로 소스 연결을 조사한다. 구현 전 별도 preflight review를 받는다.
+- 목표 consumer는 패키지에 포함할 offline report recipe다. 중첩 Pydantic 입력/출력, computed report path,
+  scoped proposal write, 승인 대기, committed release, 새 loop restore와 읽기를 공개 API로 연결한다.
+  from_tools 전달 smoke와 scoped from_config 전체 흐름을 모두 검증한다. 기존 wheel audit/install CI를 재사용한다.
+- constructor는 binding tuple/중복 key identity·name/동기 callable 형태를 첫 callback 등록·파일 생성 전에 검사한다.
+  key/resource는 checkpoint와 tool schema에 넣지 않는다. descriptor의 공개 타입 이름은 `HostToolActivation`으로
+  확정해 factory를 정적으로 작성할 수 있게 한다. 나머지 public 이름과 helper는 §4.1을 유지한다.
+- `LoopBootstrapper.bootstrap`의 context 생성 직후 registry를 loop에 연결하고 factories를 연다.
+  첫 `_bootstrap_resources` 게시 전 실패는 registry → provisional recorder 순서로 정리한다.
+  valid closer를 factory callback 안에서 ExitStack에 등록하고 guard postcheck를 수행한다.
+  duplicate adapter identity는 두 번째 등록 전에 거부한다. 일반 callback 오류는 고정 메시지로 바꾸며
+  직접 발생한 RunCancelled/RunTimeout/TurnInterrupted/TurnPaused 및 BaseException 제어 신호를 유지한다.
+  awaitable 반환은 기존 `core._sync_bridge.dispose_unawaited`로 처리한 뒤 거부한다.
+- `_ainvoke_handler`가 실제 admission 뒤 받은 immutable authorization과 side_effect를 새 call lease에 고정한다.
+  `authorization.scope`와 `surface_scope`를 모두 검사한다. provider façade에는 활성 lease가 없다.
+  기존 ContextVar enter/exit를 유지하고 새 helper만 call façade를 사용한다. 진입 assert까지 finally 범위에 둔다.
+- call/key 첫 lookup의 동시성은 짧은 call-state lock 안에서 표준 `concurrent.futures.Future`를 등록한다.
+  한 winner가 lock 밖에서 bind/accepts를 실행하고 다른 explicit thread는 lease를 재검사하며 결과를 기다린다.
+  사용자 callback을 가진 lock 기반 lazy cache와 새로운 async resource scheduler는 도입하지 않는다.
+  call 종료는 closed Event를 먼저 set하고 cache를 비운다. 실패 결과에도 원본 secret 예외를 저장하지 않는다.
+- local workspace 작업의 lock 순서는 **call → activation → writer**다. 종료는 Event를 먼저 set하고 해당 lock으로
+  진입한 작업만 기다린다. activation 종료는 call lock을 획득하지 않는다. writer revoke callback은 기존처럼
+  writer lock 밖에서 실행된다. arbitrary open/bind/accepts/close 및 일반 client I/O는 이 lock들을 잡지 않는다.
+  workspace는 기존 backend의 local-mutation 계약을 재사용하며, 일반 network adapter는 lease 전후 guard와
+  host의 외부 fencing을 사용한다. scope는 normalized lexical path이며 별도 alias/OS sandbox를 추가하지 않는다.
+- 정상 close는 진입 시 P3 수명을 끝내고, 기존 finalization/subscription/checkpoint 처리의 finally에서 자원을 닫는다.
+  committed release는 fingerprint 검증 후 수명을 끝내며 subscription/recorder 또는 resource close 실패 시 기존 discard로
+  마무리한다. discard는 P3 close 오류를 모은 뒤 job/recorder/subscription teardown을 계속한다.
+  기존 원래 오류를 보존하고, 이미 관측된 authority loss 우선순위도 유지한다. recordable bootstrap 실패에서는
+  P3 registry만 즉시 닫고 기존 failed-session recorder 수명을 유지한다. async lifecycle bridge는 그대로 사용한다.
+- registry는 callback 전에 closed 표시 및 owned map을 비우고 ExitStack으로 역순 최대 한 번 dispose한다.
+  추가 close 실패는 값·repr·traceback 없는 고정 진단만 남긴다. normal close가 host writer를 revoke하지 않는다.
+  deferred workspace adapter는 실제 backend 내용에 접근하지 않고 call view에서만 연산한다.
+  restore 순서와 schema를 유지한다. child/fork에는 bindings를 전달하지 않으며 상속 옵션은 P3-03에서 추가한다.
+- 필요한 L0는 tuple/중복/partial-init, safe-error/async rejection, computed scope·policy·mode·hash,
+  retained A ctx/view while B active, explicit thread와 sync→awaitable, native async·timeout·abandon,
+  local-write barrier/revoke·close 경쟁, 정상/실패/park/restore/async-cancel cleanup과 report consumer다.
+  새 API의 happy-path만으로 완료 판정하지 않는다. 기존 cleanup339·tool surface·checkpoint·public/compat 검사를 합친다.
+- 예상 기능 600–1,000줄, 전체 1,300–2,100줄과 campaign 누적 한도를 유지한다. resource registry만 분리하지 않는다.
+  A 등급 independent preflight, 서로 다른 두 final-code review, L1/L2 core, integration push full CI,
+  실제 installed-wheel report 실행이 완료 신호다. 외부 근거는 §3의 표준 ExitStack 및 실제 merged fixes를 사용한다.
+- 사전 검토가 지적한 종료 진입 경계도 포함한다. 이미 writer가 revoke된 상태에서 close/release를 호출하면
+  현재 선두 assert가 teardown 밖에서 실패한다. 이 두 종료 진입점은 lease_lost를 보존하면서 기존 discard를
+  best-effort 수행해 P3 자원과 나머지 owned handle을 정리한다. 일반 uncommitted release 거부는 계속 자원을 유지한다.
+  두 직접 진입 회귀와 기존 stale cleanup 대조를 추가한다.
+
+독립 reviewer `p3_02_preflight_review`는 위 보완을 포함한
+SHA256 `E6D6AAFB14A9AEE0456DCAF4165281A3682391B5CF120BB75EF49CD7C56E0144`에 READY를 반환했다.
+root가 소스 조사를 수행했고 추가 research worker는 초기화 대기 상태여서 결과 근거에 포함하지 않았다.
+구현은 7개 공개 이름을 신규 모듈에 제공하며 기존 root export/ToolContext 필수 멤버를 유지한다.
+callback close가 writer를 revoke하는 경우에도 local dispose를 모두 시도한 뒤 lease_lost를 보존한다.
+
+초기 typed report smoke는 approval replay의 기존 `tool_approval_replay:read`/nested result envelope에 맞춰
+검증 경로를 수정했다. staging backend는 host가 제공한 staging directory에 직접 쓰므로 overlay와 구분해
+기존 동작을 검증했다. 신규 회귀 및 기존 cleanup/checkpoint/cancellation/hosting/session/loop/async/tool-surface/
+workspace-permission/public/compat 검사는 **583 passed, 1 platform skip / 17.56s**다
+(`.tmp/v025/p3-02-focused.log`). 추가 hosted duplicate-command 테스트 및 close/secret/awaitable 검사
+**5 passed / 0.89s**도 확인했다. 실제 duplicate command는 host factory를 다시 실행하지 않았다.
+
+새 wheel audit에 두 모듈을 포함하고 기존 minimal install CI에서 report recipe를 실행하도록 연결했다.
+별도 venv에 wheel을 설치하고 PYTHONPATH를 비운 checkout 밖 실행에서 `site-packages` import를 확인했다.
+Python3.11.9/Pydantic2.14.1 환경의 결과는
+`{"activations":2,"approved_read":true,"proposal_only":true,"status":"completed"}`다.
+로컬 focused 환경의 Pydantic은 2.13.4다. 의존성 범위·배포 버전은 변경하지 않았다.
+최종 code review 및 PR CI 증거는 후보 확정 뒤 기록한다.
