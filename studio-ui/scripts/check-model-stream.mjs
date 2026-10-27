@@ -1676,6 +1676,26 @@ const factChecks = [
     }));
     assert.equal(wrongTurn.needsHydration, false, "same stream/floor with a different turn is a different call");
     assert.deepEqual(wrongTurn.calls, newer.calls);
+    let streaming = newer;
+    let streamingRun = projectModelStreamFrame(runState(), initialModelStreamState(ROOT), newer, opened(1, {
+      step: 2, turn_id: "new-turn", stream_id: "new-stream",
+    }));
+    for (const frame of [
+      delta(2, "output", "current answer", { step: 2, turn_id: "new-turn", stream_id: "new-stream" }),
+      delta(3, "reasoning", "current reasoning", { step: 2, turn_id: "new-turn", stream_id: "new-stream" }),
+    ]) {
+      const prior = streaming;
+      streaming = reduceModelStreamFrame(streaming, frame);
+      streamingRun = projectModelStreamFrame(streamingRun, prior, streaming, frame);
+    }
+    const rejectedClose = decodeModelStreamFrame(factClose(4, {
+      step: 2, stream_id: "new-stream", content_omitted: true,
+    }));
+    assert.ok(rejectedClose);
+    const rejected = reduceModelStreamFrame(streaming, rejectedClose);
+    const projected = projectModelStreamFrame(streamingRun, streaming, rejected, rejectedClose);
+    assert.equal(projected.activeResponse, "current answer", "a rejected compact close cannot clear the current bubble");
+    assert.equal(projected.reasoning, "current reasoning", "a rejected compact close cannot clear current reasoning");
     const replaced = reduceModelStreamFrame(factLive(), opened(3, {
       step: 2, turn_id: "new-turn", stream_id: "new-stream",
     }));

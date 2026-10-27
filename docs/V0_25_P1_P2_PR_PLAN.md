@@ -745,3 +745,24 @@ Studio status/outcome 불일치도 별도 red 후 거부하도록 수정했다. 
 Python lint/diff check 통과. 현재 제품 source/Studio 추가 315·삭제 15줄(공백·주석 포함)로
 최초 기능 추정 400 이내다. 두 독립 코드 리뷰, 실제 구형 client binary와 새 wire, 설치 wheel,
 최종 combined CI는 계속 진행한다.
+
+`24855df` wheel audit과 현재·최소 의존성의 실제 설치 검증은 각각 **406 passed / 4 skipped**
+(9.69/9.02s)였다. skip은 Windows symlink 권한이며 Linux CI에서 검증한다. Pydantic 2.14.1/2.6.4,
+HTTPX 0.28.1/0.27.0, OTel SDK 1.45.1/1.20.0을 사용했다. 두 공개 예제도 양쪽에서 통과했다.
+wheel SHA256은 `064dc6095b06e7dc94de789af92ffd1084be4b6772efc30abd345bfa2f03ac00`이다.
+`.tmp/v025/p1p2-04-actual-binary-peers.txt`는 실제 01 reader-prep wheel과 04 wheel을 별도 프로세스로
+연결한 양방향 sync/SSE 성공·실패 검증이다. 구형 peer의 숫자와 오류 분류를 유지하며 관측을 합성하지 않았다.
+
+첫 후보의 독립 리뷰 A는 PASS, B는 Studio projection의 P2 회귀를 확인했다. 현재 호출과 turn이 다른
+compact close를 reducer가 거부해도 App의 후속 projection이 현재 answer/reasoning을 지웠다.
+실제 decode → reduce → project 경로의 회귀를 먼저 실패시켰다
+(`.tmp/v025/p1p2-04-projection-red.txt`). terminal projection도 수락된 close에만 적용하는 경계로 수정하고,
+같은 identity의 late facts enrichment와 기존 terminal SSE fence를 유지한다. Studio bundle을 다시 생성하고
+최종 head의 두 targeted 리뷰·wheel audit·필수 combined CI로 마무리한다.
+
+수정 후 실제 projection 회귀와 모든 Studio 검증을 통과했다. `npm run check`는 오류·경고 0,
+기존 13개 protocol/reducer/transport/integration 그룹과 8개 facts 그룹 PASS다.
+`npm run build`로 서버가 제공하는 bundle도 재생성했다. 원본은
+`p1p2-04-projection-check.txt`, `p1p2-04-projection-build.txt`다. 이번 수정은 Studio source·검증·bundle에
+한정되므로 같은 Python runtime의 앞선 406개 설치 검증과 양방향 gateway binary 근거를 재사용한다.
+새 bundle을 포함한 최종 wheel의 package audit은 별도로 수행한다.

@@ -768,6 +768,15 @@ export function projectModelStreamFrame(
   if (after.needsHydration || frame.kind === "reset" || frame.root_run_id !== run.runId) return run;
   if (frame.run_id !== frame.root_run_id) return run;
   if (after.supersededRootTurnIds.has(frame.turn_id)) return run;
+  if (frame.kind === "closed") {
+    const identity = modelStreamCallKey(frame.run_id, frame.stream_id);
+    const prior = before.calls[identity];
+    const call = after.calls[identity];
+    // Only an accepted transition to closed owns terminal projection. Rejected frames and facts
+    // added to an already-closed snapshot leave the current chat projection intact.
+    if (!call || call === prior || call.status === "running" || !sameCallIdentity(call, frame)
+      || (prior && prior.status !== "running")) return run;
+  }
   if (run.messages.some((message) => message.source?.kind === "model_stream_active")) {
     // The initial private snapshot request may fail while the transcript and live SSE still work.
     // Once a root frame is valid, its bubble owns the ephemeral row and must not render beside it.
