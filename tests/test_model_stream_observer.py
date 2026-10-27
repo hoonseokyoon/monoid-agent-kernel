@@ -1268,14 +1268,10 @@ def test_a_drain_knob_that_is_not_a_real_number_means_no_drain_at_the_loop(
     assert asyncio.run(read()) == (0.0, 8.0)
 
 
-def test_astream_sizes_its_early_exit_wait_from_the_knobs_read_as_the_wait_starts(
+def test_astream_without_an_active_call_keeps_only_its_base_exit_wait(
     tmp_path: Path,
 ) -> None:
-    """8 s with the drain off (today's value); drain + model cancel grace on top with it on.
-
-    One ``RunStream``, made before any knob moves: the wait follows the knobs live, as the
-    runner does, instead of freezing them when ``astream()`` is called.
-    """
+    """Future call configuration cannot add a wait when the runner owns no call."""
 
     loop = _loop(tmp_path, _ScriptedStreamAdapter([]), stream_model_calls=True)
 
@@ -1293,4 +1289,41 @@ def test_astream_sizes_its_early_exit_wait_from_the_knobs_read_as_the_wait_start
         finally:
             await loop.aclose()
 
-    assert asyncio.run(waits()) == [8.0, 11.5, 8.0]
+    assert asyncio.run(waits()) == [8.0, 8.0, 8.0]
+
+
+def test_astream_exit_uses_only_the_drain_time_that_is_still_owned(tmp_path, monkeypatch) -> None:
+    from monoid_agent_kernel.core import _deadline as deadline_clock
+
+    now = [100.0]
+    monkeypatch.setattr(deadline_clock, "monotonic", lambda: now[0])
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class Adapter:
+            async def astream_turn(self, request):
+                yield TextDelta("hello")
+                entered.set()
+                await release.wait()
+                yield TurnComplete(usage=_DRAINED_BILL)
+
+        loop = _loop(tmp_path, Adapter(), stream_model_calls=True)
+        loop.async_model_abort_drain_s = 5.0
+        loop.async_model_cancel_grace_s = 0.5
+        await loop.aopen()
+        stream = loop.astream("go")
+        await stream.__aenter__()
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            loop.cancellation_token.cancel()
+            now[0] += 3.0
+            # The stop has consumed three of the original five seconds. Sizing the
+            # actual managed stream must preserve that fact even before its next tick.
+            assert stream._exit_wait_s() == pytest.approx(8.0 + 2.0 + 0.5)
+        finally:
+            release.set()
+            await asyncio.wait_for(stream.__aexit__(None, None, None), 3)
+            await loop.aclose()
+
+    asyncio.run(run())
