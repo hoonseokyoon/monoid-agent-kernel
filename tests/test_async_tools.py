@@ -52,6 +52,60 @@ def _event_types(run_dir: Path) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("shape", ["native", "sync", "sync_awaitable"])
+@pytest.mark.parametrize("shift", [0.0, 3600.0, -3600.0])
+def test_native_tool_waits_keep_the_open_run_cutoff_across_wall_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, shift: float,
+) -> None:
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+    calls = []
+
+    def answer(context, arguments):
+        calls.append(arguments)
+        offset[0] = shift
+        return ToolResult(ok=True, content={"answer": "tool completed"})
+
+    async def async_answer(context, arguments):
+        return answer(context, arguments)
+
+    def awaitable_answer(context, arguments):
+        return async_answer(context, arguments)
+
+    handler = {
+        "native": async_answer, "sync": answer, "sync_awaitable": awaitable_answer,
+    }[shape]
+    spec = ToolSpec(
+        id="clock.capture", description="return a value after the wall clock changes",
+        input_schema={"type": "object"}, capability="", side_effect="read", handler=handler,
+    )
+    adapter = FakeModelAdapter(turns=[
+        ModelTurn(tool_calls=(fake_tool_call("clock_capture", {}, "clock-call"),)),
+        ModelTurn(final_text="answer"),
+    ])
+    loop = AgentLoop.from_tools(
+        _spec(tmp_path, limits=RunLimits(max_duration_s=60)), adapter, [spec],
+    )
+
+    async def run():
+        try:
+            return await asyncio.wait_for(loop.arun_once("go"), 5)
+        finally:
+            if loop._session is not None:
+                await loop.aclose()
+
+    result = asyncio.run(run())
+    assert result.status == "completed"
+    assert result.final_text == "answer"
+    assert calls == [{}]
+    assert len(adapter.requests) == 2
+    assert 0 <= result.metrics["duration_s"] < 60
+    event_types = _event_types(result.run_dir)
+    assert event_types.count("tool.call.started") == 1
+    assert event_types.count("tool.call.finished") == 1
+
+
 def test_async_and_sync_tool_handlers_use_native_and_worker_paths_sequentially(
     tmp_path: Path,
 ) -> None:

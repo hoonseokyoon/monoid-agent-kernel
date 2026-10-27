@@ -17,6 +17,9 @@ from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
+from monoid_agent_kernel.core._deadline import _MonotonicDeadline
+from monoid_agent_kernel.core.termination_budget import TerminationBudgetSnapshot
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
     CalleeCancelled,
@@ -1899,6 +1902,25 @@ class AgentLoop:
             raise TurnNotSettled(suspension)
         return suspension.turn
 
+    def termination_budget(self) -> TerminationBudgetSnapshot:
+        """Read this run's deadline and root model calls without evaluating host getters.
+
+        The immutable snapshot covers the current run resources. Tool waits, children and
+        host resource cleanup remain outside the model-call tuple.
+        """
+        return self._termination_budget_at()
+
+    def _termination_budget_at(self, now: float | None = None) -> TerminationBudgetSnapshot:
+        session = self._session
+        resources = session.res if session is not None else self._bootstrap_resources
+        if resources is None:
+            return TerminationBudgetSnapshot(
+                observed_at_monotonic_s=deadline_clock.monotonic() if now is None else now,
+            )
+        return resources.model_runner._termination_budgets.snapshot(
+            now=now, run_deadline=resources.deadline,
+        )
+
     def astream(self, user_input: str | tuple[ContentPart, ...]) -> RunStream:
         """Stream one user turn live: the async-CM analog of :meth:`asubmit`.
 
@@ -1925,37 +1947,41 @@ class AgentLoop:
             sink=sink,
             drive_factory=lambda: self._astream_drive(user_input),
             request_cancel=token.cancel,
-            current_extra_grace_s=self._run_stream_drain_grace_s,
+            _termination_budget=self._termination_budget_at,
+            _exit_extra_grace_s=self._run_stream_drain_grace_s,
         )
 
-    def _run_stream_drain_grace_s(self) -> float:
-        """What ``RunStream``'s early-exit wait adds so it outlasts a drain the exit itself starts.
+    def _run_stream_drain_grace_s(
+        self, snapshot: TerminationBudgetSnapshot | None = None,
+    ) -> float:
+        """Reserve exit allowance from active calls at the first exit wait.
 
-        Leaving the ``astream`` block early cancels the run with ``user_cancel``, which with
-        ``async_model_abort_drain_s`` set turns an in-flight stream into a drain lasting up to that
-        budget plus the model cancel grace. ``RunStream`` hard-cancels the drive after its own
-        fixed wait, and a hard cancel cuts the drain and loses its bill, so the drain and the
-        close are added to that wait.
-
-        Read when the exit's wait starts, not when ``astream()`` is called: the runner reads the
-        drain as each stream opens and the grace where it is spent, so a knob raised inside the
-        ``async with`` before the first call is a drain this wait must cover. The drain is the
-        larger of the knob now and the budget the in-flight stream opened with, which a knob
-        lowered since does not shorten. With neither on, nothing is added and ``RunStream`` keeps
-        its default.
+        Each call can spend drain then cleanup; concurrent calls share the largest
+        allowance. The current grace is an exit-policy candidate sampled once here.
+        Future drain configuration contributes no time.
         """
-
-        drain_s = _positive_seconds(lambda: self.async_model_abort_drain_s)
-        try:
-            session = self._session
-            resources = session.res if session is not None else self._bootstrap_resources
-            if resources is not None:
-                drain_s = max(drain_s, resources.model_runner._open_abort_drain_s())
-        except Exception:  # noqa: BLE001 - sizing an exit must not be what fails it
-            pass
-        if not drain_s:
-            return 0.0
-        return drain_s + _positive_seconds(lambda: self.async_model_cancel_grace_s)
+        snapshot = self.termination_budget() if snapshot is None else snapshot
+        eligible = {"waiting", "streaming", "draining"}
+        grace_candidate = (
+            _positive_seconds(lambda: self.async_model_cancel_grace_s)
+            if any(call.phase in eligible for call in snapshot.calls) else 0.0
+        )
+        extra = 0.0
+        for call in snapshot.calls:
+            drain = 0.0
+            if call.phase == "draining":
+                drain = call.drain_remaining_s or 0.0
+            elif call.phase == "streaming":
+                drain = call.drain_budget_s or 0.0
+                if call.deadline_remaining_s is not None:
+                    drain = min(drain, call.deadline_remaining_s)
+            grace = grace_candidate if call.phase in eligible else 0.0
+            for window in call.grace_windows:
+                value = window.remaining_s if window.remaining_s is not None else window.budget_s
+                if value is not None:
+                    grace = max(grace, value)
+            extra = max(extra, drain + grace)
+        return extra
 
     async def _astream_drive(
         self, user_input: str | tuple[ContentPart, ...]
@@ -2636,9 +2662,9 @@ class AgentLoop:
         self._assert_write_authority()
         session = self._require_open()
         manager = session.res.context._job_manager
-        deadline = time.time() + max(0.0, timeout_s)
+        deadline = deadline_clock.monotonic() + max(0.0, timeout_s)
         while manager.has_resume_jobs():
-            remaining = deadline - time.time()
+            remaining = deadline - deadline_clock.monotonic()
             if remaining <= 0:
                 return False
             if manager.wait_for_reentry(min(0.25, remaining)):
@@ -3197,7 +3223,7 @@ class AgentLoop:
             turn, receipt = await runner.acall(
                 request,
                 context=invocation_context,
-                deadline=deadline,
+                _deadline=_MonotonicDeadline(deadline),
                 delta_consumer=delta_consumer,
                 before_dispatch=before_dispatch,
                 before_settlement=before_settlement,
@@ -3645,7 +3671,7 @@ class AgentLoop:
             workspace_delta=self._workspace_delta_entries(res.workspace),
             workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
             remaining_duration_s=(
-                max(0.0, res.deadline - time.time()) if res.deadline is not None else None
+                max(0.0, res.deadline - deadline_clock.monotonic()) if res.deadline is not None else None
             ),
             cancellation_requested=cancellation_requested,
             applied_input_ids=sorted(session.applied_input_ids),
@@ -3881,7 +3907,7 @@ class AgentLoop:
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
         if cp.remaining_duration_s is not None:
-            now = time.time()
+            now = deadline_clock.monotonic()
             max_duration_s = self.spec.limits.max_duration_s
             started = (
                 now - (max_duration_s - cp.remaining_duration_s)
@@ -4543,7 +4569,7 @@ class AgentLoop:
             step=step,
             remaining_steps=remaining_steps,
             remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
-            deadline_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            deadline_s=(res.deadline - deadline_clock.monotonic()) if res.deadline is not None else None,
             plan=tuple(res.context.plan),
             pending_observation_count=len(state.pending_observations),
         )
@@ -6162,7 +6188,7 @@ class AgentLoop:
             self._check_run_boundary(deadline)
             wait_s = 0.25
             if deadline is not None:
-                wait_s = max(0.01, min(wait_s, deadline - time.time()))
+                wait_s = max(0.01, min(wait_s, deadline - deadline_clock.monotonic()))
             if context._job_manager.wait_for_reentry(wait_s):
                 return
 
@@ -7162,7 +7188,7 @@ class AgentLoop:
                     self.cancellation_token.cause or InterruptionCause.USER_CANCEL
                 ),
             )
-        if deadline is not None and time.time() >= deadline:
+        if deadline is not None and deadline_clock.monotonic() >= deadline:
             raise RunTimeout("run exceeded max duration")
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:

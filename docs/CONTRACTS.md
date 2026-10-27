@@ -1094,6 +1094,24 @@ node configured differently records differently from there on. The CLI exposes t
 switches on both shapes, as `monoid run --model-calls-file` / `monoid run --model-payload-file`
 and `monoid backend serve --model-calls-file` / `monoid backend serve --model-payload-file`.
 
+**Deadline clocks.** Public `ModelCallRunner.acall(deadline=...)` and
+`ValidatedCallRunner.acall(deadline=...)` accept absolute Unix epoch seconds. They convert
+once at call entry to a process-monotonic cutoff shared by retries and validated repairs.
+`None` and positive infinity mean unbounded; past values, zero and negative infinity
+expire immediately. NaN, booleans, nonnumeric values and unrepresentably large integers
+raise `ValueError` before adapter access, invocation creation, attempt callbacks or receipts.
+A valid expired deadline preserves authoritative recovery and evidence publication before
+the existing boundary check; it does not permit a new dispatch.
+
+An `AgentLoop` starts its monotonic duration budget after workspace and host resources open.
+Run guards, model/tool waits, drain windows, turn remaining time and duration metrics use
+that clock. Wall-clock changes during a run cannot replenish or exhaust those budgets.
+Checkpoint `remaining_duration_s` keeps its existing format: restore creates a new local
+cutoff and excludes parked downtime. Bounded elapsed time is reconstructed from the configured
+duration and remaining budget; historical `None`/zero values carry their existing information
+limits. Process-monotonic timestamps are never persisted as portable deadlines. Capability
+expiry, host leases and provider I/O timeouts retain their own clock contracts.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn` — except a `user_cancel` of a streamed call that has entered the
 provider under a positive `abort_drain_s`, which drains first (below). Stream cancellation closes
@@ -1119,10 +1137,11 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 
 - **Window.** The same stream is read on until it ends or `min(stop + abort_drain_s, deadline)`
   passes (`stop + abort_drain_s` without a deadline), and is then closed within the ordinary cancel
-  grace. The worst-case wall time after the stop is `abort_drain_s + async_model_cancel_grace_s`.
-  `AgentLoop.astream`'s early exit waits that long plus its own 8 s before hard-cancelling the
-  drive, sized when the wait starts from the knobs then and never below the budget the in-flight
-  call opened with.
+  grace. Each drain and cleanup wait owns its own window. `AgentLoop.astream`'s early exit
+  adds the maximum remaining active-call allowance to its own 8 s, using the deadline-capped
+  drain and phase-specific cleanup windows described under termination budgets below.
+  It freezes that allowance once. After requesting hard cancellation it continues to await
+  the driver, including resource cleanup and durable settlement.
   The drain is raced outside the run-deadline race: a deadline that closes the window ends the
   drain and never turns the stop into `RunTimeout`.
 - **Delivery.** Nothing read after the stop reaches `delta_consumer`, the durable delta mirror, a
@@ -1163,6 +1182,58 @@ their default `async_model_abort_drain_s` of `0`, so a token `cancel()` during a
 call still cuts it at once and reports no usage for that call; passing the knob to children is a
 follow-up. `interrupt_turn()` never reaches a child: the child streams its call to completion and
 bills it in full, unchanged from earlier releases.
+
+**Termination budget observation (v0.25).** `ModelCallRunner.termination_budget()`,
+`AgentLoop.termination_budget()` and `RunStream.termination_budget()` synchronously return a
+frozen `TerminationBudgetSnapshot`. The four DTOs are exported from the package root and
+`contracts`. A query samples process-monotonic time once, copies owned state under a lock,
+and invokes no host configuration getter. It starts no wait and requests no cancellation.
+
+| Snapshot field | Meaning |
+|---|---|
+| `observed_at_monotonic_s` | Process-local observation time; portable records use the existing receipt/checkpoint formats |
+| `run_deadline_remaining_s` | Remaining active run time; None for a standalone runner, unbounded run or absent run resources |
+| `calls` | Immutable tuple of the root runner's currently owned logical model calls |
+| `stream_exit` | `StreamExitBudget` on RunStream; None on a runner or loop |
+
+Each `CallTerminationBudget` has an ephemeral unique `call_id`, optional existing `logical_call_id`,
+and `attempt_index` for the current or latest kernel dispatch. Provider-free recovery has no local
+dispatch index. Retries retain the call ID; separate validated repair calls receive separate IDs.
+`phase` is `preparing`, `waiting`, `streaming`, `draining`, `backoff`, `closing` or `settling`.
+Calls remain visible through durable settlement and receipt publication, and retire in the call's
+finally. The tuple covers model calls; tools, child runs and host-resource cleanup have separate owners.
+
+`deadline_remaining_s` reads the call cutoff. `drain_budget_s` is None until the dispatch shape is
+known, zero for a one-shot or drain-disabled stream, and the committed budget for an enabled stream.
+`drain_remaining_s` exists from accepted stop until its wait owner releases, including time when the
+stream is closing. A delayed stop callback cannot reopen a released window.
+
+`grace_windows` is a tuple of `GraceBudget(source, budget_s, remaining_s)` for independent
+`wait_cancel`, `stream_close` and `drain_detach` owners. Finite budget with remaining=None means
+reserved at wait entry; a started window reports its remaining seconds. None/None means unbounded
+grace. Negative and NaN grace retain their effective zero timeout. Unrepresentable/custom reservations
+are omitted until the actual wait produces a safely representable timeout; existing errors and
+fallbacks keep their timing. Queries never perform user-defined numeric operations. Phase-specific
+getter sampling stays intact, and overlapping cleanup windows retain separate entries.
+
+Managed RunStream exit freezes one allowance after requesting cooperative cancellation. For each call,
+drain contributes its remaining window in `draining`, or its committed budget capped by the remaining
+deadline in `streaming`; other phases contribute zero drain. Cleanup contributes the maximum of
+started finite grace remaining, unstarted finite reservations, and one current exit-policy grace
+candidate for `waiting`/`streaming`/`draining`. Concurrent calls use the largest drain-plus-cleanup
+allowance. The stream adds its base wait (8 seconds for AgentLoop); no active calls adds nothing.
+Unbounded grace adds no finite allowance. Future drain configuration adds nothing, and later knob
+changes or repeated Stop do not extend the frozen cutoff. Raw `current_extra_grace_s` keeps its
+legacy calculation and fallback behavior.
+
+`StreamExitBudget` reports `idle`, `cooperative_wait`, `wait_interrupted`,
+`hard_cancel_requested` or `settled`. `wait_budget_s` records the first selected finite wait.
+`hard_cancel_remaining_s` counts down only while that waiter owns its timer; cancelling or failing
+the waiter changes it to None and `wait_interrupted`. Direct exit re-entry uses the original cutoff.
+Once hard cancellation was requested, remaining stays zero through settlement. Cooperative completion
+uses settled/None. Legacy nonfinite waits expose numeric None while preserving their execution;
+an actual hard-cancel request still reports zero. The driver is awaited after cancellation, so host
+resource cleanup and durable settlement can continue while remaining is zero.
 
 Independently of the drain, a `should_abort` stop observed after the terminal chunk was delivered
 now carries that chunk's usage (previously discarded); a run-token cancel with the drain off still
@@ -3216,7 +3287,7 @@ Host-owned event and terminal adapters apply the same result rule. A `fenced` re
 event and terminal storage remains a host responsibility; AgentLoop directly wires checkpoint and
 model-invocation sink operations in v0.22.
 
-Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
+Token-based `deadline` and monotonic run-duration `RunTimeout` share one terminal projection:
 `status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
 `interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
 run. A previously settled park keeps its single turn settlement; close adds the timeout terminal

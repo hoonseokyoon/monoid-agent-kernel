@@ -133,7 +133,7 @@ timeout 뒤 유료 재시도 정책을 새로 도입하지 않는다.
 
 ### 4.2 호출 상태와 읽기 계약
 
-`ModelCallRunner.termination_budget()`와 `AgentLoop.termination_budget()`는 동기·읽기 전용 API로 제안한다.
+`ModelCallRunner.termination_budget()`와 `AgentLoop.termination_budget()`는 동기·읽기 전용 API다.
 각 logical `acall` 진입부터 receipt/evidence 처리가 끝나거나 소유권을 내려놓는 finally까지 registry에 등록한다.
 drain=0, async/sync one-shot, sync→awaitable, stream, retry backoff, early error를 모두 포함한다.
 `calls=()`는 해당 owner가 기다리는 model call이 없다는 의미다. tool·host resource 정리·descendant 전체 완료는 별개다.
@@ -149,7 +149,7 @@ drain=0, async/sync one-shot, sync→awaitable, stream, retry backoff, early err
   source state는 finally에서 퇴역하고, detach 뒤 late callback이 퇴역한 호출을 다시 등록하지 못한다.
 - snapshot은 process-local 관측이다. 기록용 receipt·checkpoint·Studio wire에 새 형식으로 저장하지 않는다.
 
-제안 타입 `TerminationBudgetSnapshot`:
+공개 타입 `TerminationBudgetSnapshot`:
 
 | 필드 | 의미 |
 |---|---|
@@ -232,7 +232,7 @@ stalled provider thread가 외부에서 계속 실행되는 경우도 기존 det
 
 ## 5. 통합 개발자가 쓸 API 예시
 
-아래는 **구현 전 제안**이다. P4-02에서 공개 export·docstring·설치 wheel 예제를 함께 검증한다.
+아래 API를 P4-02에서 구현했다. 공개 export·docstring·설치 wheel 예제의 검증 결과는 §9.3에 기록한다.
 
 ```python
 def on_stop(loop, cancellation_token):
@@ -399,3 +399,148 @@ manual diagnostic 또는 dormant 성공을 대체 근거로 사용하지 않는�
 [GitHub 이벤트 문서](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)를
 10/28 재확인했고 기존 Draft-fast/Ready-required 경계를 유지한다. 코드 리뷰와 최종 remote CI는 이어서 확인한다.
 기능 delta는 등록 2줄이고 계획 commit의 475줄 churn과 실행 기록을 누적 비용에 포함한다.
+
+00 [PR #162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 final head `1be46be`에서 독립 코드 **PASS**,
+[L1 40543644526](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40543644526) 및
+[required L2 core 40543818445](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40543818445) **SUCCESS**를 확인했다.
+Ready 전환으로 자동 실행된 GitHub 리뷰도 같은 head에 지적이 없었다. dormant run은 병합 근거에서 제외했다.
+develop merge는 `22aae182f98b8846747b894a661dfad6e5f52bd2`다. fetch 후 reviewed head와 tree 동일성을 확인했다.
+이 base에서 `codex/v0.25-p4-termination-budget`를 생성·push하고, 01 branch `codex/v0.25-p4-clock`를 만들었다.
+
+### 9.2 P4-01 사전조사 — 2026-10-28
+
+actual base는 00 병합 뒤 `22aae18`이며 runtime는 계획 기준 `2914c43`과 동일하다.
+읽기 전용 조사자 `p4_01_research`가 내부 public acall 소비자(loop/validated)와 실제 CSP epoch 입력을 대조했다.
+최소 private `_MonotonicDeadline(cutoff_s)` carrier는 공개 진입 경계만 구분하고 내부 기존 deadline 인자는 monotonic float로 유지한다.
+public acall 경로·callback arity를 보존하고 `_deadline` keyword로 이미 변환된 unbounded도 전달한다.
+private deadline을 epoch로 표시하는 제품 소비자는 없으므로 별도의 wall deadline 복제본은 만들지 않는다.
+숫자로 표현할 수 없는 큰 정수 입력도 ValueError로 거부하며 unbounded로 바꾸지 않는다.
+
+수정 지도는 model/validated/loop/loop_phases/shared bridge의 16개 시간 계산과 작은 core helper다.
+private checkpoint assertion 1개는 monotonic 기준으로, public deadline에 monotonic 과거값을 주던 테스트 1개는 epoch로 바로잡는다.
+테스트 helper가 public runner에 전달하는 epoch 입력은 그대로 유지한다. invalid는 accessor·invocation·receipt 전 검증하되,
+valid-expired durable recovery는 기존 evidence 재게시 뒤 boundary 검사를 유지한다.
+CPython b94b9c8·AnyIO #1317·Python 3.11 clock 문서를 10/28 재확인했다.
+PR별 상세 조사 `.tmp/v025/p4-01-preflight.md`를 별도 독립 reviewer가 검토하며, 코드보다 행동 회귀를 먼저 고정한다.
+
+독립 reviewer `p4_01_preflight_review`는 actual base `22aae18`에서 **READY**, 필수 보완 0건으로 판정했다.
+검토한 preflight SHA-256은 `6846584bf88279f96cc43b0e97371f0e70cc0e732a17635359371edc33ef200f`다.
+이후 root가 공유 runner·최종 구현/통합을, `p4_01_research`가 테스트 파일에 한정한 실패 회귀 작성을 맡는다.
+테스트-only 실패를 실행·commit하기 전 제품 코드는 수정하지 않는다.
+
+통합 branch 최초 push [CI 40544692527](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40544692527)은
+`22aae18`에서 **SUCCESS**, actual combined services 포함이다. 01 제품 수정 전 테스트-only `029152f`를 고정했다.
+`.tmp/v025/p4-01-red-core.txt`는 **22 failed / 24 passed (8.75s)**다. wall jump의 조기 종료·retry/repair 예산 재충전·
+drain 연장과 invalid 입력의 부수효과를 실제 runner에서 확인했다. 최초 테스트 fixture의 사용량 정규화와
+validated durable ID 설정 오류를 교정한 뒤 기록한 결과이며, 모든 무변경 대조군이 통과한다.
+root는 그 뒤 private carrier·16개 시간 계산·public 소비자 연결과 clock 계약 문서를 수정한다.
+
+핵심 회귀 **46 passed (5.90s)**, 실제 loop/tool/restore를 포함한 영향군 **728 passed (40.22s)**다.
+후자는 model/validated/async loop/tools/checkpoint/cancellation/stream observer 8개 모듈을 함께 실행했다.
+원본 `.tmp/v025/p4-01-green-core.txt`, `p4-01-related-green.txt`. 추가 정밀 경계·설치 wheel과 독립 리뷰·CI는 이어서 확인한다.
+
+추가 exact cutoff·drain 동률·서로 다른 monotonic 원점의 실제 park/restore 10개도 **PASS (5.93s)**:
+`.tmp/v025/p4-01-boundary-green.txt`. P4-01 신규 행동 회귀는 81개다. ruff 0.15.6·diff check와 wheel audit가 통과했다.
+
+01 [PR #163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)은 final head `4818e06`에서
+서로 독립적인 코드 reviewer A/B **PASS**, 필수 지적 0건이다. checkout 밖 설치 wheel은 Python 3.11 /
+Pydantic 2.14.1과 최소 2.6.4에서 각각 **736 passed**다. source AST census 2개는 앞선 source 검증에 포함했다.
+wheel SHA256 `BA76B1D0ECCFA9ACEEB2AE384186E15A6355F16B2182696F3101B8D7B439AE04`.
+[L1 40548876259](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40548876259)와
+[required L2 combined 40548898276](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40548898276)는 **SUCCESS**다.
+Python 3.11/3.12 core와 실제 combined services가 모두 통과했다. Draft/label 전환의 취소된 dormant run은 제외했다.
+통합 merge는 `3beb8057367779fce86efd5e087a926730e65e7e`이며 fetch 뒤 reviewed head와 tree 동일성을 확인했다.
+01 delta는 기능 코드 98줄, 전체 churn 950줄이다. 계획·00 비용과 합산하여 다음 PR의 추정에 유지한다.
+
+### 9.3 P4-02 사전조사 — 2026-10-28
+
+최신 develop은 `22aae18`, actual integration base는 01 merge `3beb805`다. 새 branch는 `codex/v0.25-p4-budget-snapshot`.
+root가 source 변경을 통합하고 공유 runner를 소유한다. 읽기 전용 `p4_02_research`의 조사와 actual-base 대조를
+`.tmp/v025/p4-02-research.md`, `p4-02-preflight.md`에 기록했다. 별도 독립 reviewer가 구현 전 검토한다.
+
+기존 public acall을 소유권 wrapper로 유지하고 runner의 registry 하나로 drain 전용 목록을 대체한다.
+phase·grace·drain 갱신은 실제 wait owner에서 수행한다. 임의의 grace 객체에 관측용 변환·비교를 추가하지 않고,
+이미 읽은 내장 숫자 예약과 실제 wait에서 계산된 timeout을 기록한다. 표현할 수 없는 예약은 생략하며 기존 오류·fallback을 유지한다.
+managed RunStream은 실제 owner snapshot으로 최초 cutoff를 고정하고 raw callback 경로를 보존한다.
+
+[gRPC의 소유 call registry 변경](https://github.com/grpc/grpc/commit/72694561276a1d492b0f5c08fd870825b31fe90f),
+[AnyIO 4.15.1 cancellation 문서](https://anyio.readthedocs.io/en/stable/cancellation.html),
+[Python 3.11 wait 문서](https://docs.python.org/3.11/library/asyncio-task.html#asyncio.wait)를 10/28 재확인했다.
+실제 소유 상태 조회와 finally 퇴역을 적용하고 기존 asyncio cancellation·bridge·thread 접근 계약을 유지한다.
+기능 450–600줄과 테스트·문서·예제 650–850줄을 예상한다. 구현 전 기존 consumer에서 exit sizing 실패부터 고정한다.
+
+독립 `p4_02_preflight_review`는 actual base `3beb805`에서 **READY**, blocker 0건이다.
+같은 base에 테스트만 추가한 `b42fa4c`에서 **2 failed / 2 passed (2.76s)**를 확인했다.
+활성 호출이 없어도 11.5초를 주는 경로와 이미 drain 3초를 사용했는데도 13.5초를 다시 주는 경로가 실패했다.
+기대값은 각각 기본 8초와 10.5초다. `.tmp/v025/p4-02-red.txt`에 원본을 보존했다.
+
+root는 model/loop/bridge 연결·공개 export·문서·예제를, `p4_02_research`는 core DTO/registry와 RunStream을,
+`p4_01_research`는 새 관측·RunStream·public surface 테스트를 맡는다. 파일 소유권과 단일 runner를 분리했다.
+첫 구현에서 호출 관측·기존 streaming consumer·export **77 passed (5.23s)**와 pinned ruff가 통과했다.
+외부 취소 thread의 on_begin이 wait 종료 뒤 도착할 수 있어, drain owner 종료를 별도로 기록하고 실제 경합 회귀를 추가한다.
+실제 aopen→astream→Stop→진행 조회→receipt offline 예제도 source에서 성공했다. 전체 영향군·wheel·두 리뷰·CI는 이어서 확인한다.
+
+15개 영향 모듈 **1,060 passed (29.14s)**: 종료 관측·실제 exit 경합·공개 export·기존 model/validated/loop/tool/
+checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했다. 원본 `.tmp/v025/p4-02-related-green.txt`.
+외부 thread의 늦은 on_begin이 settling 중 종료된 drain을 다시 만들지 않는 회귀도 포함한다.
+02 기능 churn은 약 601줄이며 테스트·문서·예제 포함 약 1,690줄이다. 00 계획/CI와 01을 합한 전체는 약 3,200줄로
+최초 2,450줄의 약 1.3배다. 기능 합계는 약 701줄이다. 추가 비용은 실제 경합을 제어하는 fixture와 공개 예제에 사용했다.
+기존 drain 목록을 제거하고 하나의 registry와 기존 wait 경계의 hook을 선택해 중복 소유권과 새 timer service를 피했다.
+
+02 첫 후보 `3575356`의 설치 wheel은 현재/최소 Pydantic에서 각각 **764 passed**와 공개 API·offline 예제를 통과했다.
+첫 L1/required L2는 요청 정규화 순서의 source census가 이전 public acall 본문을 읽어 실패했다.
+검사를 실제 본문인 `_acall_owned`로 옮겨 정규화→identity 순서 assertion을 유지했고 **31 passed**였다.
+
+독립 코드 reviewer B가 raw legacy callback 실행 시간이 첫 종료 대기에서 차감되는 호환성 회귀를 재현했다.
+테스트-only `6527869`에서 callback 정상/예외 fallback 두 경로 모두 **2 failed (9.26s)**를 고정했다.
+raw 경로의 최초 cutoff를 callback 평가 뒤에 잡고 managed snapshot 기준과 재진입 cutoff는 유지했다.
+수정 후 RunStream·request identity·stream observer **83 passed (12.92s)**다.
+원본 `.tmp/v025/p4-02-review-red.txt`, `p4-02-review-green.txt`. 두 독립 최종 검토·새 wheel·필수 CI를 이어서 확인한다.
+
+02 [PR #164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)의 최종 `08e6eba`는 두 독립 코드 reviewer의 **PASS**를 받았다.
+raw callback 지적은 정상/예외 fallback 모두 실제 cooperative completion을 다시 확인해 해소했다.
+[L1 40554818455](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40554818455)와
+[required combined L2 40554877403](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40554877403)는 **SUCCESS**다.
+Python 3.11/3.12는 각각 core **4,911 passed**, serial **741 passed**, 실제 services는 **234 passed**다.
+최종 설치 wheel은 Python 3.11.9 / 현재 Pydantic 2.14.1과 최소 2.6.4에서 각각 **766 passed**(20.42/20.59s),
+공개 DTO import·offline Stop/조회/receipt·audit를 통과했다. SHA256은
+`A52B6108FEC32613D57CB4B747E90215E45EC1416F714A170267FC80A74D999E`다.
+통합 merge는 `be35567dddfa62c32401b7062bbd9a2a1e54a43d`이며 fetch 뒤 reviewed head와 tree 동일성을 확인했다.
+
+### 9.4 P4-I 최종 통합 — 2026-10-28
+
+[PR #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)는 `codex/v0.25-p4-termination-budget`에서 develop을 대상으로 한다.
+actual base는 02 merge `be35567`, 다시 fetch한 develop은 `22aae18`이며 이미 ancestor다.
+독립 actual-base preflight는 **READY**, blocker 0건이다. 검토한 preflight SHA256은
+`668B5E7E32D85781124C5E849803A70755C3F7194C1F8963ACED4D8D4BD85E38`이다.
+root가 통합/문서/단일 runner를, 연구자가 실제 소비자 대조를 맡았다. I의 최초 후보는 상태 문서와 기존 종료 대기 설명 5개 문서를 수정했다.
+core 기능·schema·provider·Studio bundle은 02의 검토/설치 후보와 동일하게 유지한다.
+
+실제 CSP `pipeline_core/skills/llm_namespace.py`의 epoch 입력은 그대로 사용 가능하다.
+기존 checkpoint는 remaining duration을 유지하고 복구 downtime을 제외한다. P1/P2 facts·usage, P3 resource cleanup,
+P5 전달 권한 경계는 누적 코드와 기존 회귀·full/combined CI에 연결했다. core 703줄·CI/profile 3줄,
+전체 3,212줄의 기존 누적 churn에 이번 문서 마감 비용을 더한다. 최초 추정은 기능 800줄·전체 2,450줄이다.
+
+02 wheel의 packaged source·metadata·asset·예제 입력 동일성을 확인해 현재/최소 환경의 766개 결과를 재사용한다.
+전체 명령·12개 테스트 모듈·source-only 제외 2개·checkout 밖 경로·실제 import provenance는
+`.tmp/v025/p4-02-final-wheel-evidence.md`에 묶었다. I에서 같은 설치 wheel로 facts·recovery·host resource 예제를
+두 환경 모두 추가 실행해 통과했다. 원본은 `.tmp/v025/p4-i-{facts,recovery,resources}-{current311,minimum311}.txt`다.
+새 source 검사를 중복 실행하지 않고 최종 head의 두 fresh 누적 리뷰, full push CI와 required combined CI를 확인한다.
+그 결과와 develop merge SHA는 #165의 최종 검증 기록에 둔다.
+
+운영 의미는 기존 범위를 유지한다. `calls=()`는 소유 model wait 부재, `hard_cancel_remaining_s=0`은 강제 취소 요청 사실이다.
+driver의 자원 정리·durable settlement는 계속 기다릴 수 있다. unbounded 실행의 과거 elapsed와 remaining=0 이후 초과 cleanup
+시간은 기존 checkpoint로 복원할 수 없다. 릴리스·배포·CSP pin 변경은 별도 작업이다.
+
+최초 I 후보 `44728a2`는 두 fresh 누적 코드 reviewer **PASS**, L1 `40556925253`과 required combined
+`40557033294` **SUCCESS**를 받았다. full push `40556908534`는 14개 중 13개 job이 통과했고,
+coverage job은 **81.16%**로 기준 80%를 충족했으나 기존 backend 복구 테스트의 fixture 경합 1건으로 실패했다.
+`run.finished` append 뒤 최종 status writer가 아직 살아 있는데 테스트가 `status.json`을 덮어써 같은 임시 파일을 경합했다.
+해당 fixture·backend·atomic writer는 P4 이전 develop과 동일하다. `shutdown()`은 이 writer 완료를 기다리는 API가 아니다.
+
+독립 targeted preflight는 기존 테스트 관리자가 보관한 실제 run Future의 완료를 기다리는 **test-only 수리 READY**였다.
+실제 최종 status replace를 barrier로 멈춘 probe에서 helper가 먼저 반환해 **1 failed (9.45s)**를 확인했다.
+`_closed_limited_run`이 추적 Future의 존재를 확인하고 `result(timeout=20)`으로 완료·오류를 받도록 수정했다.
+legacy terminal 거부·nonterminal 복구·중복 재개 방지 assertion을 보존했고, probe와 backend recovery 모듈은
+**37 passed (16.51s)**다. 원본 `.tmp/v025/p4-i-fixture-{red,green}.txt`; probe는 `test_p4_i_fixture_race.py`다.
+제품 코드와 설치 wheel 입력은 그대로다. 최종 수정에 대한 두 targeted 리뷰와 새 head의 L1·full push·required combined를 확인한다.

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
 from monoid_agent_kernel.core.agents import (
     AgentRuntimeConfig,
     compile_bound_tool_catalog,
@@ -57,8 +57,8 @@ class _RunResources:
     recorder: AgentRecorder
     context: Any
     base_tool_specs: tuple[ToolSpec, ...]
-    started: float
-    deadline: float | None
+    started: float  # process-monotonic seconds
+    deadline: float | None  # absolute process-monotonic cutoff
     static_segments: tuple[str, ...]
     model_runner: ModelCallRunner
     model_stream_observers: tuple[Any, ...] = ()
@@ -186,7 +186,7 @@ class LoopBootstrapper:
                 parent=loop._host_tool_parent,
             )
             loop._host_tool_registry.open(loop.host_tool_bindings)
-            started = time.time()
+            started = deadline_clock.monotonic()
             deadline = (
                 started + loop.spec.limits.max_duration_s
                 if loop.spec.limits.max_duration_s is not None
@@ -290,7 +290,7 @@ class LoopBootstrapper:
             step=1,
             remaining_steps=max(0, loop.spec.limits.max_steps - 1),
             remaining_tool_calls=loop.spec.limits.max_tool_calls,
-            deadline_s=(deadline - time.time()) if deadline is not None else None,
+            deadline_s=(deadline - deadline_clock.monotonic()) if deadline is not None else None,
             plan=(),
             pending_observation_count=0,
         )
@@ -655,7 +655,7 @@ class LoopFinalizer:
         )
         metrics = {
             "status": state.status,
-            "duration_s": time.time() - res.started,
+            "duration_s": deadline_clock.monotonic() - res.started,
             "steps_limit": loop.spec.limits.max_steps,
             "tool_calls": state.total_tool_calls,
             # `metrics.json` is a public run artifact, like `events.jsonl` and `status.json`, and was

@@ -655,7 +655,7 @@ Treat `CancellationToken.cause` as first-cause execution-control history. Inject
 when lease ownership moves. Revocation wakes the loop while preserving an earlier Stop or drain
 cause, and the stale activation returns an ephemeral `lease_lost` disposition. Required-evidence
 recovery checks the authority before and after its lifecycle hook. Token-based deadlines use the
-same `run_timeout` terminal projection as elapsed wall-clock deadlines.
+same `run_timeout` terminal projection as elapsed run-duration deadlines.
 
 Keep the host's `WriterToken(run_id, owner_id, generation)` beside the process-local authority.
 Checkpoint, invocation, canonical event, and terminal adapters validate that token atomically with
@@ -828,6 +828,21 @@ model text. `read_after()` returns private bytes and performs no tenant authoriz
 only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
 apply tenant scoping in that wrapper.
 
+### Deadline inputs and restoration
+
+Pass an absolute Unix epoch to standalone `ModelCallRunner.acall` or
+`ValidatedCallRunner.acall`, for example `deadline=time.time() + 30`. The runner converts
+it once to a monotonic budget covering retries and validated repairs. `None` or `math.inf`
+is unbounded; an expired epoch or `-math.inf` expires immediately. Invalid numbers such as
+NaN, booleans, nonnumeric values and overflowing integers raise `ValueError` before any
+adapter or receipt callback. Keep passing epoch values through existing wrappers.
+
+`RunLimits.max_duration_s` measures active time from workspace and host-resource setup
+completion. Model waits, tool waits, drain windows and duration metrics share this monotonic
+clock. Checkpoints store the remaining duration and restore it against the new process clock,
+so time spent parked does not consume the run budget. Existing settled-call recovery still
+publishes its authoritative evidence before applying an expired run boundary.
+
 ### Billing a stopped stream
 
 A Stop normally closes the provider stream before its terminal chunk, so the tokens the provider
@@ -850,8 +865,9 @@ window: a drain ends by `min(Stop + async_model_abort_drain_s, run deadline)` an
 as the Stop, never as a timeout. Nothing read after the Stop is delivered to the UI, observers,
 recorder or sidecars. The Stop's outcome is unchanged (the `interrupted` suspension, or the
 terminal `limited` result with `interruption_cause=user_cancel` that a `user_cancel` produces), only
-later: the stopped call ends at most `async_model_abort_drain_s + async_model_cancel_grace_s` after
-the Stop is observed.
+later: the owned drain and cleanup windows allow time to collect usage and close the stream.
+Use `termination_budget()` to observe those windows and the stream's hard-cancel request cutoff.
+The driver continues to await resource cleanup and durable settlement after that request.
 
 The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
 of `0`, so a token `cancel()` during a child's streamed call still cuts it and reports no usage for
@@ -876,14 +892,44 @@ Read the bill where you already read it:
   not substitute an estimate for it.
 
 Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
-with `user_cancel`, which drains a streamed call in flight. `RunStream` then waits
-`async_model_abort_drain_s + async_model_cancel_grace_s + 8 s` (8 s with the drain off) before it
-hard-cancels the drive, so that drain finishes and keeps its bill. Both knobs are read when that
-wait starts, not when `astream()` is called, and the drain term is never less than the budget the
-in-flight call opened with, so setting them inside the `async with` before the first call, or
-lowering them mid-call, cannot leave the wait shorter than the drain. The drain keeps the connection and the provider's generation alive for up to the budget;
-durable lifecycle calls still end `dispatch_unknown` with the usage on the exception stamp; it is
-not journalled, though the failed receipt delivered to `settled_sink` still carries it.
+with `user_cancel`, which drains a streamed call in flight. RunStream freezes its exit wait from
+the calls actually owned at that moment: 8 seconds plus the largest remaining drain-and-cleanup
+allowance. An active one-shot call contributes its cleanup reservation; no active call adds zero.
+Already consumed drain time and future configured drain add no extra time. Phase-specific cleanup
+continues to sample its own grace, while later settings changes leave the stream's first cutoff fixed.
+After that cutoff, RunStream requests driver cancellation and awaits its cleanup and settlement.
+
+### Showing Stop progress
+
+Keep the `RunStream` handle in the host and poll it from a separate progress task while the context
+manager exits. The same read-only `termination_budget()` API is available on AgentLoop and a
+standalone ModelCallRunner. It exposes frozen DTOs and performs no cancellation or getter calls.
+
+```python
+snapshot = stream.termination_budget()
+for call in snapshot.calls:
+    print(call.call_id, call.phase, call.deadline_remaining_s, call.drain_remaining_s)
+    for window in call.grace_windows:
+        print(window.source, window.budget_s, window.remaining_s)
+exit_wait = snapshot.stream_exit
+print(exit_wait.phase, exit_wait.hard_cancel_remaining_s)
+```
+
+A finite grace budget with remaining=None is reserved but has not begun. None/None denotes an
+unbounded grace window. Closing can coexist with a live outer drain window. Empty `calls` describes
+the root runner's model calls; tool, child and resource cleanup remain separate.
+
+Before exit, `stream_exit.phase` is idle. During its wait, the phase is cooperative_wait. If the
+exit waiter is cancelled, wait_interrupted/None says that timer has stopped; directly re-entering
+exit reuses the original cutoff. After hard cancellation is requested, remaining is zero and
+cleanup may still be running. The final phase is settled; zero preserves an earlier hard-cancel
+request, while None denotes completion without that request. Read the final bill from receipts.
+
+Run [the offline termination example](../examples/termination_budget.py) with
+`python examples/termination_budget.py`. It opens a real AgentLoop, streams a response, presses
+Stop, polls during exit, and verifies the final termination facts and reported usage.
+
+### Resuming event delivery
 
 Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
 The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
