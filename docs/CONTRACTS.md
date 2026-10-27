@@ -488,9 +488,10 @@ withholds reconstructed subscription and ledger receipts. The current stream obs
 `failed` / `evidence_uncommitted` with final text, usage, termination and usage evidence unavailable.
 This keeps historical usage separate from the replacement request's model and routing metadata.
 
-See the offline [subscription example](../examples/model_call_facts.py). In the P1P2-02 preparation
-stage, invocation/model-calls writers remain v1 and omit these facts. P1P2-03 activates v2 writers;
-P1P2-04 completes gateway-server, live/Studio and OTel projections.
+See the offline [subscription example](../examples/model_call_facts.py) and
+[JSON recovery example](../examples/recover_model_call_facts.py). Fresh invocation revisions and
+model-call ledger entries use v2 and preserve these facts. Existing v1 history stays readable with
+unavailable observations. P1P2-04 completes gateway-server, live/Studio and OTel projections.
 
 `ModelCallReceipt.attempt_log` itemizes what `attempts` counts: per dispatch, the index, the
 elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
@@ -872,7 +873,7 @@ remain side-effect free. A `stream_closed` record carries the boolean `retryable
 treat its absence as `false` for records written before that field was introduced.
 
 `AgentLoop.model_calls_file=True` writes the optional private `model_calls.jsonl` ledger: one
-`monoid.model-calls.v1` record of kind `model_call` per settled call, **including failed ones**.
+`monoid.model-calls.v2` record of kind `model_call` per settled call, **including failed ones**.
 Existing run directories may omit the file, and it is independent of `model_content_file` and
 `stream_model_calls` — a ledger of what was called selects no provider streaming. A subagent
 inherits the switch and records into its own run directory, so every record carries `root_run_id`

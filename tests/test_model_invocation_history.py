@@ -48,6 +48,7 @@ def test_historical_settlement_recovers_without_rewriting_its_coordinate(
     sha = hashlib.sha256(blob).hexdigest()
     blobs = {sha: blob} if success else {}
     payload = DurableModelInvocation(
+        schema_version="monoid.model-invocation.v1",
         run_id="history",
         logical_call_id="call_1",
         revision=3,
@@ -192,7 +193,8 @@ def test_v2_facts_do_not_expand_v1_or_unknown_receipt_vocabulary() -> None:
     assert decode_model_invocation(raw).status == "corrupt"
 
 
-def test_new_revision_from_loaded_v2_selects_default_writer_and_drops_source_envelope() -> None:
+@pytest.mark.parametrize("schema", ["monoid.model-invocation.v1", "monoid.model-invocation.v2"])
+def test_new_revision_from_loaded_history_selects_v2_writer_and_drops_source_envelope(schema) -> None:
     from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
 
     raw = next(
@@ -200,7 +202,7 @@ def test_new_revision_from_loaded_v2_selects_default_writer_and_drops_source_env
         for item in load_compatibility_fixtures()
         if item.fixture_id == "model-invocation-v025-facts-v2"
     )
-    raw.update(revision=1, dispatch_state="reserved", receipt=None, failure_code="")
+    raw.update(schema_version=schema, revision=1, dispatch_state="reserved", receipt=None, failure_code="")
     invocation = decode_model_invocation(raw).value
     harness = DeterministicFencedRunHarness()
     token = harness.claim_writer(raw["run_id"], "worker")
@@ -224,6 +226,6 @@ def test_new_revision_from_loaded_v2_selects_default_writer_and_drops_source_env
     newer = harness.sink.load_invocation(raw["run_id"], raw["logical_call_id"]).value.invocation
     assert newer.revision == 2
     assert (
-        model_invocation_payload_for_write(newer)["schema_version"] == "monoid.model-invocation.v1"
+        model_invocation_payload_for_write(newer)["schema_version"] == "monoid.model-invocation.v2"
     )
     assert model_invocation_payload_for_write(invocation) == raw

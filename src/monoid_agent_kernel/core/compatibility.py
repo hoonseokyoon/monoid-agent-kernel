@@ -306,13 +306,14 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         source=("core/checkpoint.py:CHECKPOINT_CODEC",),
         legacy_reader=True,
     ),
-    _monoid_artifact(
-        "model-invocation.v1",
+    CompatibilityArtifact(
+        key="model-invocation",
         kind="durable",
+        current_writer="monoid.model-invocation.v2",
+        supported_readers=("monoid.model-invocation.v1", "native-agent-runner.model-invocation.v1", "monoid.model-invocation.v2"),
+        namespace_aliases=("native-agent-runner.model-invocation.v1",),
         reader_policy="checked",
-        source=("core/model_invocation.py:MODEL_INVOCATION_CODEC",),
-        legacy_reader=True,
-        additional_readers=("monoid.model-invocation.v2",),
+        source=("core/model_invocation.py:decode_model_invocation",),
     ),
     _monoid_artifact(
         "backend-run.v1",
@@ -357,9 +358,12 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
             "that transcript when the sidecar cannot resolve a digest."
         ),
     ),
-    _monoid_artifact(
-        "model-calls.v1",
+    CompatibilityArtifact(
+        key="model-calls",
         kind="durable",
+        current_writer="monoid.model-calls.v2",
+        supported_readers=("monoid.model-calls.v1", "monoid.model-calls.v2"),
+        namespace_aliases=(),
         reader_policy="json-schema",
         source=(
             "core/schemas.py:MODEL_CALLS_RECORD_SCHEMA",
@@ -367,8 +371,6 @@ PUBLIC_ARTIFACT_COMPATIBILITY: tuple[CompatibilityArtifact, ...] = (
         ),
         # No legacy namespace: this artifact has never existed under native-agent-runner.*, and
         # advertising a reader for records that cannot exist is a false compatibility claim.
-        legacy_reader=False,
-        additional_readers=("monoid.model-calls.v2",),
         notes=(
             "Optional private run-dir ledger of settled model calls, one record per call including "
             "failed ones. Metadata and the replay key only: a record is a declared projection of "

@@ -639,3 +639,64 @@ failed/evidence_uncommitted로 정상 close하며 text·usage·termination·evid
 복구 게시와 기존 회계 증분은 유지한다. 새 placeholder 모델이나 wire 형식은 추가하지 않는다.
 실제 host의 모델·provider·destination 변경 회귀는 수정 전 실패했고, 동일/변경 요청 5개는 수정 후
 통과했다(2.55s; `p1p2-02-recovery-attribution-{red,green}.txt`). 기존 content-only 억제를 이 정책으로 대체한다.
+
+**02 완료.** PR #158은 최종 `7208615e91e173a2c15781dffad8eda3f6f14970`에서 두 독립 코드 리뷰 PASS,
+L1 `40461636410`·필수 core L2 `40461723407` SUCCESS 후 통합 `617deadc5012c2d749b395497651a7dc69985572`에
+병합했다. 최종 코드 `1cc172b` wheel은 current/minimum 각각 154 tests PASS(3.27/2.93s), 예제·audit 통과.
+마지막 head는 계약 문서만 수정했으므로 같은 binary 근거를 재사용했고 문서 delta도 두 리뷰가 확인했다.
+마지막 attribution 관련 recovery·observer·census 297개 통과(13.22s). 실제 source 추가 788/삭제 104줄,
+전체 추가 1,501/삭제 128줄이다. 줄 수에는 공백·주석이 포함되며 기능 비용의 보수적 대용치로 기록한다.
+
+### 9.4 P1P2-03 실제 base 사전조사
+
+새 branch `codex/v0.25-p1-p2-storage`의 base는 위 02 병합본 `617deadc`다. 재조회한 develop은 `d4e659c`다.
+사전조사 `.tmp/v025/p1p2-03-preflight.md` SHA-256
+`064BC150A186FBF04FD865D42DBE5183161ED4BAB88281F0BA6AC38EB2979C71`는 독립 검토 READY다.
+기존 두 codec·source envelope·bounded projection·실제 service harness를 재사용한다. v1 codec 식별자는
+고정하고 version dispatch reader를 registry에 기록한다. reader-prep binary가 새 v1 revision을 쓰는 롤백에서는
+그 revision이 보존하지 못한 관측을 legacy_ambiguous로 유지하며 새 provenance를 만들어 내지 않는다.
+03 추정은 350 기능/1,250 총 변경 줄이다. 누적 2,187은 추가 줄 기준 예상이며 02 삭제까지 포함하면
+2,291이다. 이 기준을 구분하고 더 작은 기존 경계 재사용으로 soft limit 접근 원인을 해소한다.
+root가 제품 소스와 단일 테스트 runner를 담당하고 별도 worker가 지정된 세 service-test 파일을 담당한다.
+모든 편집을 마친 뒤 테스트를 실행하며, 최종 두 코드 리뷰·설치 wheel·combined CI는 별도 gate다.
+
+03 실제 base의 제품 소스를 수정하기 전 새 회귀 11개가 모두 실패했다(3.04s;
+`.tmp/v025/p1p2-03-red.txt`). 실제 fenced 복구 6개, recorder 성공·실패·retry 3개,
+historical v1/v2에서 새 revision 전이 2개다. service worker는 같은 경계를 기존 PG16/18,
+ObjectStore·Temporal 테스트에 연결했고 아직 실행하지 않았다. 아래 테스트 전용 commit으로 red를 고정한다.
+
+**03 후보.** 테스트 전용 commit은 `25c8fbf`다. 첫 red 중 outbox 2개에는 crash fixture의
+stage_evidence 전달 누락이 있었다. fixture를 보완하고 같은 base의 설치된 02 wheel에서 전체 11개를
+다시 실패시켰다(2.24s; `p1p2-03-red-base-wheel.txt`). 잘못된 동일 checkpoint 재사용도 고쳐서
+반복 evidence 검증은 실제 lifecycle.recover를 사용한다. 서비스 실패 fixture는 확정 refusal을 사용한다.
+제품 writer 수정 후 관련 **319 passed, 4 skipped / 4.65s** (`p1p2-03-related2.txt`)였다.
+skip은 Windows 파일 symlink 권한이며 Linux CI에서 계속 검증한다. 확장 계약 545개 중 10개는
+current version과 namespace alias를 같은 것으로 가정한 conformance fixture에서 실패했다.
+별칭 probe를 명시적 v1 쌍으로 고정하고 일반 probe는 v2를 유지했으며 관련 **275 passed / 9.34s**였다.
+bounded projection·두 closed schema·version registry를 갱신했고 공개 오프라인 JSON 복구 예제는
+provider 호출 1회, v2 facts 유지와 total unknown을 출력했다. 전체 lint/diff check 통과.
+두 독립 코드 리뷰·실제 binary rollback·설치 wheel·필수 combined CI를 이어간다.
+
+03 PR #159의 첫 후보 `4eadd548` wheel audit과 current/minimum 설치 검증은 각각
+**336 passed, 4 Windows symlink skipped**(5.02/3.84s)였고 복구 예제도 양쪽에서 통과했다.
+제품 import는 site-packages에서 확인했다. 실제 binary 검증 스크립트는
+`.tmp/v025/p1p2-03-installed-tests/binary_rollback.py`, 교환 JSON은 같은 폴더의 `binary-history.json`이다.
+03 wheel → 01 reader-prep wheel → 03 wheel 순서로 별도 프로세스를 실행했다. v2 성공 기록·ledger·nested
+checkpoint를 읽고 같은 좌표를 재게시해 hash를 보존했다. 01 lifecycle이 v2 reservation에서 새 v1
+started/settled revision을 썼고, 03 lifecycle은 이를 읽어 새 v2 retry revision으로 이어갔다.
+구형 writer가 보존하지 못한 첫 observation은 legacy_ambiguous, 새 관측은 partial로 검증했다.
+이 binary 전이 검증은 저장/lifecycle 호환성을 증명하며 실제 runner의 retry 회계는 앞의 복구 테스트가 검증한다.
+PyPI v0.24.0의 별도 설치 reader는 v2를 unsupported_version으로 거부하고 v1은 읽었다.
+01 wheel SHA-256 `ab8e726eb0a5c79b25264088e71c1e5f54424d5fd034a2ab25fbf75505f464b4`,
+03 wheel SHA-256 `18c3eebba5ec4405188623930b5feb79f1919f8acb7c37201671606c1edc9cfd`다.
+
+두 코드 리뷰가 같은 mixed-ledger fixture 누락을 지적했다. `_record()`가 새 writer를 따르면서 두 행 모두
+v2가 된 검증 결함이었다. 과거 행을 명시적 v1으로 고정하고 실제 AgentLoop/recorder 재개 시 원래 v1
+bytes를 보존하며 v2를 append하는 회귀까지 보완했다(2 passed/2.46s). 제품 코드는 그대로다.
+
+`6cb2a36`은 두 최종 코드 리뷰 PASS와 L1 `40464755363` SUCCESS였다. combined L2
+`40465167666`의 두 Python 코어 job은 통과했고 실제 서비스는 226 passed/8 failed였다.
+새 PG 회귀의 응답 유실 주입이 settlement 전 `load_invocation()`의 default transaction에서 먼저
+발동했다. 주입을 실제 settled invocation commit 진입에 한정해 저장 완료 후 응답 유실과
+sink의 canonical readback을 검증하도록 고쳤다. 제품 binary와 기존 wheel 근거는 유지한다.
+테스트 delta를 두 리뷰가 재검토하고 새 head의 전체 combined CI를 다시 검증한다.

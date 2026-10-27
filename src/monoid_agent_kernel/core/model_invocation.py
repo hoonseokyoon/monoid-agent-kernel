@@ -31,8 +31,9 @@ from monoid_agent_kernel.core.wire_validation import (
 )
 from monoid_agent_kernel.identifiers import accepted_namespaced_ids, namespaced_id
 
-MODEL_INVOCATION_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
+MODEL_INVOCATION_V1_SCHEMA_VERSION = namespaced_id("model-invocation.v1")
 MODEL_INVOCATION_V2_SCHEMA_VERSION = namespaced_id("model-invocation.v2")
+MODEL_INVOCATION_SCHEMA_VERSION = MODEL_INVOCATION_V2_SCHEMA_VERSION
 ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS = (
     *accepted_namespaced_ids("model-invocation.v1"), MODEL_INVOCATION_V2_SCHEMA_VERSION,
 )
@@ -206,7 +207,26 @@ def model_invocation_receipt(receipt: Any) -> dict[str, Any]:
     http_status = getattr(receipt, "http_status", None)
     if type(http_status) is int and 100 <= http_status <= 599:
         projected["http_status"] = http_status
-    normalized = _normalized_receipt(projected)
+    termination = getattr(receipt, "termination", None)
+    if termination is not None:
+        projected["termination"] = {
+            "outcome": termination.outcome,
+            "requested_by": termination.requested_by,
+            "ended_by": termination.ended_by,
+        }
+    evidence = getattr(receipt, "usage_evidence", None)
+    if evidence is not None:
+        projected["usage_evidence"] = {
+            "reported": dict(evidence.reported),
+            "completeness": dict(evidence.completeness),
+            "attempts": [{
+                "index": entry.index,
+                "reported": dict(entry.observation.reported),
+                "source": entry.observation.source,
+                "collection": entry.observation.collection,
+            } for entry in evidence.attempts],
+        }
+    normalized = _normalized_receipt(projected, allow_facts=True)
     if normalized is None:  # pragma: no cover - the projection above is always a mapping
         raise AssertionError("durable model invocation receipt projection disappeared")
     return normalized
@@ -422,7 +442,7 @@ class DurableModelInvocation:
         return {
             "schema_version": (MODEL_INVOCATION_V2_SCHEMA_VERSION
                                if self.schema_version == MODEL_INVOCATION_V2_SCHEMA_VERSION
-                               else MODEL_INVOCATION_SCHEMA_VERSION),
+                               else MODEL_INVOCATION_V1_SCHEMA_VERSION),
             "run_id": self.run_id,
             "logical_call_id": self.logical_call_id,
             "revision": self.revision,
@@ -496,9 +516,10 @@ def _model_invocation_from_payload(payload: dict[str, Any]) -> DurableModelInvoc
     return invocation
 
 
+# Retain the exported v1 codec's identity. Mixed-version callers use decode_model_invocation.
 MODEL_INVOCATION_CODEC = DurableCodec[DurableModelInvocation](
     family="model-invocation",
-    current_schema=MODEL_INVOCATION_SCHEMA_VERSION,
+    current_schema=MODEL_INVOCATION_V1_SCHEMA_VERSION,
 )
 MODEL_INVOCATION_V2_CODEC = DurableCodec[DurableModelInvocation](
     family="model-invocation", current_schema=MODEL_INVOCATION_V2_SCHEMA_VERSION,
@@ -540,6 +561,7 @@ def decode_model_invocation(payload: object) -> DurableLoadResult[DurableModelIn
 
 __all__ = [
     "MODEL_INVOCATION_SCHEMA_VERSION",
+    "MODEL_INVOCATION_V1_SCHEMA_VERSION",
     "MODEL_INVOCATION_V2_SCHEMA_VERSION",
     "ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS",
     "MODEL_REQUEST_DIGEST_GENERATION",

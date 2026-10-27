@@ -64,6 +64,7 @@ from monoid_agent_kernel.adapters.temporal.workflow import TemporalRunWorkflow  
 from monoid_agent_kernel.core._util import canonical_sha256  # noqa: E402
 from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore  # noqa: E402
 from monoid_agent_kernel.core.interruption import InterruptionCause  # noqa: E402
+from monoid_agent_kernel.core.model_facts import UsageObservation  # noqa: E402
 from monoid_agent_kernel.core.spec import AgentRunSpec  # noqa: E402
 from monoid_agent_kernel.errors import ModelAdapterError  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
@@ -79,6 +80,7 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
     WriterToken,
 )
 from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
+from monoid_agent_kernel.model_lifecycle import durable_model_turn  # noqa: E402
 from monoid_agent_kernel.providers.base import (  # noqa: E402
     ModelRequest,
     ModelTurn,
@@ -153,7 +155,13 @@ class _StreamingCountingAdapter:
         self.calls += 1
         for chunk in self.private_chunks:
             yield TextDelta(chunk)
-        yield TurnComplete(response_id="combined-stream-response", stop_reason="stop")
+        yield TurnComplete(
+            response_id="combined-stream-response", stop_reason="stop",
+            usage={"input_tokens": 0},
+            usage_evidence=UsageObservation(
+                reported={"input_tokens": 0}, source="adapter", collection="normal",
+            ),
+        )
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         del request
@@ -670,6 +678,23 @@ def test_actual_temporal_postgres_objectstore_stream_path_is_content_private(
         assert channel == "output"
         assert state == "sealed"
         assert cursor_bytes == len(private_content.encode())
+        loaded = run_sink.load_invocation(run_id, str(logical_call_id))
+        assert loaded.status == "loaded" and loaded.value is not None
+        invocation = loaded.value.invocation
+        assert invocation.schema_version == "monoid.model-invocation.v2"
+        assert invocation.receipt["termination"] == {
+            "outcome": "completed", "requested_by": None, "ended_by": "provider_terminal",
+        }
+        evidence = invocation.receipt["usage_evidence"]
+        assert evidence["reported"] == {"input_tokens": 0}
+        assert evidence["completeness"]["input_tokens"] == "complete"
+        assert evidence["completeness"]["output_tokens"] == "unknown"
+        assert evidence["attempts"] == [{
+            "index": 1, "reported": {"input_tokens": 0},
+            "source": "adapter", "collection": "normal",
+        }]
+        result_blob = loaded.value.blob(invocation.result_ref.removeprefix("blob:"))
+        assert durable_model_turn(result_blob).final_text == private_content
         identity = DurableStreamIdentity(
             run_id=run_id,
             stream_id=str(stream_id),
@@ -1013,7 +1038,7 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
     root = Path(__file__).resolve().parents[2]
     process: subprocess.Popen[str] | None = None
 
-    async def run() -> tuple[TemporalRunStatus, Any]:
+    async def run() -> tuple[TemporalRunStatus, Any, dict[str, Any]]:
         nonlocal process
         async with await WorkflowEnvironment.start_local(
             port=port,
@@ -1073,6 +1098,11 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
                     env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 )
                 await asyncio.to_thread(_wait_for_marker, process, marker_path)
+                saved = await asyncio.to_thread(
+                    harness.sink.load_invocation, run_id, marker_path.read_text("utf-8"),
+                )
+                assert saved.status == "loaded" and saved.value is not None
+                original_payload = saved.value.invocation.to_json()
                 process.terminate()
                 await asyncio.to_thread(process.wait, 10)
                 assert process.returncode is not None
@@ -1116,10 +1146,10 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
                         )
                 handle = environment.client.get_workflow_handle(temporal_workflow_id(run_id))
                 await handle.cancel()
-                return status, receipt
+                return status, receipt, original_payload
 
     try:
-        status, receipt = asyncio.run(run())
+        status, receipt, original_payload = asyncio.run(run())
     finally:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -1128,6 +1158,24 @@ def test_worker_kill_takes_over_expired_generation_without_repeating_paid_call(
     assert status.next_command_sequence == 2
     assert receipt.activation_receipt is not None
     assert counter_path.read_text("utf-8") == "1"
+    assert original_payload["schema_version"] == "monoid.model-invocation.v2"
+    assert original_payload["receipt"]["termination"] == {
+        "outcome": "completed", "requested_by": None, "ended_by": "provider_terminal",
+    }
+    evidence = original_payload["receipt"]["usage_evidence"]
+    assert evidence["reported"] == {"input_tokens": 0}
+    assert evidence["completeness"]["input_tokens"] == "complete"
+    assert evidence["completeness"]["output_tokens"] == "unknown"
+    assert evidence["attempts"] == [{
+        "index": 1, "reported": {"input_tokens": 0},
+        "source": "adapter", "collection": "normal",
+    }]
+    recovered = harness.sink.load_invocation(run_id, original_payload["logical_call_id"])
+    assert recovered.status == "loaded" and recovered.value is not None
+    assert recovered.value.invocation.to_json() == original_payload
+    checkpoint = harness.sink.latest_checked(run_id)
+    assert checkpoint.status == "loaded" and checkpoint.value is not None
+    assert checkpoint.value.checkpoint.last_model_invocation == original_payload
     final_authority = harness.authority.read(run_id)
     assert final_authority is not None
     assert final_authority.writer_token.generation >= 3

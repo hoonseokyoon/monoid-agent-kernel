@@ -117,11 +117,13 @@ class _CrashAfterInvocationCommit:
         blobs: Mapping[str, bytes],
         *,
         writer_token: WriterToken,
+        stage_evidence: bool = False,
     ) -> CommitResult:
         result = self.inner.commit_invocation(
             invocation,
             blobs,
             writer_token=writer_token,
+            stage_evidence=stage_evidence,
         )
         if (
             self.armed
@@ -516,6 +518,67 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     assert checkpoint.total_usage == turn.usage
 
 
+@pytest.mark.parametrize("policy", ["passive", "required", "outbox"])
+@pytest.mark.parametrize("refused", [False, True])
+def test_fresh_v2_settlement_preserves_sparse_facts_after_process_loss(tmp_path: Path, policy, refused) -> None:
+    from support.fenced_hosting import _record_digest
+    from monoid_agent_kernel.core.model_facts import UsageObservation
+    from monoid_agent_kernel.core.model_io import CapturePolicy, ModelIOSubscription
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(harness.sink.capabilities, transactional_outbox=True)
+    usage = {"input_tokens": 0, "output_tokens": 2, "total_tokens": 2}
+    observation = UsageObservation(reported={"input_tokens": 0, "output_tokens": 2}, source="adapter", collection="normal")
+    result = ModelDispatchRefused("refused", error_code="provider_refused") if refused else ModelTurn(
+        final_text="stored answer", usage=usage, usage_evidence=observation,
+    )
+    if refused:
+        mark_provider_usage(result, usage)
+        mark_usage_observation(result, observation)
+    adapter = _ScriptedAdapter(result)
+    baseline, stored = _crash_at(tmp_path, harness, adapter, "settled", model_evidence_policy=policy)
+    payload = stored.invocation.to_json()
+    assert payload["schema_version"] == "monoid.model-invocation.v2"
+    evidence = payload["receipt"]["usage_evidence"]
+    assert evidence["reported"] == {"input_tokens": 0, "output_tokens": 2}
+    assert evidence["completeness"]["input_tokens"] == "complete"
+    assert evidence["completeness"]["total_tokens"] == "unknown"
+    assert evidence["attempts"][0]["source"] == "adapter"
+    captures = []
+
+    class Observer:
+        def on_model_call(self, capture):
+            captures.append(capture.receipt)
+
+    coord = (RUN_ID, LOGICAL_CALL_ID, stored.revision)
+    original_digest = harness.sink._invocations[coord][0]
+    suspension, checkpoint = _restore(
+        tmp_path, harness, adapter, baseline, model_evidence_policy=policy,
+        model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="none")),),
+    )
+    assert suspension.reason == ("terminal" if refused else "settled")
+    assert checkpoint.total_usage == usage
+    assert checkpoint.last_model_invocation["receipt"]["usage_evidence"] == evidence
+    assert captures[-1].usage_evidence.to_json() == evidence
+    assert captures[-1].termination.to_json() == payload["receipt"]["termination"]
+    from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle
+    from monoid_agent_kernel.model_lifecycle import ModelDispatchRecoveryQuery
+
+    lifecycle = FencedModelCallLifecycle(harness.sink, harness.claim_writer(RUN_ID, "worker-3"))
+    for _ in range(2):
+        recovered = lifecycle.recover(ModelDispatchRecoveryQuery(
+            logical_call_id=LOGICAL_CALL_ID, request_digest=payload["request_digest"],
+            digest_generation=payload["digest_generation"],
+        ))
+        assert recovered.receipt["usage_evidence"] == evidence
+        assert len(adapter.requests) == 1
+        assert harness.sink._invocations[coord][0] == original_digest
+    if policy != "passive":
+        delivered = harness.sink._model_evidence if policy == "required" else harness.sink._model_evidence_outbox
+        assert len(delivered) == 1 and delivered[coord][0] == _record_digest(payload)
+
+
 def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
     tmp_path: Path,
 ) -> None:
@@ -784,18 +847,23 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
     )
 
     historical_coordinate = (RUN_ID, LOGICAL_CALL_ID, failed.revision)
-    if with_v2_facts:
-        from support.fenced_hosting import _record_digest
-        from support.model_facts import facts
-        from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+    from support.fenced_hosting import _record_digest
+    from monoid_agent_kernel.core.model_invocation import decode_model_invocation
 
-        payload = failed.invocation.to_json()
+    payload = failed.invocation.to_json()
+    if with_v2_facts:
+        from support.model_facts import facts
+
         payload["schema_version"] = "monoid.model-invocation.v2"
         payload["receipt"].update(facts(dict(failed.invocation.receipt["usage"]), outcome="failed"))
-        checked = decode_model_invocation(payload)
-        assert checked.status == "loaded"
-        failed = replace(failed, invocation=checked.value)
-        harness.sink._invocations[historical_coordinate] = (_record_digest(payload), failed)
+    else:
+        payload["schema_version"] = "monoid.model-invocation.v1"
+        payload["receipt"].pop("termination", None)
+        payload["receipt"].pop("usage_evidence", None)
+    checked = decode_model_invocation(payload)
+    assert checked.status == "loaded"
+    failed = replace(failed, invocation=checked.value)
+    harness.sink._invocations[historical_coordinate] = (_record_digest(payload), failed)
     historical_digest = harness.sink._invocations[historical_coordinate][0]
     if cancel_backoff:
         from monoid_agent_kernel.errors import RunCancelled
@@ -857,7 +925,8 @@ def test_recovered_retryable_refusal_resumes_remaining_kernel_attempt(
     assert loaded.value.invocation.receipt is not None
     assert loaded.value.invocation.receipt["attempts"] == 2
     assert loaded.value.invocation.receipt["usage"] == expected_usage
-    assert loaded.value.invocation.schema_version == "monoid.model-invocation.v1"
+    assert loaded.value.invocation.schema_version == "monoid.model-invocation.v2"
+    assert loaded.value.invocation.receipt["usage_evidence"] == receipt.usage_evidence.to_json()
     assert harness.sink._invocations[historical_coordinate][0] == historical_digest
 
 

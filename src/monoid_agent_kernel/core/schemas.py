@@ -18,6 +18,7 @@ from monoid_agent_kernel.core.model_calls import (
     MODEL_CALL_KIND,
     MODEL_CALLS_FILENAME,
     MODEL_CALLS_SCHEMA_VERSION,
+    MODEL_CALLS_V1_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
 from monoid_agent_kernel.core.model_payloads import (
@@ -1024,7 +1025,7 @@ _MODEL_CALL_CONFIG_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
+MODEL_CALLS_V1_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
         "schema_version",
@@ -1054,7 +1055,7 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "capture_downgrades",
     ],
     "properties": {
-        "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
+        "schema_version": {"enum": [MODEL_CALLS_V1_SCHEMA_VERSION]},
         "kind": {"const": MODEL_CALL_KIND},
         "run_id": {"type": "string", "minLength": 1},
         "root_run_id": {"type": "string", "minLength": 1},
@@ -1212,15 +1213,16 @@ USAGE_EVIDENCE_SCHEMA = {
         }},
     }, "additionalProperties": False,
 }
-# Both generations are closed; the current writer remains v1 until the writer rollout.
-MODEL_CALLS_V2_RECORD_SCHEMA = deepcopy(MODEL_CALLS_RECORD_SCHEMA)
+# Both generations retain closed vocabularies; fresh records select v2.
+MODEL_CALLS_V2_RECORD_SCHEMA = deepcopy(MODEL_CALLS_V1_RECORD_SCHEMA)
 MODEL_CALLS_V2_RECORD_SCHEMA["properties"].update({
-    "schema_version": {"enum": ["monoid.model-calls.v2"]},
+    "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
     "termination": MODEL_CALL_TERMINATION_SCHEMA,
     "usage_evidence": USAGE_EVIDENCE_SCHEMA,
 })
 MODEL_CALLS_V2_RECORD_SCHEMA["properties"]["attempt_log"]["items"]["properties"]["usage_evidence"] = USAGE_OBSERVATION_SCHEMA
-MODEL_CALLS_READ_SCHEMA = {"oneOf": [MODEL_CALLS_RECORD_SCHEMA, MODEL_CALLS_V2_RECORD_SCHEMA]}
+MODEL_CALLS_RECORD_SCHEMA = MODEL_CALLS_V2_RECORD_SCHEMA
+MODEL_CALLS_READ_SCHEMA = {"oneOf": [MODEL_CALLS_V1_RECORD_SCHEMA, MODEL_CALLS_V2_RECORD_SCHEMA]}
 
 
 def _payloads_envelope(kind: str) -> dict[str, Any]:
