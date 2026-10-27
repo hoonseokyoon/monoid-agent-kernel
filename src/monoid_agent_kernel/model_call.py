@@ -246,6 +246,29 @@ def _termination_for(error: BaseException) -> ModelCallTermination:
     )
 
 
+def _token_requester(token: CancellationToken | None) -> str | None:
+    requested, cause = token.snapshot() if token is not None else (False, None)
+    if not requested or cause is InterruptionCause.LEASE_LOST:
+        return None
+    return (cause or InterruptionCause.USER_CANCEL).value
+
+
+def _caller_cancellation_observer(
+    first_requester: Callable[[], str | None],
+) -> Callable[[asyncio.CancelledError], None]:
+    """Freeze the accepted requester before cleanup can introduce another request."""
+    termination: ModelCallTermination | None = None
+
+    def observe(error: asyncio.CancelledError) -> None:
+        nonlocal termination
+        if termination is None:
+            termination = _termination_for(error)
+            termination = replace(termination, requested_by=first_requester() or termination.requested_by)
+        mark_call_facts(error, termination, call_facts_of(error)[1])
+
+    return observe
+
+
 def _settled_model_stream_outcome(
     error: ModelEvidenceUncommitted,
 ) -> ModelStreamOutcome | None:
@@ -2042,6 +2065,14 @@ class ModelCallRunner:
         saw_terminal = False
         ingress = ModelStreamIngressNormalizer()
         drain = _AbortDrain(budget_s, chunks) if budget_s > 0 else None
+        accepted_stream_requester: str | None = None
+
+        def accepted_requester() -> str | None:
+            if accepted_stream_requester is not None:
+                return accepted_stream_requester
+            if drain is not None and drain.started:
+                return drain.cancel_cause.value if drain.cancel_cause is not None else "turn_interrupt"
+            return None
 
         def deliver(normalized_chunk: ModelStreamChunk) -> None:
             nonlocal retried, saw_terminal
@@ -2114,7 +2145,7 @@ class ModelCallRunner:
             raise drain.outcome()
 
         async def consume() -> ModelTurn:
-            nonlocal retried
+            nonlocal retried, accepted_stream_requester
             if drain is not None:
                 drain.entered = True
             try:
@@ -2138,6 +2169,7 @@ class ModelCallRunner:
                         (drain is None or not drain.started)
                         and abort_requested()
                     ):
+                        accepted_stream_requester = _token_requester(self._token()) or "turn_interrupt"
                         deliver_remainder()
                         if drain is not None:
                             # A no-op when a user cancel landed while `should_abort` was answering
@@ -2203,9 +2235,9 @@ class ModelCallRunner:
             self._open_drain_budgets.append(budget_s)
         try:
             if drain is None:
-                return await self._aawait(consume(), deadline)
+                return await self._aawait(consume(), deadline, first_requester=accepted_requester)
             return await self._await_draining_stream(
-                consume, drain, deadline, settle_cancelled_remainder
+                consume, drain, deadline, settle_cancelled_remainder, accepted_requester
             )
         except BaseException as exc:
             # Wraps `_aawait`, not just `consume`: the abort raised inside the loop is only one of
@@ -2214,6 +2246,10 @@ class ModelCallRunner:
             # provider had no opportunity to stamp.
             if retried:
                 mark_provider_retried(exc)
+            known, evidence = call_facts_of(exc)
+            requester = accepted_requester()
+            if known is None and requester is not None:
+                mark_call_facts(exc, replace(_termination_for(exc), requested_by=requester), evidence)
             raise
         finally:
             # A `finally` rather than a line in the handler above, and deliberately *not* because a
@@ -2239,6 +2275,7 @@ class ModelCallRunner:
         drain: _AbortDrain,
         deadline: float | None,
         settle_cancelled_remainder: Callable[[], None],
+        first_requester: Callable[[], str | None],
     ) -> ModelTurn:
         """Race one stream task in two phases: streaming, then -- after a stop -- draining.
 
@@ -2332,17 +2369,9 @@ class ModelCallRunner:
 
         task: asyncio.Future[Any] | None = None
         released = False
-        caller_termination: ModelCallTermination | None = None
-
-        def observe_caller_cancelled(error: asyncio.CancelledError) -> None:
-            nonlocal caller_termination
-            if caller_termination is None:
-                caller_termination = _termination_for(error)
-                if drain.started:
-                    caller_termination = replace(caller_termination, requested_by=(
-                        drain.cancel_cause.value if drain.cancel_cause is not None else "turn_interrupt"
-                    ))
-            mark_call_facts(error, caller_termination, call_facts_of(error)[1])
+        observe_caller_cancelled = _caller_cancellation_observer(
+            lambda: first_requester() or _token_requester(run_token),
+        )
 
         async def follow(until_drain: bool) -> Any:
             # The raced awaitable in both phases. Cancelled by the race, it cancels the stream task
@@ -2508,12 +2537,14 @@ class ModelCallRunner:
         if delay_s <= 0:
             self._check_cancel_or_deadline(deadline)
             return
+        token = self._token()
         await await_abandonable_call(
             asyncio.sleep(delay_s),
             deadline=deadline,
-            token=self._token(),
+            token=token,
             grace_s=0.0,
             check_boundary=self._check_cancel_or_deadline,
+            on_caller_cancelled=_caller_cancellation_observer(lambda: _token_requester(token)),
         )
 
     async def _aawait(
@@ -2525,6 +2556,7 @@ class ModelCallRunner:
         request: ModelRequest | None = None,
         boundary: tuple[CancellationToken | None, Callable[[float | None], None]] | None = None,
         on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
+        first_requester: Callable[[], str | None] | None = None,
     ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
 
@@ -2561,15 +2593,24 @@ class ModelCallRunner:
         # here leaves the slot spent and hands the following recording to the next caller. Both
         # exits of this function carry it, and
         # `test_every_abandonable_call_site_routes_its_discards` is what keeps that true.
+        token: CancellationToken | None = None
+        if on_caller_cancelled is None:
+            on_caller_cancelled = _caller_cancellation_observer(
+                lambda: (first_requester() if first_requester is not None else None) or _token_requester(token),
+            )
         try:
             token = self._token() if boundary is None else boundary[0]
             grace_s = self._grace_s()
         except BaseException:
-            await abandon_unwaited_call(
-                pending,
-                grace_s=self.cancel_grace_s,
-                on_discarded=_discard_hook(adapter, request),
-            )
+            try:
+                await abandon_unwaited_call(
+                    pending,
+                    grace_s=self.cancel_grace_s,
+                    on_discarded=_discard_hook(adapter, request),
+                )
+            except asyncio.CancelledError as exc:
+                on_caller_cancelled(exc)
+                raise
             raise
         try:
             return await await_abandonable_call(

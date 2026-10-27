@@ -853,3 +853,15 @@ soft limit 접근을 다시 검토했고, 기존 wait에 선택적 관찰점을 
 **14 failed / 1 passed, 4.53s**였다(`.tmp/v025/p1p2-i-requester-scope-expanded-red.txt`).
 elapsed deadline에는 수락된 token 요청이 없으므로 뒤의 첫 caller 취소를 caller_cancel로 유지하는 control이 통과했다.
 각 수정의 최초 추정과 누적 비용은 유지하며, 공통 observer 재사용으로 분기별 보상 코드를 줄인다.
+
+확장 회귀 commit은 `431e162`다. 공통 model wait observer를 적용한 뒤 최초 요청자 순서 22개,
+기존 model/tool 취소·replay·durable 복구·observer·carriage를 포함한 **822 passed / 28.10s**와
+lint/diff check를 통과했다(`p1p2-i-requester-scope-green1.txt`, `p1p2-i-requester-scope-related.txt`).
+현재 develop을 다시 fetch해 `d4e659c`가 유지됨을 확인했다. 두 독립 reviewer가 공통 wait 변경과
+각 consumer로의 사실 전달을 최종 head에서 재검토한다.
+
+non-merge commit의 반복 수정을 포함한 runtime·UI 변경량은 이번 81줄 delta까지 **2,062줄**이다.
+권장 2,000줄을 넘은 원인은 최초 요청자 소유권을 drain에만 둔 수정의 누락이다. wait 진입점을 재조사하고
+기존 관찰 callback과 frozen observer를 재사용해 단발·stream·backoff를 함께 처리했다. 승인된 보장을
+완성하는 이 경계를 유지한다. 모든 파일의 누적 변경은 이 기록 직전 5,859줄로 최초 총 6,580줄 추정 안이다.
+최종 wheel과 필수 CI는 이 source에서 갱신하고, 정확한 head·결과·merge SHA를 통합 PR과 memory에 기록한다.
