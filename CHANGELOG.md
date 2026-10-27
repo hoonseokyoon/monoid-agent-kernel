@@ -7,7 +7,20 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+### Added
+
+- Typed host tool bindings with activation-owned adapters and call-scoped views. The optional
+  helper preserves the existing ToolContext interface; workspace views enforce admitted write
+  intent, binding/surface path scopes, operator permissions and writer authority on each operation.
+  Resources close once on failure, close or committed park release, and restore uses fresh factories.
+  Run the installed `monoid_agent_kernel.reference.host_tool_report` recipe for typed proposal,
+  approval, recovery and child/fork delegation. `inherit_to_children=True` opens fresh adapters
+  at each child/fork hop with the original parent activation and writer authority chain.
+
 ### Fixed
+
+- Child and fork workspaces inherit the parent's effective operator permission policy, including
+  policies supplied through the `AgentLoop` constructor keyword.
 
 - Release activation-owned recorder handles when authority is lost during construction or before
   bootstrap publishes its resources. Subscription cleanup failures now finish session, callback,

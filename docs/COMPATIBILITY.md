@@ -33,6 +33,18 @@ lists every identifier this release can emit; most artifacts contain only `curre
 
 ## Typed tool source compatibility (v0.25)
 
+`host_tool_bindings` is an optional keyword on AgentLoop and its convenience constructors.
+`monoid_agent_kernel.tools.host_bindings` provides the typed key, synchronous resource contracts
+and optional context helper. Existing ToolContext implementations keep their required methods.
+Keys use process-local identity; restore requires host injection again. No wire/durable version
+changes, automatic client serialization or migration of existing workspace providers accompany
+this seam. Existing providers can adopt the [recipe](EMBEDDING.md#inject-host-resources-into-tools-v025)
+one handler at a time.
+
+`HostToolBinding.inherit_to_children` is a keyword-only boolean, defaulting to False. Opt-in
+factories rerun for children and forks with fresh adapters and original parent authority checks.
+Children inherit the effective parent operator policy, including a constructor-level override.
+
 `@tool` now delivers validated Python values to handlers. A parameter annotated with a Pydantic
 model receives that model, including nested fields and models in lists or dictionaries. Handlers
 that kept a model annotation but accessed `draft["title"]` should use `draft.title`, or choose a

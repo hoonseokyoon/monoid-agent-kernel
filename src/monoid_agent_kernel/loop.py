@@ -7,6 +7,7 @@ import fnmatch
 import inspect
 import json
 import logging
+import sys
 import threading
 import time
 import uuid
@@ -26,6 +27,14 @@ from monoid_agent_kernel.core._util import canonical_sha256, sha256_bytes, utc_t
 from monoid_agent_kernel.core.authority import (
     ActivationWriteAuthority,
     WriteAuthorityRevoked,
+)
+from monoid_agent_kernel.tools.host_bindings import (
+    HostToolBinding,
+    HostToolKey,
+    _HostToolCall,
+    _HostToolRegistry,
+    _ResourceLifetime,
+    _validate_host_tool_bindings,
 )
 from monoid_agent_kernel.model_call import (
     ModelCallRunner,
@@ -590,10 +599,16 @@ class _ExtensionToolContext(ToolContext):
     extension boundary; arbitrary Python code is not sandboxed.
     """
 
-    __slots__ = ("_delegate",)
+    __slots__ = ("_delegate", "_host_call")
 
-    def __init__(self, delegate: AgentToolContext) -> None:
+    def __init__(self, delegate: AgentToolContext, host_call: _HostToolCall | None = None) -> None:
         self._delegate = delegate
+        self._host_call = host_call
+
+    def _require_host_tool_binding(self, key: HostToolKey[Any]) -> Any:
+        if self._host_call is None:
+            raise ToolExecutionError("tool call is not in flight", error_code="tool_call_not_in_flight")
+        return self._host_call.require(key)
 
     def emit_artifact(
         self, path: str, kind: str, label: str | None, metadata: dict[str, Any]
@@ -1367,6 +1382,7 @@ class AgentLoop:
     # callable(run_id) -> AgentRuntimeConfig; __post_init__ coerces to a provider.
     runtime_config_provider: RuntimeConfigSource
     tool_providers: tuple[ToolProvider, ...] = ()
+    host_tool_bindings: tuple[HostToolBinding[Any], ...] = field(default=(), repr=False)
     dynamic_tool_providers: tuple[DynamicToolProvider, ...] = ()
     tool_surface_resolver: ToolSurfaceResolver = field(default_factory=DefaultToolSurfaceResolver)
     event_sinks: tuple[EventSink, ...] = ()
@@ -1479,6 +1495,8 @@ class AgentLoop:
     # ``max_expires_at`` ceiling. 0 (default) disables rotation — leases simply expire and re-broker.
     capability_rotate_skew_seconds: float = 0.0
     _bootstrap_resources: _RunResources | None = field(default=None, init=False, repr=False)
+    _host_tool_registry: _HostToolRegistry | None = field(default=None, init=False, repr=False)
+    _host_tool_parent: _ResourceLifetime | None = field(default=None, init=False, repr=False)
     _session: _Session | None = field(default=None, init=False, repr=False)
     # Monotonic "this activation was torn down" fact. Set at exactly the sites that null
     # ``_session`` on a teardown path — ``close()``, ``release_parked()``,
@@ -1528,6 +1546,7 @@ class AgentLoop:
     def __post_init__(self) -> None:
         # Coerce a bare AgentRuntimeConfig or a callable(run_id) into a provider, so callers
         # can pass any of the three forms without hand-wrapping a StaticRuntimeConfigProvider.
+        self.host_tool_bindings = _validate_host_tool_bindings(self.host_tool_bindings)
         self.runtime_config_provider = coerce_runtime_config_provider(self.runtime_config_provider)
         if not isinstance(self.write_authority, ActivationWriteAuthority):
             raise AgentConfigError("write_authority must be an ActivationWriteAuthority")
@@ -1586,6 +1605,35 @@ class AgentLoop:
         self._authority_unsubscribe = None
         if unsubscribe is not None:
             unsubscribe()
+
+    def _end_host_tool_resources(self) -> None:
+        if self._host_tool_registry is not None:
+            self._host_tool_registry.lifetime.end()
+
+    def _close_host_tool_resources(
+        self, *, preserve_error: bool = False, check_authority: bool = False
+    ) -> None:
+        registry, self._host_tool_registry = self._host_tool_registry, None
+        if registry is not None:
+            try:
+                try:
+                    registry.close()
+                finally:
+                    if check_authority:
+                        self._assert_write_authority()
+            except BaseException:
+                if not preserve_error:
+                    raise
+
+    def _assert_teardown_authority(self) -> None:
+        try:
+            self._assert_write_authority()
+        except WriteAuthorityRevoked:
+            try:
+                self.discard_uncommitted()
+            except BaseException:
+                pass
+            raise
 
     def _validate_durable_hosting(self) -> None:
         if type(self.model_evidence_policy) is not str or self.model_evidence_policy not in {
@@ -1783,6 +1831,7 @@ class AgentLoop:
             res = self._bootstrap()
         except BaseException as exc:
             res = self._bootstrap_resources
+            self._close_host_tool_resources(preserve_error=True)
             # Only ordinary failures with published resources become recordable failed sessions.
             # Escaping bootstrap/control failures release this activation and keep their cause.
             if res is None or not isinstance(exc, Exception):
@@ -2597,8 +2646,9 @@ class AgentLoop:
     def close(self) -> AgentRunResult:
         """Finalize the run: cancel jobs, write the terminal proposal, emit
         run.finished, close the recorder, and return the cumulative result."""
-        self._assert_write_authority()
+        self._assert_teardown_authority()
         session = self._require_open()
+        self._end_host_tool_resources()
         try:
             # Ordered before the turn-failure promotion below: a cancel acknowledged at an
             # errored park is the operator's later, stronger verdict, and after it the run is
@@ -2641,15 +2691,26 @@ class AgentLoop:
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.
-            self._finalized = True
-            self._session = None
-            self._bootstrap_resources = None
-            self._stream_sink = None
-            self._detach_authority_callback()
-            # Multi-turn sync usage (open/submit*/close) ends here, in the caller thread, so the
-            # owned loop is torn down now. The run_once path calls close() from within the loop;
-            # there _maybe_close_loop is a no-op and run_once's finally does the teardown.
-            self._maybe_close_loop()
+            unwinding = sys.exc_info()[0] is not None
+            try:
+                try:
+                    self._close_host_tool_resources(
+                        preserve_error=unwinding or result.status != "completed"
+                    )
+                finally:
+                    # A recorded failure survives disposal errors. A newly observed lease loss
+                    # still wins when close is returning a result; an escaping exception keeps
+                    # the existing unwind priority.
+                    if not unwinding:
+                        self._assert_write_authority()
+            finally:
+                self._finalized = True
+                self._session = None
+                self._bootstrap_resources = None
+                self._stream_sink = None
+                self._detach_authority_callback()
+                # The owned loop is torn down by the caller when close runs on that loop itself.
+                self._maybe_close_loop()
         return result
 
     def release_parked(self) -> None:
@@ -2662,7 +2723,7 @@ class AgentLoop:
         """
 
         session = self._require_open()
-        self._assert_write_authority()
+        self._assert_teardown_authority()
         checkpoint = self.snapshot()
         if (
             session.last_suspension is None
@@ -2675,8 +2736,10 @@ class AgentLoop:
                 error_code="run_not_durably_parked",
             )
         try:
+            self._end_host_tool_resources()
             self._close_model_io_subscriptions(session.res)
             session.res.recorder.close()
+            self._close_host_tool_resources(check_authority=True)
         except BaseException:
             # The committed boundary remains recoverable, but this process-local activation is no
             # longer usable after its observers close. Discard it while preserving the close error.
@@ -2717,6 +2780,10 @@ class AgentLoop:
         session = self._session
         resources = session.res if session is not None else self._bootstrap_resources
         cleanup_errors: list[BaseException] = []
+        try:
+            self._close_host_tool_resources()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         if resources is not None:
             try:
                 resources.context._job_manager.discard_uncommitted(
@@ -4149,7 +4216,7 @@ class AgentLoop:
             mode=self.spec.mode if is_fork else (definition.mode or self.spec.mode),
             workspace_backend="overlay",
             limits=self.spec.limits if is_fork else (definition.limits or self.spec.limits),
-            permission_policy=self.spec.permission_policy,
+            permission_policy=self.permission_policy,
             metadata={
                 **subagent.child_metadata(),
             },
@@ -4158,6 +4225,16 @@ class AgentLoop:
         child_step = f"subagent:{subagent.task_id}"
         if parent_invocation.step_id:
             child_step = f"{parent_invocation.step_id}/{child_step}"
+        child_bindings = tuple(b for b in self.host_tool_bindings if b.inherit_to_children)
+        parent_lifetime = None
+        if child_bindings:
+            registry = self._host_tool_registry
+            if registry is None:
+                raise ToolExecutionError(
+                    "host tool resources are closed", error_code="host_tool_resource_closed"
+                )
+            parent_lifetime = registry.lifetime
+            parent_lifetime.assert_active()
         child = AgentLoop(
             spec=child_spec,
             model_adapter=self.model_adapter,
@@ -4180,8 +4257,9 @@ class AgentLoop:
             # Inherit the parent's tool providers so MCP/custom tools are in the child's
             # registry (the inherited bindings reference them).
             tool_providers=self.tool_providers,
+            host_tool_bindings=child_bindings,
             dynamic_tool_providers=self.dynamic_tool_providers,
-            permission_policy=self.spec.permission_policy,
+            permission_policy=self.permission_policy,
             cancellation_token=self.cancellation_token,
             shell_approval_provider=self.shell_approval_provider,
             web_gateway_client=self.web_gateway_client,
@@ -4203,6 +4281,9 @@ class AgentLoop:
             model_payload_file=self.model_payload_file,
             model_stream_observer_factories=self.model_stream_observer_factories,
         )
+        # Carry only the original lifetime token. Each child opens its own registry/adapters;
+        # parent restoration creates a new token and cannot revive an old descendant's lease.
+        child._host_tool_parent = parent_lifetime
         child._capability_vault = self._capability_vault.fork_for_child()
         result = await child.arun_once(
             task.prompt, seed_messages=seed_messages, seed_media_blobs=seed_media_blobs
@@ -6235,31 +6316,41 @@ class AgentLoop:
         deadline: float | None,
     ) -> ToolResult:
         spec = bound_tool.base_spec
-        context._enter_call(
-            CallContext(
-                tool_call_id=call_id,
-                turn_id=turn_id,
-                tool_event_id=started_event.event_id,
-                binding_id=bound_tool.binding_id,
-                tool_id=bound_tool.base_spec.id,
-                model_name=bound_tool.model_name,
-                authorization=authorization,
-                scope=authorization.scope,
-                runtime=bound_tool.runtime,
+        registry = self._host_tool_registry
+        if registry is None:
+            raise ToolExecutionError(
+                "host tool resources are closed", error_code="host_tool_resource_closed"
             )
-        )
-        self.write_authority.assert_active()
+        host_call = _HostToolCall(registry, call_id, authorization, spec.side_effect)
+        call_context = _ExtensionToolContext(context, host_call)
         try:
+            context._enter_call(
+                CallContext(
+                    tool_call_id=call_id,
+                    turn_id=turn_id,
+                    tool_event_id=started_event.event_id,
+                    binding_id=bound_tool.binding_id,
+                    tool_id=bound_tool.base_spec.id,
+                    model_name=bound_tool.model_name,
+                    authorization=authorization,
+                    scope=authorization.scope,
+                    runtime=bound_tool.runtime,
+                )
+            )
+            # General tool dispatch retains its child-local policy. Parent lineage fences only
+            # host resource factories/lookups/views; child-wide cancellation belongs to P8.
+            registry.lifetime.assert_local_active()
+            self.write_authority.assert_active()
             handler = spec.handler
             async_call = is_async_callable(handler)
             if async_call:
-                pending = handler(context._extension_context, arguments)
+                pending = handler(call_context, arguments)
                 result = await self._await_native_tool_handler(pending, deadline)
             else:
                 result = await self._await_native_tool_handler(
                     start_abandonable_sync_call(
                         lambda: self.write_authority.guard_external_call(
-                            lambda: handler(context._extension_context, arguments)
+                            lambda: handler(call_context, arguments)
                         ),
                         thread_name=f"nar-tool-{self.spec.run_id}",
                     ),
@@ -6271,6 +6362,7 @@ class AgentLoop:
                 raise TypeError("tool handler must return ToolResult")
         finally:
             try:
+                host_call.end()
                 context._exit_call()
             finally:
                 # Native async callbacks cannot be held under a synchronous guard while awaited.

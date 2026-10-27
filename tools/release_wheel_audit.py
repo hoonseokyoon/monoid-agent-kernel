@@ -13,6 +13,8 @@ from zipfile import ZipFile
 EXPECTED_VERSION = "0.24.0"
 EXPECTED_BASE_DEPENDENCIES = {"click", "jsonschema", "pathspec", "pydantic"}
 REQUIRED_MEMBERS = {
+    "monoid_agent_kernel/tools/host_bindings.py",
+    "monoid_agent_kernel/reference/host_tool_report.py",
     "monoid_agent_kernel/core/authority.py",
     "monoid_agent_kernel/core/model_invocation.py",
     "monoid_agent_kernel/core/outcome.py",

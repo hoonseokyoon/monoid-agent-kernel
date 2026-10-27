@@ -1,8 +1,8 @@
 # v0.25 P3: 호스트 자원 주입·권한·수명·복구 PR 계획
 
-작성·조사일: 2026-10-27 KST. 기준: 최신 `origin/develop`
-`5b08b10d82a948268d1a95b51112b1508e233e3d` (P5 #148, DX1 #149 병합).
-상태: **2026-10-27 구현 승인·P3-00/01 사전조사 갱신 중.** 사용자는 P3-00·01부터 진행하고,
+작성·조사일: 2026-10-27 KST. 최초 기준은 `develop=5b08b10` (P5 #148, DX1 #149 병합),
+최종 통합 사전조사 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`다.
+구현 기록: **P3-00/01 develop 병합, P3-02/03 통합 브랜치 병합.** 사용자는 P3-00·01부터 진행하고,
 P3-01은 실패 회귀를 먼저 고정한 독립 PR로 구현한 뒤 리뷰·CI를 확인하도록 요청했다.
 이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·CSP 변경은 범위 밖이다.
 
@@ -31,7 +31,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 
 ## 2. 코드와 실제 소비자에서 확인한 간격
 
-| 생산자 → 소비자 | 현재 사실·위치 | P3에서 정할 경계 |
+| 생산자 → 소비자 | 최초 조사 기준의 사실·위치 | P3에서 구현한 경계 |
 |---|---|---|
 | handler dispatch → extension context | [loop.py](../src/monoid_agent_kernel/loop.py) `_ainvoke_handler`는 provider와 handler에 같은 façade를 전달. `_live_call`은 ContextVar가 없는 thread에서 최신 `_call_fallback`을 사용 | 호출마다 새 façade에 원래 lease를 고정. 새 helper가 현재 전역 call을 조회하지 않음 |
 | tool admission → workspace | `_aexecute_tool_call`이 surface·승인·capability를 검사. `_check_permissions`는 선언한 `path_args`만 확인. [AuthorityBoundWorkspace](../src/monoid_agent_kernel/core/workspace.py)는 activation authority만 확인 | handler가 계산한 경로에도 작업마다 call의 path scope·PermissionPolicy·workspace mode 적용 |
@@ -56,7 +56,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 | model-I/O observer.close에서 authority revoke 후 public discard | `WriteAuthorityRevoked`; observer close 1회, session·authority callback 남음, finalized=false. 두 번째 discard에서 session 해제 | 첫 cleanup 시도에서 teardown을 끝내도록 P3-01에서 수정 |
 
 기존 관련 회귀 **13 passed in 4.21s**. 이 성공은 위 두 순서가 이미 검증됐다는 뜻으로 사용하지 않는다.
-새 host resource API는 아직 없으므로 위 결과는 기존 recorder/subscription 수명 결함의 증거다.
+위 결과는 새 host resource API 구현 전에 확인한 recorder/subscription 수명 결함의 증거다.
 
 ## 3. 외부에서 확인한 문제와 채택할 답안
 
@@ -82,8 +82,8 @@ LangGraph #5705/#6381은 closed·unmerged, PydanticAI #10479/#11255는 open·unm
 ### 4.1 등록과 소유권
 
 - 신규 모듈은 `monoid_agent_kernel.tools.host_bindings`. 공개 이름은 `HostToolKey[T]`,
-  `HostToolBinding[T]`, `HostToolResource[T]`, `HostToolCallLease`, `ToolWorkspace`,
-  `require_host_tool_binding`으로 계획한다. 기존 `ToolContext` 필수 멤버를 늘리지 않는다.
+  `HostToolBinding[T]`, `HostToolResource[T]`, `HostToolActivation`, `HostToolCallLease`, `ToolWorkspace`,
+  `require_host_tool_binding`이다. 기존 `ToolContext` 필수 멤버를 유지한다.
   helper가 사용하는 선택적 확장 Protocol은 새 모듈에 둔다.
 - `AgentLoop(..., host_tool_bindings=...)`는 keyword-only다. `from_tools`/`from_config`는 같은 인자를 전달한다.
   constructor에서 tuple snapshot과 등록 형태·identity/name 중복을 검사한다. 이 단계 factory 호출은 0회다.
@@ -201,13 +201,13 @@ open/bind_call/accepts의 일반 예외는 새 경계에서 단계별 고정 메
 ### 4.4 child·fork
 
 P3-02의 기본값은 상속 OFF이고, 미완성 상속 옵션을 노출하지 않는다.
-P3-03에서 `HostToolBinding(..., inherit_to_children=True)`를 추가한다. 각 hop에서 opt-in 등록만 전달하며 child와 fork에 동일 적용한다.
+P3-03의 `HostToolBinding(..., inherit_to_children=True)`로 상속을 선택한다. 각 hop에서 opt-in 등록만 전달하며 child와 fork에 동일 적용한다.
 자식은 새 registry·adapter·call view를 갖고 factory를 자식 descriptor로 다시 실행한다.
 부모 resource/view 또는 WriterToken을 전달하지 않는다. factory closure의 host-owned pool 공유는 host의 명시적 책임이다.
 
 상속한 view는 child-local guard와 모든 parent activation/authority lineage를 검사한다.
 parent revoke 또는 parent activation 종료 후 자식의 새 접근을 거부한다.
-child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 각 child 종료에 제거한다.
+child 종료는 parent/sibling adapter를 닫지 않는다. lineage는 수명 token 검사로 연결하며 새 callback을 등록하지 않는다.
 복구된 parent가 새 child를 만들면 새 lineage에 연결한다. 끝난 parent의 child를 자동 재연결하지 않는다.
 
 이 보장은 신규 상속 자원의 사용 권한이다. 자식 모델 호출 강제 취소·drain/usage 합산은 P8에서 다룬다.
@@ -226,7 +226,7 @@ child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 �
 
 ## 5. PR별 변경 범위·의존성·완료 기준
 
-예정 통합 브랜치: `codex/v0.25-p3-host-resources`. 아직 생성하지 않았다.
+통합 브랜치: `codex/v0.25-p3-host-resources`. P3-00/01 병합 후 생성했다.
 계획 보존 브랜치는 `codex/v0.25-p3-plan`이다. 현재 실행 브랜치·증거는 §9에 기록한다.
 `pr-fast.yml`/`pr-full.yml`은 base 필터가 없지만 `ci.yml` push는 main/develop/v0.23만 등록한다.
 운영 규칙에 따라 P3-00에서 새 통합 base를 먼저 등록한다.
@@ -251,8 +251,9 @@ CSP migration·배포·릴리스, 범용 DB/HTTP adapter, delete/list/glob 등 w
 
 ## 6. 실제 통합 개발자 API 예시
 
-아래는 **P3 구현 목표 API**다. 현재 배포 패키지에서 실행되는 예제로 표시하지 않는다.
-P3-02에서 전체 example을 패키지 smoke에 포함하고 실제 import·타입·승인 경로를 확정한다.
+아래는 **P3-02/03에서 구현한 API**다. 이 브랜치에서 빌드한 wheel의
+[실행 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)가 승인·복구와 fresh/fork 상속을 검증한다.
+v0.25 배포는 남은 필수 작업군과 별도의 릴리스 절차를 따른다.
 
 ~~~python
 from pathlib import Path
@@ -558,6 +559,85 @@ discard가 그 인스턴스만 닫도록 수정했다. 정상 EventBus.close 계
 (`.tmp/v025/p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
 최종 후보를 두 reviewer가 표적 재검토한 뒤 독립 PR의 L1/L2를 확인한다.
 
+두 reviewer의 최종 판정은 `47ff2cf424b88189082202173601bb66b97910f3`에 대해 PASS다.
+[P3-01 PR #151](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/151)은
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40426994584)과
+[L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40426994558)를 통과했다.
+자동 GitHub review도 동일 head에 finding 없이 완료됐다. develop merge는
+`4539296dd9633743144d75a62a562a2d636d05a8`이다. 최종 전체 diff는 619 추가/133 제거이며
+bootstrap indentation과 테스트·문서가 대부분이다. 이 base에서 통합 branch
+`codex/v0.25-p3-host-resources`를 생성·push하고 P3-02 branch를 분기했다.
+
+### P3-02 사전조사 — 2026-10-27
+
+- 최신 develop·통합 base는 `4539296dd9633743144d75a62a562a2d636d05a8`이다.
+  실행 branch는 `codex/v0.25-p3-02-root-resources`. root가 구현/runner를 소유하고
+  `p3_02_preflight_research`가 독립적으로 소스 연결을 조사한다. 구현 전 별도 preflight review를 받는다.
+- 목표 consumer는 패키지에 포함할 offline report recipe다. 중첩 Pydantic 입력/출력, computed report path,
+  scoped proposal write, 승인 대기, committed release, 새 loop restore와 읽기를 공개 API로 연결한다.
+  from_tools 전달 smoke와 scoped from_config 전체 흐름을 모두 검증한다. 기존 wheel audit/install CI를 재사용한다.
+- constructor는 binding tuple/중복 key identity·name/동기 callable 형태를 첫 callback 등록·파일 생성 전에 검사한다.
+  key/resource는 checkpoint와 tool schema에 넣지 않는다. descriptor의 공개 타입 이름은 `HostToolActivation`으로
+  확정해 factory를 정적으로 작성할 수 있게 한다. 나머지 public 이름과 helper는 §4.1을 유지한다.
+- `LoopBootstrapper.bootstrap`의 context 생성 직후 registry를 loop에 연결하고 factories를 연다.
+  첫 `_bootstrap_resources` 게시 전 실패는 registry → provisional recorder 순서로 정리한다.
+  valid closer를 factory callback 안에서 ExitStack에 등록하고 guard postcheck를 수행한다.
+  duplicate adapter identity는 두 번째 등록 전에 거부한다. 일반 callback 오류는 고정 메시지로 바꾸며
+  직접 발생한 RunCancelled/RunTimeout/TurnInterrupted/TurnPaused 및 BaseException 제어 신호를 유지한다.
+  awaitable 반환은 기존 `core._sync_bridge.dispose_unawaited`로 처리한 뒤 거부한다.
+- `_ainvoke_handler`가 실제 admission 뒤 받은 immutable authorization과 side_effect를 새 call lease에 고정한다.
+  `authorization.scope`와 `surface_scope`를 모두 검사한다. provider façade에는 활성 lease가 없다.
+  기존 ContextVar enter/exit를 유지하고 새 helper만 call façade를 사용한다. 진입 assert까지 finally 범위에 둔다.
+- call/key 첫 lookup의 동시성은 짧은 call-state lock 안에서 표준 `concurrent.futures.Future`를 등록한다.
+  한 winner가 lock 밖에서 bind/accepts를 실행하고 다른 explicit thread는 lease를 재검사하며 결과를 기다린다.
+  사용자 callback을 가진 lock 기반 lazy cache와 새로운 async resource scheduler는 도입하지 않는다.
+  call 종료는 closed Event를 먼저 set하고 cache를 비운다. 실패 결과에도 원본 secret 예외를 저장하지 않는다.
+- local workspace 작업의 lock 순서는 **call → activation → writer**다. 종료는 Event를 먼저 set하고 해당 lock으로
+  진입한 작업만 기다린다. activation 종료는 call lock을 획득하지 않는다. writer revoke callback은 기존처럼
+  writer lock 밖에서 실행된다. arbitrary open/bind/accepts/close 및 일반 client I/O는 이 lock들을 잡지 않는다.
+  workspace는 기존 backend의 local-mutation 계약을 재사용하며, 일반 network adapter는 lease 전후 guard와
+  host의 외부 fencing을 사용한다. scope는 normalized lexical path이며 별도 alias/OS sandbox를 추가하지 않는다.
+- 정상 close는 진입 시 P3 수명을 끝내고, 기존 finalization/subscription/checkpoint 처리의 finally에서 자원을 닫는다.
+  committed release는 fingerprint 검증 후 수명을 끝내며 subscription/recorder 또는 resource close 실패 시 기존 discard로
+  마무리한다. discard는 P3 close 오류를 모은 뒤 job/recorder/subscription teardown을 계속한다.
+  기존 원래 오류를 보존하고, 이미 관측된 authority loss 우선순위도 유지한다. recordable bootstrap 실패에서는
+  P3 registry만 즉시 닫고 기존 failed-session recorder 수명을 유지한다. async lifecycle bridge는 그대로 사용한다.
+- registry는 callback 전에 closed 표시 및 owned map을 비우고 ExitStack으로 역순 최대 한 번 dispose한다.
+  추가 close 실패는 값·repr·traceback 없는 고정 진단만 남긴다. normal close가 host writer를 revoke하지 않는다.
+  deferred workspace adapter는 실제 backend 내용에 접근하지 않고 call view에서만 연산한다.
+  restore 순서와 schema를 유지한다. child/fork에는 bindings를 전달하지 않으며 상속 옵션은 P3-03에서 추가한다.
+- 필요한 L0는 tuple/중복/partial-init, safe-error/async rejection, computed scope·policy·mode·hash,
+  retained A ctx/view while B active, explicit thread와 sync→awaitable, native async·timeout·abandon,
+  local-write barrier/revoke·close 경쟁, 정상/실패/park/restore/async-cancel cleanup과 report consumer다.
+  새 API의 happy-path만으로 완료 판정하지 않는다. 기존 cleanup339·tool surface·checkpoint·public/compat 검사를 합친다.
+- 예상 기능 600–1,000줄, 전체 1,300–2,100줄과 campaign 누적 한도를 유지한다. resource registry만 분리하지 않는다.
+  A 등급 independent preflight, 서로 다른 두 final-code review, L1/L2 core, integration push full CI,
+  실제 installed-wheel report 실행이 완료 신호다. 외부 근거는 §3의 표준 ExitStack 및 실제 merged fixes를 사용한다.
+- 사전 검토가 지적한 종료 진입 경계도 포함한다. 이미 writer가 revoke된 상태에서 close/release를 호출하면
+  현재 선두 assert가 teardown 밖에서 실패한다. 이 두 종료 진입점은 lease_lost를 보존하면서 기존 discard를
+  best-effort 수행해 P3 자원과 나머지 owned handle을 정리한다. 일반 uncommitted release 거부는 계속 자원을 유지한다.
+  두 직접 진입 회귀와 기존 stale cleanup 대조를 추가한다.
+
+독립 reviewer `p3_02_preflight_review`는 위 보완을 포함한
+SHA256 `E6D6AAFB14A9AEE0456DCAF4165281A3682391B5CF120BB75EF49CD7C56E0144`에 READY를 반환했다.
+root가 소스 조사를 수행했고 추가 research worker는 초기화 대기 상태여서 결과 근거에 포함하지 않았다.
+구현은 7개 공개 이름을 신규 모듈에 제공하며 기존 root export/ToolContext 필수 멤버를 유지한다.
+callback close가 writer를 revoke하는 경우에도 local dispose를 모두 시도한 뒤 lease_lost를 보존한다.
+
+초기 typed report smoke는 approval replay의 기존 `tool_approval_replay:read`/nested result envelope에 맞춰
+검증 경로를 수정했다. staging backend는 host가 제공한 staging directory에 직접 쓰므로 overlay와 구분해
+기존 동작을 검증했다. 신규 회귀 및 기존 cleanup/checkpoint/cancellation/hosting/session/loop/async/tool-surface/
+workspace-permission/public/compat 검사는 **583 passed, 1 platform skip / 17.56s**다
+(`.tmp/v025/p3-02-focused.log`). 추가 hosted duplicate-command 테스트 및 close/secret/awaitable 검사
+**5 passed / 0.89s**도 확인했다. 실제 duplicate command는 host factory를 다시 실행하지 않았다.
+
+새 wheel audit에 두 모듈을 포함하고 기존 minimal install CI에서 report recipe를 실행하도록 연결했다.
+별도 venv에 wheel을 설치하고 PYTHONPATH를 비운 checkout 밖 실행에서 `site-packages` import를 확인했다.
+Python3.11.9/Pydantic2.14.1 환경의 결과는
+`{"activations":2,"approved_read":true,"proposal_only":true,"status":"completed"}`다.
+로컬 focused 환경의 Pydantic은 2.13.4다. 의존성 범위·배포 버전은 변경하지 않았다.
+최종 code review 및 PR CI 증거는 후보 확정 뒤 기록한다.
+
 ### 통합 CI fixture 보완 — 2026-10-27
 
 P3-01 #151은 최종 head `47ff2cf`의 두 독립 review와 L1/L2를 통과해 develop `4539296`으로 병합됐다.
@@ -579,3 +659,168 @@ production 변경은 0줄이다. 독립 B 등급 reviewer `p3_01_code_review_a`�
 
 수정 뒤 `tests/test_backend_control.py` 전체는 **56 passed / 5.48s**다. 표준 4-worker pytest,
 ruff0.15.6 및 diff 공백 검사를 통과했다. production source diff는 없다.
+
+PR #152의 최종 head `bfff4b7`은 독립 B 등급 review PASS, L1 `40430303690`,
+L2 `40430303478`을 통과했다. 자동 GitHub review도 동일 head에 finding 없이 완료됐다.
+develop merge는 `336cb4cb59d78e9bc083cfbbdd9500817f6065da`다. 통합 branch와 P3-02가
+이 prerequisite를 포함한다. P3-02 production diff는 최초 검토 후보 `9df07fb`와 동일하다.
+
+P3-02 최종 head `73f1c3995f9ebefa42f8183dbef58fe3263a5d26`의 독립 reviewer
+`p3_02_code_review_a/b`는 모두 PASS다. 추가 probe에서 bind 진행 중 종료한 call의 winner/waiter 거부,
+취소를 삼킨 native async handler의 late write 거부를 각각 확인했다. 별도 installed-wheel 환경의
+**Pydantic 2.6.4**에서도 같은 report recipe 결과를 확인했다. 새 의존성·버전 변경은 없다.
+[PR #153](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/153)은
+L1 `40431097973`, L2 `40431098042`를 통과했고 자동 review도 동일 head에 finding 없이 완료됐다.
+통합 merge는 `78cd610aac3f27b02de09ad3e2136bf84e1e2583`이다. 전체 diff는 1,824 추가/28 제거,
+production은 480줄 registry와 156줄 소비 예제, 기존 loop/bootstrap 연결로 계획 범위 안이다.
+
+### P3-03 사전조사 — 2026-10-27
+
+- 최신 fetch: develop `336cb4cb59d78e9bc083cfbbdd9500817f6065da`, 실제 구현 base는
+  P3 통합 `78cd610aac3f27b02de09ad3e2136bf84e1e2583`이다. 실행 branch는
+  `codex/v0.25-p3-03-child-resources`. root가 소스 조사·구현·runner를 소유하고 fresh reviewer가
+  아래 설계와 실제 소비자 연결을 독립 검토한다. P3-02 integration full CI를 확인한 뒤 구현한다.
+- 실제 생산 지점은 `AgentLoop._run_subagent_child` 하나다. fresh/fork 모두 이곳에서 새 loop를 만들고
+  `arun_once`를 실행한다. `SubagentRuntimeContext.create`는 검증된 root/parent/task lineage를 제공한다.
+  fresh는 tool allow/deny와 mode/limits를 좁히고, fork는 parent config를 복사한다. 이 정책은 유지한다.
+- `HostToolBinding`에 keyword-only bool `inherit_to_children=False`를 추가한다. constructor가 정확한 bool을
+  검사한다. 매 hop에서 True 등록만 자식 생성자에 전달한다. factory closure/key는 공유하고 반환 adapter,
+  workspace resource, call view는 해당 자식 activation에서 새로 생성한다. public WriterToken 전달은 없다.
+- 자식 생성 전에 현재 parent registry의 수명 token을 확보하고, private init=False loop 필드로 전달한다.
+  registry의 `_ResourceLifetime`은 parent의 같은 수명 token만 참조한다. parent registry/workspace/adapter는
+  보관하지 않는다. 연결된 token chain의 assert가 root부터 child까지 closed 상태와 writer를 검사한다.
+  parent 복구 시 새 registry/token을 만들므로 이전 child가 새 activation에 연결되지 않는다.
+- 사전 reviewer가 실제 공통 handler 진입의 무조건 `host_call.assert_active()`를 확인했다. 여기에 parent
+  chain을 그대로 적용하면 P3 자원을 사용하지 않는 기존 child tool까지 정책이 확대된다. 수명 token의
+  `assert_local_active()`로 현재 local closed+writer 검사를 분리하고 handler 진입은 이 검사를 유지한다.
+  full lineage 검사는 factory·lookup·bind·lease·workspace에 적용한다. 실제 parent P3 종료 후에도 일반
+  child tool은 실행되고 자원 접근은 거부되는 대조를 둔다. 기존 builtin 권한 연동 정책은 P8에 유지한다.
+- 독립 실제 child/fork probe는 operator policy 전달 결함도 확인했다. 부모 생성자의 명시적
+  `permission_policy`가 spec과 다르면 부모는 deny하지만 자식 생성의 두 지점은 spec policy를 다시 사용한다.
+  상속 자원도 이 누락을 받으므로 child spec/constructor 모두 부모의 해석된 `self.permission_policy`를
+  전달하도록 선행 보완한다. bootstrap의 기존 policy 우선순위는 유지한다. 기존 fs.write → agent.spawn
+  consumer의 loop keyword/spec/override × fresh/fork 회귀를 수정 전에 고정하고, 신규 computed workspace
+  path에도 같은 policy가 적용됨을 검증한다. policy 모델·병합 규칙 전체를 바꾸는 작업은 포함하지 않는다.
+- callback 전파 대신 매 접근의 lineage 검사와 기존 RLock guard를 조합한다. 새 revoke callback을 등록하지
+  않으므로 child 종료 시 callback 해제 장치를 추가할 필요가 없다. parent 종료·revoke는 sticky Event를 먼저
+  게시한다. local 연산은 **call → root activation → root writer → ... → child activation → child writer**
+  순서로 재귀 guard에 진입하고 반대로 빠져나온다. parent end는 자신의 activation lock만 기다린다.
+  writer의 기존 revoke callback은 writer lock 밖에서 실행된다. 다른 call lock을 획득하지 않는다.
+- open은 lineage 전체의 external pre/post guard를 사용한다. callback 반환 즉시 P3-02와 같은 closer 등록을
+  완료한 다음 postcheck로 나가므로 parent가 factory 중 종료해도 fresh child adapter를 회수한다.
+  bind/accepts/general client guard도 같은 lineage assert를 사용한다. 임의 host callback을 잠근 채 실행하지 않는다.
+- parent 정상 close/committed release/discard는 기존 P3 lifetime만 끝낸다. child cleanup은 child adapter만
+  닫으며 parent·sibling writer를 revoke하지 않는다. 부모 종료 뒤 child의 이미 진입한 local write는 끝날 수 있지만
+  결과를 성공으로 발급하지 않고 후속 write를 막는다. P8의 모델 호출 취소·drain·과금 합산은 이 변경과 독립이다.
+- 외부 근거를 다시 확인했다. [LangGraph #5707](https://github.com/langchain-ai/langgraph/pull/5707)은
+  parent runtime 전달 누락을 고친 merged 수정이며 runtime context는 durable state와 별도다.
+  이는 실제 child 진입점을 검증할 근거다. Monoid의 fresh adapter와 parent authority 회수는 우리 제품의 추가 계약이다.
+  표준 RLock/context-manager 중첩과 기존 guard를 사용하고 DI graph·새 scheduler·callback registry는 추가하지 않는다.
+- 첫 consumer는 패키지 offline report 예제의 자식 report 실행이다. 실제 `agent.spawn`을 사용해 fresh/fork를
+  모두 실행하고 root·child descriptor, 서로 다른 adapter, child close 후 parent 접근, sibling 독립을 관찰한다.
+  기존 report 승인·release·restore 예제를 유지하고 installed-wheel CI에서 child consumer도 실행한다.
+- 검증은 실제 nested child/grandchild와 fork 기본 거부/opt-in, root 및 중간 parent 종료·writer revoke 뒤
+  현재 call의 view/helper 거부, 새 factory 중 parent 종료의 partial cleanup, 들어간 local write와 parent end/revoke
+  barrier, parent 복구 후 새 child freshness, async·explicit-thread call 보장, callback 수/역순 close를 포함한다.
+  handler 반환 뒤 call 종료만으로 통과하는 검사를 lineage 증거로 사용하지 않는다. 기존 subagent·root P3·
+  cleanup·checkpoint·cancellation·public/compat 회귀와 wheel current/minimum Pydantic 검사를 재사용한다.
+- 예상 production 150–300줄, 총 450–800줄을 유지한다. 현재까지 구현 PR의 전체 diff 합계는 약 2,634줄
+  (P3-01 752, P3-02 1,852, CI fixture 30; 최초 계획 문서 비용 별도)다. 새 기능·테스트/문서도 누적에 포함한다.
+  A 등급 독립 preflight → 두 fresh code review → L1/L2 → 통합 full CI 후 P3-I로 연결한다.
+
+독립 reviewer `p3_03_preflight_review`는 두 보완을 반영한 preflight
+SHA256 `5F1AEE882658BE31DEBA24AFB21783A26E6B1BF8D7B03F6EED3E19C049D9551A`에 **READY**다.
+정책 probe 원본/결과는 `.tmp/v025/p3-03-preflight-review-policy.py`와 같은 이름의 `.json`에 있다.
+해당 probe는 미구현 상속 전달만 메모리에서 모사했으며 production 완료 증거로 사용하지 않는다.
+CI fixture 보완 뒤 develop `40430925138` 및 integration `40430979676` 전체 CI는 모두 성공했다.
+
+수정 전 `tests/test_host_tool_children.py`는 **6 failed, 4 passed / 3.13s**다.
+4개 실패는 명시적 loop policy/override의 fresh·fork에서 실제 `fs.write`가 허용되는 기존 결함이다.
+나머지 2개 실패는 `inherit_to_children` 신규 API가 아직 없어 생긴 TypeError다.
+기본 상속 거부와 spec policy 경로 4개는 통과 대조다. 초기 fixture의 reports directory를 준비한 뒤
+실제 child write 성공을 관찰해 고정했다. production source는 base와 동일하다.
+원본은 `.tmp/v025/p3-03-red.log`. 표준 4-worker pytest로 새 test module만 실행했다.
+
+수정 전 회귀 commit은 `f10f6de`다. P3-02 integration 전체 CI `40431588835`의 14개 job 성공을
+확인한 뒤 production을 변경했다. opt-in field, fresh child factory, parent lifetime chain,
+effective policy 전달과 handler의 local/resource 검사를 연결했다. 초기 10개 회귀는 **10 passed / 2.87s**다.
+
+실제 child/fork/nested 실행, 호출 중 root·중간 parent 종료/revoke, callback 전후, 진입한 child write barrier,
+sibling/parent 독립, mixed opt-in, fresh restore 및 packaged consumer까지 **35 passed / 5.96s**다.
+원본은 `.tmp/v025/p3-03-green.log`. 초기 restore fixture는 공유 FakeModelAdapter의 소비된 turn list를
+복사하도록 수정했고, 중간 parent revoke의 기존 `TurnNotSettled(interruption_cause=lease_lost)`도 보존했다.
+기존 `snapshot()`은 실행 중인 in-process resume job을 durable park로 허용하지 않는다.
+공개 committed release 회귀는 `create_task(..., resume_on_exit=False)`의 host-driven child를 사용해
+정상 committed 경계에서 parent를 release하고, 아직 살아 있는 child call의 접근 거부를 검증한다.
+새로운 background-task 복구 정책은 추가하지 않았다.
+
+최종 focused 검사는 **647 passed, 1 platform skip / 20.31s**다
+(`.tmp/v025/p3-03-focused.log`). 기존 P3-02 focused 목록에 새 child tests와 기존
+`test_subagent.py`/`test_subagent_runtime_context.py`를 추가했다. ruff0.15.6과 diff 공백 검사도 통과했다.
+메모리에서 parent token 연결만 제거한 음성 대조는 child write 도중 parent end가 즉시 반환하여
+barrier 회귀가 **1 failed / 0.66s**로 검출했다. production은 변경하지 않았고 원본은
+`.tmp/v025/p3-03-parent-guard-negative.py`/`.log`다.
+
+현재 source wheel audit 및 PYTHONPATH 없는 checkout 밖 installed-wheel recipe를 다시 실행했다.
+Python3.11.9/Pydantic2.14.1과 최소 계열2.6.4 모두 승인·복구 및 fresh/fork report를 완료했다.
+각 흐름의 activation은 2개이고 proposal-only 결과를 확인했다. 기존 minimal install CI가 같은 module을 실행한다.
+현재 P3-03 변경은 production 약 160줄, 총 약 910줄이다. 원래 총량 상한800보다 약14% 늘어난 부분은
+실제 policy 회귀, nested/barrier/committed release 검증과 실행 기록이다. 누적 구현 diff는 약3,550줄로
+기능2,000줄 soft limit·총비용1.5배 재계획 기준 이내다. 범용 추상화와 새 runner는 추가하지 않았다.
+
+첫 후보 `293a712`의 reviewer A는 PASS였고, reviewer B는 P2 테스트 관찰점 결함을 재현했다.
+computed allowed write 및 parent read가 거부돼도 앞서 기록한 표식 때문에 두 테스트가 통과했다.
+성공 표식을 실제 read/check 완료 뒤로 옮기고 handler 밖에서 확인한다. factory 중 parent end 검사도
+parent 두 요청만 model에 도달했음을 확인한다. production 변경은 없다.
+보완 뒤 같은 positive-operation 거부 변이는 **4 failed / 1.48s**, parent token 제거 변이는 barrier와
+factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tmp/v025/p3-03-success-oracle-negative.log`,
+`p3-03-parent-guard-negative-final.log`다. 원래 구현의 새 35개 검사는 **35 passed / 12.21s**이며
+`.tmp/v025/p3-03-final-green.log`에 기록했다. 두 reviewer의 최종 판정은
+`c517e15dbc61d4c3b6ca28877b350fb7057ea631`에서 모두 PASS다.
+같은 head의 L1 `40438800639`, 필수 L2 `40439077960`이 성공했다.
+[PR #154](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/154)는 통합 브랜치에
+`aa9e07e6175ff05d58c265e2d82e5daa73889f74`로 merge했다.
+
+### P3-I 통합 사전조사와 인계 — 2026-10-27
+
+최신 develop `336cb4c`를 다시 fetch했고, 통합 `aa9e07e`의 source tree가 P3-03 최종 검토 후보와 같음을 확인했다.
+독립 사전 검토는 `.tmp/v025/p3-i-preflight.md`의 SHA256
+`CF76EB5E4164FD093A24D6D89F2B8E585AE2BE9DD0161F5CA131E96444738125`에 READY를 반환했다.
+이 검토 이후 P3-03의 테스트 성공 관찰점만 보완했고, production 차이는 없다.
+
+P3-I 최초 후보 `d476276`은 실행 상태·공개 API·소비 예제를 반영하는 문서 정리였다.
+누적 코드 검토에서 두 cleanup 경계 문제가 발견되어 아래의 제한된 보완을 포함했다.
+최종 develop 대비 source 변경은 948줄(257줄 실행 예제 포함)이다.
+P3-01·02·03, CI fixture와 통합 보완의 누적 비용은 약 3,900줄이며, 최초 계획 문서 비용은 별도다.
+총량은 최초 예상 상한 3,700줄보다 약 5% 늘었다. 추가 비용은 실제 경합·복구·child 검증과
+독립 리뷰에서 확인한 실패 관찰점·cleanup 경계의 회귀에 집중됐다.
+기능 2,000줄 soft limit과 총비용 1.5배 재계획 기준을 유지한다.
+
+최종 누적 코드 검토는 두 독립 reviewer가 develop 대비 전체 변경과 P3-01 cleanup의 결합을 확인한다.
+최초 후보의 로컬 문서 링크·anchor 111개, Python 예시 AST 8개와 공백 검사를 통과했다.
+P3-I PR에 최종 head, 두 리뷰 판정, L1/L2 및 통합 브랜치 전체 CI를 기록한 뒤 merge commit으로 develop에 합친다.
+병합 후 develop 전체 CI까지 확인하고 같은 PR과 로컬 memory에 마감 결과를 남긴다.
+
+두 reviewer가 발견한 P2와 수정 전 사전 검토 READY는 다음과 같다.
+
+- A: pump가 이미 기록한 `limited/cancelled`, `limited/run_timeout`, `failed/model_error` 결과를
+  host disposer의 일반 오류가 덮어썼다. `close()`는 기록된 비성공 결과를 보존하고, 예외가 전파 중인
+  unwind와 구분한다. 결과를 반환하는 경로에서 새로 관측한 writer revoke는 계속 `lease_lost`를 우선한다.
+  이미 전파 중인 `TurnNotSettled(host_shutdown)`의 기존 우선순위도 유지한다.
+- B: 두 번째 factory가 public discard 후 첫 adapter를 다시 반환하면 registry의 identity 기록이 지워져
+  두 번 닫혔다. 순차 `open()` 시도의 지역 객체 맵으로 중복 identity를 보존하고 finally에서 해제한다.
+  ExitStack의 소유권과 역순 해제는 유지한다. 늦게 반환된 새로운 adapter는 한 번 닫는다.
+
+수정 전 test-only `9cf1003`은 **4 failed, 10 passed / 7.46s**였다(`.tmp/v025/p3-i-red.log`).
+실패는 위 세 결과 덮어쓰기와 중복 close였고, 정상 disposer·writer revoke·기존 unwind·fresh late adapter는 대조로 통과했다.
+보완 후 관련 cleanup 검사는 **24 passed / 5.66s**, 전체 focused 검사는 **661 passed, 1 platform skip / 38.14s**다
+(`p3-i-repair-green.log`, `p3-i-focused.log`). ruff0.15.6과 공백 검사도 통과했다.
+수정된 source로 새 wheel을 빌드하고 release wheel audit를 통과했다.
+checkout 밖 설치 환경의 Pydantic 2.14.1 및 2.6.4에서 승인·복구·fresh/fork recipe가 모두 통과했다.
+최종 수정은 두 reviewer가 재검토하고, [P3-I PR #155](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/155)의
+새 head에서 L1/L2와 전체 CI를 확인한다.
+
+후속 책임은 P1/P2 종료·사용량, P4 예산, DX2의 남은 스트리밍 조합에 있다.
+P8이 일반 child 중단·drain을 소유하고, P7이 OS 격리를 소유한다.
+호스트는 일반 외부 client의 fencing·idempotency·pool 수명과 async I/O를 소유한다.
+실행 중 in-process resume job의 durable park 제한은 기존 snapshot 계약을 따른다.

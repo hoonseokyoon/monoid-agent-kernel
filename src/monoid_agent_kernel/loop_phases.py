@@ -100,15 +100,9 @@ class LoopBootstrapper:
     def bootstrap(self) -> _RunResources:
         loop = self._loop
         loop._assert_write_authority()
-        # Asked of the FIELDS, not of the class. ``==`` against ``PermissionPolicy()`` is
-        # class-exact, so a deployment's extension subclass with both pattern tuples empty read
-        # as "the caller configured this" and the operator's spec policy was silently not
-        # adopted -- leaving the loop enforcing the empty policy at every
-        # ``self.permission_policy`` site while the subagent sites read
-        # ``self.spec.permission_policy`` directly, so half the run honoured the operator's
-        # lists and half did not. Such a subclass reaches here intact by design (the spec
-        # validator gates on ``isinstance``). Same gate the two model configs use, spelled the
-        # same way: see ``PermissionPolicy.is_default``.
+        # Resolve the effective policy before constructing services, resources and children.
+        # is_default inspects fields, so extension subclasses with empty settings also adopt
+        # the operator's spec policy. A configured constructor policy takes precedence.
         if loop.permission_policy.is_default and not loop.spec.permission_policy.is_default:
             loop.permission_policy = loop.spec.permission_policy
         workspace_factory = loop.workspace_factory or default_local_workspace_factory
@@ -178,6 +172,20 @@ class LoopBootstrapper:
                 _outbox=loop._outbox,
                 invocation_traceparent=safe_invocation_context.traceparent,
             )
+            from monoid_agent_kernel.tools.host_bindings import _HostToolRegistry
+
+            parent_run_id = loop.spec.metadata.get("parent_run_id")
+            loop._host_tool_registry = _HostToolRegistry(
+                run_id=loop.spec.run_id,
+                root_run_id=loop._validated_root_run_id(),
+                parent_run_id=parent_run_id if isinstance(parent_run_id, str) else None,
+                mode=loop.spec.mode,
+                workspace=workspace,
+                policy=loop.permission_policy,
+                writer=loop.write_authority,
+                parent=loop._host_tool_parent,
+            )
+            loop._host_tool_registry.open(loop.host_tool_bindings)
             started = time.time()
             deadline = (
                 started + loop.spec.limits.max_duration_s
@@ -245,6 +253,7 @@ class LoopBootstrapper:
         except BaseException:
             # Before publication the constructor callback owns this provisional recorder, including
             # a result rejected by the external guard postcheck. Preserve the original failure.
+            loop._close_host_tool_resources(preserve_error=True)
             if recorder is not None:
                 try:
                     recorder.discard_uncommitted()
