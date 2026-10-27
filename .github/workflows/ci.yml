@@ -206,6 +206,10 @@ jobs:
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
         run: python -c "import boto3, dbos, openai, httpx, opentelemetry.sdk, psycopg, psycopg_pool, temporalio"
+      - name: Run installed host resource approval and recovery recipe
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: python -m monoid_agent_kernel.reference.host_tool_report
       - name: Run installed conformance evidence smoke
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}

@@ -178,6 +178,19 @@ class LoopBootstrapper:
                 _outbox=loop._outbox,
                 invocation_traceparent=safe_invocation_context.traceparent,
             )
+            from monoid_agent_kernel.tools.host_bindings import _HostToolRegistry
+
+            parent_run_id = loop.spec.metadata.get("parent_run_id")
+            loop._host_tool_registry = _HostToolRegistry(
+                run_id=loop.spec.run_id,
+                root_run_id=loop._validated_root_run_id(),
+                parent_run_id=parent_run_id if isinstance(parent_run_id, str) else None,
+                mode=loop.spec.mode,
+                workspace=workspace,
+                policy=loop.permission_policy,
+                writer=loop.write_authority,
+            )
+            loop._host_tool_registry.open(loop.host_tool_bindings)
             started = time.time()
             deadline = (
                 started + loop.spec.limits.max_duration_s
@@ -245,6 +258,7 @@ class LoopBootstrapper:
         except BaseException:
             # Before publication the constructor callback owns this provisional recorder, including
             # a result rejected by the external guard postcheck. Preserve the original failure.
+            loop._close_host_tool_resources(preserve_error=True)
             if recorder is not None:
                 try:
                     recorder.discard_uncommitted()
