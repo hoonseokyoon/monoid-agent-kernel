@@ -438,3 +438,6 @@ root는 그 뒤 private carrier·16개 시간 계산·public 소비자 연결과
 핵심 회귀 **46 passed (5.90s)**, 실제 loop/tool/restore를 포함한 영향군 **728 passed (40.22s)**다.
 후자는 model/validated/async loop/tools/checkpoint/cancellation/stream observer 8개 모듈을 함께 실행했다.
 원본 `.tmp/v025/p4-01-green-core.txt`, `p4-01-related-green.txt`. 추가 정밀 경계·설치 wheel과 독립 리뷰·CI는 이어서 확인한다.
+
+추가 exact cutoff·drain 동률·서로 다른 monotonic 원점의 실제 park/restore 10개도 **PASS (5.93s)**:
+`.tmp/v025/p4-01-boundary-green.txt`. P4-01 신규 행동 회귀는 81개다. ruff 0.15.6·diff check와 wheel audit가 통과했다.
