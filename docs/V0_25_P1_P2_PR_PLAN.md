@@ -878,3 +878,12 @@ RunCancelled 수락 → provider cleanup → caller 취소 순서로 재현했�
 유지한다. 공통 private helper를 `_aawait`·`_abackoff`에서 재사용한다. 관련 순서·accessor 회귀는
 **27 passed / 7.55s**, lint/diff check PASS다(`p1p2-i-final-owner-green.txt`).
 runtime·UI 누적 수정은 2,109줄, 전체는 이 기록 직전 6,004줄이다. 최종 두 targeted 리뷰·설치 wheel·CI를 갱신한다.
+
+`689ea60`은 current/minimum 설치 검증 각 **456 passed / 4 Windows skip**(20.94/17.38s),
+실제 양방향 gateway binary·v2 → reader-prep v1 → v2 복구·공개 예제·audit·bundle byte 비교를 통과했다.
+reviewer B는 교체된 token B의 host_shutdown이 수락된 뒤 예전 wake token A의 user_cancel이 대기를 깨우면
+helper가 A를 우선하는 P2를 확인했다. 실제 boundary 수락과 단순 wake snapshot을 구분해야 한다.
+회귀 `89e5c99`는 **1 failed / 2 passed, 7.93s**다. 독립 검토에 따라 이미 수락한 stream requester,
+실제 RunCancelled requester, caller-only 시점의 fallback snapshot 순서로 분리했다.
+수정 후 관련 **28 passed / 6.72s**, lint/diff check PASS다(`p1p2-i-owner-precedence-green.txt`).
+wake·예외·회계 흐름은 그대로이며, 최종 검토가 끝난 source에서 wheel과 필수 CI를 확인한다.

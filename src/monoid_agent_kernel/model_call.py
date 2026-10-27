@@ -271,7 +271,9 @@ def _caller_cancellation_observer(
 
 def _model_wait_handlers(
     check_boundary: Callable[[float | None], None],
-    first_requester: Callable[[], str | None],
+    fallback_requester: Callable[[], str | None],
+    *,
+    first_accepted_requester: Callable[[], str | None] | None = None,
 ) -> tuple[Callable[[float | None], None], Callable[[asyncio.CancelledError], None]]:
     accepted_requester: str | None = None
 
@@ -283,10 +285,11 @@ def _model_wait_handlers(
             # A live boundary may accept a different token from the one that wakes this wait.
             # Keep that accepted fact before cleanup can replace the exception with caller cancel.
             if accepted_requester is None:
-                accepted_requester = first_requester() or _termination_for(exc).requested_by
+                prior = first_accepted_requester() if first_accepted_requester is not None else None
+                accepted_requester = prior or _termination_for(exc).requested_by
             raise
 
-    return check, _caller_cancellation_observer(lambda: accepted_requester or first_requester())
+    return check, _caller_cancellation_observer(lambda: accepted_requester or fallback_requester())
 
 
 def _settled_model_stream_outcome(
@@ -2626,6 +2629,7 @@ class ModelCallRunner:
             check_boundary, on_caller_cancelled = _model_wait_handlers(
                 check_boundary,
                 lambda: (first_requester() if first_requester is not None else None) or _token_requester(token),
+                first_accepted_requester=first_requester,
             )
         try:
             token = self._token() if boundary is None else boundary[0]
