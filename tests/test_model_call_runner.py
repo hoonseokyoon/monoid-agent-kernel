@@ -178,6 +178,36 @@ def test_p1p2_explicit_zero_received_during_drain_replaces_prior_report() -> Non
     assert call_facts_of(outcome.error) == (outcome.receipt.termination, outcome.receipt.usage_evidence)
 
 
+def test_p1p2_requester_capture_reuses_the_stream_owners_token() -> None:
+    token = CancellationToken()
+    accepted = False
+    captures, seen = [], []
+
+    def current_token():
+        if accepted:
+            raise RuntimeError("host token accessor changed after stop acceptance")
+        return token
+
+    def should_abort():
+        nonlocal accepted
+        accepted = True
+        return True
+
+    runner = ModelCallRunner(
+        adapter=_DrainStream(TextDelta("visible"), TurnComplete(usage={"output_tokens": 5})),
+        current_cancellation_token=current_token, abort_drain_s=1, settled_sink=captures.append,
+    )
+    with pytest.raises(ModelCallAborted) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=seen.append, should_abort=should_abort))
+
+    assert captures[0].receipt.termination == ModelCallTermination(
+        outcome="interrupted", requested_by="turn_interrupt", ended_by="provider_terminal",
+    )
+    assert captures[0].receipt.usage["output_tokens"] == 5
+    assert provider_usage_of(caught.value)["output_tokens"] == 5
+    assert [chunk.text for chunk in seen] == ["visible"]
+
+
 @pytest.mark.parametrize("chunk", [TextDelta(42), ReasoningDelta(42), ToolCallDelta(index=-1)])
 def test_p1p2_malformed_fragments_end_at_local_validation(chunk):
     outcome = _drain_call(_DrainStream(chunk), drain_s=0)
