@@ -164,6 +164,10 @@ def test_service_profile_rejects_missing_multiple_and_wrong_labels() -> None:
         ("codex/v0.23-production-adapters", ["ci:combined"], "combined"),
         ("codex/v0.25-p1-p2-call-facts", [], "combined"),
         ("codex/v0.25-p1-p2-call-facts", ["ci:combined"], "combined"),
+        ("codex/v0.25-p4-termination-budget", [], "combined"),
+        ("codex/v0.25-p4-termination-budget", ["ci:combined"], "combined"),
+        ("codex/v0.25-p4-termination-budget-fix", [], "core"),
+        ("codex/v0.25-p4-clock", [], "core"),
         ("develop", [], "combined"),
         ("feature/unrelated", [], "core"),
         ("feature/service-change", ["ci:postgres"], "postgres"),
@@ -180,7 +184,10 @@ def test_terminal_and_non_campaign_branches_have_total_profile_resolution(
 
 
 @pytest.mark.parametrize(
-    "head_ref", ["codex/v0.23-production-adapters", "codex/v0.25-p1-p2-call-facts"]
+    "head_ref", [
+        "codex/v0.23-production-adapters", "codex/v0.25-p1-p2-call-facts",
+        "codex/v0.25-p4-termination-budget",
+    ]
 )
 @pytest.mark.parametrize("manual", [False, True])
 def test_terminal_branch_rejects_a_profile_weaker_than_combined(
@@ -246,6 +253,7 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "pull_request:" not in integration
     assert "codex/v0.23-production-adapters" in integration
     assert "codex/v0.25-p1-p2-call-facts" in integration
+    assert "codex/v0.25-p4-termination-budget" in integration
     assert "      - name: Record integration evidence\n        if: always()" not in integration
     assert (
         "      - uses: actions/upload-artifact@v7\n"
