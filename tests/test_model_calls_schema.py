@@ -98,8 +98,9 @@ def _errors(record: dict[str, object]) -> list[str]:
 def test_mixed_v1_v2_ledger_reads_facts_without_an_itemized_attempt_log(tmp_path: Path) -> None:
     from support.model_facts import facts
 
-    old = _record()
+    old = {**_record(), "schema_version": "monoid.model-calls.v1"}
     new = {**old, "schema_version": "monoid.model-calls.v2", **facts(old["usage"])}
+    assert {old["schema_version"], new["schema_version"]} == {"monoid.model-calls.v1", "monoid.model-calls.v2"}
     path = tmp_path / MODEL_CALLS_FILENAME
     path.write_text(json.dumps(old) + "\n" + json.dumps(new) + "\n", encoding="utf-8")
     assert not [issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)]

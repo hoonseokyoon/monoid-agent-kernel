@@ -372,6 +372,15 @@ def test_a_reopened_run_appends_to_the_ledger_it_already_has(tmp_path: Path) -> 
     first_result = first.run_once("hi")
     run_dir = first_result.run_dir
     assert len(_records(run_dir)) == 1
+    historical = _records(run_dir)[0]
+    historical["schema_version"] = "monoid.model-calls.v1"
+    historical.pop("termination", None)
+    historical.pop("usage_evidence", None)
+    for entry in historical.get("attempt_log", []):
+        entry.pop("usage_evidence", None)
+    ledger = run_dir / MODEL_CALLS_FILENAME
+    ledger.write_text(json.dumps(historical) + "\n", encoding="utf-8")
+    original_bytes = ledger.read_bytes()
 
     reopened = AgentLoop(
         spec=AgentRunSpec(
@@ -391,6 +400,9 @@ def test_a_reopened_run_appends_to_the_ledger_it_already_has(tmp_path: Path) -> 
     assert len(records) == 2
     assert [record["call_index"] for record in records] == [0, 0]
     assert records[0]["recorded_at"] <= records[1]["recorded_at"]
+    assert ledger.read_bytes().startswith(original_bytes)
+    assert [record["schema_version"] for record in records] == ["monoid.model-calls.v1", "monoid.model-calls.v2"]
+    assert not [issue for issue in validate_run_dir(run_dir) if "model_calls" in issue.path]
 
 
 def _standalone_recorder(tmp_path: Path) -> Any:

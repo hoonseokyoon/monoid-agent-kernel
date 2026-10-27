@@ -676,3 +676,20 @@ current version과 namespace alias를 같은 것으로 가정한 conformance fix
 bounded projection·두 closed schema·version registry를 갱신했고 공개 오프라인 JSON 복구 예제는
 provider 호출 1회, v2 facts 유지와 total unknown을 출력했다. 전체 lint/diff check 통과.
 두 독립 코드 리뷰·실제 binary rollback·설치 wheel·필수 combined CI를 이어간다.
+
+03 PR #159의 첫 후보 `4eadd548` wheel audit과 current/minimum 설치 검증은 각각
+**336 passed, 4 Windows symlink skipped**(5.02/3.84s)였고 복구 예제도 양쪽에서 통과했다.
+제품 import는 site-packages에서 확인했다. 실제 binary 검증 스크립트는
+`.tmp/v025/p1p2-03-installed-tests/binary_rollback.py`, 교환 JSON은 같은 폴더의 `binary-history.json`이다.
+03 wheel → 01 reader-prep wheel → 03 wheel 순서로 별도 프로세스를 실행했다. v2 성공 기록·ledger·nested
+checkpoint를 읽고 같은 좌표를 재게시해 hash를 보존했다. 01 lifecycle이 v2 reservation에서 새 v1
+started/settled revision을 썼고, 03 lifecycle은 이를 읽어 새 v2 retry revision으로 이어갔다.
+구형 writer가 보존하지 못한 첫 observation은 legacy_ambiguous, 새 관측은 partial로 검증했다.
+이 binary 전이 검증은 저장/lifecycle 호환성을 증명하며 실제 runner의 retry 회계는 앞의 복구 테스트가 검증한다.
+PyPI v0.24.0의 별도 설치 reader는 v2를 unsupported_version으로 거부하고 v1은 읽었다.
+01 wheel SHA-256 `ab8e726eb0a5c79b25264088e71c1e5f54424d5fd034a2ab25fbf75505f464b4`,
+03 wheel SHA-256 `18c3eebba5ec4405188623930b5feb79f1919f8acb7c37201671606c1edc9cfd`다.
+
+두 코드 리뷰가 같은 mixed-ledger fixture 누락을 지적했다. `_record()`가 새 writer를 따르면서 두 행 모두
+v2가 된 검증 결함이었다. 과거 행을 명시적 v1으로 고정하고 실제 AgentLoop/recorder 재개 시 원래 v1
+bytes를 보존하며 v2를 append하는 회귀까지 보완했다(2 passed/2.46s). 제품 코드는 그대로다.
