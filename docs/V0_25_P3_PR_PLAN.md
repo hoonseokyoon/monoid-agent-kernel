@@ -788,17 +788,37 @@ factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tm
 `CF76EB5E4164FD093A24D6D89F2B8E585AE2BE9DD0161F5CA131E96444738125`에 READY를 반환했다.
 이 검토 이후 P3-03의 테스트 성공 관찰점만 보완했고, production 차이는 없다.
 
-P3-I의 새 변경은 실행 상태·공개 API·소비 예제를 통합 계획에 반영하는 문서 정리다.
-source 증분은 0이며 최종 develop 대비 source 변경은 934줄(257줄 실행 예제 포함)이다.
-P3-01·02·03, CI fixture 보완과 이번 문서 정리의 누적 비용은 약 3,700줄이며, 최초 계획 문서 비용은 별도다.
-추가 비용은 실제 경합·복구·child 검증과 리뷰에서 보완한 성공 관찰점에 집중됐다.
+P3-I 최초 후보 `d476276`은 실행 상태·공개 API·소비 예제를 반영하는 문서 정리였다.
+누적 코드 검토에서 두 cleanup 경계 문제가 발견되어 아래의 제한된 보완을 포함했다.
+최종 develop 대비 source 변경은 948줄(257줄 실행 예제 포함)이다.
+P3-01·02·03, CI fixture와 통합 보완의 누적 비용은 약 3,900줄이며, 최초 계획 문서 비용은 별도다.
+총량은 최초 예상 상한 3,700줄보다 약 5% 늘었다. 추가 비용은 실제 경합·복구·child 검증과
+독립 리뷰에서 확인한 실패 관찰점·cleanup 경계의 회귀에 집중됐다.
 기능 2,000줄 soft limit과 총비용 1.5배 재계획 기준을 유지한다.
 
 최종 누적 코드 검토는 두 독립 reviewer가 develop 대비 전체 변경과 P3-01 cleanup의 결합을 확인한다.
-647 passed / 1 platform skip, 보완된 child 35 passed, current/minimum Pydantic installed-wheel 결과는
-동일 source 증거로 재사용한다. 로컬 문서 링크·anchor 111개, Python 예시 AST 8개와 공백 검사를 통과했다.
+최초 후보의 로컬 문서 링크·anchor 111개, Python 예시 AST 8개와 공백 검사를 통과했다.
 P3-I PR에 최종 head, 두 리뷰 판정, L1/L2 및 통합 브랜치 전체 CI를 기록한 뒤 merge commit으로 develop에 합친다.
 병합 후 develop 전체 CI까지 확인하고 같은 PR과 로컬 memory에 마감 결과를 남긴다.
+
+두 reviewer가 발견한 P2와 수정 전 사전 검토 READY는 다음과 같다.
+
+- A: pump가 이미 기록한 `limited/cancelled`, `limited/run_timeout`, `failed/model_error` 결과를
+  host disposer의 일반 오류가 덮어썼다. `close()`는 기록된 비성공 결과를 보존하고, 예외가 전파 중인
+  unwind와 구분한다. 결과를 반환하는 경로에서 새로 관측한 writer revoke는 계속 `lease_lost`를 우선한다.
+  이미 전파 중인 `TurnNotSettled(host_shutdown)`의 기존 우선순위도 유지한다.
+- B: 두 번째 factory가 public discard 후 첫 adapter를 다시 반환하면 registry의 identity 기록이 지워져
+  두 번 닫혔다. 순차 `open()` 시도의 지역 객체 맵으로 중복 identity를 보존하고 finally에서 해제한다.
+  ExitStack의 소유권과 역순 해제는 유지한다. 늦게 반환된 새로운 adapter는 한 번 닫는다.
+
+수정 전 test-only `9cf1003`은 **4 failed, 10 passed / 7.46s**였다(`.tmp/v025/p3-i-red.log`).
+실패는 위 세 결과 덮어쓰기와 중복 close였고, 정상 disposer·writer revoke·기존 unwind·fresh late adapter는 대조로 통과했다.
+보완 후 관련 cleanup 검사는 **24 passed / 5.66s**, 전체 focused 검사는 **661 passed, 1 platform skip / 38.14s**다
+(`p3-i-repair-green.log`, `p3-i-focused.log`). ruff0.15.6과 공백 검사도 통과했다.
+수정된 source로 새 wheel을 빌드하고 release wheel audit를 통과했다.
+checkout 밖 설치 환경의 Pydantic 2.14.1 및 2.6.4에서 승인·복구·fresh/fork recipe가 모두 통과했다.
+최종 수정은 두 reviewer가 재검토하고, [P3-I PR #155](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/155)의
+새 head에서 L1/L2와 전체 CI를 확인한다.
 
 후속 책임은 P1/P2 종료·사용량, P4 예산, DX2의 남은 스트리밍 조합에 있다.
 P8이 일반 child 중단·drain을 소유하고, P7이 OS 격리를 소유한다.

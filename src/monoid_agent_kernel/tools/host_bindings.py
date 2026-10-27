@@ -333,7 +333,6 @@ class _HostToolRegistry:
         self.policy = policy
         self.workspace: Workspace | None = workspace
         self.resources: dict[HostToolKey[Any], HostToolResource[Any]] = {}
-        self.owned: dict[int, HostToolResource[Any]] = {}
         self.stack = ExitStack()
         self.close_lock = threading.Lock()
         self.disposed = False
@@ -347,41 +346,49 @@ class _HostToolRegistry:
         return _WorkspaceResource(self)
 
     def open(self, bindings: Iterable[HostToolBinding[Any]]) -> None:
-        for binding in bindings:
+        # Keep identities through a factory that returns after concurrent/reentrant close.
+        # References belong to this open attempt and are released when it unwinds.
+        acquired: dict[int, HostToolResource[Any]] = {}
+        try:
+            for binding in bindings:
 
-            def acquire(binding: HostToolBinding[Any] = binding) -> HostToolResource[Any]:
-                resource = _safe_callback(
-                    lambda: binding.open(self.activation), "open", config=True
-                )
-                closer = getattr(resource, "close", None)
-                if not callable(closer):
-                    raise AgentConfigError("host tool resource must provide a local close callable")
-                with self.close_lock:
-                    if id(resource) in self.owned:
-                        raise AgentConfigError(
-                            "host tool factories must return distinct resource adapters"
-                        )
-                    late = self.disposed
-                    if not late:
-                        self.owned[id(resource)] = resource
-                        self.stack.callback(self._dispose, closer)
-                if late:
-                    _safe_callback(closer, "close")
-                    self.lifetime.assert_active()
-                binder = getattr(resource, "bind_call", None)
-                if not callable(binder) or is_async_callable(binder) or is_async_callable(closer):
-                    raise AgentConfigError(
-                        "host tool resource bind_call and close must be synchronous"
+                def acquire(binding: HostToolBinding[Any] = binding) -> HostToolResource[Any]:
+                    resource = _safe_callback(
+                        lambda: binding.open(self.activation), "open", config=True
                     )
-                return resource
+                    closer = getattr(resource, "close", None)
+                    if not callable(closer):
+                        raise AgentConfigError(
+                            "host tool resource must provide a local close callable"
+                        )
+                    with self.close_lock:
+                        if id(resource) in acquired:
+                            raise AgentConfigError(
+                                "host tool factories must return distinct resource adapters"
+                            )
+                        acquired[id(resource)] = resource
+                        late = self.disposed
+                        if not late:
+                            self.stack.callback(self._dispose, closer)
+                    if late:
+                        _safe_callback(closer, "close")
+                        self.lifetime.assert_active()
+                    binder = getattr(resource, "bind_call", None)
+                    if not callable(binder) or is_async_callable(binder) or is_async_callable(closer):
+                        raise AgentConfigError(
+                            "host tool resource bind_call and close must be synchronous"
+                        )
+                    return resource
 
-            self.lifetime.assert_active()
-            resource = self.lifetime.guard_external(
-                lambda: _safe_callback(acquire, "open", config=True)
-            )
-            with self.close_lock:
                 self.lifetime.assert_active()
-                self.resources[binding.key] = resource
+                resource = self.lifetime.guard_external(
+                    lambda: _safe_callback(acquire, "open", config=True)
+                )
+                with self.close_lock:
+                    self.lifetime.assert_active()
+                    self.resources[binding.key] = resource
+        finally:
+            acquired.clear()
 
     def bind(self, key: HostToolKey[_T], lease: HostToolCallLease) -> _T:
         lease.assert_active()
@@ -411,7 +418,6 @@ class _HostToolRegistry:
             # Pop ownership before callbacks: reentrant or repeated cleanup cannot call one twice.
             pending = self.stack.pop_all()
             self.resources.clear()
-            self.owned.clear()
             self.workspace = None
         pending.close()
         errors, self.close_errors = self.close_errors, []

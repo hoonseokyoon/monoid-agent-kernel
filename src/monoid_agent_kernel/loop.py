@@ -2691,10 +2691,18 @@ class AgentLoop:
         finally:
             # Finalization already closed the recorder. A checkpoint-delete failure must end this
             # activation without asking recorder/event sinks to close a second time.
+            unwinding = sys.exc_info()[0] is not None
             try:
-                self._close_host_tool_resources(
-                    preserve_error=sys.exc_info()[0] is not None, check_authority=True
-                )
+                try:
+                    self._close_host_tool_resources(
+                        preserve_error=unwinding or result.status != "completed"
+                    )
+                finally:
+                    # A recorded failure survives disposal errors. A newly observed lease loss
+                    # still wins when close is returning a result; an escaping exception keeps
+                    # the existing unwind priority.
+                    if not unwinding:
+                        self._assert_write_authority()
             finally:
                 self._finalized = True
                 self._session = None
