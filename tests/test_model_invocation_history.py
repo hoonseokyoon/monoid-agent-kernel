@@ -42,6 +42,7 @@ def test_historical_settlement_recovers_without_rewriting_its_coordinate(
     policy: str,
     variant: str,
     success: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     blob = durable_model_result_blob(ModelTurn(final_text="answer", stop_reason="stop"))
     sha = hashlib.sha256(blob).hexdigest()
@@ -102,6 +103,23 @@ def test_historical_settlement_recovers_without_rewriting_its_coordinate(
         digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
     )
     lifecycle = FencedModelCallLifecycle(harness.sink, token)
+    if policy == "required" and variant == "v2":
+        from monoid_agent_kernel.core.model_facts import call_facts_of
+        from monoid_agent_kernel.errors import ModelEvidenceUncommitted
+
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("evidence store unavailable after restart")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(harness.sink, "commit_model_evidence", unavailable)
+            for _ in range(2):
+                with pytest.raises(ModelEvidenceUncommitted) as caught:
+                    lifecycle.recover(query)
+                termination, evidence = call_facts_of(caught.value)
+                assert termination is not None and evidence is not None
+                assert termination.to_json() == payload["receipt"]["termination"]
+                assert evidence.to_json() == payload["receipt"]["usage_evidence"]
+                assert harness.sink._invocations[coord][0] == original_digest
     for _ in range(2):
         recovered = lifecycle.recover(query)
         assert recovered is not None

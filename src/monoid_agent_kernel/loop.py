@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import sys
+from monoid_agent_kernel.core.model_facts import call_facts_of, mark_call_facts
 import threading
 import time
 import uuid
@@ -3188,6 +3189,10 @@ class AgentLoop:
         outcome_error_code: str | None = None
         outcome_retryable = False
         outcome_config_recoverable = False
+        outcome_termination = None
+        outcome_evidence = None
+        escaped: BaseException | None = None
+        recovery_identity_mismatch = False
         try:
             turn, receipt = await runner.acall(
                 request,
@@ -3205,6 +3210,7 @@ class AgentLoop:
                 abort_after_recovery_probe=abort_after_recovery_probe,
             )
         except ModelCallAborted as exc:
+            escaped = exc
             outcome_status = "interrupted"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "interrupted"
@@ -3215,6 +3221,7 @@ class AgentLoop:
             # for; the interrupt did not un-spend them.
             raise _carrying_stamps(TurnInterrupted("turn interrupted"), exc) from exc
         except RunCancelled as exc:
+            escaped = exc
             lease_lost_now = self._lease_authority_lost()
             cause = (
                 exc.interruption_cause
@@ -3226,19 +3233,35 @@ class AgentLoop:
             outcome_status, outcome_error_code = _cancelled_model_stream_outcome(cause)
             outcome_final_text = "".join(output_fragments) or None
             raise
-        except RunTimeout:
+        except RunTimeout as exc:
+            escaped = exc
             outcome_status = "timed_out"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "run_timeout"
             raise
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            escaped = exc
             outcome_status = "cancelled"
             outcome_final_text = "".join(output_fragments) or None
             outcome_error_code = "cancelled"
             raise
         except ModelEvidenceUncommitted as exc:
+            escaped = exc
+            recovery_identity_mismatch = getattr(exc, "_checked_recovery_request_mismatch", False) is True
             settled_stream = _settled_model_stream_outcome(exc)
-            if settled_stream is None:
+            recovered_termination, _ = call_facts_of(exc)
+            if recovery_identity_mismatch:
+                # This observer opened under the current routing. Historical facts remain
+                # on the exception for accounting and cannot be attributed to that routing.
+                outcome_status = "failed"
+                outcome_error_code = exc.error_code
+                outcome_retryable = exc.retryable is True
+            elif settled_stream is None and recovered_termination is not None:
+                outcome_status = recovered_termination.outcome
+                if outcome_status != "completed":
+                    outcome_error_code = exc.error_code
+                    outcome_retryable = exc.retryable is True
+            elif settled_stream is None:
                 # A durable provider refusal can also park on required evidence. It has no
                 # successful stream outcome to preserve, so it keeps the ordinary failure
                 # classification used before the projection lane was separated.
@@ -3256,6 +3279,7 @@ class AgentLoop:
                 outcome_usage = settled_stream.usage
             raise
         except BaseException as exc:
+            escaped = exc
             outcome_status = "failed"
             outcome_final_text = "".join(output_fragments) or None
             try:
@@ -3286,7 +3310,13 @@ class AgentLoop:
             outcome_status = "completed"
             outcome_final_text = turn.final_text
             outcome_usage = turn.usage
+            outcome_termination = receipt.termination
+            outcome_evidence = receipt.usage_evidence
         finally:
+            if escaped is not None and not recovery_identity_mismatch:
+                outcome_termination, outcome_evidence = call_facts_of(escaped)
+                if outcome_usage is None and outcome_status != "completed":
+                    outcome_usage = provider_usage_of(escaped) or None
             lifecycle = runner.lifecycle_hook
             if session is not None and lifecycle is not None:
                 latest_invocation = getattr(lifecycle, "last_invocation", None)
@@ -3302,6 +3332,8 @@ class AgentLoop:
                         error_code=outcome_error_code,
                         retryable=outcome_retryable,
                         config_recoverable=outcome_config_recoverable,
+                        termination=outcome_termination,
+                        usage_evidence=outcome_evidence,
                     )
                 except Exception:
                     # Outcome capture is diagnostic too. Preserve the terminal status even if a
@@ -4778,6 +4810,7 @@ class AgentLoop:
                 provider_retried=call_receipt.provider_retried,
             )
             mark_provider_usage(recovered_error, call_receipt.usage)
+            mark_call_facts(recovered_error, call_receipt.termination, call_receipt.usage_evidence)
             usage_delta = _usage_delta(call_receipt.usage, already_accounted_usage)
             self._record_failed_model_turn(
                 res,
@@ -7354,6 +7387,7 @@ def _carrying_stamps(replacement: BaseException, original: BaseException) -> Bas
 
     probe = ModelCallReceipt().with_error(original)
     mark_provider_usage(replacement, probe.usage)
+    mark_call_facts(replacement, *call_facts_of(original))
     if probe.provider_retried:
         mark_provider_retried(replacement)
     return replacement

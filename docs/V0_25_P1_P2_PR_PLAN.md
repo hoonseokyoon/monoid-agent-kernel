@@ -534,3 +534,108 @@ import가 site-packages임을 검사했고 Pydantic 2.14.1은 120 passed/3.75s, 
 기존 stamped 후보를 evidence와 검증한 뒤 채택하도록 좁혀 unknown counter의 숫자와 확인된 0을 함께 보존한다.
 관련 receipt/facts **95 passed in 3.02s**. source 상한은 529줄, 누적 예상은 1,999줄이다.
 `e7bffea`의 갱신 wheel audit은 통과했고 독립 설치 환경은 current/minimum 각각 125 passed/2.96s·3.21s였다.
+
+01 최종 `74ff289431f203cb84595f90e0e09abfec12ee72`는 서로 다른 두 코드 reviewer의 PASS를 받았다.
+최종 wheel audit과 설치 환경 Pydantic 2.14.1/2.6.4가 각각 **127 passed / 3.09s·3.04s**였다.
+[L1 40453578644](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40453578644)와
+[required combined L2 40453679101](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40453679101)이
+성공했다. Python 3.11/3.12와 실제 PostgreSQL·ObjectStore·Temporal job을 확인했다.
+[PR #157](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/157)을 expected head로 고정해
+통합 브랜치에 merge commit `ec32ca8e2adc86354cfb9acd7cd5f3b9d657b537`으로 병합했다.
+
+### 9.3 P1P2-02 구현 전 사전조사
+
+실제 fetch한 integration base는 `ec32ca8e2adc86354cfb9acd7cd5f3b9d657b537`, develop은 계속 `d4e659c`다.
+검토한 01 head와 tree가 같다. 작업 브랜치는 `codex/v0.25-p1-p2-runtime`이다.
+root가 구현·runner, `p1p2_01_research`가 읽기 전용 조사, `p1p2_02_preflight_review`가 독립 검토를 맡았다.
+사전조사 `.tmp/v025/p1p2-02-preflight.md` SHA-256은
+`91F74B73941E3D206CFF629BDC25ABE8D68C0AE50780243458B4D5BC19F45B54`, 판정은 **READY**다.
+같은 날 확인한 §3의 pinned 외부 구현을 재사용하고, 현재 OpenAI Responses 경로를 직접 대조했다.
+
+**확인한 upstream 경계.** OpenAI는 raw terminal을 받은 뒤 EOF·cleanup을 마쳐야 TurnComplete를 내보낸다.
+terminal을 일찍 yield하면 direct consumer가 client 정리를 마치기 전에 멈출 수 있다.
+기존 wait bridge는 boundary가 이기면 callee의 결과·예외를 버리므로 예외 stamp만으로도 부족하다.
+기존 `collect_retry_reports`의 ContextVar·mutable carrier 패턴을 재사용하는 작은 **dispatch별 usage collector**를 둔다.
+숫자 snapshot·typed observation·normal/drain phase·closed만 보관하고 lock으로 update/phase/close를 보호한다.
+dispatch 종료 시 닫아 늦은 worker가 다음 관측을 바꾸지 못하게 한다. RetryProgress의 논리 호출 범위는 유지한다.
+원본 수신 시 만든 observation은 지연 terminal에서도 원래 collection을 유지한다.
+
+normalizer의 alias 선택을 sparse 추출에도 재사용하며 명시적 0과 미보고를 분리한다.
+숫자와 evidence를 한 snapshot으로 선택한다. 새 explicit report가 기존 pair를 교체하고,
+usage 없는 terminal·legacy numeric-only conduit는 이미 확인한 explicit snapshot을 덮지 않는다.
+OpenAI의 EOF refusal은 알려진 source 경계에서 provider_eof를 stamp한다. gateway의 기존 frameless EOF 허용은 유지한다.
+runner는 stop 요청과 실제 읽기 종료를 각각 기록하며, provider cancellation은 CalleeCancelled의 원래 cause에서 구별한다.
+
+**독립 검토에서 확정한 선행 수정.** malformed OpenAI 응답의 prompt_tokens/nested reasoning은 기존 실패 stamp에서
+canonical 예산 항목으로 전달되지 않는다. first-party raw failure 경계에서 유효한 sibling을 보존하며 alias를
+canonical로 한 번 선택한다. generic `usage_reported_by`의 임의 key 운반과 정상 parser의 엄격한 거부는 유지한다.
+또한 실제 lifecycle probe에서 refused 5 → ambiguous 2가 cumulative stamp를 다시 더해 attempt-log ValueError로
+바뀌었다. 기존 숫자 settlement에서 이미 합산한 dispatch와 현재 attempt를 구별하여 원래 dispatch_unknown과 합계 7을 보존한다.
+
+recovered v2 evidence prefix는 private attempt log와 따로 유지하고 v1의 과거 dispatch는 legacy_ambiguous로 채운다.
+backoff 취소는 호출 종료 사실만 바꾼다. loop failure observer·예외 translation·required evidence failure·ValidatedCallRunner까지
+동일 사실을 전달한다. invocation/ledger writer는 v1, 03이 영속화, 04가 gateway server·live·Studio·OTel을 담당한다.
+
+수정 전 테스트는 **14 failed / 1 skipped in 4.58s**였다. shared Python의 OpenAI 미설치로 생긴 skip은
+별도 Python 3.11 환경에 최소 지원 OpenAI 1.80.0을 설치해 다시 실행했고 **1 failed in 5.41s**였다.
+실제 terminal→hung EOF→deadline에서 이미 보고한 120/340/460이 빈 stamp로 나오는 실패다.
+raw 출력은 `.tmp/v025/p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때 `git diff -- src`는 비어 있다.
+
+02 최초 600 기능/1,900 총 변경 줄 추정은 유지하며, 숨은 수신 경계와 실패 전달을 반영한 예산은 850/2,300이다.
+01 실제 source 상한 529를 포함한 누적 예상은 2,249 기능 상한/약 7,500 총 변경 줄이다.
+범용 상태 머신·serializer·새 회계 경로는 추가하지 않고 기존 ingress·race·stamp·settlement에 수정을 제한한다.
+기능 2,000줄 soft limit에 접근한 원인과 이 대안을 검토했다. 최종 실제 diff·리뷰 비용을 계속 누적한다.
+
+**02 구현 후보.** 수정 전 회귀 commit은 `9e8c0ef`다. 최초 15개가 통과한 뒤 실제 observer,
+재시도·복구 prefix, 명시적 0과 drain provenance, gateway 선택 reader, unknown 오류 변환을 확장했다.
+준비 callback이 취소를 요청한 뒤 provider에 진입하는 기존 경계도 확인하여 진입 직전 취소 검사를 추가했다.
+`attempts=0`과 provider 진입 0회를 검증한다. unknown의 기존 failed 결과와 별도로 최초 stop·read end를 보존한다.
+
+최종 후보의 관련 suite는 **834 passed in 23.69s**였다. 원본은
+`.tmp/v025/p1p2-02-candidate-tests2.txt`다. 전체 ruff와 diff check, 오프라인
+`examples/model_call_facts.py`도 통과했다. 예제는 input=0의 complete와 total의 unknown을 출력한다.
+runner까지 unwind하는 BaseException은 관측을 보존하며, Python event loop 자체를 끝내는
+KeyboardInterrupt/SystemExit의 기존 원형 전파도 검사했다. 프로세스 종료 뒤 subscriber 실행 보장은 추가하지 않는다.
+carriage census는 새 observation helper·상태 전달·실패 시 비용 보존을 기존 검사에 등록했다.
+stream 종료 뒤 오류·취소·deadline 경합과 P5 권한 회귀도 같은 실행에 포함했다.
+01 병합 후 integration full CI `40454581400`은 성공했다. 02는 두 독립 코드 리뷰와 최종 CI를 진행한다.
+
+**02 리뷰 수정.** 첫 후보 `6950e44`는 두 독립 코드 리뷰에서 NEEDS_FIX였다. 기본 drain-off의 stop,
+로컬 stream callback·fragment 검증을 provider error로 분류하는 경계, malformed usage의 scalar/container 혼동,
+호출자 except 문맥이 새 성공 observer를 덮는 경계, 두 번째 durable dispatch의 BaseException이 이전 receipt를
+재사용하는 경계를 각각 실패시켰다. source owner에서 read-end를 stamp하고, 로컬 caught exception을 보관하며,
+dispatch 시작 시 이전 settlement 임시값을 비우는 수정으로 해결했다. 새로운 회계 경로는 추가하지 않았다.
+
+복구 integrity 오류와 required evidence 재게시 오류도 실제 lifecycle·observer로 확인했다. 독립 targeted
+preflight는 READY였다. 결과 검증 실패의 공개 복구 outcome은 failed/local_failure이며 저장된 원본은 유지한다.
+검증된 복구 receipt 전용 carrier를 recovery hook/decoder 경계에서만 소비해 historical attempts·usage를 보존한다.
+required evidence 게시 실패는 확인된 provider outcome을 유지하고, 읽지 않은 final text·마지막 turn usage는 비워 둔다.
+required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함께 보존한다.
+추가 회귀 원본은 `.tmp/v025/p1p2-02-*-red.txt`, 수정 후 관련 **884 passed / 22.71s**는
+`p1p2-02-review-green.txt`에 있다. source 변경 상한은 약 710줄(공백·주석 포함)로 갱신 예산 850 이내다.
+초기 600/1,900 추정과 누적 비용 기록은 유지한다. 최종 head 재검토·wheel·CI를 다시 확인한다.
+
+재검토 `ef50d9c`는 기존 지적을 해소했다. 남은 required-evidence 복구 재실패의 subscription 미전달도
+02의 공개 전달 계약에 포함했다. 실제 host에서 성공·refusal·손상 결과 세 회귀가 먼저 실패했다.
+같은 checked carrier를 기존 게시 경로에 연결하고 원래 invocation의 failure code·key·request digest를
+유지했다. 원래 provider receipt와 현재 projection 오류를 구분하며 콘텐츠는 생성하지 않는다.
+관련 **42 passed / 2.77s** (`p1p2-02-recovery-subscription-green.txt`), 전체 lint 통과.
+`ef50d9c` wheel audit과 current/minimum 설치 검증은 각각 151 tests PASS였고, 새 final candidate로 갱신한다.
+
+`c979d96` 재검토에서 evidence 게시가 query digest 검증보다 먼저 실패하면 원래 receipt와 현재 prompt를
+함께 공개하는 반례가 나왔다. 실제 full subscription 회귀를 먼저 실패시켰고, digest가 다른 복구 오류는
+현재 요청 content·prompt digest·preimage를 생략하도록 기존 게시 함수를 연결했다. payload capture를 켠
+동일/변경 요청 테스트로 원래 식별자와 필요한 preimage의 유지/생략을 검사했다(4 passed/2.35s).
+`c979d96` 설치 wheel은 current/minimum 각각 152 tests PASS; 최종 변경으로 다시 갱신한다.
+확장 검증 604개에서 새 recovery carrier의 config_recoverable census 등록 누락과 기존 30ms backoff의
+Windows 타이밍 하한 assertion이 한 번 실패했다(602 passed). 등록을 보완했고 같은 timing case를 포함한
+census 196개는 통과했다(10.23s). retry 대기 코드는 변경하지 않았다. 최종 원격 CI로 전체 계약을 확인한다.
+
+`b8f2bd3` 설치 wheel은 current/minimum 각각 153 tests PASS였다. 재검토에서 변경된 모델 설정도
+과거 사용량에 귀속되는 반례를 확인했다. journal에는 과거 ModelConfig가 없으므로 targeted preflight로
+정책을 확정했다(READY). query digest가 다른 required-evidence 실패는 예외·journal의 검증된 사용량과
+facts를 유지하고, 재구성한 subscription/ledger receipt 게시를 생략한다. 현재 routing으로 열린 stream은
+failed/evidence_uncommitted로 정상 close하며 text·usage·termination·evidence를 비워 둔다. 같은 query의
+복구 게시와 기존 회계 증분은 유지한다. 새 placeholder 모델이나 wire 형식은 추가하지 않는다.
+실제 host의 모델·provider·destination 변경 회귀는 수정 전 실패했고, 동일/변경 요청 5개는 수정 후
+통과했다(2.55s; `p1p2-02-recovery-attribution-{red,green}.txt`). 기존 content-only 억제를 이 정책으로 대체한다.

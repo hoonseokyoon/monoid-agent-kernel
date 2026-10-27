@@ -159,7 +159,10 @@ class FencedModelCallLifecycle:
             raise
         except Exception as exc:
             failed = ModelEvidenceUncommitted()
-            mark_recovered_model_usage(failed, invocation.receipt or {})
+            mark_recovered_model_usage(
+                failed, invocation.receipt or {}, failure_code=invocation.failure_code,
+                idempotency_key=invocation.idempotency_key, request_digest=invocation.request_digest,
+            )
             raise failed from exc
 
     def _reject_evidence_policy_change(
@@ -283,7 +286,10 @@ class FencedModelCallLifecycle:
             message,
             error_code="durable_invocation_result_corrupt",
         )
-        mark_recovered_model_usage(error, invocation.receipt or {})
+        mark_recovered_model_usage(
+            error, invocation.receipt or {},
+            idempotency_key=invocation.idempotency_key, request_digest=invocation.request_digest,
+        )
         return error
 
     def recover(
