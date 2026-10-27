@@ -1781,10 +1781,15 @@ class AgentLoop:
             )
         try:
             res = self._bootstrap()
-        except Exception as exc:  # controlled recording boundary for standalone CLI
+        except BaseException as exc:
             res = self._bootstrap_resources
-            if res is None:
-                self._close_model_io_subscriptions()
+            # Only ordinary failures with published resources become recordable failed sessions.
+            # Escaping bootstrap/control failures release this activation and keep their cause.
+            if res is None or not isinstance(exc, Exception):
+                try:
+                    self.discard_uncommitted()
+                except BaseException:
+                    pass
                 raise
             state = RunState()
             try:
@@ -2624,8 +2629,8 @@ class AgentLoop:
             except BaseException:
                 pass
             raise
-        self._close_model_io_subscriptions(session.res)
         try:
+            self._close_model_io_subscriptions(session.res)
             # A successfully completed run has nothing to recover: drop its checkpoints. A
             # failed/limited run KEEPS its checkpoints so the last-good one (named in
             # failure.json) is available for an operator-driven restore.
@@ -2725,21 +2730,25 @@ class AgentLoop:
                 resources.recorder.discard_uncommitted()
             except BaseException as exc:  # cleanup continues through the owned event loop
                 cleanup_errors.append(exc)
-        if self.write_authority.revoked:
-            # External observer close hooks may flush or commit projections. A stale activation
-            # releases only kernel-owned handles and leaves adapter cleanup to its fenced host.
-            self._model_io_subscriptions_closed = True
-        else:
-            self._close_model_io_subscriptions(resources)
-        self._finalized = True
-        self._session = None
-        self._bootstrap_resources = None
-        self._stream_sink = None
-        self._detach_authority_callback()
         try:
-            self._maybe_close_loop()
-        except BaseException as exc:
-            cleanup_errors.append(exc)
+            if self.write_authority.revoked:
+                # External observer close hooks may flush or commit projections. A stale activation
+                # releases only kernel-owned handles and leaves adapter cleanup to its fenced host.
+                self._model_io_subscriptions_closed = True
+            else:
+                self._close_model_io_subscriptions(resources)
+        finally:
+            # Subscription authority/control failures retain their existing precedence over the
+            # collected cleanup errors, while every path releases the activation on its first try.
+            self._finalized = True
+            self._session = None
+            self._bootstrap_resources = None
+            self._stream_sink = None
+            self._detach_authority_callback()
+            try:
+                self._maybe_close_loop()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         if cleanup_errors:
             raise cleanup_errors[0]
 
@@ -3754,10 +3763,10 @@ class AgentLoop:
         try:
             res = self._bootstrap()
             self._rehydrate(checkpoint, res, _as_blob_reader(blobs))
-        except Exception:
+        except BaseException:
             try:
                 self.discard_uncommitted()
-            except Exception:
+            except BaseException:
                 # Preserve the restore failure as the actionable cause. Cleanup still attempts
                 # every owned resource before it reports its own first error.
                 pass

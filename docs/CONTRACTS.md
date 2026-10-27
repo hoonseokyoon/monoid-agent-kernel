@@ -2543,6 +2543,12 @@ competing input.
   durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
   process. Terminal artifact finalization remains the caller's responsibility.
+- Escaping bootstrap and restore failures release activation-owned handles, including when a
+  recorder constructor's authority postcheck rejects its result. Ordinary bootstrap failures
+  that produce a recordable failed session keep its recorder alive until `close()` returns that
+  failed result. Subscription cleanup failure still tears down the session, authority callback,
+  and owned loop on the first attempt. Cleanup preserves an already-escaping failure and the
+  existing authority-loss precedence; stale cleanup performs only local handle disposal.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, provider_error_code, http_status, retryable, config_recoverable, type,
   last_good_seq, restore_hint}`) —

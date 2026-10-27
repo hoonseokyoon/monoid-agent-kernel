@@ -9,6 +9,10 @@ out in commit messages and here.
 
 ### Fixed
 
+- Release activation-owned recorder handles when authority is lost during construction or before
+  bootstrap publishes its resources. Subscription cleanup failures now finish session, callback,
+  and owned-loop teardown on the first attempt. Escaping bootstrap, restore, and finalization
+  errors keep their original cause; recordable failed sessions retain their recorder until close.
 - Preserve validated Python values in `@tool` inputs, including nested Pydantic models, without
   running input serializers. Serialize top-level model returns in JSON mode using the existing
   tool observation envelope; serialization failures remain controlled tool errors and available

@@ -449,6 +449,7 @@ class AgentRecorder:
     run_dir: Path = field(init=False)
     artifacts_dir: Path = field(init=False)
     event_bus: EventBus = field(init=False)
+    _event_file_sink: JsonlEventSink = field(init=False, repr=False)
     _transcript_file: TextIO = field(init=False, repr=False)
     started_at: float = field(default_factory=time.time)
     artifacts: list[AgentArtifact] = field(default_factory=list)
@@ -514,12 +515,13 @@ class AgentRecorder:
     _payload_chunk_shas: set[str] = field(default_factory=set, init=False, repr=False)
     _payload_request_digests: set[str] = field(default_factory=set, init=False, repr=False)
 
-    @_authority_local_mutation
     def __post_init__(self) -> None:
         transcript_file: TextIO | None = None
         event_file_sink: JsonlEventSink | None = None
-        self._check_writer_authority()
-        try:
+
+        def initialize() -> None:
+            nonlocal transcript_file, event_file_sink
+            self._check_writer_authority()
             if (
                 not is_portable_json_integer(self.event_sequence_seed)
                 or self.event_sequence_seed < 0
@@ -550,6 +552,7 @@ class AgentRecorder:
             self._terminate_torn_transcript_tail()
             self._check_writer_authority()
             event_file_sink = JsonlEventSink(events_path)
+            self._event_file_sink = event_file_sink
             self._check_writer_authority()
             sinks: list[EventSink] = [*self.authoritative_event_sinks, event_file_sink]
             if self.status_file:
@@ -562,6 +565,11 @@ class AgentRecorder:
                 write_authority=self.write_authority,
             )
             self._check_writer_authority()
+
+        try:
+            # The guard's postcheck can fail after initialization returns. Keep ownership of the
+            # opened handles until that check has also succeeded and the constructor can return.
+            self.write_authority.guard_local_mutation(initialize)
         except BaseException:
             # Construction can lose authority after opening local files but before bootstrap can
             # publish this recorder for ordinary cleanup. Release only recorder-owned handles:
@@ -1465,13 +1473,10 @@ class AgentRecorder:
     def discard_uncommitted(self) -> None:
         """Release recorder-owned handles without publishing through observer or event sinks."""
 
-        for sink in getattr(self.event_bus, "sinks", ()):
-            if isinstance(sink, JsonlEventSink):
-                try:
-                    sink.close()
-                except OSError:
-                    _LOGGER.debug("event log discard close failed", exc_info=True)
-                break
+        try:
+            self._event_file_sink.close()
+        except OSError:
+            _LOGGER.debug("event log discard close failed", exc_info=True)
         self._close_owned_handles(flush_model_content=False)
 
     def _close_owned_handles(self, *, flush_model_content: bool = True) -> None:
