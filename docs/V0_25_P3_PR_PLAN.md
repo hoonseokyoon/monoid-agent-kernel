@@ -207,7 +207,7 @@ P3-03에서 `HostToolBinding(..., inherit_to_children=True)`를 추가한다. �
 
 상속한 view는 child-local guard와 모든 parent activation/authority lineage를 검사한다.
 parent revoke 또는 parent activation 종료 후 자식의 새 접근을 거부한다.
-child 종료는 parent/sibling adapter를 닫지 않는다. 등록 callback은 각 child 종료에 제거한다.
+child 종료는 parent/sibling adapter를 닫지 않는다. lineage는 수명 token 검사로 연결하며 새 callback을 등록하지 않는다.
 복구된 parent가 새 child를 만들면 새 lineage에 연결한다. 끝난 parent의 child를 자동 재연결하지 않는다.
 
 이 보장은 신규 상속 자원의 사용 권한이다. 자식 모델 호출 강제 취소·drain/usage 합산은 P8에서 다룬다.
@@ -739,3 +739,30 @@ CI fixture 보완 뒤 develop `40430925138` 및 integration `40430979676` 전체
 기본 상속 거부와 spec policy 경로 4개는 통과 대조다. 초기 fixture의 reports directory를 준비한 뒤
 실제 child write 성공을 관찰해 고정했다. production source는 base와 동일하다.
 원본은 `.tmp/v025/p3-03-red.log`. 표준 4-worker pytest로 새 test module만 실행했다.
+
+수정 전 회귀 commit은 `f10f6de`다. P3-02 integration 전체 CI `40431588835`의 14개 job 성공을
+확인한 뒤 production을 변경했다. opt-in field, fresh child factory, parent lifetime chain,
+effective policy 전달과 handler의 local/resource 검사를 연결했다. 초기 10개 회귀는 **10 passed / 2.87s**다.
+
+실제 child/fork/nested 실행, 호출 중 root·중간 parent 종료/revoke, callback 전후, 진입한 child write barrier,
+sibling/parent 독립, mixed opt-in, fresh restore 및 packaged consumer까지 **35 passed / 5.96s**다.
+원본은 `.tmp/v025/p3-03-green.log`. 초기 restore fixture는 공유 FakeModelAdapter의 소비된 turn list를
+복사하도록 수정했고, 중간 parent revoke의 기존 `TurnNotSettled(interruption_cause=lease_lost)`도 보존했다.
+기존 `snapshot()`은 실행 중인 in-process resume job을 durable park로 허용하지 않는다.
+공개 committed release 회귀는 `create_task(..., resume_on_exit=False)`의 host-driven child를 사용해
+정상 committed 경계에서 parent를 release하고, 아직 살아 있는 child call의 접근 거부를 검증한다.
+새로운 background-task 복구 정책은 추가하지 않았다.
+
+최종 focused 검사는 **647 passed, 1 platform skip / 20.31s**다
+(`.tmp/v025/p3-03-focused.log`). 기존 P3-02 focused 목록에 새 child tests와 기존
+`test_subagent.py`/`test_subagent_runtime_context.py`를 추가했다. ruff0.15.6과 diff 공백 검사도 통과했다.
+메모리에서 parent token 연결만 제거한 음성 대조는 child write 도중 parent end가 즉시 반환하여
+barrier 회귀가 **1 failed / 0.66s**로 검출했다. production은 변경하지 않았고 원본은
+`.tmp/v025/p3-03-parent-guard-negative.py`/`.log`다.
+
+현재 source wheel audit 및 PYTHONPATH 없는 checkout 밖 installed-wheel recipe를 다시 실행했다.
+Python3.11.9/Pydantic2.14.1과 최소 계열2.6.4 모두 승인·복구 및 fresh/fork report를 완료했다.
+각 흐름의 activation은 2개이고 proposal-only 결과를 확인했다. 기존 minimal install CI가 같은 module을 실행한다.
+현재 P3-03 변경은 production 약 160줄, 총 약 910줄이다. 원래 총량 상한800보다 약14% 늘어난 부분은
+실제 policy 회귀, nested/barrier/committed release 검증과 실행 기록이다. 누적 구현 diff는 약3,550줄로
+기능2,000줄 soft limit·총비용1.5배 재계획 기준 이내다. 범용 추상화와 새 runner는 추가하지 않았다.
