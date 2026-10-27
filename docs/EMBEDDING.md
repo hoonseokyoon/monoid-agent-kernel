@@ -655,7 +655,7 @@ Treat `CancellationToken.cause` as first-cause execution-control history. Inject
 when lease ownership moves. Revocation wakes the loop while preserving an earlier Stop or drain
 cause, and the stale activation returns an ephemeral `lease_lost` disposition. Required-evidence
 recovery checks the authority before and after its lifecycle hook. Token-based deadlines use the
-same `run_timeout` terminal projection as elapsed wall-clock deadlines.
+same `run_timeout` terminal projection as elapsed run-duration deadlines.
 
 Keep the host's `WriterToken(run_id, owner_id, generation)` beside the process-local authority.
 Checkpoint, invocation, canonical event, and terminal adapters validate that token atomically with
@@ -827,6 +827,21 @@ Stream metadata contains opaque IDs, channel taxonomy, offsets, sizes, and diges
 model text. `read_after()` returns private bytes and performs no tenant authorization; expose it
 only through a product-owned authenticated projection. Derive globally unique kernel run IDs or
 apply tenant scoping in that wrapper.
+
+### Deadline inputs and restoration
+
+Pass an absolute Unix epoch to standalone `ModelCallRunner.acall` or
+`ValidatedCallRunner.acall`, for example `deadline=time.time() + 30`. The runner converts
+it once to a monotonic budget covering retries and validated repairs. `None` or `math.inf`
+is unbounded; an expired epoch or `-math.inf` expires immediately. Invalid numbers such as
+NaN, booleans, nonnumeric values and overflowing integers raise `ValueError` before any
+adapter or receipt callback. Keep passing epoch values through existing wrappers.
+
+`RunLimits.max_duration_s` measures active time from workspace and host-resource setup
+completion. Model waits, tool waits, drain windows and duration metrics share this monotonic
+clock. Checkpoints store the remaining duration and restore it against the new process clock,
+so time spent parked does not consume the run budget. Existing settled-call recovery still
+publishes its authoritative evidence before applying an expired run boundary.
 
 ### Billing a stopped stream
 

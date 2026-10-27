@@ -4085,7 +4085,7 @@ def test_a_call_refused_before_its_key_hands_the_sink_no_preimage() -> None:
         adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
     )
     with pytest.raises(RunTimeout):
-        asyncio.run(runner.acall(REQUEST, deadline=time.monotonic() - 1.0))
+        asyncio.run(runner.acall(REQUEST, deadline=time.time() - 1.0))
 
     assert len(recorded) == 1
     assert recorded[0].request_preimage is None

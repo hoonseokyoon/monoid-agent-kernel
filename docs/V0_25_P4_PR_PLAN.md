@@ -399,3 +399,42 @@ manual diagnostic 또는 dormant 성공을 대체 근거로 사용하지 않는�
 [GitHub 이벤트 문서](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)를
 10/28 재확인했고 기존 Draft-fast/Ready-required 경계를 유지한다. 코드 리뷰와 최종 remote CI는 이어서 확인한다.
 기능 delta는 등록 2줄이고 계획 commit의 475줄 churn과 실행 기록을 누적 비용에 포함한다.
+
+00 [PR #162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 final head `1be46be`에서 독립 코드 **PASS**,
+[L1 40543644526](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40543644526) 및
+[required L2 core 40543818445](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40543818445) **SUCCESS**를 확인했다.
+Ready 전환으로 자동 실행된 GitHub 리뷰도 같은 head에 지적이 없었다. dormant run은 병합 근거에서 제외했다.
+develop merge는 `22aae182f98b8846747b894a661dfad6e5f52bd2`다. fetch 후 reviewed head와 tree 동일성을 확인했다.
+이 base에서 `codex/v0.25-p4-termination-budget`를 생성·push하고, 01 branch `codex/v0.25-p4-clock`를 만들었다.
+
+### 9.2 P4-01 사전조사 — 2026-10-28
+
+actual base는 00 병합 뒤 `22aae18`이며 runtime는 계획 기준 `2914c43`과 동일하다.
+읽기 전용 조사자 `p4_01_research`가 내부 public acall 소비자(loop/validated)와 실제 CSP epoch 입력을 대조했다.
+최소 private `_MonotonicDeadline(cutoff_s)` carrier는 공개 진입 경계만 구분하고 내부 기존 deadline 인자는 monotonic float로 유지한다.
+public acall 경로·callback arity를 보존하고 `_deadline` keyword로 이미 변환된 unbounded도 전달한다.
+private deadline을 epoch로 표시하는 제품 소비자는 없으므로 별도의 wall deadline 복제본은 만들지 않는다.
+숫자로 표현할 수 없는 큰 정수 입력도 ValueError로 거부하며 unbounded로 바꾸지 않는다.
+
+수정 지도는 model/validated/loop/loop_phases/shared bridge의 16개 시간 계산과 작은 core helper다.
+private checkpoint assertion 1개는 monotonic 기준으로, public deadline에 monotonic 과거값을 주던 테스트 1개는 epoch로 바로잡는다.
+테스트 helper가 public runner에 전달하는 epoch 입력은 그대로 유지한다. invalid는 accessor·invocation·receipt 전 검증하되,
+valid-expired durable recovery는 기존 evidence 재게시 뒤 boundary 검사를 유지한다.
+CPython b94b9c8·AnyIO #1317·Python 3.11 clock 문서를 10/28 재확인했다.
+PR별 상세 조사 `.tmp/v025/p4-01-preflight.md`를 별도 독립 reviewer가 검토하며, 코드보다 행동 회귀를 먼저 고정한다.
+
+독립 reviewer `p4_01_preflight_review`는 actual base `22aae18`에서 **READY**, 필수 보완 0건으로 판정했다.
+검토한 preflight SHA-256은 `6846584bf88279f96cc43b0e97371f0e70cc0e732a17635359371edc33ef200f`다.
+이후 root가 공유 runner·최종 구현/통합을, `p4_01_research`가 테스트 파일에 한정한 실패 회귀 작성을 맡는다.
+테스트-only 실패를 실행·commit하기 전 제품 코드는 수정하지 않는다.
+
+통합 branch 최초 push [CI 40544692527](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40544692527)은
+`22aae18`에서 **SUCCESS**, actual combined services 포함이다. 01 제품 수정 전 테스트-only `029152f`를 고정했다.
+`.tmp/v025/p4-01-red-core.txt`는 **22 failed / 24 passed (8.75s)**다. wall jump의 조기 종료·retry/repair 예산 재충전·
+drain 연장과 invalid 입력의 부수효과를 실제 runner에서 확인했다. 최초 테스트 fixture의 사용량 정규화와
+validated durable ID 설정 오류를 교정한 뒤 기록한 결과이며, 모든 무변경 대조군이 통과한다.
+root는 그 뒤 private carrier·16개 시간 계산·public 소비자 연결과 clock 계약 문서를 수정한다.
+
+핵심 회귀 **46 passed (5.90s)**, 실제 loop/tool/restore를 포함한 영향군 **728 passed (40.22s)**다.
+후자는 model/validated/async loop/tools/checkpoint/cancellation/stream observer 8개 모듈을 함께 실행했다.
+원본 `.tmp/v025/p4-01-green-core.txt`, `p4-01-related-green.txt`. 추가 정밀 경계·설치 wheel과 독립 리뷰·CI는 이어서 확인한다.

@@ -15,12 +15,12 @@ import contextlib
 import inspect
 import logging
 import threading
-import time
 from collections.abc import Callable
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.errors import RunCancelled, RunTimeout
@@ -325,6 +325,7 @@ async def await_abandonable_call(
     of which boundaries are terminal *while this kind of call is in flight*: a model call answers to
     cancellation and the deadline only, a tool handler also answers to interrupt and pause.
     `grace_s` is how long an abandoned worker gets to settle.
+    `deadline` is an absolute process-monotonic cutoff, shared with `check_boundary`.
 
     A synchronous callee cannot be interrupted: its thread keeps running to completion. Cancelling
     its future therefore *abandons* the call -- the run stops waiting within `grace_s` and the
@@ -374,7 +375,7 @@ async def await_abandonable_call(
     try:
         if token is not None:
             remove_callback = token.add_cancel_callback(signal_cancelled)
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        timeout = None if deadline is None else max(0.0, deadline - deadline_clock.monotonic())
         await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         # Checked before the result is read, so a boundary that lands in the same tick as a
         # completed call still wins. A run told to stop must not report work it decided not to do.

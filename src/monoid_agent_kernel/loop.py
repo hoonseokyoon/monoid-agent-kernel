@@ -17,6 +17,8 @@ from contextvars import ContextVar
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
+from monoid_agent_kernel.core._deadline import _MonotonicDeadline
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
     CalleeCancelled,
@@ -2636,9 +2638,9 @@ class AgentLoop:
         self._assert_write_authority()
         session = self._require_open()
         manager = session.res.context._job_manager
-        deadline = time.time() + max(0.0, timeout_s)
+        deadline = deadline_clock.monotonic() + max(0.0, timeout_s)
         while manager.has_resume_jobs():
-            remaining = deadline - time.time()
+            remaining = deadline - deadline_clock.monotonic()
             if remaining <= 0:
                 return False
             if manager.wait_for_reentry(min(0.25, remaining)):
@@ -3197,7 +3199,7 @@ class AgentLoop:
             turn, receipt = await runner.acall(
                 request,
                 context=invocation_context,
-                deadline=deadline,
+                _deadline=_MonotonicDeadline(deadline),
                 delta_consumer=delta_consumer,
                 before_dispatch=before_dispatch,
                 before_settlement=before_settlement,
@@ -3645,7 +3647,7 @@ class AgentLoop:
             workspace_delta=self._workspace_delta_entries(res.workspace),
             workspace_base=res.workspace.workspace_base_payload(self.spec.run_id),
             remaining_duration_s=(
-                max(0.0, res.deadline - time.time()) if res.deadline is not None else None
+                max(0.0, res.deadline - deadline_clock.monotonic()) if res.deadline is not None else None
             ),
             cancellation_requested=cancellation_requested,
             applied_input_ids=sorted(session.applied_input_ids),
@@ -3881,7 +3883,7 @@ class AgentLoop:
         # max_duration_s (a run parked overnight on a human should not time out). Keep
         # the elapsed-so-far consistent so _build_metrics duration stays sane.
         if cp.remaining_duration_s is not None:
-            now = time.time()
+            now = deadline_clock.monotonic()
             max_duration_s = self.spec.limits.max_duration_s
             started = (
                 now - (max_duration_s - cp.remaining_duration_s)
@@ -4543,7 +4545,7 @@ class AgentLoop:
             step=step,
             remaining_steps=remaining_steps,
             remaining_tool_calls=max(0, limits.max_tool_calls - state.total_tool_calls),
-            deadline_s=(res.deadline - time.time()) if res.deadline is not None else None,
+            deadline_s=(res.deadline - deadline_clock.monotonic()) if res.deadline is not None else None,
             plan=tuple(res.context.plan),
             pending_observation_count=len(state.pending_observations),
         )
@@ -6162,7 +6164,7 @@ class AgentLoop:
             self._check_run_boundary(deadline)
             wait_s = 0.25
             if deadline is not None:
-                wait_s = max(0.01, min(wait_s, deadline - time.time()))
+                wait_s = max(0.01, min(wait_s, deadline - deadline_clock.monotonic()))
             if context._job_manager.wait_for_reentry(wait_s):
                 return
 
@@ -7162,7 +7164,7 @@ class AgentLoop:
                     self.cancellation_token.cause or InterruptionCause.USER_CANCEL
                 ),
             )
-        if deadline is not None and time.time() >= deadline:
+        if deadline is not None and deadline_clock.monotonic() >= deadline:
             raise RunTimeout("run exceeded max duration")
         # Run-level cancel (terminal) takes precedence over a turn-level interrupt (non-terminal).
         if self._interrupt_requested:
