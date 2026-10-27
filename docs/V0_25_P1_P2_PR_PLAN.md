@@ -639,3 +639,28 @@ failed/evidence_uncommitted로 정상 close하며 text·usage·termination·evid
 복구 게시와 기존 회계 증분은 유지한다. 새 placeholder 모델이나 wire 형식은 추가하지 않는다.
 실제 host의 모델·provider·destination 변경 회귀는 수정 전 실패했고, 동일/변경 요청 5개는 수정 후
 통과했다(2.55s; `p1p2-02-recovery-attribution-{red,green}.txt`). 기존 content-only 억제를 이 정책으로 대체한다.
+
+**02 완료.** PR #158은 최종 `7208615e91e173a2c15781dffad8eda3f6f14970`에서 두 독립 코드 리뷰 PASS,
+L1 `40461636410`·필수 core L2 `40461723407` SUCCESS 후 통합 `617deadc5012c2d749b395497651a7dc69985572`에
+병합했다. 최종 코드 `1cc172b` wheel은 current/minimum 각각 154 tests PASS(3.27/2.93s), 예제·audit 통과.
+마지막 head는 계약 문서만 수정했으므로 같은 binary 근거를 재사용했고 문서 delta도 두 리뷰가 확인했다.
+마지막 attribution 관련 recovery·observer·census 297개 통과(13.22s). 실제 source 추가 788/삭제 104줄,
+전체 추가 1,501/삭제 128줄이다. 줄 수에는 공백·주석이 포함되며 기능 비용의 보수적 대용치로 기록한다.
+
+### 9.4 P1P2-03 실제 base 사전조사
+
+새 branch `codex/v0.25-p1-p2-storage`의 base는 위 02 병합본 `617deadc`다. 재조회한 develop은 `d4e659c`다.
+사전조사 `.tmp/v025/p1p2-03-preflight.md` SHA-256
+`064BC150A186FBF04FD865D42DBE5183161ED4BAB88281F0BA6AC38EB2979C71`는 독립 검토 READY다.
+기존 두 codec·source envelope·bounded projection·실제 service harness를 재사용한다. v1 codec 식별자는
+고정하고 version dispatch reader를 registry에 기록한다. reader-prep binary가 새 v1 revision을 쓰는 롤백에서는
+그 revision이 보존하지 못한 관측을 legacy_ambiguous로 유지하며 새 provenance를 만들어 내지 않는다.
+03 추정은 350 기능/1,250 총 변경 줄이다. 누적 2,187은 추가 줄 기준 예상이며 02 삭제까지 포함하면
+2,291이다. 이 기준을 구분하고 더 작은 기존 경계 재사용으로 soft limit 접근 원인을 해소한다.
+root가 제품 소스와 단일 테스트 runner를 담당하고 별도 worker가 지정된 세 service-test 파일을 담당한다.
+모든 편집을 마친 뒤 테스트를 실행하며, 최종 두 코드 리뷰·설치 wheel·combined CI는 별도 gate다.
+
+03 실제 base의 제품 소스를 수정하기 전 새 회귀 11개가 모두 실패했다(3.04s;
+`.tmp/v025/p1p2-03-red.txt`). 실제 fenced 복구 6개, recorder 성공·실패·retry 3개,
+historical v1/v2에서 새 revision 전이 2개다. service worker는 같은 경계를 기존 PG16/18,
+ObjectStore·Temporal 테스트에 연결했고 아직 실행하지 않았다. 아래 테스트 전용 commit으로 red를 고정한다.

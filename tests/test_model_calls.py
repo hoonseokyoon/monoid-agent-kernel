@@ -122,6 +122,47 @@ def test_every_settled_call_including_a_failed_one_gets_exactly_one_line(tmp_pat
     assert record["request_digest"]
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "retry"])
+def test_fresh_v2_ledger_preserves_sparse_dispatch_observations(tmp_path: Path, outcome: str) -> None:
+    from monoid_agent_kernel.core.model_facts import UsageObservation
+    from monoid_agent_kernel.core.spec import ModelRetryConfig
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    refused = ModelAdapterError("upstream refused", retryable=outcome == "retry")
+    mark_provider_usage(refused, {"input_tokens": 2, "output_tokens": 0, "total_tokens": 2})
+    mark_usage_observation(refused, UsageObservation(
+        reported={"input_tokens": 2, "output_tokens": 0}, source="adapter", collection="normal",
+    ))
+    turn = ModelTurn(final_text="answer", usage={"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                     usage_evidence=UsageObservation(reported={"input_tokens": 3}, source="adapter", collection="normal"))
+    results = [turn] if outcome == "success" else [refused, turn] if outcome == "retry" else [refused]
+
+    class Adapter(_Adapter):
+        def next_turn(self, request):
+            result = results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    result = _loop(tmp_path, Adapter(), config=runtime_config("run.finish", model=ModelConfig(
+        retry=ModelRetryConfig(layer="kernel", max_attempts=2, initial_delay_s=0, jitter_s=0),
+    ))).run_once("hi")
+    records = _records(result.run_dir)
+    assert len(records) == 1
+    record = records[0]
+    assert record["schema_version"] == "monoid.model-calls.v2"
+    assert record["termination"]["outcome"] == ("failed" if outcome == "failure" else "completed")
+    evidence = record["usage_evidence"]
+    assert evidence["completeness"]["total_tokens"] == "unknown"
+    assert evidence["completeness"]["output_tokens"] == {"success": "unknown", "failure": "complete", "retry": "partial"}[outcome]
+    assert evidence["reported"]["input_tokens"] == record["usage"]["input_tokens"]
+    assert len(record["attempt_log"]) == len(evidence["attempts"]) == record["attempts"]
+    for entry, observed in zip(record["attempt_log"], evidence["attempts"]):
+        assert entry["usage_evidence"] == {key: observed[key] for key in ("reported", "source", "collection")}
+    assert validate_run_dir(result.run_dir) == []
+
+
 def test_the_ledger_a_run_writes_validates_against_its_own_schema(tmp_path: Path) -> None:
     """``monoid validate`` is the ledger's only reader in this release, so it has to agree."""
     result = _loop(tmp_path, _Adapter()).run_once("hi")

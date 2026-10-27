@@ -516,6 +516,58 @@ def test_settled_success_replays_private_result_without_provider_call(tmp_path: 
     assert checkpoint.total_usage == turn.usage
 
 
+@pytest.mark.parametrize("policy", ["passive", "required", "outbox"])
+@pytest.mark.parametrize("refused", [False, True])
+def test_fresh_v2_settlement_preserves_sparse_facts_after_process_loss(tmp_path: Path, policy, refused) -> None:
+    from support.fenced_hosting import _record_digest
+    from monoid_agent_kernel.core.model_facts import UsageObservation
+    from monoid_agent_kernel.core.model_io import CapturePolicy, ModelIOSubscription
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    harness = DeterministicFencedRunHarness()
+    harness.sink.capabilities = replace(harness.sink.capabilities, transactional_outbox=True)
+    usage = {"input_tokens": 0, "output_tokens": 2, "total_tokens": 2}
+    observation = UsageObservation(reported={"input_tokens": 0, "output_tokens": 2}, source="adapter", collection="normal")
+    result = ModelDispatchRefused("refused", error_code="provider_refused") if refused else ModelTurn(
+        final_text="stored answer", usage=usage, usage_evidence=observation,
+    )
+    if refused:
+        mark_provider_usage(result, usage)
+        mark_usage_observation(result, observation)
+    adapter = _ScriptedAdapter(result)
+    baseline, stored = _crash_at(tmp_path, harness, adapter, "settled", model_evidence_policy=policy)
+    payload = stored.invocation.to_json()
+    assert payload["schema_version"] == "monoid.model-invocation.v2"
+    evidence = payload["receipt"]["usage_evidence"]
+    assert evidence["reported"] == {"input_tokens": 0, "output_tokens": 2}
+    assert evidence["completeness"]["input_tokens"] == "complete"
+    assert evidence["completeness"]["total_tokens"] == "unknown"
+    assert evidence["attempts"][0]["source"] == "adapter"
+    captures = []
+
+    class Observer:
+        def on_model_call(self, capture):
+            captures.append(capture.receipt)
+
+    coord = (RUN_ID, LOGICAL_CALL_ID, stored.revision)
+    original_digest = harness.sink._invocations[coord][0]
+    for _ in range(2):
+        suspension, checkpoint = _restore(
+            tmp_path, harness, adapter, baseline, model_evidence_policy=policy,
+            model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="none")),),
+        )
+        assert suspension.reason == ("terminal" if refused else "settled")
+        assert checkpoint.total_usage == usage
+        assert checkpoint.last_model_invocation["receipt"]["usage_evidence"] == evidence
+        assert captures[-1].usage_evidence.to_json() == evidence
+        assert captures[-1].termination.to_json() == payload["receipt"]["termination"]
+        assert len(adapter.requests) == 1
+        assert harness.sink._invocations[coord][0] == original_digest
+    if policy != "passive":
+        delivered = harness.sink._model_evidence if policy == "required" else harness.sink._model_evidence_outbox
+        assert len(delivered) == 1 and delivered[coord][0] == _record_digest(payload)
+
+
 def test_required_evidence_obligation_survives_pre_checkpoint_settlement_crash(
     tmp_path: Path,
 ) -> None:
