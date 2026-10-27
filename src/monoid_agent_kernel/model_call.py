@@ -97,6 +97,7 @@ from monoid_agent_kernel.model_lifecycle import (
     durable_model_result_blob,
     durable_model_turn,
     mark_recovered_model_usage,
+    recovered_model_failure_receipt,
     raise_model_dispatch_unknown,
     recover_model_dispatch,
     reserve_model_dispatch,
@@ -1171,11 +1172,17 @@ class ModelCallRunner:
                         error_code="durable_invocation_unkeyable",
                     )
                 if lifecycle_hook is not None:
-                    recovered = recover_model_dispatch(
-                        lifecycle_hook,
-                        logical_call_id=logical_call_id,
-                        request_digest=receipt.request_digest,
-                    )
+                    try:
+                        recovered = recover_model_dispatch(
+                            lifecycle_hook,
+                            logical_call_id=logical_call_id,
+                            request_digest=receipt.request_digest,
+                        )
+                    except DurableModelCallError as recovery_error:
+                        recovered_failure_receipt = recovered_model_failure_receipt(
+                            recovery_error, receipt,
+                        )
+                        raise
                     if recovered is not None:
                         # The recovery hook performs the fenced, idempotent settlement/evidence
                         # commit and invokes no provider. Let that commit barrier finish before a
@@ -1255,7 +1262,9 @@ class ModelCallRunner:
                                 turn = durable_model_turn(recovered.result_blob)
                             except DurableModelCallError as recovery_error:
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
-                                recovered_failure_receipt = receipt.with_error(recovery_error)
+                                recovered_failure_receipt = recovered_model_failure_receipt(
+                                    recovery_error, receipt,
+                                ) or receipt.with_error(recovery_error)
                                 raise
                             if not _recovered_result_matches_evidence(turn, recovered.receipt):
                                 recovery_error = DurableModelCallError(
@@ -1263,7 +1272,9 @@ class ModelCallRunner:
                                     error_code="durable_invocation_result_corrupt",
                                 )
                                 mark_recovered_model_usage(recovery_error, recovered.receipt)
-                                recovered_failure_receipt = receipt.with_error(recovery_error)
+                                recovered_failure_receipt = recovered_model_failure_receipt(
+                                    recovery_error, receipt,
+                                ) or receipt.with_error(recovery_error)
                                 raise recovery_error
                             settled = self._publish(
                                 request,
@@ -1307,7 +1318,11 @@ class ModelCallRunner:
                         # `acall` docstring draws for `should_abort`.
                         nonlocal delivered
                         delivered = True
-                        inner_consumer(chunk)
+                        try:
+                            inner_consumer(chunk)
+                        except BaseException as exc:
+                            mark_read_end(exc, _termination_for(exc).ended_by)
+                            raise
 
                     consumer = _marking_consumer
                 reservation: ModelDispatchReservation | None = None
@@ -1345,6 +1360,7 @@ class ModelCallRunner:
                         lifecycle_hook.dispatch_started(reservation)
                         self._assert_write_authority()
                     attempts_made = next_attempt
+                    durable_outcome_receipt = None
                     reports_before = progress.count
                     attempt_started = time.monotonic()
                     try:
@@ -2035,6 +2051,15 @@ class ModelCallRunner:
             for normalized_chunk in ingress.finish():
                 deliver(normalized_chunk)
 
+        def abort_requested() -> bool:
+            if should_abort is None:
+                return False
+            try:
+                return should_abort()
+            except BaseException as exc:
+                mark_read_end(exc, _termination_for(exc).ended_by)
+                raise
+
         async def drain_rest(drain: _AbortDrain, first: Any) -> ModelTurn:
             # Everything the provider still sends goes through a normalizer of its own and is
             # dropped after the fold: no delivery, no assembly (a truncated tool argument must not
@@ -2090,8 +2115,7 @@ class ModelCallRunner:
                         deliver(normalized_chunk)
                     if (
                         (drain is None or not drain.started)
-                        and should_abort is not None
-                        and should_abort()
+                        and abort_requested()
                     ):
                         deliver_remainder()
                         if drain is not None:
@@ -2531,7 +2555,7 @@ class ModelCallRunner:
             raise cancelled from exc
         except BaseException as exc:
             if read_end_of(exc) is None:
-                if isinstance(exc, (RunCancelled, RunTimeout, asyncio.CancelledError)):
+                if isinstance(exc, (RunCancelled, RunTimeout, ModelCallAborted, asyncio.CancelledError)):
                     mark_read_end(exc, _termination_for(exc).ended_by)
                 else:
                     mark_read_end(exc, "provider_error")

@@ -475,6 +475,13 @@ delivered later. Escaping runner exceptions carry `model_call_termination` and
 `model_usage_evidence`; existing numeric `provider_usage` stamps continue to serve accounting.
 `ValidatedCallRunner.receipts` contains completed calls; the failed call keeps its own exception facts.
 
+Recovery verification failures report a current `failed` / `local_failure` outcome while keeping
+checked historical attempts, numeric usage and usage evidence. The immutable stored settlement
+retains its original termination and hash. A required-evidence projection failure retains the
+checked provider outcome; when no private turn has been loaded, the stream observer leaves final
+text and successful final-turn usage unavailable. Refusal replay preserves its facts alongside
+the existing accounting delta, which can be empty after the original usage was applied.
+
 See the offline [subscription example](../examples/model_call_facts.py). In the P1P2-02 preparation
 stage, invocation/model-calls writers remain v1 and omit these facts. P1P2-03 activates v2 writers;
 P1P2-04 completes gateway-server, live/Studio and OTel projections.

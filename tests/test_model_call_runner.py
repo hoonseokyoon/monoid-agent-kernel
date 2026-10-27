@@ -157,6 +157,31 @@ def test_p1p2_explicit_zero_received_during_drain_replaces_prior_report() -> Non
     assert call_facts_of(outcome.error) == (outcome.receipt.termination, outcome.receipt.usage_evidence)
 
 
+@pytest.mark.parametrize("chunk", [TextDelta(42), ReasoningDelta(42), ToolCallDelta(index=-1)])
+def test_p1p2_malformed_fragments_end_at_local_validation(chunk):
+    outcome = _drain_call(_DrainStream(chunk), drain_s=0)
+    assert isinstance(outcome.error, ModelAdapterError)
+    assert outcome.receipt.termination.ended_by == "local_failure"
+
+
+@pytest.mark.parametrize("callback", ["delta_consumer", "should_abort"])
+def test_p1p2_stream_callback_failure_is_local(callback):
+    failure = RuntimeError("local callback failed")
+
+    def refuse(*args):
+        raise failure
+
+    async def run():
+        return await ModelCallRunner(adapter=_DrainStream(TextDelta("a"))).acall(
+            REQUEST, **{"delta_consumer": lambda chunk: None, callback: refuse},
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(run())
+    assert caught.value is failure
+    assert call_facts_of(failure)[0].ended_by == "local_failure"
+
+
 def test_p1p2_caller_cancellation_is_distinct_from_provider_self_cancel() -> None:
     captures = []
 
@@ -211,7 +236,10 @@ def test_p1p2_drain_keeps_first_stop_and_actual_read_end(tail: tuple, ended_by: 
     assert len(outcome.receipt.usage_evidence.attempts) == 1
 
 
-def test_p1p2_durable_retry_then_unknown_preserves_original_error_and_single_sum() -> None:
+@pytest.mark.parametrize("hard_crash", [False, True])
+def test_p1p2_durable_retry_then_unknown_preserves_original_error_and_single_sum(hard_crash) -> None:
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
     class Adapter:
         calls = 0
 
@@ -219,21 +247,27 @@ def test_p1p2_durable_retry_then_unknown_preserves_original_error_and_single_sum
             self.calls += 1
             error = (
                 ModelDispatchRefused("refused", retryable=True, http_status=429)
-                if self.calls == 1 else ModelAdapterError("read failed")
+                if self.calls == 1 else _HardLifecycleCrash() if hard_crash else ModelAdapterError("read failed")
             )
             mark_provider_usage(error, {"input_tokens": 5 if self.calls == 1 else 2})
+            mark_usage_observation(error, UsageObservation(
+                reported={"input_tokens": 5 if self.calls == 1 else 2},
+                source="adapter", collection="normal",
+            ))
             raise error
 
     captures = []
     lifecycle = _JournalLifecycle(DeterministicFencedRunHarness())
-    with pytest.raises(DurableModelCallError, match="unknown") as caught:
+    with pytest.raises(_HardLifecycleCrash if hard_crash else DurableModelCallError) as caught:
         asyncio.run(ModelCallRunner(
             adapter=Adapter(), lifecycle_hook=lifecycle, settled_sink=captures.append,
         ).acall(replace(REQUEST, model=_kernel_model()), logical_call_id="call-durable-1"))
-    assert caught.value.error_code == "dispatch_unknown"
+    if not hard_crash:
+        assert caught.value.error_code == "dispatch_unknown"
     assert provider_usage_of(caught.value) == {"input_tokens": 7}
     assert captures[-1].receipt.usage == {"input_tokens": 7}
     assert len(captures[-1].receipt.usage_evidence.attempts) == 2
+    assert captures[-1].receipt.usage_evidence.reported == {"input_tokens": 7}
 
 
 def _raises(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -6279,6 +6313,7 @@ def test_abort_drain_is_off_by_default_and_closes_at_the_abort_point() -> None:
 
         assert isinstance(outcome.error, ModelCallAborted), outcome.error
         assert len(stream.yielded) == 1, "a zero budget must not read past the stop"
+        assert outcome.receipt.termination.ended_by == "stop_request"
         assert stream.closed is True
         assert outcome.texts == ["a"]
         assert outcome.receipt.usage == {}

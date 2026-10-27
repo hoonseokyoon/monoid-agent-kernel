@@ -599,3 +599,18 @@ KeyboardInterrupt/SystemExit의 기존 원형 전파도 검사했다. 프로세�
 carriage census는 새 observation helper·상태 전달·실패 시 비용 보존을 기존 검사에 등록했다.
 stream 종료 뒤 오류·취소·deadline 경합과 P5 권한 회귀도 같은 실행에 포함했다.
 01 병합 후 integration full CI `40454581400`은 성공했다. 02는 두 독립 코드 리뷰와 최종 CI를 진행한다.
+
+**02 리뷰 수정.** 첫 후보 `6950e44`는 두 독립 코드 리뷰에서 NEEDS_FIX였다. 기본 drain-off의 stop,
+로컬 stream callback·fragment 검증을 provider error로 분류하는 경계, malformed usage의 scalar/container 혼동,
+호출자 except 문맥이 새 성공 observer를 덮는 경계, 두 번째 durable dispatch의 BaseException이 이전 receipt를
+재사용하는 경계를 각각 실패시켰다. source owner에서 read-end를 stamp하고, 로컬 caught exception을 보관하며,
+dispatch 시작 시 이전 settlement 임시값을 비우는 수정으로 해결했다. 새로운 회계 경로는 추가하지 않았다.
+
+복구 integrity 오류와 required evidence 재게시 오류도 실제 lifecycle·observer로 확인했다. 독립 targeted
+preflight는 READY였다. 결과 검증 실패의 공개 복구 outcome은 failed/local_failure이며 저장된 원본은 유지한다.
+검증된 복구 receipt 전용 carrier를 recovery hook/decoder 경계에서만 소비해 historical attempts·usage를 보존한다.
+required evidence 게시 실패는 확인된 provider outcome을 유지하고, 읽지 않은 final text·마지막 turn usage는 비워 둔다.
+required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함께 보존한다.
+추가 회귀 원본은 `.tmp/v025/p1p2-02-*-red.txt`, 수정 후 관련 **884 passed / 22.71s**는
+`p1p2-02-review-green.txt`에 있다. source 변경 상한은 약 710줄(공백·주석 포함)로 갱신 예산 850 이내다.
+초기 600/1,900 추정과 누적 비용 기록은 유지한다. 최종 head 재검토·wheel·CI를 다시 확인한다.

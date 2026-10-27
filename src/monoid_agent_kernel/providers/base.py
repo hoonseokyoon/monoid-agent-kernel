@@ -1201,12 +1201,15 @@ class ModelStreamIngressNormalizer:
     def normalize(self, chunk: ModelStreamChunk) -> list[ModelStreamChunk]:
         try:
             return self._normalize(chunk)
-        except ModelAdapterError:
+        except ModelAdapterError as exc:
+            mark_read_end(exc, "local_failure")
             raise
         except Exception as exc:
-            raise ModelAdapterError(
+            refusal = ModelAdapterError(
                 "model adapter returned a non-portable stream fragment"
-            ) from exc
+            )
+            mark_read_end(refusal, "local_failure")
+            raise refusal from exc
 
     def _normalize(self, chunk: ModelStreamChunk) -> list[ModelStreamChunk]:
         sequence = self._sequence

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn, Protocol
 
 from monoid_agent_kernel.core.json_ingress import (
@@ -185,20 +185,46 @@ def mark_recovered_model_usage(
     error: BaseException,
     receipt: Mapping[str, Any],
 ) -> None:
-    """Carry already-billed public usage when recovered result verification fails."""
+    """Carry checked settlement facts when its result or evidence projection fails."""
 
     raw_usage = receipt.get("usage")
-    if not isinstance(raw_usage, Mapping):
-        return
     usage = {
-        key: value
-        for key, value in raw_usage.items()
-        if type(key) is str
-        and key in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
-        and is_portable_json_integer(value)
-        and value >= 0
-    }
+        key: value for key, value in raw_usage.items()
+        if type(key) is str and key in MODEL_INVOCATION_RECEIPT_USAGE_FIELDS
+        and is_portable_json_integer(value) and value >= 0
+    } if isinstance(raw_usage, Mapping) else {}
     mark_provider_usage(error, usage)
+    try:
+        termination = (
+            ModelCallTermination.from_json(receipt["termination"])
+            if "termination" in receipt else None
+        )
+        evidence = UsageEvidence.from_json(receipt["usage_evidence"]) if "usage_evidence" in receipt else None
+        if evidence is not None:
+            evidence.validate_usage(receipt.get("usage", {}), receipt.get("attempts", 0))
+        if not isinstance(error, ModelEvidenceUncommitted):
+            termination = ModelCallTermination(outcome="failed", ended_by="local_failure")
+        checked = ModelCallReceipt(
+            attempts=receipt["attempts"], usage=usage,
+            termination=termination, usage_evidence=evidence,
+        )
+        mark_call_facts(error, termination, evidence)
+        error._checked_recovery_receipt = checked  # type: ignore[attr-defined]
+    except Exception:
+        pass  # Corrupt recovery data must preserve the original verification failure.
+
+
+def recovered_model_failure_receipt(
+    error: BaseException, base: ModelCallReceipt,
+) -> ModelCallReceipt | None:
+    """Read checked recovery metadata only at the recovery hook/decoder boundary."""
+    checked = getattr(error, "_checked_recovery_receipt", None)
+    if not isinstance(checked, ModelCallReceipt):
+        return None
+    return replace(
+        base.with_error(error), attempts=checked.attempts, usage=checked.usage,
+        termination=checked.termination, usage_evidence=checked.usage_evidence,
+    )
 
 
 def reserve_model_dispatch(

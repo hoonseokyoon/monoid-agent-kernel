@@ -45,14 +45,18 @@ def test_p1p2_openai_presence_is_captured_before_numeric_normalization(raw: Any)
     assert turn.usage_evidence.source == ("provider" if expected else None)
 
 
-def test_p1p2_openai_malformed_body_retains_valid_canonical_alias_usage() -> None:
+@pytest.mark.parametrize("bad_shape", [
+    {"input_tokens": True, "output_tokens_details": {"reasoning_tokens": 2}},
+    {"input_tokens": {}, "output_tokens_details": 0, "reasoning_tokens": 2},
+    {"input_tokens_details": 7, "reasoning_tokens": 2},
+])
+def test_p1p2_openai_malformed_body_retains_valid_canonical_alias_usage(bad_shape) -> None:
     from monoid_agent_kernel.providers.base import provider_usage_of
     from monoid_agent_kernel.providers.openai import _parse_response
 
     with pytest.raises(ModelAdapterError) as caught:
         _parse_response({"output": 4, "usage": {
-            "input_tokens": True, "prompt_tokens": 5,
-            "output_tokens_details": {"reasoning_tokens": 2},
+            "prompt_tokens": 5, **bad_shape,
         }})
     usage = provider_usage_of(caught.value)
     assert usage["input_tokens"] == 5

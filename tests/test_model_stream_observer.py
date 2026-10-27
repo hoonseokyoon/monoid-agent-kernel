@@ -38,6 +38,34 @@ from monoid_agent_kernel.providers.base import (
 from monoid_agent_kernel.recorder import MemoryEventSink
 
 
+@pytest.mark.parametrize("stamped", [False, True])
+def test_successful_model_observer_ignores_callers_handled_exception(tmp_path, stamped):
+    from monoid_agent_kernel.core.model_facts import mark_call_facts
+
+    observer = _RecordingObserver()
+    loop = _loop(tmp_path, _ScriptedStreamAdapter([
+        TextDelta("ok"), TurnComplete(usage={"input_tokens": 5}),
+    ]), observer_factories=(lambda: observer,))
+
+    async def run():
+        try:
+            previous = RuntimeError("previous attempt")
+            if stamped:
+                mark_call_facts(previous, ModelCallTermination(
+                    outcome="failed", ended_by="provider_error",
+                ), UsageEvidence())
+            raise previous
+        except RuntimeError:
+            return await loop.arun_once("hello")
+
+    assert asyncio.run(run()).final_text == "ok"
+    outcome = observer.writers[0].outcomes[0]
+    assert outcome.final_text == "ok"
+    assert outcome.usage["input_tokens"] == 5
+    assert outcome.termination.outcome == "completed"
+    assert len(outcome.usage_evidence.attempts) == 1
+
+
 class _RecordingWriter:
     def __init__(self) -> None:
         self.deltas: list[ModelStreamDelta] = []

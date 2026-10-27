@@ -93,11 +93,16 @@ def provider_snapshot(
     """Use the same alias precedence for numeric and sparse first-party source readings."""
     if lenient:
         raw = raw if isinstance(raw, dict) else {}
+        detail_fields = {
+            "input_tokens_details", "prompt_tokens_details",
+            "output_tokens_details", "completion_tokens_details",
+        }
         raw = {
             key: ({k: v for k, v in value.items() if is_portable_json_integer(v) and v >= 0}
-                  if isinstance(value, dict) else value)
+                  if key in detail_fields else value)
             for key, value in raw.items()
-            if isinstance(value, dict) or (is_portable_json_integer(value) and value >= 0)
+            if (isinstance(value, dict) if key in detail_fields
+                else is_portable_json_integer(value) and value >= 0)
         }
     reported = normalize_usage(raw, legacy_aliases=True, sparse=True)
     usage = (
