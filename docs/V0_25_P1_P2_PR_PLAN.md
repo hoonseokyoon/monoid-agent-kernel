@@ -4,6 +4,8 @@
 P5·DX1·P3가 병합된 상태다. 계획은 로컬 `94ea35a`에 기록했다.
 **2026-10-27 사용자가 P1P2-00·01 구현과 리뷰·CI 후 02·03·04 순차 진행을 승인했다.**
 00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·CSP 변경은 별도다.
+구현 상태: 00 #156은 develop에, 01–04 #157–160은 통합 브랜치에 병합했다.
+실제 공개 API와 실행 예제를 제공하며, 최종 누적 검증·수정 기록은 §9.6에 둔다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#51-p1p2-종료-사실과-사용량-증거)의 G1을 구체화한다.
 기존 [API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)의 P1·P2 예시는 아래 계약을 따른다.
@@ -162,7 +164,8 @@ receipt에 attempts>0인데 구형 attempt log가 없으면 complete를 만들�
 
 ### 4.3 실제 개발자 사용 예시
 
-다음은 **계획된 API**다. 새 타입은 아직 구현되지 않았다. 현재 공개 subscription을 첫 실제 소비자로 사용한다.
+다음은 구현된 공개 subscription API다. [실행 예제](../examples/model_call_facts.py)와
+[저장·복구 예제](../examples/recover_model_call_facts.py)는 provider 자격 증명 없이 실행한다.
 
 ```python
 from monoid_agent_kernel import CapturePolicy, ModelIOSubscription
@@ -766,3 +769,41 @@ compact close를 reducer가 거부해도 App의 후속 projection이 현재 answ
 `p1p2-04-projection-check.txt`, `p1p2-04-projection-build.txt`다. 이번 수정은 Studio source·검증·bundle에
 한정되므로 같은 Python runtime의 앞선 406개 설치 검증과 양방향 gateway binary 근거를 재사용한다.
 새 bundle을 포함한 최종 wheel의 package audit은 별도로 수행한다.
+
+**04 완료.** 최종 `5b2aeb74cf61d0c0ec685e2d7b62ac56c32427c2`에서 두 독립 targeted 리뷰 PASS,
+L1 `40470663542`와 필수 combined L2 `40470870142` SUCCESS였다. Python 3.11/3.12와 실제 서비스 gate를
+확인한 뒤 PR #160을 통합 `cc7d8480a459d9e2281fbd36d32181185bfd1cc1`에 merge commit으로 병합했다.
+최종 wheel SHA256 `0056606DCAFA3C50B8CA7B55C1C9197FA0F90180AB51D62096C2D5854D40D23B`의 audit과
+tracked Studio bundle 3개 파일의 byte 일치도 확인했다.
+
+### 9.6 P1P2-I 누적 검증과 통합 수정
+
+실제 base는 최신 develop `d4e659c`와 04 병합본 `cc7d848`다. 누적 사전조사
+`.tmp/v025/p1p2-integration-preflight.md`와 아래 두 수정 경계의 독립 검토는 READY다.
+두 코드 reviewer는 개별 PR 검토 경험을 밝히고 전체 `d4e659c..5b2aeb7`의 소비자 연결을 다시 검토했다.
+`cc7d848`의 제품 tree는 `5b2aeb7`과 같다. 각 reviewer가 확인한 P2를 다음과 같이 수용했다.
+
+- legacy adapter가 stop 전 3, drain에서 9 → 5 → 미보고 terminal을 보내면 기존 drain fold가 3으로
+  되돌아갔다. 실제 reader-prep binary는 5를 보존했다. 이미 ingress가 선택한 dispatch collector의
+  숫자 snapshot을 drain에서 사용하며, 기존 exception 우선순위와 출력 차단 경계를 유지한다.
+- gateway가 성공 응답의 잘못된 observation 또는 적용 증명 누락을 거부할 때 종료 원인이 provider_error로
+  표시됐다. 실제 local validation 생성 지점에서 기존 오류에 local_failure를 stamp한다. 같은 오류 코드를
+  가진 원격 오류와 network/timeout은 기존 provider 경계를 유지한다. 기존 constructor와 carriage census를
+  유지하는 작은 private stamper를 사용한다.
+
+두 수정 전 실제 runner 회귀는 **16 failed / 6 passed, 3.07s**였다
+(`.tmp/v025/p1p2-i-regressions-red-corrected.txt`). 실패는 legacy drain 2개와 sync/SSE local 거부 14개다.
+같은 gateway_bad_response 코드를 가진 정상 원격 오류와 network control 6개는 통과했다.
+첫 실행의 미보고 numeric 키 assertion을 기존 empty usage 계약에 맞게 고친 뒤 다시 실행했다.
+이 회귀를 테스트 전용 commit으로 먼저 고정하고 제품 수정을 진행한다.
+
+비용은 최초 1,870 기능 / 6,580 전체 변경 줄 추정을 유지한다. 04까지의 non-merge commit을 모두 합산하면
+runtime·UI 추가 1,598/삭제 208(1,806줄), 예제 147, compatibility fixture 160, 테스트·script 2,528,
+문서 497, bundle 29로 총 5,167줄이다. 공백·주석과 같은 줄의 반복 수정을 포함한다. 최종 net runtime·UI는
+1,732줄이다. 이전 넓은 source 집계에는 예제·JSON fixture가 포함됐으므로 이 수치와 구분한다.
+반복 작업은 복구 귀속, 소비자 identity, drain snapshot 선택과 owner stamp의 누락에서 발생했다.
+기존 collector·codec·오류 stamp 경계를 재사용해 수정을 제한하며 새 회계 경로나 범용 validator를 추가하지 않는다.
+
+최종 두 누적 리뷰, full CI·combined 서비스, current/minimum 설치 wheel·공개 예제·package audit을
+실제 수정 head에 연결한 뒤 develop에 merge commit으로 반영한다. 정확한 최종 head·CI·merge SHA는
+통합 PR과 같은 패스의 프로젝트 memory에 기록한다. 배포 전 dual-reader host inventory와 §8의 후속 범위는 유지한다.

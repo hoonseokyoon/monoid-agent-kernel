@@ -143,6 +143,27 @@ def test_p1p2_drain_window_and_deadline_keep_distinct_read_ends(deadline_wins: b
     assert outcome.receipt.termination.ended_by == ("deadline" if deadline_wins else "drain_timeout")
 
 
+@pytest.mark.parametrize("unreported", [{}, {"output_tokens": 0}])
+def test_p1p2_legacy_drain_snapshot_survives_a_later_unreported_terminal(unreported) -> None:
+    outcome = _drain_call(_DrainStream(
+        TurnComplete(usage={"output_tokens": 3}),
+        TurnComplete(usage={"output_tokens": 9}),
+        TurnComplete(usage={"output_tokens": 5}),
+        TurnComplete(usage=unreported),
+    ), should_abort=_Polls(1))
+
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert provider_usage_of(outcome.error)["output_tokens"] == 5
+    assert outcome.receipt.usage["output_tokens"] == 5
+    assert outcome.receipt.attempt_log[0].usage["output_tokens"] == 5
+    assert outcome.receipt.usage_evidence.reported == {}
+    assert outcome.receipt.usage_evidence.completeness["output_tokens"] == "unknown"
+    assert outcome.receipt.usage_evidence.attempts[0].observation.source == "legacy_ambiguous"
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
+    assert outcome.receipt.termination.ended_by == "provider_terminal"
+    assert len(outcome.seen) == 1
+
+
 def test_p1p2_explicit_zero_received_during_drain_replaces_prior_report() -> None:
     def terminal(count):
         return TurnComplete(usage={"output_tokens": count}, usage_evidence=UsageObservation(

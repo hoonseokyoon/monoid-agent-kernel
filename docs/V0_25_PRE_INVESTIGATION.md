@@ -4,7 +4,8 @@
 
 구현 기록: **P5 #148·DX1 #149·P3 #150–155 develop 병합**.
 P3-I #155의 develop 반영은 `4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`이다.
-현재 요청은 이 기준의 **P1P2-00·01 구현 및 리뷰·CI 후 02·03·04 순차 진행**이다.
+P1/P2는 00 #156을 develop에, 01–04 #157–160을 통합 브랜치에 병합했다.
+공개 API·v2 저장·복구·gateway·Studio·OTel 연결을 구현했고, 최종 누적 검증과 develop 통합을 진행한다.
 구체적인 정책·외부 근거·PR 범위는 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은

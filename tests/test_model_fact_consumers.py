@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -12,7 +14,7 @@ from monoid_agent_kernel.core.model_facts import (
     ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamContext, ModelStreamOutcome
-from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ModelRetryConfig
+from monoid_agent_kernel.core.spec import GenerationConfig, ModelConfig, ModelRetryConfig, ReasoningConfig
 from monoid_agent_kernel.errors import ModelAdapterError
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.providers._usage import mark_usage_observation, usage_observation_of
@@ -29,6 +31,77 @@ from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 
 
 REQUEST = ModelRequest(instruction="go", system_prompt="sys", tools=())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("case", [
+    "bad_observation", "bad_control", "invalid_json", "nonobject",
+    "proof_generation", "proof_schema", "proof_reasoning", "remote_error", "remote_http", "network",
+])
+def test_gateway_runner_records_the_owner_of_local_refusals(monkeypatch, stream, case):
+    payload = {
+        "type": "turn_complete", "final_text": "answer", "usage": {"input_tokens": 7},
+        "usage_evidence": {"reported": {"input_tokens": 7}, "source": "provider", "collection": "normal"},
+    }
+    config_args = {"retry": ModelRetryConfig(max_attempts=1)}
+    request = REQUEST
+    if case == "bad_observation":
+        payload["usage_evidence"]["collection"] = "bogus"
+    elif case == "bad_control":
+        payload["provider_retried"] = "false"
+    elif case.startswith("remote_"):
+        # The same classified error code can originate remotely. Ownership decides read-end.
+        payload.update(type="error", error="remote refusal", error_code="gateway_bad_response", retryable=False)
+    elif case == "proof_generation":
+        config_args["generation"] = GenerationConfig(max_output_tokens=17, on_unsupported="fail")
+    elif case == "proof_schema":
+        request = ModelRequest(instruction="go", system_prompt="sys", tools=(), output_schema={"type": "object"})
+    elif case == "proof_reasoning":
+        config_args["reasoning"] = ReasoningConfig(effort="low", on_unsupported="fail")
+    body = "{" if case == "invalid_json" else "[]" if case == "nonobject" else json.dumps(payload)
+
+    def sync_response(*args, **kwargs):
+        if case == "network":
+            raise URLError("connection failed")
+        if case == "remote_http":
+            raise HTTPError("http://gateway.invalid", 422, "refused", {}, io.BytesIO(body.encode()))
+        return io.BytesIO(body.encode())
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.gateway.urlopen", sync_response)
+    if stream:
+        httpx = pytest.importorskip("httpx")
+        client_type = httpx.AsyncClient
+
+        def stream_response(http_request):
+            if case == "network":
+                raise httpx.ReadError("connection failed", request=http_request)
+            if case == "remote_http":
+                return httpx.Response(422, content=body)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=f"data: {body}\n\n")
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(
+            transport=httpx.MockTransport(stream_response), **kwargs,
+        ))
+
+    received = []
+    runner = ModelCallRunner(
+        GatewayModelAdapter(ModelConfig(**config_args), gateway_url="http://gateway.invalid", token="fake"),
+        settled_sink=received.append,
+    )
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(runner.acall(request, delta_consumer=(lambda _: None) if stream else None))
+    receipt = received[0].receipt
+    expected_usage = 0 if case in {"invalid_json", "nonobject", "network"} else 7
+    assert provider_usage_of(caught.value).get("input_tokens", 0) == expected_usage
+    assert receipt.usage.get("input_tokens", 0) == expected_usage
+    expected_code = (
+        f"gateway_{case.removeprefix('proof_')}_not_applied" if case.startswith("proof_")
+        else "gateway_network_error" if case == "network" else "gateway_bad_response"
+    )
+    assert caught.value.provider_error_code == expected_code
+    assert receipt.termination.ended_by == (
+        "provider_error" if case in {"remote_error", "remote_http", "network"} else "local_failure"
+    )
 
 
 def _server(adapter):

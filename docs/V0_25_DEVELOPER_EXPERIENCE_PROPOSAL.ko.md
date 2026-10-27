@@ -9,8 +9,9 @@ P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기�
 P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. P3 구현은 승인됐으며 §9에 실행 증거를 기록한다.
 DX1의 순수 typed 도구는 [실행 예제](../examples/custom_tool_quickstart.py)에 반영했다.
 P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)와 함께 구현했다.
-P1/P2 종료·사용량 및 P4 예산 조회의 신규 API 명칭과 후속 릴리스 배치는 설계 제안이다.
-현재 P1·P2 구현은 승인됐으며 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 정책·저장 호환성·PR 순서와 실행 기록을 둔다.
+P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model_call_facts.py)와
+[복구 예제](../examples/recover_model_call_facts.py)를 제공한다. 정책·저장 호환성·실행 기록은
+[P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4 예산 조회와 후속 릴리스 배치는 설계 제안이다.
 
 ## 1. 제품 방향과 릴리스 경계
 
@@ -207,12 +208,12 @@ authority loss는 즉시 view를 무효화한다. 이때 cleanup은 외부 쓰�
 
 ## 5. v0.25 API 예시: 종료와 사용량의 사실
 
-`ModelCallReceipt.termination`, `ModelCallReceipt.usage_evidence` 및 attempt의 증거 필드는 **신규 제안**이다.
+`ModelCallReceipt.termination`, `ModelCallReceipt.usage_evidence` 및 attempt의 증거 필드를 구현했다.
 기존 `usage`, `stop_reason`, `attempts`, `attempt_log`를 유지한다. 기존 attempt log를 확장해 시도별 증거를 보존한다.
 구체적인 vocabulary·snapshot 규칙·소비자별 projection은 [P1·P2 정책](V0_25_P1_P2_PR_PLAN.md#4-채택할-런타임-정책)을 따른다.
 canonical v2는 private attempt log 전체와 분리된 안전한 `usage_evidence.attempts`로 복구 provenance를 보존한다.
 
-| 제안 표면 | 의미 |
+| 공개 표면 | 의미 |
 |---|---|
 | `termination.outcome` | 기존 stream outcome과 같은 completed/interrupted/failed/cancelled/timed_out 분류 |
 | `termination.requested_by` | 최초 수락한 종료 요청; 요청이 없으면 null |
@@ -231,8 +232,8 @@ from monoid_agent_kernel import CapturePolicy, ModelIOSubscription
 class ModelDiagnostics:
     def on_model_call(self, capture):
         receipt = capture.receipt
-        facts = receipt.termination       # 제안; 구형 record이면 None
-        evidence = receipt.usage_evidence # 제안; 구형 record이면 None
+        facts = receipt.termination       # 구형 record이면 None
+        evidence = receipt.usage_evidence # 구형 record이면 None
         print({
             "outcome": facts.outcome if facts else None,
             "requested_by": facts.requested_by if facts else None,
@@ -268,7 +269,7 @@ diagnostics = ModelIOSubscription(ModelDiagnostics(), CapturePolicy(mode="none")
 | settled 결과 복구·재전달 | 최초 증거 보존, 이미 반영한 usage 재합산 금지 |
 
 P1/P2는 같은 영속 schema 변경으로 설계한다. dual-reader 준비 → 새 writer 활성화 → 혼합 버전 및 rollback 검증 순서다.
-rollback도 새 record를 읽는 reader를 유지하거나 검증된 변환을 거쳐야 한다. 구형 reader의 새 format 수용을 가정하지 않는다.
+rollback은 새 record를 읽는 reader-prep 버전을 유지한다. 기존 불변 기록을 변환하는 downgrade migration은 제공하지 않는다.
 구체안은 invocation/model-calls v2와 retained v1 reader다. 동일 settled 좌표를 복구할 때 검증된 원래 payload/hash를 보존하고,
 새 revision부터 새 format을 쓴다. rollback은 v2 reader를 유지한 reader 준비 버전으로 수행한다.
 receipt/attempt, 예외, runner·ValidatedCallRunner, gateway 오류, durable codec·ledger, loop 집계, live closed frame,
