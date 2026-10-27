@@ -6615,6 +6615,7 @@ def test_future_family_status_json_is_already_wider_than_its_own_schema() -> Non
 CARRIER_FILES: dict[str, frozenset[str]] = {
     "config_recoverable": frozenset(
         {
+            "model_lifecycle.py",
             # Joined in the burn-down: the immutable record of one call, the live stream lane
             # (outcome type, sidecar writer/reader) that used to classify with half the
             # vocabulary.

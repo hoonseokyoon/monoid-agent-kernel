@@ -621,3 +621,12 @@ required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함
 유지했다. 원래 provider receipt와 현재 projection 오류를 구분하며 콘텐츠는 생성하지 않는다.
 관련 **42 passed / 2.77s** (`p1p2-02-recovery-subscription-green.txt`), 전체 lint 통과.
 `ef50d9c` wheel audit과 current/minimum 설치 검증은 각각 151 tests PASS였고, 새 final candidate로 갱신한다.
+
+`c979d96` 재검토에서 evidence 게시가 query digest 검증보다 먼저 실패하면 원래 receipt와 현재 prompt를
+함께 공개하는 반례가 나왔다. 실제 full subscription 회귀를 먼저 실패시켰고, digest가 다른 복구 오류는
+현재 요청 content·prompt digest·preimage를 생략하도록 기존 게시 함수를 연결했다. payload capture를 켠
+동일/변경 요청 테스트로 원래 식별자와 필요한 preimage의 유지/생략을 검사했다(4 passed/2.35s).
+`c979d96` 설치 wheel은 current/minimum 각각 152 tests PASS; 최종 변경으로 다시 갱신한다.
+확장 검증 604개에서 새 recovery carrier의 config_recoverable census 등록 누락과 기존 30ms backoff의
+Windows 타이밍 하한 assertion이 한 번 실패했다(602 passed). 등록을 보완했고 같은 timing case를 포함한
+census 196개는 통과했다(10.23s). retry 대기 코드는 변경하지 않았다. 최종 원격 CI로 전체 계약을 확인한다.

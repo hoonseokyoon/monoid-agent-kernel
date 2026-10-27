@@ -1040,6 +1040,7 @@ class ModelCallRunner:
             pending_backoff_ms = 0
             recovered_failure_receipt: ModelCallReceipt | None = None
             durable_outcome_receipt: ModelCallReceipt | None = None
+            recovery_request: ModelRequest | None = request
             elapsed_before_recovery_ms = 0
 
             def prepare_durable_stream_settlement(
@@ -1084,6 +1085,7 @@ class ModelCallRunner:
                     # evidence barrier below; a stale owner may not attempt that mutation.
                     self._assert_write_authority()
                 request = normalize_model_request(request)
+                recovery_request = request
                 normalized_context = _normalize_invocation_context(
                     context if context is not None else InvocationContext()
                 )
@@ -1182,6 +1184,12 @@ class ModelCallRunner:
                         checked_receipt = recovered_model_failure_receipt(
                             recovery_error, receipt,
                         )
+                        if checked_receipt is not None and checked_receipt.request_digest != receipt.request_digest:
+                            # Required evidence can fail before recovery checks request identity.
+                            # The current prompt cannot be attributed to that historical call.
+                            recovery_request = None
+                            request_preimage = None
+                            checked_receipt = replace(checked_receipt, prompt_digest="")
                         if isinstance(recovery_error, ModelEvidenceUncommitted):
                             durable_outcome_receipt = checked_receipt
                         else:
@@ -1592,7 +1600,7 @@ class ModelCallRunner:
                         )
                         mark_provider_usage(exc, durable_outcome_receipt.usage)
                         self._publish_best_effort(
-                            request,
+                            recovery_request,
                             None,
                             durable_outcome_receipt,
                             elapsed_ms=durable_outcome_receipt.latency_ms,
@@ -1601,7 +1609,7 @@ class ModelCallRunner:
                     raise
                 if recovered_failure_receipt is not None:
                     self._publish_best_effort(
-                        request,
+                        recovery_request,
                         None,
                         recovered_failure_receipt,
                         elapsed_ms=recovered_failure_receipt.latency_ms,
@@ -1850,7 +1858,7 @@ class ModelCallRunner:
 
     def _publish(
         self,
-        request: ModelRequest,
+        request: ModelRequest | None,
         turn: ModelTurn | None,
         receipt: ModelCallReceipt,
         *,
@@ -1877,7 +1885,7 @@ class ModelCallRunner:
         try:
             self._assert_write_authority()
             if self.subscriptions:
-                content = _call_content(request, turn)
+                content = _call_content(request, turn) if request is not None else {}
                 self._assert_write_authority()
                 settled = dispatch_model_call(
                     receipt=timed,
@@ -1893,7 +1901,7 @@ class ModelCallRunner:
 
     def _publish_best_effort(
         self,
-        request: ModelRequest,
+        request: ModelRequest | None,
         turn: ModelTurn | None,
         receipt: ModelCallReceipt,
         *,

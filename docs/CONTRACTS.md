@@ -481,6 +481,9 @@ retains its original termination and hash. A required-evidence projection failur
 checked provider outcome; when no private turn has been loaded, the stream observer leaves final
 text and successful final-turn usage unavailable. Refusal replay preserves its facts alongside
 the existing accounting delta, which can be empty after the original usage was applied.
+Required-evidence recovery can precede request identity validation. If a failed projection belongs
+to a different stored request digest, public capture includes its checked historical receipt and
+omits the current request content, prompt digest and request preimage.
 
 See the offline [subscription example](../examples/model_call_facts.py). In the P1P2-02 preparation
 stage, invocation/model-calls writers remain v1 and omit these facts. P1P2-03 activates v2 writers;

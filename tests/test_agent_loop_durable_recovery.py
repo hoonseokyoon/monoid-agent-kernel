@@ -333,6 +333,7 @@ def _loop(
     context_providers: tuple[Any, ...] = (),
     model_calls_file: bool = False,
     model_content_file: bool = False,
+    model_payload_file: bool = False,
     model_stream_observer_factories: tuple[Any, ...] = (),
     model_io_subscriptions: tuple[Any, ...] = (),
     tool_ids: tuple[str, ...] = (),
@@ -351,6 +352,7 @@ def _loop(
         context_providers=context_providers,
         model_calls_file=model_calls_file,
         model_content_file=model_content_file,
+        model_payload_file=model_payload_file,
         model_stream_observer_factories=model_stream_observer_factories,
         model_io_subscriptions=model_io_subscriptions,
         cancellation_token=cancellation_token,
@@ -418,6 +420,7 @@ def _restore(
     tool_ids: tuple[str, ...] = (),
     model_io_subscriptions: tuple[Any, ...] = (),
     model_stream_observer_factories: tuple[Any, ...] = (),
+    model_payload_file: bool = False,
 ):
     token = harness.claim_writer(RUN_ID, "worker-2")
     loop = _loop(
@@ -434,6 +437,7 @@ def _restore(
         tool_ids=tool_ids,
         model_io_subscriptions=model_io_subscriptions,
         model_stream_observer_factories=model_stream_observer_factories,
+        model_payload_file=model_payload_file,
     )
     loop.restore(baseline)
     try:
@@ -2558,8 +2562,8 @@ def test_changed_request_is_blocked_before_provider_reentry(tmp_path: Path) -> N
     assert len(adapter.requests) == 1
 
 
-@pytest.mark.parametrize("fault", ["integrity", "evidence_success", "evidence_refusal"])
-def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path, fault) -> None:
+@pytest.mark.parametrize("fault", ["integrity", "evidence_success", "evidence_refusal", "evidence_changed_request"])
+def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path, fault, monkeypatch) -> None:
     from support.fenced_hosting import _record_digest
     from support.model_facts import facts
     from monoid_agent_kernel.core.model_invocation import decode_model_invocation
@@ -2567,6 +2571,15 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
 
     projection_only = fault != "integrity"
     refusal = fault == "evidence_refusal"
+    changed_request = fault == "evidence_changed_request"
+    recorded = []
+    original_record = ModelCallRunner._record
+
+    def record(self, receipt, request_preimage, turn):
+        recorded.append((receipt, request_preimage))
+        original_record(self, receipt, request_preimage, turn)
+
+    monkeypatch.setattr(ModelCallRunner, "_record", record)
     harness = DeterministicFencedRunHarness()
     turn = ModelTurn(
         final_text="first",
@@ -2617,10 +2630,12 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
         harness,
         adapter,
         baseline,
+        user_input="different new input" if changed_request else "hello",
         sink=_RejectModelEvidence(harness.sink) if projection_only else _TamperInvocationResultLoad(harness.sink),
         model_evidence_policy="required" if projection_only else "passive",
         model_stream_observer_factories=(Observer,),
-        model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="digest")),),
+        model_payload_file=True,
+        model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="full")),),
     )
 
     assert suspension.reason == ("turn_failed" if projection_only else "terminal")
@@ -2642,6 +2657,12 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
     assert receipt.idempotency_key == payload["idempotency_key"]
     assert receipt.request_digest == payload["request_digest"]
     assert receipt.error_code == ("rate_limited" if refusal else "" if projection_only else "durable_invocation_result_corrupt")
+    if changed_request:
+        assert captures[0].content == {}
+        assert receipt.prompt_digest == ""
+        assert recorded[-1][1] is None
+    else:
+        assert recorded[-1][1] is not None
 
 
 def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> None:
