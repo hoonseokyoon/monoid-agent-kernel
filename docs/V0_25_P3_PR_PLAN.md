@@ -546,3 +546,14 @@ python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thre
 
 기능 수정은 기존 소유권과 finally를 사용한다. 공백을 제외한 production diff는 41줄 추가/11줄 제거이며,
 일반 diff에는 bootstrap cleanup 범위의 indentation 이동도 포함한다. 새 lifecycle framework는 추가하지 않았다.
+
+P3-00 develop 전체 CI `40420547924`도 14개 job 모두 성공했다.
+P3-01 첫 후보 `d3d047d`의 독립 코드 reviewer `p3_01_code_review_a/b`는 같은 P2를 재현했다.
+기존 discard helper는 sink 목록에서 첫 JsonlEventSink를 선택하므로 authoritative host sink가 먼저 있으면
+그 외부 sink를 닫고 owned events 파일은 남긴다. 새 prepublication caller에서도 이 문제가 도달 가능했다.
+추가 회귀는 provisional/published 두 경로 모두 **2 failed / 0.70s**로 고정했다(commit `fb55581`,
+`.tmp/v025/p3-01-owned-sink-red.log`). 생성자가 정확한 owned sink를 private 필드에 보관하고
+discard가 그 인스턴스만 닫도록 수정했다. 정상 EventBus.close 계약은 유지한다.
+같은 focused 검사에 두 회귀를 더한 결과는 **339 passed / 17.75s**다
+(`.tmp/v025/p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
+최종 후보를 두 reviewer가 표적 재검토한 뒤 독립 PR의 L1/L2를 확인한다.
