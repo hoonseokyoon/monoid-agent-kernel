@@ -280,6 +280,154 @@ def test_p1p2_caller_cancellation_preserves_request_order_before_cleanup(first, 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(("shape", "drain_s", "cause"), [
+    ("stream", 0, "turn_interrupt"), ("stream", 0, "user_cancel"), ("stream", 0, "predicate_user"),
+    ("stream", 1, "graceful_drain"), ("stream", 1, "host_shutdown"), ("stream", 1, "deadline"),
+    ("async", 0, "user_cancel"), ("async", 0, "deadline"), ("async", 0, "elapsed"),
+    ("sync", 0, "user_cancel"),
+])
+def test_p1p2_all_model_waits_preserve_an_accepted_request_before_caller_cancel(shape, drain_s, cause):
+    captures, seen = [], []
+    token = CancellationToken()
+
+    async def run():
+        entered, cleanup, release, stopped = (asyncio.Event() for _ in range(4))
+        worker_release, worker_stopped = threading.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+
+        async def finish():
+            cleanup.set()
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+
+        class Stream:
+            async def astream_turn(self, request):
+                try:
+                    entered.set()
+                    yield TurnComplete(usage={"output_tokens": 5})
+                    await asyncio.Event().wait()
+                finally:
+                    await finish()
+
+        class Async:
+            async def anext_turn(self, request):
+                try:
+                    entered.set()
+                    await asyncio.Event().wait()
+                finally:
+                    await finish()
+
+        class Sync:
+            def next_turn(self, request):
+                loop.call_soon_threadsafe(entered.set)
+                try:
+                    assert worker_release.wait(2)
+                    return ModelTurn(final_text="discarded")
+                finally:
+                    worker_stopped.set()
+
+        runner = ModelCallRunner(
+            adapter={"stream": Stream, "async": Async, "sync": Sync}[shape](),
+            abort_drain_s=drain_s, cancel_grace_s=0.5,
+            current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+
+        def stop():
+            if cause == "predicate_user":
+                token.cancel(InterruptionCause.USER_CANCEL)
+            return True
+
+        task = asyncio.create_task(runner.acall(
+            REQUEST, deadline=time.time() + 0.03 if cause == "elapsed" else None,
+            delta_consumer=seen.append if shape == "stream" else None,
+            should_abort=stop if cause in {"turn_interrupt", "predicate_user"} else None,
+        ))
+        await asyncio.wait_for(entered.wait(), 1)
+        if cause not in {"turn_interrupt", "predicate_user", "elapsed"}:
+            token.cancel(InterruptionCause(cause))
+        if shape != "sync":
+            await asyncio.wait_for(cleanup.wait(), 1)
+        task.cancel()
+        worker_release.set()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            release.set()
+        if shape == "sync":
+            assert await asyncio.to_thread(worker_stopped.wait, 1)
+        else:
+            await asyncio.wait_for(stopped.wait(), 1)
+        facts, _ = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", ended_by="stop_request",
+            requested_by=("caller_cancel" if cause == "elapsed" else
+                          "user_cancel" if cause == "predicate_user" else cause),
+        )
+        assert captures[0].receipt.termination == facts
+        assert len(seen) == (1 if shape == "stream" else 0)
+
+    asyncio.run(run())
+
+
+def test_p1p2_accepted_interrupt_precedes_a_cancel_in_remainder_delivery():
+    token = CancellationToken()
+    captures, seen = [], []
+
+    def consume(chunk):
+        seen.append(chunk)
+        if isinstance(chunk, TextDelta) and chunk.text == "\ufffd":
+            token.cancel(InterruptionCause.USER_CANCEL)
+
+    runner = ModelCallRunner(
+        adapter=_DrainStream(TextDelta("x\ud83d"), TurnComplete(usage={"output_tokens": 5})),
+        abort_drain_s=1, current_cancellation_token=lambda: token, settled_sink=captures.append,
+    )
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=consume, should_abort=lambda: True))
+    assert caught.value.interruption_cause is InterruptionCause.USER_CANCEL
+    assert captures[0].receipt.termination.requested_by == "turn_interrupt"
+    assert call_facts_of(caught.value)[0].requested_by == "turn_interrupt"
+    assert captures[0].receipt.usage["output_tokens"] == 5
+    assert [chunk.text for chunk in seen] == ["x", "\ufffd"]
+
+
+def test_p1p2_backoff_preserves_token_request_before_caller_cancel():
+    token = CancellationToken()
+    captures = []
+
+    async def run():
+        backoff = asyncio.Event()
+
+        class Runner(ModelCallRunner):
+            async def _abackoff(self, delay_s, deadline):
+                backoff.set()
+                await super()._abackoff(delay_s, deadline)
+
+        class Adapter:
+            def next_turn(self, request):
+                raise ModelAdapterError("retry", retryable=True)
+
+        runner = Runner(
+            adapter=Adapter(), current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(replace(REQUEST, model=ModelConfig(
+            retry=ModelRetryConfig(layer="kernel", max_attempts=2, initial_delay_s=2, jitter_s=0),
+        ))))
+        await asyncio.wait_for(backoff.wait(), 1)
+        token.cancel(InterruptionCause.USER_CANCEL)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert call_facts_of(caught.value)[0].requested_by == "user_cancel"
+        assert captures[0].receipt.attempts == 1
+        assert captures[0].receipt.termination.requested_by == "user_cancel"
+
+    asyncio.run(run())
+
+
 def test_p1p2_caller_cancellation_is_distinct_from_provider_self_cancel() -> None:
     captures = []
 
@@ -6535,6 +6683,7 @@ def test_a_run_boundary_during_drain_stops_it_immediately(cause: InterruptionCau
 
     assert type(outcome.error) is RunCancelled, outcome.error
     assert outcome.error.interruption_cause is cause
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
     assert outcome.elapsed < 3.0
     assert len(stream.yielded) == 1, "the drain read on after the boundary fired"
     assert stream.closed is True

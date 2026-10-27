@@ -837,3 +837,19 @@ caller 단독·caller→cleanup의 user stop·반복 caller control은 통과했
 runtime·UI의 수정 이력을 포함한 변경량은 이 48줄 delta까지 **1,981줄**이다. 최초 1,870줄 추정과
 soft limit 접근을 다시 검토했고, 기존 wait에 선택적 관찰점을 추가하는 경계가 task/shield 재구성보다 작다.
 이 최종 source로 wheel·두 targeted 리뷰·필수 CI를 갱신한다.
+
+`a5dbcd1` 재검토에서 같은 요청자 소유권 문제가 drain-off와 즉시 종료 token, one-shot 및 backoff에도
+남는 것을 확인했다. 이 후보의 설치 wheel은 양쪽 438개 검증을 통과했지만 최종 승인은 보류했다.
+관련 wait 진입점을 다시 조사한 구조 검토는 READY다. 기존 bridge 관찰점을 유지하고 공통 frozen observer를
+`_aawait`·`_abackoff`·stream owner가 재사용한다. token의 최초 수락과 이미 수락한 cooperative stop을
+각 소유자에서 읽으며, 이후 boundary가 정한 outcome과 read-end는 유지한다.
+
+`should_abort` 안에서 먼저 수락된 token과, 반환 뒤 remainder consumer에서 생긴 token도 구분한다.
+이미 수락한 stream requester가 이후 drain requester보다 우선한다. caller 취소 사실이 고정된 오류는
+후속 stream 정리에서 다시 해석하지 않는다. `_aawait`의 accessor 실패 후 abandonment에서도 같은 관찰자를 사용한다.
+새 영속 슬롯이나 취소 정책을 추가하지 않는다. 공개 계약에 이미 포함된 requester 범위를 공통 소유 경계에서 완성한다.
+
+실제 stream·async one-shot·sync worker·retry backoff와 기존 operational-boundary 회귀는 수정 전
+**14 failed / 1 passed, 4.53s**였다(`.tmp/v025/p1p2-i-requester-scope-expanded-red.txt`).
+elapsed deadline에는 수락된 token 요청이 없으므로 뒤의 첫 caller 취소를 caller_cancel로 유지하는 control이 통과했다.
+각 수정의 최초 추정과 누적 비용은 유지하며, 공통 observer 재사용으로 분기별 보상 코드를 줄인다.
