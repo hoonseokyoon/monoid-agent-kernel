@@ -2,7 +2,7 @@
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
-구현 기록: **2026-10-27 P5·DX1·P3 develop 병합** (`4e14618`). 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
+구현 기록: **2026-10-27 P5·DX1·P3·P1/P2 develop 병합** (`2914c43`). 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.
 범위의 기준은 통합 계획이고 첫 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md)이다.
@@ -11,7 +11,8 @@ DX1의 순수 typed 도구는 [실행 예제](../examples/custom_tool_quickstart
 P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)와 함께 구현했다.
 P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model_call_facts.py)와
 [복구 예제](../examples/recover_model_call_facts.py)를 제공한다. 정책·저장 호환성·실행 기록은
-[P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4 예산 조회와 후속 릴리스 배치는 설계 제안이다.
+[P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4의 정책·외부 근거·변경 범위는 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 있다.
+P4 예산 조회는 설계 제안이며 현재 구현은 보류한다.
 
 ## 1. 제품 방향과 릴리스 경계
 
@@ -280,7 +281,8 @@ Studio reader, OTel의 같은 사실을 대조한다. replay request identity와
 
 ## 6. v0.25 API 예시: Stop 이후 현재 대기 조회
 
-`CancellationToken.cancel`은 기존 API이고, `loop.termination_budget()`은 **신규 제안**이다.
+`CancellationToken.cancel`은 기존 API이고, `termination_budget()`은 **신규 제안**이다.
+[P4 PR 계획](V0_25_P4_PR_PLAN.md#4-채택할-제어-정책)이 clock·복구·phase·RunStream의 구체적인 계약을 정의한다.
 
 ```python
 def on_stop(loop, cancellation_token):
@@ -292,22 +294,39 @@ def on_stop(loop, cancellation_token):
             "phase": call.phase,
             "deadline_remaining_s": call.deadline_remaining_s,
             "drain_remaining_s": call.drain_remaining_s,
-            "effective_grace_s": call.effective_grace_s,
+            "cleanup": [
+                {"source": w.source, "budget_s": w.budget_s, "remaining_s": w.remaining_s}
+                for w in call.grace_windows
+            ],
         }
         for call in snapshot.calls
     ]
 ```
 
-snapshot에는 관측 시각, 진행 중 call 식별자와 streaming/draining/closing phase, 현재 유효 deadline,
-호출에 고정된 drain budget, 남은 drain, 적용 grace를 둔다. drain 전에는 `drain_remaining_s=None`,
-deadline 미설정에는 `deadline_remaining_s=None`, active call이 없으면 빈 calls다. 동시 조회는 일관된 복사본을 반환한다.
+snapshot은 process-local 단일 관측 시각, runner가 소유한 acall의 고유 ID·phase·deadline·drain·grace 창을 담는다.
+drain 전 잔여값, 미설정 deadline, 유한 grace의 cleanup 시작 전 remaining은 None이다. unbounded grace는 budget도 None이다.
+active model call이 없으면 calls=()다. tool·host resource·descendant 전체 종료와 구별한다.
+wait 진입 때 예약한 grace와 실제 close에서 읽은 grace는 서로 다를 수 있어 각각 표시한다.
+query는 host getter·취소·대기를 시작하지 않고 immutable 복사본을 반환한다.
 
-조회값은 호스트가 Stop 상태를 설명하는 샘플이다. 다음 retry·미래 자식 호출의 예산을 현재 값에 섞지 않는다.
-동시 대기는 각 호출의 상한을 정책 한도 내에서 조합하며 단순 합산하지 않는다. provider 프로세스 종료와 최종 청구 시점은 별도다.
+```python
+def stop_progress(stream):
+    exit_budget = stream.termination_budget().stream_exit
+    return {
+        "phase": exit_budget.phase,
+        "hard_cancel_remaining_s": exit_budget.hard_cancel_remaining_s,
+    }
+```
 
-내부 제어도 monotonic cutoff로 정렬한다. 공개 epoch deadline과 저장 시각은 유지하고 진입 경계에서 변환한다.
-run guard, model call, drain, sync wait, RunStream 종료 대기가 같은 제어 기준을 사용해야 한다.
-관측용 monotonic timestamp 하나만 붙이는 변경으로 이 보장을 충족하지 않는다.
+RunStream exit wait에 진입하면 현재 소유 호출의 잔여 drain·grace와 exit 정책 후보로 대기를 정하고,
+병렬 호출은 max로 조합한다. 최초 cutoff는 고정된다. 그전에는 idle/None이다.
+`hard_cancel_requested`와 remaining=0 뒤에도 자원 정리로 driver가 pending일 수 있다.
+exit waiter가 외부 취소되면 `wait_interrupted`와 remaining=None으로 timer 중단을 표시한다.
+직접 exit에 재진입하면 최초 cutoff를 재사용한다. 이미 요청한 hard cancel은 기록에 남는다.
+이 API는 강제 취소 요청 시점까지의 시간을 표시한다. 최종 결과·usage는 P1/P2 receipt/outcome에서 읽는다.
+
+core 제어는 process monotonic cutoff로 정렬하고 공개 epoch deadline은 최초 진입에서 한 번 변환한다.
+retry·repair에 같은 cutoff를 쓰며 checkpoint는 기존 remaining duration과 parked downtime 제외 정책을 유지한다.
 
 ## 7. DX2: 실제 통합 흐름을 릴리스의 증거로 삼기
 
@@ -427,8 +446,9 @@ BaseModel 반환 probe는 tool observation이 `tool_result_unportable`였다. �
 당시 Python 예시 5개는 AST 문법 검사를 통과했다. 구현된 P3의 실행 증거는 설치 wheel과 회귀 검사로 별도 기록했다.
 문서의 로컬 링크 대상을 확인했다. 기존 계약 정합성과 독립 설계 리뷰도 이 문서 단계의 확인 대상이다.
 
-남은 설계 결정은 작업군별 preflight에서 좁힌다: G1 필드/codec 버전,
-G3 조회 명칭과 clock 변환, 후속 web adapter의 request/history 및 cursor 계약.
+G1 필드·codec은 구현됐고 G3 조회·clock·복구 정책은 P4 PR 계획으로 구체화했다.
+P4의 내부 cutoff 운반·hook 배치는 구현 preflight에서 실제 소비자와 대조한다.
+후속 web adapter의 request/history 및 cursor 계약은 해당 작업군에서 결정한다.
 P3 공개 이름과 동기 host adapter 프로토콜, DX1 JSON 변환 실패의 `tool_result_unportable` 분류는 구현에 반영했다.
 이 결정들은 설계 명칭·구현 선택이다. P1–P5 필수 범위나 사용자의 승인된 동작 보장을 줄이는 변경은 별도 범위 결정으로 남긴다.
 
