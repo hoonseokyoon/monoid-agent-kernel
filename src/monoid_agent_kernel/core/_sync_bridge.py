@@ -11,6 +11,7 @@ and ``loop`` imports ``model_call``, so leaving it in ``loop`` would close a cyc
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import threading
@@ -310,6 +311,7 @@ async def await_abandonable_call(
     grace_s: float,
     check_boundary: Callable[[float | None], None],
     on_discarded: Callable[[Any], None] | None = None,
+    on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
 ) -> Any:
     """Await a call while propagating run cancellation and the run deadline.
 
@@ -363,6 +365,12 @@ async def await_abandonable_call(
     def remove_callback() -> None:
         return None
 
+    def observe_caller_cancelled(error: asyncio.CancelledError) -> None:
+        # The owner can freeze diagnostic facts before cleanup accepts another stop.
+        if on_caller_cancelled is not None:
+            with contextlib.suppress(Exception):
+                on_caller_cancelled(error)
+
     try:
         if token is not None:
             remove_callback = token.add_cancel_callback(signal_cancelled)
@@ -399,14 +407,21 @@ async def await_abandonable_call(
                 ),
             )
         raise RunTimeout("run exceeded max duration")
+    except asyncio.CancelledError as exc:
+        observe_caller_cancelled(exc)
+        raise
     finally:
         remove_callback()
         if not cancelled.done():
             cancelled.cancel()
         if not task.done():
-            await detach_unfinished_call(
-                task, sync_call, grace_s=grace_s, on_discarded=on_discarded
-            )
+            try:
+                await detach_unfinished_call(
+                    task, sync_call, grace_s=grace_s, on_discarded=on_discarded
+                )
+            except asyncio.CancelledError as exc:
+                observe_caller_cancelled(exc)
+                raise
         elif not outcome_consumed:
             # The callee finished -- possibly by raising -- in the same loop turn that made a run
             # boundary observable, so ``check_boundary`` raised before anything read the outcome.

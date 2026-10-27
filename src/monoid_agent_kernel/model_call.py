@@ -2332,6 +2332,17 @@ class ModelCallRunner:
 
         task: asyncio.Future[Any] | None = None
         released = False
+        caller_termination: ModelCallTermination | None = None
+
+        def observe_caller_cancelled(error: asyncio.CancelledError) -> None:
+            nonlocal caller_termination
+            if caller_termination is None:
+                caller_termination = _termination_for(error)
+                if drain.started:
+                    caller_termination = replace(caller_termination, requested_by=(
+                        drain.cancel_cause.value if drain.cancel_cause is not None else "turn_interrupt"
+                    ))
+            mark_call_facts(error, caller_termination, call_facts_of(error)[1])
 
         async def follow(until_drain: bool) -> Any:
             # The raced awaitable in both phases. Cancelled by the race, it cancels the stream task
@@ -2368,7 +2379,8 @@ class ModelCallRunner:
                 )
             try:
                 streamed = await self._aawait(
-                    follow(True), deadline, boundary=(view, streaming_boundary)
+                    follow(True), deadline, boundary=(view, streaming_boundary),
+                    on_caller_cancelled=observe_caller_cancelled,
                 )
             except RunTimeout:
                 # The deadline fired in the tick the stop was decided, before phase one saw it.
@@ -2402,7 +2414,10 @@ class ModelCallRunner:
             if deadline is not None:
                 window_end = min(window_end, deadline)
             try:
-                await self._aawait(follow(False), window_end, boundary=(view, draining_boundary))
+                await self._aawait(
+                    follow(False), window_end, boundary=(view, draining_boundary),
+                    on_caller_cancelled=observe_caller_cancelled,
+                )
             except RunTimeout:
                 # The window closed; `draining_boundary` never raises a timeout of its own.
                 raise drain.outcome(ended_by=(
@@ -2431,7 +2446,11 @@ class ModelCallRunner:
                     grace_s = self._grace_s()
                 except Exception:
                     grace_s = self.cancel_grace_s
-                await detach_unfinished_call(task, None, grace_s=grace_s)
+                try:
+                    await detach_unfinished_call(task, None, grace_s=grace_s)
+                except asyncio.CancelledError as exc:
+                    observe_caller_cancelled(exc)
+                    raise
 
     async def _aclose_within_grace(self, aclose: Callable[[], Any]) -> None:
         """Close a provider's stream, spending at most the grace interval on its cleanup.
@@ -2505,6 +2524,7 @@ class ModelCallRunner:
         adapter: Any = None,
         request: ModelRequest | None = None,
         boundary: tuple[CancellationToken | None, Callable[[float | None], None]] | None = None,
+        on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
     ) -> ModelTurn:
         """Await model I/O against the shared cancel/deadline race.
 
@@ -2561,6 +2581,7 @@ class ModelCallRunner:
                     self._check_cancel_or_deadline if boundary is None else boundary[1]
                 ),
                 on_discarded=_discard_hook(adapter, request),
+                on_caller_cancelled=on_caller_cancelled,
             )
         except CalleeCancelled as exc:
             cancelled = ModelAdapterError(

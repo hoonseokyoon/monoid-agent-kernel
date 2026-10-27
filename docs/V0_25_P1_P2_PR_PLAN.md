@@ -830,3 +830,10 @@ wait와 drain owner의 cleanup await에서 추가 취소가 와도 같은 사실
 (`.tmp/v025/p1p2-i-caller-order-expanded-red.txt`). 앞선 stop→caller 및 cleanup 중 첫 caller 4개가 실패하고,
 caller 단독·caller→cleanup의 user stop·반복 caller control은 통과했다. 이 회귀를 먼저 commit으로 고정한다.
 공유 wait primitive 변경이므로 기존 bridge·model/tool 취소·durable unknown/P5 계약과 두 리뷰를 갱신한다.
+
+회귀 commit은 `cf8f727`이다. 수정 후 경합 7개와 관련 model/tool wait·replay·durable 복구·observer·census
+**810 passed / 26.00s**, lint/diff check를 통과했다(`p1p2-i-caller-order-green.txt`,
+`p1p2-i-cancellation-related.txt`). callback은 caller 취소 시점과 cleanup 취소만 관찰하며 기본값은 None이다.
+runtime·UI의 수정 이력을 포함한 변경량은 이 48줄 delta까지 **1,981줄**이다. 최초 1,870줄 추정과
+soft limit 접근을 다시 검토했고, 기존 wait에 선택적 관찰점을 추가하는 경계가 task/shield 재구성보다 작다.
+이 최종 source로 wheel·두 targeted 리뷰·필수 CI를 갱신한다.
