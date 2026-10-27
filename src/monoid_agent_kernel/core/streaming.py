@@ -228,6 +228,10 @@ class RunStream:
         if not frozen:
             now = deadline_clock.monotonic()
             value = self._exit_wait_s(_now=now)
+            if self._owner_budget is None:
+                # Legacy callbacks finish before their selected wait begins.
+                # Managed allowances already measure time from the owner snapshot.
+                now = deadline_clock.monotonic()
             budget = None
             if type(value) in (bool, int, float):
                 try:

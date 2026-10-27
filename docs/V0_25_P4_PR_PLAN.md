@@ -486,3 +486,13 @@ checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했�
 02 기능 churn은 약 601줄이며 테스트·문서·예제 포함 약 1,690줄이다. 00 계획/CI와 01을 합한 전체는 약 3,200줄로
 최초 2,450줄의 약 1.3배다. 기능 합계는 약 701줄이다. 추가 비용은 실제 경합을 제어하는 fixture와 공개 예제에 사용했다.
 기존 drain 목록을 제거하고 하나의 registry와 기존 wait 경계의 hook을 선택해 중복 소유권과 새 timer service를 피했다.
+
+02 첫 후보 `3575356`의 설치 wheel은 현재/최소 Pydantic에서 각각 **764 passed**와 공개 API·offline 예제를 통과했다.
+첫 L1/required L2는 요청 정규화 순서의 source census가 이전 public acall 본문을 읽어 실패했다.
+검사를 실제 본문인 `_acall_owned`로 옮겨 정규화→identity 순서 assertion을 유지했고 **31 passed**였다.
+
+독립 코드 reviewer B가 raw legacy callback 실행 시간이 첫 종료 대기에서 차감되는 호환성 회귀를 재현했다.
+테스트-only `6527869`에서 callback 정상/예외 fallback 두 경로 모두 **2 failed (9.26s)**를 고정했다.
+raw 경로의 최초 cutoff를 callback 평가 뒤에 잡고 managed snapshot 기준과 재진입 cutoff는 유지했다.
+수정 후 RunStream·request identity·stream observer **83 passed (12.92s)**다.
+원본 `.tmp/v025/p4-02-review-red.txt`, `p4-02-review-green.txt`. 두 독립 최종 검토·새 wheel·필수 CI를 이어서 확인한다.
