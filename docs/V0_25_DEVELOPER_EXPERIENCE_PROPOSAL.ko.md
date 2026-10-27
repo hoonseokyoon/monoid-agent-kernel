@@ -15,7 +15,8 @@ P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model
 P4 예산 조회와 monotonic 제어를 구현했다. [실행 예제](../examples/termination_budget.py)는 실제 Stop·진행 조회·receipt를 연결한다.
 [최종 통합 #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)에서 누적 검증과 develop 반영 결과를 확인한다.
 2026-10-28 최신 develop `973e474`에서 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 조사했다.
-첫 도구·요청 스트림·승인 재개의 경험과 기존 예제 편집, PR별 수용 기준을 구체화했으며 구현은 보류한다.
+첫 도구·요청 스트림·승인 재개의 경험과 기존 예제 편집, PR별 수용 기준을 구체화했다.
+같은 날 사용자가 00·01과 리뷰·CI 후 02·03·최종 통합까지 순차 구현을 승인했다.
 
 ## 1. 제품 방향과 릴리스 경계
 

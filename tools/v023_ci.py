@@ -29,6 +29,7 @@ CAMPAIGN_TERMINAL_PROFILES = {
     "codex/v0.23-production-adapters": "combined",
     "codex/v0.25-p1-p2-call-facts": "combined",
     "codex/v0.25-p4-termination-budget": "combined",
+    "codex/v0.25-dx2-integration-recipes": "combined",
     "develop": "combined",
 }
 SDK_IMPORT_MODULES = {

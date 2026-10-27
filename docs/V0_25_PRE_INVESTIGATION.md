@@ -10,7 +10,8 @@ P4-00 [#162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 de
 P4-01·02 [#163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)·[#164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)는
 통합 브랜치 `be35567`에 병합했다. [P4-I #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)를 통해
 develop `973e474`에 최종 통합했다. P1–P5와 DX1의 구현은 완료됐다.
-2026-10-28 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 최신 develop에서 조사하고 독립 검토 ready를 받았다. 구현은 보류한다.
+2026-10-28 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 최신 develop에서 조사하고 독립 검토 ready를 받았다.
+사용자가 00·01과 리뷰·CI 후 02·03·최종 통합까지 순차 구현을 승인했다.
 정책·외부 근거·회귀·리뷰·CI 기록은 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
@@ -322,7 +323,7 @@ P1/P2/P4의 사실·복구·Stop 예제도 구현됐다. [DX2 PR 계획](V0_25_D
 | G3 종료 예산 | P4 | #165로 develop `973e474` 통합 완료 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
 | G4 출력 권한 수정 | P5 | PR-01, 독립 버그 수정 PR → develop | 일반·terminal·잔여 출력의 권한 검사와 정상 flush 보존 |
 | G6 typed 도구 | DX1 | PR-02, 독립 PR → develop | serializer 없는 입력 전달, JSON 결과·기존 envelope, 실제 loop 소비 |
-| G7 통합 예제 | DX2 | 기능별 예제 구현 후 [DX2-00→01→02→03→I](V0_25_DX2_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 남은 조합 마감; 계획 단계 | 첫 도구·요청/passive 수명·새 interpreter 승인 재개와 설치 wheel 수용 검증 |
+| G7 통합 예제 | DX2 | 기능별 예제 구현 후 [DX2-00→01→02→03→I](V0_25_DX2_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 남은 조합 마감; 순차 구현 승인 | 첫 도구·요청/passive 수명·새 interpreter 승인 재개와 설치 wheel 수용 검증 |
 | G5 자식 정책 | P8 조건부 | 독립 작업군 → develop | opt-in 상속·전파·대기·회계 검증 |
 | M 유지보수 | P6/P9 | 항목별 독립 PR → develop | 각각의 결함 또는 운영 개선을 단독 검증 |
 
@@ -405,7 +406,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 | D11 | DX1·DX2 포함 | 사용자 통합 요청 반영. P1–P5와 함께 v0.25 필수; 기존 기능 진입점과 예제 개선 |
 | D12 | 최초 PR 순서 | P5 우선, DX1 별도 PR. 10/26 사용자 구현 요청에 따라 최신 develop에서 실행 착수 |
 | D13 | 외부 사례 적용 | 전달 직전 재검사, 입력 검증/출력 직렬화 분리, 관측 불능 usage 유지; 근거·채택 범위는 PR 계획 §2 |
-| D14 | DX2 경험·예제·검증 | [DX2 PR 계획](V0_25_DX2_PR_PLAN.md): 기존 예제 정리, 설치 provenance, 요청/passive 수명, 새 interpreter 승인 재개. 조사·계획만 승인, 구현 보류 |
+| D14 | DX2 경험·예제·검증 | [DX2 PR 계획](V0_25_DX2_PR_PLAN.md): 기존 예제 정리, 설치 provenance, 요청/passive 수명, 새 interpreter 승인 재개. 10/28 00–03·I 순차 구현 승인 |
 
 이 문서는 통합 범위와 작업 경계를 기록한다. 구현 PR 사전조사에서는 최신 develop을 다시 읽고
 변경 파일·상태 전이·실패 우선순위·호환성·검증 명령·종료 조건을 구체화한다.

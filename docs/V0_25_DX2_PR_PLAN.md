@@ -2,8 +2,9 @@
 
 조사일: 2026-10-28 KST. 기준: fetch한 `origin/develop=973e47492ab0c7ff0747af25776476f22704fcb5`.
 P5·DX1·P3·P1/P2·P4는 develop에 병합됐다. P4 최종 통합은 [#165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)다.
-**현재 요청은 조사와 계획 구체화다. 구현·구현 PR·원격 게시·릴리스는 시작하지 않는다.**
-로컬 계획 브랜치는 `codex/v0.25-dx2-plan`이다. 이 문서가 DX2의 범위·결정·검증·진행 기록을 소유한다.
+**2026-10-28 사용자가 DX2-00·01 구현과 리뷰·CI 후 02·03·최종 통합까지 순차 진행을 승인했다.**
+00은 develop 대상 독립 PR이고 01은 수정 전 실패 회귀부터 진행한다. 릴리스·배포·CSP 제품 변경은 별도다.
+계획은 로컬 `88b3f9e`에 기록했다. 이 문서가 DX2의 범위·결정·검증·진행 기록을 소유하며 최신 실행 상태는 §9.1 이후에 둔다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)의 G7과
 [개발자 경험 설계 §7](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#7-dx2-실제-통합-흐름을-릴리스의-증거로-삼기)을 구체화한다.
@@ -259,7 +260,7 @@ current/최소 지원 계열 Pydantic 검증은 실제 resolved version을 기�
 
 G7 완료는 세 학습 경로와 passive 비교가 같은 최종 설치 wheel에서 실행되고, 문서가 그 검증 수준을 정확히 설명할 때다.
 추가 서비스·UI가 없어도 typed 도구, Stop·관측, 승인 후 재구성을 따라 할 수 있어야 한다.
-계획 검토가 끝나도 구현은 현재 사용자 지시에 따라 보류한다.
+구현은 승인된 PR 순서와 각 PR의 사전조사·리뷰·CI를 따른다.
 
 ## 9. 계획 검토와 진행 기록
 
@@ -272,4 +273,20 @@ G7 완료는 세 학습 경로와 passive 비교가 같은 최종 설치 wheel�
 이후 변경은 이 결과 기록이다. 미해결 중대 지적은 없다. 리뷰 원문은 `.tmp/v025/dx2-plan-review.md`,
 재현 명령·환경·증거 범위는 `.tmp/v025/dx2-baseline-evidence.md`에 둔다.
 연결 문서 4개의 local link/anchor 141개와 Python block 7개의 문법 검사를 통과했다.
-종료 직전 fetch에서도 develop은 `973e474`다. 이 판정은 계획의 진행 가능성을 다루며 현재 구현 보류를 유지한다.
+계획 종료 직전 fetch에서도 develop은 `973e474`였다. 이 판정은 계획의 진행 가능성을 다뤘으며 당시 구현은 보류했다.
+
+### 9.1 실행 착수와 DX2-00
+
+2026-10-28 사용자가 00·01과 후속 02·03·최종 통합을 승인했다. 착수 시 fetch한 develop은 `973e474`이며
+기존 계획의 source와 같다. 00 브랜치 `codex/v0.25-dx2-ci`는 계획 commit `88b3f9e`를 포함한다.
+root가 00 구현·공유 문서·runner·Git/PR 통합을 맡고, `dx2_01_research`가 01 코드·외부 사례를 갱신한다.
+00 사전조사는 `.tmp/v025/dx2-00-preflight.md`, 독립 검토는 `dx2_00_preflight_review`가 맡는다.
+GitHub의 현재 branch filter 문서와 실제 allowlist/profile resolver를 확인했다. 적용 범위는 exact branch 두 등록과 기존 회귀 확장이다.
+릴리스·버전·배포·CSP 변경은 수행하지 않는다. 다음 파트의 상태와 증거를 이 절에 이어 기록한다.
+
+00 독립 사전 검토는 ready였다. Tests-only `a76f7fd`에서 기존 foundation 모듈은 **4 FAIL / 31 PASS**:
+exact branch 기본 combined, 약한 label/manual 거부, push 등록 누락을 각각 확인했다.
+두 설정 등록 후 같은 모듈 **35 PASS**, Ruff 0.15.6과 `git diff --check`를 통과했다.
+명령은 §7의 pytest prefix와 `tests/test_v023_ci_foundation.py`, source PYTHONPATH·4 workers를 사용했다.
+원본은 `.tmp/v025/dx2-00-red.txt`, `dx2-00-green.txt`, 독립 검토는 `dx2-00-preflight-review.md`다.
+현재 누적 비용은 계획·승인 기록을 포함한 약 350줄이며 runtime core 변경은 0줄이다.
