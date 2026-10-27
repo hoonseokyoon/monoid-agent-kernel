@@ -162,6 +162,8 @@ def test_service_profile_rejects_missing_multiple_and_wrong_labels() -> None:
     [
         ("codex/v0.23-production-adapters", [], "combined"),
         ("codex/v0.23-production-adapters", ["ci:combined"], "combined"),
+        ("codex/v0.25-p1-p2-call-facts", [], "combined"),
+        ("codex/v0.25-p1-p2-call-facts", ["ci:combined"], "combined"),
         ("develop", [], "combined"),
         ("feature/unrelated", [], "core"),
         ("feature/service-change", ["ci:postgres"], "postgres"),
@@ -177,14 +179,21 @@ def test_terminal_and_non_campaign_branches_have_total_profile_resolution(
     assert module.resolve_profile(lock, head_ref=head_ref, labels=labels) == expected
 
 
-def test_terminal_branch_rejects_a_profile_weaker_than_combined() -> None:
+@pytest.mark.parametrize(
+    "head_ref", ["codex/v0.23-production-adapters", "codex/v0.25-p1-p2-call-facts"]
+)
+@pytest.mark.parametrize("manual", [False, True])
+def test_terminal_branch_rejects_a_profile_weaker_than_combined(
+    head_ref: str, manual: bool
+) -> None:
     module = _load_ci_module()
     lock = module.validate_lock()
     with pytest.raises(ValueError, match="requires ci:combined"):
         module.resolve_profile(
             lock,
-            head_ref="codex/v0.23-production-adapters",
-            labels=["ci:core"],
+            head_ref=head_ref,
+            labels=[] if manual else ["ci:core"],
+            requested_profile="core" if manual else None,
         )
 
 
@@ -236,6 +245,7 @@ def test_ci_workflows_encode_the_fast_full_and_cancel_boundaries() -> None:
     assert "full-pr-${{ github.event.pull_request.number || github.ref }}" in cancel
     assert "pull_request:" not in integration
     assert "codex/v0.23-production-adapters" in integration
+    assert "codex/v0.25-p1-p2-call-facts" in integration
     assert "      - name: Record integration evidence\n        if: always()" not in integration
     assert (
         "      - uses: actions/upload-artifact@v7\n"

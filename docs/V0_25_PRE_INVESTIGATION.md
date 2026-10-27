@@ -2,9 +2,10 @@
 
 작성일: 2026-09-28. 통합 갱신: 2026-10-27. 최초 코드 기준: v0.24.0 / `8d56e0d`.
 
-구현 기록: **P5 #148·DX1 #149·P3-00 #150·P3-01 #151 develop 병합, P3-02 #153·P3-03 #154 통합 브랜치 병합**.
-P3 최종 통합의 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`,
-통합 source는 `aa9e07e`다. 최종 리뷰·CI와 develop 반영 결과는 P3-I PR에서 확인한다.
+구현 기록: **P5 #148·DX1 #149·P3 #150–155 develop 병합**.
+P3-I #155의 develop 반영은 `4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`이다.
+현재 요청은 이 기준의 **P1P2-00·01 구현 및 리뷰·CI 후 02·03·04 순차 진행**이다.
+구체적인 정책·외부 근거·PR 범위는 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
 [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)에 기록한다. 릴리스 범위의 기준은 이 문서다.
@@ -109,6 +110,9 @@ CSP 자체 신호 타입을 바꾸지는 않는다. CSP의 현재 workspace 주�
 
 ### 5.1 P1·P2: 종료 사실과 사용량 증거
 
+2026-10-27 최신 develop 조사, 실제 cancel-drain probe, v2 reader/writer·rollback 정책과 PR별 수용 기준은
+[P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 구체화했다. 아래 원칙을 유지하며 세부 계약은 새 계획을 따른다.
+
 **현재 간격.** [usage 정규화](../src/monoid_agent_kernel/providers/_common.py)는 누락된 token 항목을 0으로 채우고,
 [runner](../src/monoid_agent_kernel/model_call.py)의 `_streamed_usage`는 값이 모두 0인 terminal usage를
 미보고로 처리한다. 확인된 0과 누락의 구분은 adapter 입력에서 이미 사라질 수 있다.
@@ -130,7 +134,7 @@ drain에서 회수한 usage가 현재 전달되지 않는다. 이 전달 누락�
 | 출처·수집 경로 | provider/adapter 보고 출처와 일반 완료/drain 수집 경로 | recovery는 재전달 경로이며 최초 provenance를 유지 |
 | 관측 범위 | 어느 dispatch에서 관측이 있었는지와 counter별 완전성을 분리 | `complete_keys`류 항목별 기준, attempts=0은 `no_dispatch` |
 
-필드 이름은 구현 설계에서 고정한다. 모든 dispatch에서 input만 보고했다면 input만 완전하다.
+공개 필드와 bounded vocabulary는 P1·P2 PR 계획 §4에 정했다. 모든 dispatch에서 input만 보고했다면 input만 완전하다.
 이 상태를 전체 token 사용량이 확정된 것으로 표현하지 않는다. first-party adapter의 검증된 raw 입력은
 provider 보고로 기록할 수 있다. 출처를 입증할 수 없는 구형/외부 exception stamp는
 `legacy_ambiguous` 또는 adapter 보고로 남긴다. malformed 입력의 부분 수용은 별도 호환성 결정이다.
@@ -154,6 +158,10 @@ provider 보고로 기록할 수 있다. 출처를 입증할 수 없는 구형/�
 P1과 P2의 영속 필드를 한 번에 설계하고, 지원할 새 format의 dual-reader 준비 → 새 writer 활성화 →
 혼합 버전·rollback 검증 순서를 하나의 변경 계획으로 둔다. 구형 reader가 새 format을 읽는다고 가정하지 않는다.
 rollback에는 구형 writer 전환 뒤에도 새 record를 읽을 수 있는 reader 유지 또는 검증된 데이터 전환이 필요하다.
+
+구체안은 invocation/model-calls v2와 v1 dual-reader다. immutable settled 좌표를 재게시할 때 원래 검증 payload/hash를
+보존한다. reader 준비 버전을 먼저 배포하고 새 writer를 활성화한다. rollback은 v2 reader를 유지한 버전으로 수행한다.
+private replay와 model-content는 기존 projection을 유지하고, live/gateway의 optional 필드와 OTel 진단을 별도로 연결한다.
 
 `unknown`의 partial-evidence 영속 slot 신설은 v0.25 필수 범위에서 제외하는 것을 권고한다.
 현재 프로세스의 exception에 남은 부분값과 재시작 후 canonical unknown의 증거 부재를 명시한다.
@@ -301,7 +309,7 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 
 | 작업군 | 대상 | 통합 방식 | 독립 완료 조건 |
 |---|---|---|---|
-| G1 종료·사용량 | P1/P2 | 공동 설계 후 완결 PR 또는 자체 소규모 캠페인 → develop | 타입·생산자·소비자·영속 형식·복구·fixture가 함께 일치 |
+| G1 종료·사용량 | P1/P2 | P1P2-00 독립 PR, 01–04 순차 통합 브랜치 → develop | 타입·생산자·소비자·영속 형식·복구·fixture가 함께 일치 |
 | G2 도구 확장점 | P3 | 독립 작업군 → develop | 공개 주입 경로, 권한 상실·child/fork·복구·호환성 검증 |
 | G3 종료 예산 | P4 | 독립 PR 또는 자체 소규모 캠페인 → develop | 현재 유효 예산 조회와 RunStream 대기의 일관성 |
 | G4 출력 권한 수정 | P5 | PR-01, 독립 버그 수정 PR → develop | 일반·terminal·잔여 출력의 권한 검사와 정상 flush 보존 |
@@ -312,6 +320,8 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 
 P1/P2는 receipt·attempt·종료 분류를 함께 검토해야 한다. 공동 설계는 필수지만 단일 거대 PR은 요구하지 않는다.
 독립적으로 유효한 reader·writer·회계 상태를 만들 수 있는 지점에서 PR을 나눈다.
+G1의 구체적인 순서는 [P1P2-00 → 01 reader → 02 producer/observer → 03 writer/recovery → 04 소비자 → I](V0_25_P1_P2_PR_PLAN.md#6-pr별-범위의존성우선순위)다.
+통합 브랜치 `codex/v0.25-p1-p2-call-facts`와 combined profile 등록은 P1P2-00에서 수행한다.
 착수 순서는 **P5 → DX1**, 다음 우선군은 P3·P1/P2·P4다. P5와 DX1 사이에는 기술적 선행 의존성이 없다.
 P3·P4·P5·DX1은 G1을 기다리는 전역 의존성이 없다. P8도 기존 계약으로 구현할 수 있으며, 새 API를 실제로 소비할 때
 그 관계만 선행 조건으로 추가한다.
@@ -374,7 +384,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 |---|---|---|
 | D01 | P3 포함, P7 후속 | 사용자 결정 |
 | D02 | 독립 작업군 → develop → 적정 시점 릴리스 | 사용자 방향 반영 |
-| D03 | P1/P2 타입·저장 형식 | 기존 숫자 유지·증거 추가, 공동 schema 컷과 reader/writer 전환 검증 권고; unknown 증거 slot은 필수 제외 권고 |
+| D03 | P1/P2 타입·저장 형식 | P1·P2 PR 계획: 기존 숫자+희소 증거, invocation/model-calls v2·dual-reader, 원본 hash 보존 복구, reader 유지 rollback; unknown 증거 slot 후속. 구현 승인 |
 | D04 | P3 주입·권한·수명 | P3-02/03 구현: 선택적 확장 Protocol, call별 lease, fresh child adapter와 parent lineage, restore 재주입 |
 | D05 | P4 clock·집계·조회 | G3 내부 monotonic 제어 정렬 → snapshot 공개 권고; wall snapshot 대안은 보장 범위 변경을 기록 |
 | D06 | P5 | 10/25 재현에 따라 일반 delta·terminal 정규화·잔여 flush의 전달 경계로 보완; PR-01 |
