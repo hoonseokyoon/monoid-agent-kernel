@@ -208,12 +208,14 @@ def test_p1p2_requester_capture_reuses_the_stream_owners_token() -> None:
     assert [chunk.text for chunk in seen] == ["visible"]
 
 
-@pytest.mark.parametrize("replace_token", [False, True])
-def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token) -> None:
+@pytest.mark.parametrize(("replace_token", "stale_wake"), [(False, False), (True, False), (True, True)])
+def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token, stale_wake) -> None:
     captures = []
 
     async def run():
         current = [CancellationToken()]
+        original = current[0]
+        cause = InterruptionCause.HOST_SHUTDOWN if stale_wake else InterruptionCause.USER_CANCEL
         entered, accepted, cleanup, release, stopped = (asyncio.Event() for _ in range(5))
 
         class Adapter:
@@ -233,7 +235,7 @@ def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token
                 try:
                     super()._check_cancel_or_deadline(deadline)
                 except RunCancelled as exc:
-                    assert exc.interruption_cause is InterruptionCause.USER_CANCEL
+                    assert exc.interruption_cause is cause
                     accepted.set()
                     raise
 
@@ -245,7 +247,9 @@ def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token
         await asyncio.wait_for(entered.wait(), 1)
         if replace_token:
             current[0] = CancellationToken()
-        current[0].cancel(InterruptionCause.USER_CANCEL)
+        current[0].cancel(cause)
+        if stale_wake:
+            original.cancel(InterruptionCause.USER_CANCEL)
         await asyncio.wait_for(accepted.wait(), 1)
         await asyncio.wait_for(cleanup.wait(), 1)
         task.cancel()
@@ -257,7 +261,7 @@ def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token
         await asyncio.wait_for(stopped.wait(), 1)
         facts, _evidence = call_facts_of(caught.value)
         assert facts == ModelCallTermination(
-            outcome="cancelled", requested_by="user_cancel", ended_by="stop_request",
+            outcome="cancelled", requested_by=cause.value, ended_by="stop_request",
         )
         assert captures[0].receipt.termination == facts
 
