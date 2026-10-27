@@ -44,7 +44,9 @@ building against, and securing the kernel.
   The [P1/P2 PR plan](V0_25_P1_P2_PR_PLAN.md) defines termination facts, sparse usage evidence,
   versioned storage, recovery compatibility, external precedents, and sequential implementation acceptance gates.
   The [P4 PR plan](V0_25_P4_PR_PLAN.md) specifies monotonic control, remaining-duration recovery,
-  owned-call snapshots, RunStream escalation budgets, external evidence, and regression gates; sequential implementation is authorized.
+  owned-call snapshots, RunStream escalation budgets, external evidence, and completed implementation evidence.
+  The [DX2 PR plan](V0_25_DX2_PR_PLAN.md) defines the first-tool, request-stream and approval-restart journeys,
+  example simplification, installed-wheel validation, external cases and PR boundaries; sequential implementation is authorized.
   The installed [host-resource report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py)
   exercises approval, restart, and explicit fresh/fork child inheritance.
 
@@ -80,6 +82,7 @@ building against, and securing the kernel.
 | [V0_25_P3_PR_PLAN.md](V0_25_P3_PR_PLAN.md) | P3 policies, PR boundaries and execution evidence for typed host resources, call authority, lifecycle, recovery, child inheritance, and consumer acceptance criteria. |
 | [V0_25_P1_P2_PR_PLAN.md](V0_25_P1_P2_PR_PLAN.md) | Policies, PR sequence and execution evidence for termination facts, usage observations, v1/v2 readers, immutable recovery, rollout/rollback, and consumer verification. |
 | [V0_25_P4_PR_PLAN.md](V0_25_P4_PR_PLAN.md) | Clock, recovery, snapshot and RunStream policies; external cases, observed failures, PR boundaries, acceptance gates and sequential execution evidence. |
+| [V0_25_DX2_PR_PLAN.md](V0_25_DX2_PR_PLAN.md) | Developer journeys, existing-example edits, request/passive stream lifetimes, fresh-process approval, upstream evidence, PR scopes, acceptance criteria and sequential execution evidence. |
 | [V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) | Target developer APIs for typed tools, host resources, termination, usage and budgets; integration recipes and later web/Studio directions. |
 | [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
 | [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |

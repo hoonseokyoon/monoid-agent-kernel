@@ -14,6 +14,9 @@ P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model
 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4의 정책·외부 근거·변경 범위는 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 있다.
 P4 예산 조회와 monotonic 제어를 구현했다. [실행 예제](../examples/termination_budget.py)는 실제 Stop·진행 조회·receipt를 연결한다.
 [최종 통합 #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)에서 누적 검증과 develop 반영 결과를 확인한다.
+2026-10-28 최신 develop `973e474`에서 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 조사했다.
+첫 도구·요청 스트림·승인 재개의 경험과 기존 예제 편집, PR별 수용 기준을 구체화했다.
+같은 날 사용자가 00·01과 리뷰·CI 후 02·03·최종 통합까지 순차 구현을 승인했다.
 
 ## 1. 제품 방향과 릴리스 경계
 
@@ -332,8 +335,14 @@ retry·repair에 같은 cutoff를 쓰며 checkpoint는 기존 remaining duration
 ## 7. DX2: 실제 통합 흐름을 릴리스의 증거로 삼기
 
 통합 예제는 다음 세 경로를 다룬다. P3의 `python -m monoid_agent_kernel.reference.host_tool_report`는
-승인·재시작과 fresh/fork 상속을 공개 API로 실행한다. Python 3.11.9의 설치 wheel을 checkout 밖에서 실행했고,
+승인·같은 interpreter의 새 loop 복원과 fresh/fork 상속을 공개 API로 실행한다. Python 3.11.9의 설치 wheel을 checkout 밖에서 실행했고,
 Pydantic 2.14.1과 최소 지원 계열 2.6.4에서 통과했다. 최소 설치 CI도 같은 module을 실행한다.
+
+[DX2 상세 계획](V0_25_DX2_PR_PLAN.md)은 typed 도구를 첫 진입으로 삼고, 기존 예제를 실행 목적별로 정리한다.
+현재 9개 예제의 checkout `sys.path` 우회를 제거하고, P1/P2/P4 예제의 실제 파일 실행을 기존 테스트·wheel CI에 연결한다.
+`termination_budget.py`는 조용한 호출 중 Stop과 consumer 취소를 다루며, 별도 작은 Reference 예제로 passive 구독을 비교한다.
+보고서 예제는 기존 경로를 재사용하는 prepare/resume 명령과 두 interpreter 검증으로 확장한다. 새 CLI 옵션은 아직 구현되지 않았다.
+hosted/full-stack 시나리오는 고급 구성 경로로 유지하고 FastAPI/Vercel 전송 지원은 후속으로 둔다.
 
 | 예제 | 사용하는 계약 | 수용 시나리오 |
 |---|---|---|

@@ -8,7 +8,10 @@ P1P2-I #161의 develop 반영은 `2914c4366f8dfd7ed537f854388836a12a05f078`이�
 구체적인 정책·외부 근거·PR 범위는 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다.
 P4-00 [#162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 develop에,
 P4-01·02 [#163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)·[#164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)는
-통합 브랜치 `be35567`에 병합했다. [P4-I #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)가 누적 변경을 develop에 통합한다.
+통합 브랜치 `be35567`에 병합했다. [P4-I #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)를 통해
+develop `973e474`에 최종 통합했다. P1–P5와 DX1의 구현은 완료됐다.
+2026-10-28 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 최신 develop에서 조사하고 독립 검토 ready를 받았다.
+사용자가 00·01과 리뷰·CI 후 02·03·최종 통합까지 순차 구현을 승인했다.
 정책·외부 근거·회귀·리뷰·CI 기록은 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
@@ -305,10 +308,11 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 
 **DX2.** DX1의 순수 typed 도구 예제와 P3의
 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)를 구현했다.
-보고서는 승인·park/release·restore·fresh/fork 상속을 설치 wheel로 검증한다.
-종료 사실·대기를 보여주는 스트림 예제는 P1/P2/P4/P5의 계약을 소비한다.
-커널 소유 FakeModelAdapter와 기존 hosting/control로 소비 시나리오를 검증하고 설치된 wheel에서도 실행한다.
-기존 `reference`의 안정성 등급과 CSP의 별도 소비자 마이그레이션 책임을 유지한다.
+보고서는 승인·park/release·같은 interpreter의 새 loop restore·fresh/fork 상속을 설치 wheel로 검증했다.
+P1/P2/P4의 사실·복구·Stop 예제도 구현됐다. [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)은 남은 조합을 다룬다:
+설치본을 가리는 예제 경로 제거와 상시 CI, silent Stop·요청 취소와 passive 구독의 비교, 새 interpreter의 승인 재개.
+기존 예제를 재사용하고 typed 도구→요청 스트림→승인 재개의 학습 경로를 제공한다.
+기존 `reference`의 안정성 등급과 CSP의 별도 소비자 마이그레이션 책임을 유지한다. FastAPI/Vercel 어댑터는 후속이다.
 
 ## 6. 작업군과 개발 경계
 
@@ -316,10 +320,10 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 |---|---|---|---|
 | G1 종료·사용량 | P1/P2 | P1P2-00 독립 PR, 01–04 순차 통합 브랜치 → develop | 타입·생산자·소비자·영속 형식·복구·fixture가 함께 일치 |
 | G2 도구 확장점 | P3 | 독립 작업군 → develop | 공개 주입 경로, 권한 상실·child/fork·복구·호환성 검증 |
-| G3 종료 예산 | P4 | 00·01·02 병합, 최종 통합 #165 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
+| G3 종료 예산 | P4 | #165로 develop `973e474` 통합 완료 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
 | G4 출력 권한 수정 | P5 | PR-01, 독립 버그 수정 PR → develop | 일반·terminal·잔여 출력의 권한 검사와 정상 flush 보존 |
 | G6 typed 도구 | DX1 | PR-02, 독립 PR → develop | serializer 없는 입력 전달, JSON 결과·기존 envelope, 실제 loop 소비 |
-| G7 통합 예제 | DX2 | 소비하는 기능 PR에 동반하고 남은 조합만 별도 PR | 순수 도구·스트림·승인/복구, 공개 API·wheel 수용 검증 |
+| G7 통합 예제 | DX2 | 기능별 예제 구현 후 [DX2-00→01→02→03→I](V0_25_DX2_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 남은 조합 마감; 순차 구현 승인 | 첫 도구·요청/passive 수명·새 interpreter 승인 재개와 설치 wheel 수용 검증 |
 | G5 자식 정책 | P8 조건부 | 독립 작업군 → develop | opt-in 상속·전파·대기·회계 검증 |
 | M 유지보수 | P6/P9 | 항목별 독립 PR → develop | 각각의 결함 또는 운영 개선을 단독 검증 |
 
@@ -327,7 +331,8 @@ P1/P2는 receipt·attempt·종료 분류를 함께 검토해야 한다. 공동 �
 독립적으로 유효한 reader·writer·회계 상태를 만들 수 있는 지점에서 PR을 나눈다.
 G1의 구체적인 순서는 [P1P2-00 → 01 reader → 02 producer/observer → 03 writer/recovery → 04 소비자 → I](V0_25_P1_P2_PR_PLAN.md#6-pr별-범위의존성우선순위)다.
 G1은 통합 브랜치 `codex/v0.25-p1-p2-call-facts`에서 완료하고 #161로 develop에 병합했다.
-G3의 후속 순서는 [P4-00 → 01 clock/restore → 02 snapshot/RunStream → I](V0_25_P4_PR_PLAN.md#6-pr별-변경-범위와-의존성)다.
+G3은 [P4-00 → 01 clock/restore → 02 snapshot/RunStream → I](V0_25_P4_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 완료했다.
+다음 G7은 기존 코드·실행 기준선·외부 구현 조사에 따라 DX2의 학습 경로와 상시 검증을 보완한다.
 착수 순서는 **P5 → DX1**, 다음 우선군은 P3·P1/P2·P4다. P5와 DX1 사이에는 기술적 선행 의존성이 없다.
 P3·P4·P5·DX1은 G1을 기다리는 전역 의존성이 없다. P8도 기존 계약으로 구현할 수 있으며, 새 API를 실제로 소비할 때
 그 관계만 선행 조건으로 추가한다.
@@ -401,6 +406,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 | D11 | DX1·DX2 포함 | 사용자 통합 요청 반영. P1–P5와 함께 v0.25 필수; 기존 기능 진입점과 예제 개선 |
 | D12 | 최초 PR 순서 | P5 우선, DX1 별도 PR. 10/26 사용자 구현 요청에 따라 최신 develop에서 실행 착수 |
 | D13 | 외부 사례 적용 | 전달 직전 재검사, 입력 검증/출력 직렬화 분리, 관측 불능 usage 유지; 근거·채택 범위는 PR 계획 §2 |
+| D14 | DX2 경험·예제·검증 | [DX2 PR 계획](V0_25_DX2_PR_PLAN.md): 기존 예제 정리, 설치 provenance, 요청/passive 수명, 새 interpreter 승인 재개. 10/28 00–03·I 순차 구현 승인 |
 
 이 문서는 통합 범위와 작업 경계를 기록한다. 구현 PR 사전조사에서는 최신 develop을 다시 읽고
 변경 파일·상태 전이·실패 우선순위·호환성·검증 명령·종료 조건을 구체화한다.
