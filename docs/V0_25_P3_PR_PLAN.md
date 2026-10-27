@@ -1,8 +1,8 @@
 # v0.25 P3: 호스트 자원 주입·권한·수명·복구 PR 계획
 
-작성·조사일: 2026-10-27 KST. 기준: 최신 `origin/develop`
-`5b08b10d82a948268d1a95b51112b1508e233e3d` (P5 #148, DX1 #149 병합).
-상태: **2026-10-27 P3-00/01 develop 병합, P3-02 통합 branch 병합, P3-03 사전조사.** 사용자는 P3-00·01부터 진행하고,
+작성·조사일: 2026-10-27 KST. 최초 기준은 `develop=5b08b10` (P5 #148, DX1 #149 병합),
+최종 통합 사전조사 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`다.
+구현 기록: **P3-00/01 develop 병합, P3-02/03 통합 브랜치 병합.** 사용자는 P3-00·01부터 진행하고,
 P3-01은 실패 회귀를 먼저 고정한 독립 PR로 구현한 뒤 리뷰·CI를 확인하도록 요청했다.
 이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·CSP 변경은 범위 밖이다.
 
@@ -31,7 +31,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 
 ## 2. 코드와 실제 소비자에서 확인한 간격
 
-| 생산자 → 소비자 | 현재 사실·위치 | P3에서 정할 경계 |
+| 생산자 → 소비자 | 최초 조사 기준의 사실·위치 | P3에서 구현한 경계 |
 |---|---|---|
 | handler dispatch → extension context | [loop.py](../src/monoid_agent_kernel/loop.py) `_ainvoke_handler`는 provider와 handler에 같은 façade를 전달. `_live_call`은 ContextVar가 없는 thread에서 최신 `_call_fallback`을 사용 | 호출마다 새 façade에 원래 lease를 고정. 새 helper가 현재 전역 call을 조회하지 않음 |
 | tool admission → workspace | `_aexecute_tool_call`이 surface·승인·capability를 검사. `_check_permissions`는 선언한 `path_args`만 확인. [AuthorityBoundWorkspace](../src/monoid_agent_kernel/core/workspace.py)는 activation authority만 확인 | handler가 계산한 경로에도 작업마다 call의 path scope·PermissionPolicy·workspace mode 적용 |
@@ -56,7 +56,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 | model-I/O observer.close에서 authority revoke 후 public discard | `WriteAuthorityRevoked`; observer close 1회, session·authority callback 남음, finalized=false. 두 번째 discard에서 session 해제 | 첫 cleanup 시도에서 teardown을 끝내도록 P3-01에서 수정 |
 
 기존 관련 회귀 **13 passed in 4.21s**. 이 성공은 위 두 순서가 이미 검증됐다는 뜻으로 사용하지 않는다.
-새 host resource API는 아직 없으므로 위 결과는 기존 recorder/subscription 수명 결함의 증거다.
+위 결과는 새 host resource API 구현 전에 확인한 recorder/subscription 수명 결함의 증거다.
 
 ## 3. 외부에서 확인한 문제와 채택할 답안
 
@@ -82,8 +82,8 @@ LangGraph #5705/#6381은 closed·unmerged, PydanticAI #10479/#11255는 open·unm
 ### 4.1 등록과 소유권
 
 - 신규 모듈은 `monoid_agent_kernel.tools.host_bindings`. 공개 이름은 `HostToolKey[T]`,
-  `HostToolBinding[T]`, `HostToolResource[T]`, `HostToolCallLease`, `ToolWorkspace`,
-  `require_host_tool_binding`으로 계획한다. 기존 `ToolContext` 필수 멤버를 늘리지 않는다.
+  `HostToolBinding[T]`, `HostToolResource[T]`, `HostToolActivation`, `HostToolCallLease`, `ToolWorkspace`,
+  `require_host_tool_binding`이다. 기존 `ToolContext` 필수 멤버를 유지한다.
   helper가 사용하는 선택적 확장 Protocol은 새 모듈에 둔다.
 - `AgentLoop(..., host_tool_bindings=...)`는 keyword-only다. `from_tools`/`from_config`는 같은 인자를 전달한다.
   constructor에서 tuple snapshot과 등록 형태·identity/name 중복을 검사한다. 이 단계 factory 호출은 0회다.
@@ -201,7 +201,7 @@ open/bind_call/accepts의 일반 예외는 새 경계에서 단계별 고정 메
 ### 4.4 child·fork
 
 P3-02의 기본값은 상속 OFF이고, 미완성 상속 옵션을 노출하지 않는다.
-P3-03에서 `HostToolBinding(..., inherit_to_children=True)`를 추가한다. 각 hop에서 opt-in 등록만 전달하며 child와 fork에 동일 적용한다.
+P3-03의 `HostToolBinding(..., inherit_to_children=True)`로 상속을 선택한다. 각 hop에서 opt-in 등록만 전달하며 child와 fork에 동일 적용한다.
 자식은 새 registry·adapter·call view를 갖고 factory를 자식 descriptor로 다시 실행한다.
 부모 resource/view 또는 WriterToken을 전달하지 않는다. factory closure의 host-owned pool 공유는 host의 명시적 책임이다.
 
@@ -251,8 +251,9 @@ CSP migration·배포·릴리스, 범용 DB/HTTP adapter, delete/list/glob 등 w
 
 ## 6. 실제 통합 개발자 API 예시
 
-아래는 **P3 구현 목표 API**다. 현재 배포 패키지에서 실행되는 예제로 표시하지 않는다.
-P3-02에서 전체 example을 패키지 smoke에 포함하고 실제 import·타입·승인 경로를 확정한다.
+아래는 **P3-02/03에서 구현한 API**다. 이 브랜치에서 빌드한 wheel의
+[실행 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)가 승인·복구와 fresh/fork 상속을 검증한다.
+v0.25 배포는 남은 필수 작업군과 별도의 릴리스 절차를 따른다.
 
 ~~~python
 from pathlib import Path
@@ -774,4 +775,32 @@ parent 두 요청만 model에 도달했음을 확인한다. production 변경은
 보완 뒤 같은 positive-operation 거부 변이는 **4 failed / 1.48s**, parent token 제거 변이는 barrier와
 factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tmp/v025/p3-03-success-oracle-negative.log`,
 `p3-03-parent-guard-negative-final.log`다. 원래 구현의 새 35개 검사는 **35 passed / 12.21s**이며
-`.tmp/v025/p3-03-final-green.log`에 기록했다. 최종 head를 두 reviewer가 표적 재검토한다.
+`.tmp/v025/p3-03-final-green.log`에 기록했다. 두 reviewer의 최종 판정은
+`c517e15dbc61d4c3b6ca28877b350fb7057ea631`에서 모두 PASS다.
+같은 head의 L1 `40438800639`, 필수 L2 `40439077960`이 성공했다.
+[PR #154](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/154)는 통합 브랜치에
+`aa9e07e6175ff05d58c265e2d82e5daa73889f74`로 merge했다.
+
+### P3-I 통합 사전조사와 인계 — 2026-10-27
+
+최신 develop `336cb4c`를 다시 fetch했고, 통합 `aa9e07e`의 source tree가 P3-03 최종 검토 후보와 같음을 확인했다.
+독립 사전 검토는 `.tmp/v025/p3-i-preflight.md`의 SHA256
+`CF76EB5E4164FD093A24D6D89F2B8E585AE2BE9DD0161F5CA131E96444738125`에 READY를 반환했다.
+이 검토 이후 P3-03의 테스트 성공 관찰점만 보완했고, production 차이는 없다.
+
+P3-I의 새 변경은 실행 상태·공개 API·소비 예제를 통합 계획에 반영하는 문서 정리다.
+source 증분은 0이며 최종 develop 대비 source 변경은 934줄(257줄 실행 예제 포함)이다.
+P3-01·02·03, CI fixture 보완과 이번 문서 정리의 누적 비용은 약 3,700줄이며, 최초 계획 문서 비용은 별도다.
+추가 비용은 실제 경합·복구·child 검증과 리뷰에서 보완한 성공 관찰점에 집중됐다.
+기능 2,000줄 soft limit과 총비용 1.5배 재계획 기준을 유지한다.
+
+최종 누적 코드 검토는 두 독립 reviewer가 develop 대비 전체 변경과 P3-01 cleanup의 결합을 확인한다.
+647 passed / 1 platform skip, 보완된 child 35 passed, current/minimum Pydantic installed-wheel 결과는
+동일 source 증거로 재사용한다. 로컬 문서 링크·anchor 111개, Python 예시 AST 8개와 공백 검사를 통과했다.
+P3-I PR에 최종 head, 두 리뷰 판정, L1/L2 및 통합 브랜치 전체 CI를 기록한 뒤 merge commit으로 develop에 합친다.
+병합 후 develop 전체 CI까지 확인하고 같은 PR과 로컬 memory에 마감 결과를 남긴다.
+
+후속 책임은 P1/P2 종료·사용량, P4 예산, DX2의 남은 스트리밍 조합에 있다.
+P8이 일반 child 중단·drain을 소유하고, P7이 OS 격리를 소유한다.
+호스트는 일반 외부 client의 fencing·idempotency·pool 수명과 async I/O를 소유한다.
+실행 중 in-process resume job의 durable park 제한은 기존 snapshot 계약을 따른다.

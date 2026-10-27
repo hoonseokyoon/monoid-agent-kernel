@@ -40,7 +40,9 @@ building against, and securing the kernel.
   compatibility boundaries, and research evidence. Start with the [P5/DX1 PR plan](V0_25_P5_DX1_PR_PLAN.md)
   for the first two changes. The [P3 PR plan](V0_25_P3_PR_PLAN.md) specifies host-resource injection,
   call authority, lifecycle, recovery, upstream evidence, and implementation acceptance criteria; see the
-  [developer API design](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) for target examples and later directions.
+  [developer API design](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) for implemented DX1/P3 APIs and later proposals.
+  The installed [host-resource report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py)
+  exercises approval, restart, and explicit fresh/fork child inheritance.
 
 ## All documents
 

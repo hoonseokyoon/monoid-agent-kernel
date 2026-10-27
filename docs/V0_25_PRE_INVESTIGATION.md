@@ -1,10 +1,10 @@
 # v0.25 통합 개발 계획과 사전조사
 
-작성일: 2026-09-28. 통합 갱신: 2026-10-25. 코드 기준: v0.24.0 / `8d56e0d`.
+작성일: 2026-09-28. 통합 갱신: 2026-10-27. 최초 코드 기준: v0.24.0 / `8d56e0d`.
 
-상태: **2026-10-27 P5 #148·DX1 #149 병합 / P3 구현 승인·P3-00/01 착수**.
-P3의 현재 기준은 `origin/develop=5b08b10d82a948268d1a95b51112b1508e233e3d`다.
-사용자는 P3-00·01부터 구현하고 리뷰·CI 확인 뒤 통합 브랜치에서 P3-02·03을 순차 진행하도록 요청했다.
+구현 기록: **P5 #148·DX1 #149·P3-00 #150·P3-01 #151 develop 병합, P3-02 #153·P3-03 #154 통합 브랜치 병합**.
+P3 최종 통합의 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`,
+통합 source는 `aa9e07e`다. 최종 리뷰·CI와 develop 반영 결과는 P3-I PR에서 확인한다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
 [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)에 기록한다. 릴리스 범위의 기준은 이 문서다.
@@ -169,23 +169,24 @@ backend live-stream closed frame과 Studio reader, OTel의 attempt/call 계측�
 ### 5.2 P3: 타입 있는 주입과 호출별 권한
 
 2026-10-27 구체화한 정책·외부 근거·코드 재현·PR 의존성·수용 행렬은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 둔다.
-기존 cleanup 두 경계 보완 후 root의 주입·권한·복구와 실제 보고서 소비자를 한 PR에서 완결하고,
-child/fork 명시 상속을 다음 PR로 연결한다. 동기 activation adapter, 호출에 고정한 façade,
-deferred workspace, 별도 P3 lifetime guard를 채택한다. 현재 구현 실행 기록은 P3 PR 계획 §9에 둔다.
+P3-01에서 기존 cleanup을 보완했고, P3-02에서 root 주입·권한·복구와 보고서 소비자,
+P3-03에서 child/fork 명시 상속을 구현했다. 동기 activation adapter, 호출에 고정한 façade,
+deferred workspace, 별도 P3 lifetime guard를 채택했다. 구현 실행 기록은 P3 PR 계획 §9에 둔다.
 
-**현재 간격.** [ToolContext](../src/monoid_agent_kernel/tools/base.py)는 method-only Protocol이고,
+**최초 조사에서 확인한 간격.** [ToolContext](../src/monoid_agent_kernel/tools/base.py)는 method-only Protocol이고,
 [extension façade](../src/monoid_agent_kernel/loop.py)는 내부 workspace·recorder를 감춘다.
 [bootstrap](../src/monoid_agent_kernel/loop_phases.py)은 `workspace_factory`의 반환값을 받은 뒤
 authority wrapper를 만든다. CSP는 factory에서 원본 workspace를 provider에 보관한다.
 그 참조에는 커널 wrapper의 revoke 검사가 적용되지 않는다. 이 구조는 소스로 확인했으며,
 CSP 운영 환경의 권한 상실 후 쓰기 발생은 이번 조사에서 검증하지 않았다.
 
-**최소 공개 표면 권고.** keyword-only `host_tool_bindings`, 타입 검증자가 있는 `HostToolKey[T]`,
-factory 등록, `require_host_tool_binding` 같은 typed helper를 제공한다. 기존 `ToolContext`의 필수 멤버는
-유지하고 선택적 확장 Protocol로 새 접근자를 제공해 구조적 구현자의 호환성을 보존한다.
-실제 이름과 runtime type 검사 방식은 공개 표면 테스트와 함께 확정한다.
+**구현한 공개 표면.** keyword-only `host_tool_bindings`와
+`monoid_agent_kernel.tools.host_bindings`의 `HostToolKey[T]`, `HostToolBinding[T]`,
+`HostToolResource[T]`, `HostToolActivation`, `HostToolCallLease`, `ToolWorkspace`,
+`require_host_tool_binding`을 제공한다. identity key와 `accepts` 검증자를 사용하고,
+기존 `ToolContext` 필수 멤버를 유지하는 선택적 확장 Protocol로 구조적 구현자의 호환성을 보존한다.
 
-커널이 제공하는 workspace 기능은 read/write/exists 등 좁은 메서드에 한정한다.
+커널이 제공하는 workspace 기능은 `read_bytes`/`write_bytes`/`exists`다.
 각 작업에서 activation·원래 tool call의 lease·binding path policy·workspace authority를 검사한다.
 [AuthorityBoundWorkspace](../src/monoid_agent_kernel/core/workspace.py)만으로 호출별 path policy까지 보장할 수 없다.
 
@@ -201,7 +202,8 @@ factory 등록, `require_host_tool_binding` 같은 typed helper를 제공한다.
 - loop 생성 시 등록 목록을 snapshot하고 activation별 registry를 만든다. context 생성 뒤 연결하고 provider 등록 전에 제공한다.
 - factory가 도중에 실패하면 앞서 생성한 자원과 recorder/job 자원도 정리하도록 partial cleanup을 등록한다.
 - root/child/fork는 별도 registry와 view를 갖는다. 기본 상속은 끄고, 명시 상속 시 자식용 factory를 새로 실행한다.
-- 상속한 capability는 child-local guard와 parent authority lineage를 모두 검사한다. parent revoke 뒤 자식의 새 접근을 차단하고 callback을 정리한다. 자식 durable writer identity는 별도로 유지한다.
+- `inherit_to_children=True`인 등록을 각 hop에 전달하고 child/fork에서 fresh adapter를 연다.
+- 상속한 자원은 child-local guard와 parent activation/writer lineage를 모두 검사한다. parent 종료·revoke 뒤 접근을 차단한다. callback 등록 없이 수명 token을 연결하며 자식 durable writer identity는 별도로 유지한다.
 - restore는 호스트 재주입으로 fresh view를 만든다. factory가 checkpoint 적용 전 workspace 상태를 확정해 저장하지 않도록 순서를 정한다.
 - close/discard/revoke 및 성공한 `release_parked`/`arelease_parked` 뒤 retained view를 거부한다.
 - 정상 park release는 activation guard를 무효화하고 resource를 역순으로 한 번씩 정리하며 checkpoint·hosted task·재개 가능성을 보존한다.
@@ -288,8 +290,10 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 반환 annotation 강제 검증, 임의 객체 트리 변환,
 새 artifact 채널·출력 schema는 이번 범위에 추가하지 않는다. typed 입력에 dict를 기대하던 소비자에는 마이그레이션 안내를 제공한다.
 
-**DX2.** 순수 typed 도구 예제는 DX1만 기다린다. 호스트 workspace를 사용하는 보고서 예제는 DX1+P3,
-종료 사실·대기를 보여주는 스트림 예제는 P1/P2/P4/P5, 승인·재시작 예제의 새 자원 재주입은 P3를 기다린다.
+**DX2.** DX1의 순수 typed 도구 예제와 P3의
+[보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)를 구현했다.
+보고서는 승인·park/release·restore·fresh/fork 상속을 설치 wheel로 검증한다.
+종료 사실·대기를 보여주는 스트림 예제는 P1/P2/P4/P5의 계약을 소비한다.
 커널 소유 FakeModelAdapter와 기존 hosting/control로 소비 시나리오를 검증하고 설치된 wheel에서도 실행한다.
 기존 `reference`의 안정성 등급과 CSP의 별도 소비자 마이그레이션 책임을 유지한다.
 
@@ -352,7 +356,7 @@ manual dispatch는 diagnostic gate로 구분한다. Ready 후 수정은 Draft �
 
 작업군 통합 브랜치를 사용할 때는 다음을 먼저 처리한다.
 
-1. `.github/workflows/ci.yml`의 push 대상에 해당 통합 브랜치를 등록할지 결정한다. 현재 대상은 main/develop/v0.23 통합 브랜치다.
+1. `.github/workflows/ci.yml`의 push 대상에 해당 통합 브랜치를 등록한다. P3-00은 `codex/v0.25-p3-host-resources`를 main/develop/v0.23 대상에 추가했다.
 2. `tools/v023_ci.py`의 profile 판정에서 해당 작업군에 필요한 검증을 강제할 방식을 지정한다.
 3. 기존 service lock/qualification manifest의 의미를 유지하고, 새 계약을 입증할 테스트와 증거를 추가한다.
 
@@ -371,7 +375,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 | D01 | P3 포함, P7 후속 | 사용자 결정 |
 | D02 | 독립 작업군 → develop → 적정 시점 릴리스 | 사용자 방향 반영 |
 | D03 | P1/P2 타입·저장 형식 | 기존 숫자 유지·증거 추가, 공동 schema 컷과 reader/writer 전환 검증 권고; unknown 증거 slot은 필수 제외 권고 |
-| D04 | P3 주입·권한·수명 | 선택적 확장 Protocol, call별 lease, child authority lineage, restore 재주입 권고 |
+| D04 | P3 주입·권한·수명 | P3-02/03 구현: 선택적 확장 Protocol, call별 lease, fresh child adapter와 parent lineage, restore 재주입 |
 | D05 | P4 clock·집계·조회 | G3 내부 monotonic 제어 정렬 → snapshot 공개 권고; wall snapshot 대안은 보장 범위 변경을 기록 |
 | D06 | P5 | 10/25 재현에 따라 일반 delta·terminal 정규화·잔여 flush의 전달 경계로 보완; PR-01 |
 | D07 | P8 | 조건부. 준비된 완결 작업을 포함하고 필수 범위 출시를 대기시키지 않음 |

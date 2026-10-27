@@ -2,13 +2,14 @@
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
-상태: **기존 계획에 통합 / 2026-10-27 P5·DX1 병합, P3 계획 구체화**. 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
+구현 기록: **2026-10-27 P5·DX1·P3-00/01 develop 병합, P3-02/03 통합 브랜치 병합**. 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.
 범위의 기준은 통합 계획이고 첫 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md)이다.
 P3 정책·변경 범위·검증 기준은 [P3 PR 계획](V0_25_P3_PR_PLAN.md)에 있다. P3 구현은 승인됐으며 §9에 실행 증거를 기록한다.
-새 API 명칭과 후속 릴리스 배치는 설계 제안이다. DX1의 순수 typed 도구는 develop의
-[실행 예제](../examples/custom_tool_quickstart.py)에 반영했다. 나머지 신규 API는 후속 구현 대상이다.
+DX1의 순수 typed 도구는 [실행 예제](../examples/custom_tool_quickstart.py)에 반영했다.
+P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)와 함께 구현했다.
+P1/P2 종료·사용량 및 P4 예산 조회의 신규 API 명칭과 후속 릴리스 배치는 설계 제안이다.
 
 ## 1. 제품 방향과 릴리스 경계
 
@@ -64,15 +65,16 @@ P8은 준비되지 않으면 후속으로 넘긴다. **P3의 child/fork 자원 �
 
 ## 4. v0.25 API 예시: 타입 있는 도구와 자원 주입
 
-다음은 **DX1 + P3 구현 후의 목표 사용법**이다. `HostToolKey`, `HostToolBinding`, `ToolWorkspace`,
-`require_host_tool_binding`, `host_tool_bindings`가 신규 제안이다. `AgentLoop.from_tools`, `AgentRunSpec`,
-`ToolContext`, `@tool`, `run_once`는 기존 API다. import 위치와 이름은 P3 구현 전 검토에서 확정한다.
+다음은 **DX1 + P3에서 구현한 사용법**이다. `HostToolKey`, `HostToolBinding`, `ToolWorkspace`,
+`require_host_tool_binding`, `host_tool_bindings`를 기존 `AgentLoop.from_tools`, `AgentRunSpec`,
+`ToolContext`, `@tool`, `run_once`에 연결한다. 이 브랜치에서 빌드한 wheel로 검증했다.
+v0.25 배포는 남은 필수 작업군과 별도의 릴리스 절차를 따른다.
 
 ```python
 from pathlib import Path
 from pydantic import BaseModel
 from monoid_agent_kernel import AgentLoop, AgentRunSpec, ToolContext, tool
-from monoid_agent_kernel.tools.host_bindings import (  # 제안 모듈
+from monoid_agent_kernel.tools.host_bindings import (
     HostToolBinding,
     HostToolKey,
     ToolWorkspace,
@@ -87,8 +89,7 @@ class SavedReport(BaseModel):
     path: str
     sha256: str
 
-# ToolWorkspace는 새 runtime-checkable Protocol로 설계한다.
-# isinstance 검사를 지원하도록 새 Protocol에 @runtime_checkable을 선언한다.
+# ToolWorkspace는 isinstance 검사를 지원하는 runtime-checkable Protocol이다.
 REPORT_FILES = HostToolKey[ToolWorkspace](
     "report.files", accepts=lambda value: isinstance(value, ToolWorkspace)
 )
@@ -185,11 +186,11 @@ workspace write의 승인된 `side_effect="write"` 요건, 정상 종료와 writ
 귀속된 view를 만든다. `workspace_resource()`는 이 자원 factory다. provider 등록 중에는 동작 가능한 view를 발급하지 않는다.
 커널은 생성 성공한 자원의 closer를 즉시 등록하고, 부분 초기화 실패 시 역순 정리한다.
 
-`ToolWorkspace`는 우선 `read_bytes`/`write_bytes`와 실제 소비에 필요한 최소 조회만 제공한다. 각 작업에서 원래 call lease,
+`ToolWorkspace`는 `read_bytes`/`write_bytes`/`exists`를 제공한다. 각 작업에서 원래 call lease,
 activation guard, binding path scope, workspace authority를 검사한다. 보관한 view와 보관한 context의 새 helper 조회 모두
 원래 호출 종료 후 거부한다. 다음 호출의 권한을 빌릴 수 없다.
 
-root/child/fork는 별도 registry를 갖는다. 기본 상속은 OFF이고, 명시 상속 시 자식에서 factory를 다시 실행한다.
+root/child/fork는 별도 registry를 갖는다. 기본 상속은 OFF이고, `inherit_to_children=True`인 등록은 각 hop에서 자식의 factory를 다시 실행한다.
 자식의 권한과 부모 lineage를 함께 검사한다. restore에서는 새 host 주입을 수행하고 복구 완료 후 첫 호출에서 workspace 내용을 읽는다.
 factory가 복구 전 workspace 내용을 읽어 저장하지 않도록 API를 제한한다.
 
@@ -304,7 +305,9 @@ run guard, model call, drain, sync wait, RunStream 종료 대기가 같은 제�
 
 ## 7. DX2: 실제 통합 흐름을 릴리스의 증거로 삼기
 
-새 통합 프레임워크를 만들기 전에 기존 예제를 다음 세 경로로 정리한다.
+통합 예제는 다음 세 경로를 다룬다. P3의 `python -m monoid_agent_kernel.reference.host_tool_report`는
+승인·재시작과 fresh/fork 상속을 공개 API로 실행한다. Python 3.11.9의 설치 wheel을 checkout 밖에서 실행했고,
+Pydantic 2.14.1과 최소 지원 계열 2.6.4에서 통과했다. 최소 설치 CI도 같은 module을 실행한다.
 
 | 예제 | 사용하는 계약 | 수용 시나리오 |
 |---|---|---|
@@ -399,7 +402,7 @@ G3의 clock/snapshot처럼 유효한 중간 상태가 있는 경계에서 나눈
 테스트는 소유 층의 가장 작은 유효 범위를 선택한다. 사용자 흐름 자체가 계약인 DX2만 통합 시나리오로 확인한다.
 실행 prefix는 `pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread`를 사용한다.
 
-이번 대화의 초기 코드 조사에서 다음을 실행했다. 관련 코드 HEAD가 동일하므로 설계 구체화에서는 그 증거를 재사용했다.
+2026-10-25 초기 코드 조사에서 다음을 실행했다. 아래 결과는 구현 전 기준선이며, P3 구현 검증은 P3 PR 계획 §9에 기록했다.
 
 ```powershell
 & ./.venv/Scripts/python.exe examples/minimal_quickstart.py
@@ -414,12 +417,13 @@ typed `Customer` 입력 probe는 실제 AgentLoop 경로에서 dict가 전달되
 BaseModel 반환 probe는 tool observation이 `tool_result_unportable`였다. 반환 probe의 run은 scripted final로 완료되었으므로
 도구 실패와 run 실패를 구분한다. P5의 10/25 확장 재현 8개와 추가 기존 회귀 76 passed는 [PR 계획 §7](V0_25_P5_DX1_PR_PLAN.md)에 있다.
 
-전체 suite, 실제 유료 모델, 운영 서비스, 브라우저, 신규 API 실행 검증은 수행하지 않았다. 현재 baseline의 성공을
-새 설계 구현의 성공으로 해석하지 않는다. Python 예시 5개는 AST 문법 검사를 통과했다. import나 코드 실행을 수행한 검증은 아니다.
+초기 조사에서는 전체 suite, 실제 유료 모델, 운영 서비스, 브라우저, 신규 API 실행 검증을 수행하지 않았다.
+당시 Python 예시 5개는 AST 문법 검사를 통과했다. 구현된 P3의 실행 증거는 설치 wheel과 회귀 검사로 별도 기록했다.
 문서의 로컬 링크 대상을 확인했다. 기존 계약 정합성과 독립 설계 리뷰도 이 문서 단계의 확인 대상이다.
 
-남은 설계 결정은 작업군별 preflight에서 좁힌다: P3 공개 export와 host adapter 최소 프로토콜, G1 필드/codec 버전,
-G3 조회 명칭과 clock 변환, 후속 web adapter의 request/history 및 cursor 계약. DX1 JSON 변환 실패는 기존 `tool_result_unportable`로 정했다.
+남은 설계 결정은 작업군별 preflight에서 좁힌다: G1 필드/codec 버전,
+G3 조회 명칭과 clock 변환, 후속 web adapter의 request/history 및 cursor 계약.
+P3 공개 이름과 동기 host adapter 프로토콜, DX1 JSON 변환 실패의 `tool_result_unportable` 분류는 구현에 반영했다.
 이 결정들은 설계 명칭·구현 선택이다. P1–P5 필수 범위나 사용자의 승인된 동작 보장을 줄이는 변경은 별도 범위 결정으로 남긴다.
 
 ## 11. 설계 검토 기록
