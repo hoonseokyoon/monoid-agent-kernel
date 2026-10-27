@@ -2,33 +2,31 @@
 
 Run from a checkout with::
 
+    python -m pip install .
     python examples/embedding_hosted_product.py
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel.contracts import (  # noqa: E402
+from monoid_agent_kernel.contracts import (
     AgentRuntimeConfig,
     ControlCommand,
     ModelTurn,
 )
-from monoid_agent_kernel.errors import PermissionDenied  # noqa: E402
-from monoid_agent_kernel.providers import FakeModelAdapter  # noqa: E402
-from monoid_agent_kernel.reference.backend import (  # noqa: E402
+from monoid_agent_kernel.errors import PermissionDenied
+from monoid_agent_kernel.providers import FakeModelAdapter
+from monoid_agent_kernel.reference.backend import (
     BackendRunRequest,
     RunnerBackend,
     TokenManager,
 )
-from monoid_agent_kernel.reference.stores import (  # noqa: E402
+from monoid_agent_kernel.reference.stores import (
     SqliteCheckpointStore,
     SqliteCommandStore,
     SqliteLeaseStore,

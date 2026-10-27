@@ -1,6 +1,9 @@
-from __future__ import annotations
+"""Advanced backend/gateway scenario: python examples/full_stack_integration.py --mode fake.
 
-# ruff: noqa: E402
+Install this checkout with python -m pip install .; real mode uses '.[openai]' and .env credentials.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -18,9 +21,6 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PACKAGE_ROOT / "src"))
-
 from monoid_agent_kernel.reference.backend.service import BackendRunRequest, RunnerBackend
 from monoid_agent_kernel.reference._shared.tokens import TokenClaims, TokenManager
 from monoid_agent_kernel.core.agents import AgentRuntimeConfig, RegistryToolRef, ToolBinding
@@ -28,6 +28,9 @@ from monoid_agent_kernel.core.spec import ModelConfig, ReasoningConfig
 from monoid_agent_kernel.reference.llm_gateway.http import create_llm_gateway_server
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, ToolCall
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 DEFAULT_INSTRUCTION = """Read notes.md and create SUMMARY.md.
@@ -255,7 +258,6 @@ def _start_real_gateway_subprocess(
     env["OPENAI_API_KEY"] = openai_api_key
     env["MONOID_BACKEND_TOKEN_SECRET"] = token_secret
     env["MONOID_LLM_GATEWAY_ADMIN_TOKEN"] = admin_token
-    env["PYTHONPATH"] = str(PACKAGE_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     command = [
         sys.executable,
         "-m",

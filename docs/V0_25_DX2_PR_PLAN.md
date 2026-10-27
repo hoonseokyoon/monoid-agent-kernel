@@ -290,3 +290,37 @@ exact branch 기본 combined, 약한 label/manual 거부, push 등록 누락을 
 명령은 §7의 pytest prefix와 `tests/test_v023_ci_foundation.py`, source PYTHONPATH·4 workers를 사용했다.
 원본은 `.tmp/v025/dx2-00-red.txt`, `dx2-00-green.txt`, 독립 검토는 `dx2-00-preflight-review.md`다.
 현재 누적 비용은 계획·승인 기록을 포함한 약 350줄이며 runtime core 변경은 0줄이다.
+
+[PR #166](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/166)은 최종 `9ce2d31` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602017839),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602017844) 통과 후
+develop에 `5fc49b2`로 병합했다. 병합 tree와 리뷰 head의 동일성을 확인했다.
+L2 첫 실행의 기존 payload 메모리 검사는 3.11에서 한 번 실패했고, 같은 head의 실패 job 재실행에서 통과했다.
+로컬 원본 검사도 통과했다. 별도 측정 실험은 정상 validator 증가 78,318 bytes, 의도적 body 보관은 3,274,195 bytes로
+기존 798,720-byte 기준을 구별했다. 최초 CI의 정확한 할당 원인은 재현하지 못했으며 runtime·검사 기준은 변경하지 않았다.
+원문·제한은 `.tmp/v025/dx2-00-ci-triage.md`, `dx2-00-memory-probe-corrected.txt`에 남겼다.
+root가 후속 통합 CI에서 재발하면 측정 경계 수정을 다시 검토한다.
+
+### 9.2 DX2-01 착수
+
+통합 브랜치를 `5fc49b2`에서 만들고 [초기 full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602933913)를 시작했다.
+01 브랜치는 `codex/v0.25-dx2-installed-onboarding`이다. 이전 조사 대비 관련 runtime·예제·테스트 코드 diff는 없다.
+`.tmp/v025/dx2-01-preflight.md`와 `dx2-01-research.md`를 실제 base에 연결했고 독립 사전 검토를 진행한다.
+`dx2_01_research`가 예제·테스트·설치 CI·진입 문서를 구현하고 root가 runner·Git·계획 기록을 소유한다.
+
+독립 `dx2_01_preflight_review`는 실제 base에서 ready로 판정했다. Tests-only `d5cb936`을 수정 전에 고정했다.
+소스 예제 전체 **6 FAIL / 15 PASS**: local 실패 정리 2개와 실제 gateway helper 환경 전달 4개가 실패했다.
+실패 출력에서 환경 전체가 노출되지 않도록 PYTHONPATH 값만 비교한 최종 회귀 6개도 모두 실패했다.
+동일 CI Python block을 설치된 Python 3.11.9/Pydantic 2.14.1로 checkout 밖에서 실행했으며,
+실제 부모 9개·gateway 자식 2개의 import provenance **11개가 모두 실패**했다.
+원본은 `.tmp/v025/dx2-01-red.txt`, `dx2-01-red-final.txt`, `dx2-01-installed-red.txt`다.
+이후 예제·문서 수정에 착수했다. 기존 사실·복구·종료·host report의 올바른 동작은 수용 검사로 유지한다.
+
+수정 후 `test_examples.py`, `test_session_lifecycle.py`, `test_tool_decorator.py`, `test_scenario_scoring.py`
+**137 PASS**(같은 pytest prefix), Ruff 0.15.6·diff 검사, 문서 4개 local link 118개/Python block 14개 검사를 통과했다.
+정확한 개발 wheel SHA256 `2c37a7aa56bf33d03ff388511c15b97d871e87a9901d4579ff3bd22846406dee`를 audit·설치했다.
+같은 설치본으로 부모 9개·자식 2개 provenance, 복사된 typed/facts/recovery/termination,
+packaged host report를 checkout 밖에서 통과했다. wheel metadata는 기존 `0.24.0`이며 릴리스를 수행하지 않았다.
+현재 Python 3.11.9/Pydantic 2.14.1의 실행 근거는 `.tmp/v025/dx2-01-evidence.md`와 연결된 raw logs에 있다.
+초기 통합 base full CI `40602933913`의 14개 job이 모두 성공했다. 독립 `dx2_01_code_review`의 구현 검토는 PASS다.
+01 누적 변경은 약 630줄(예제·검사·문서·00 종료 기록 포함), 캠페인 누적 약 970줄이며 runtime core는 0줄이다.

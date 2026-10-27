@@ -8,7 +8,8 @@ collector:
     ├── chat {model}          (one per model turn)
     └── execute_tool {tool}   (one per tool call)
 
-Needs the SDK + exporter for *output*; install with: pip install 'monoid-agent-kernel[otel-export]'.
+Needs the SDK + exporter for output; from this checkout: python -m pip install '.[otel-export]'.
+Run: python examples/otel_tracing.py
 In a real app you'd install a global TracerProvider with an OTLP exporter instead and just pass
 ``event_sinks=(OtelEventSink(),)`` — here we build a local provider and hand it to the sink so the
 example never touches global process state.
@@ -16,14 +17,10 @@ example never touches global process state.
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-# Make the example runnable from a checkout without installing the package.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel import (  # noqa: E402
+from monoid_agent_kernel import (
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
@@ -31,10 +28,10 @@ from monoid_agent_kernel import (  # noqa: E402
     RegistryToolRef,
     ToolBinding,
 )
-from monoid_agent_kernel.observability.otel import OtelEventSink  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
-from monoid_agent_kernel.tools import tool_ids  # noqa: E402
+from monoid_agent_kernel.observability.otel import OtelEventSink
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.tools import tool_ids
 
 
 def _console_tracer_provider():

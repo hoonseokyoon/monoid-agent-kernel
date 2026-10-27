@@ -1,8 +1,9 @@
-"""Offline JSON round trip through the public lifecycle hooks.
+"""Same-process JSON round trip through the public lifecycle hooks, using memory storage.
 
-The memory journal demonstrates the hook contract. A production host supplies durable,
-fenced storage; see the FencedModelCallLifecycle adapter and its service tests.
+Install this checkout with python -m pip install .
 Run: python examples/recover_model_call_facts.py
+A production host supplies durable, fenced storage through FencedModelCallLifecycle.
+For approval and checkpoint restoration, run python -m monoid_agent_kernel.reference.host_tool_report.
 """
 
 import asyncio
@@ -10,7 +11,9 @@ import hashlib
 import json
 
 from monoid_agent_kernel import CapturePolicy, ModelIOSubscription, UsageObservation
-from monoid_agent_kernel.core.model_invocation import DurableModelInvocation, decode_model_invocation
+from monoid_agent_kernel.core.model_invocation import (
+    MODEL_INVOCATION_V2_SCHEMA_VERSION, DurableModelInvocation, decode_model_invocation,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.model_call import ModelCallRunner
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation, RecoveredModelDispatch
@@ -88,13 +91,22 @@ async def main():
     for _ in range(2):
         runner = ModelCallRunner(adapter=adapter, lifecycle_hook=journal,
                                  subscriptions=(ModelIOSubscription(diagnostics, CapturePolicy(mode="none")),))
-        await runner.acall(ModelRequest(instruction="hello", system_prompt="", tools=(),
-                                        model=ModelConfig(provider="fake", model="offline")),
-                           logical_call_id="example_call")
+        turn, _ = await runner.acall(
+            ModelRequest(instruction="hello", system_prompt="", tools=(),
+                         model=ModelConfig(provider="fake", model="offline")),
+            logical_call_id="example_call",
+        )
+        assert turn.final_text == "Ready"
     original, recovered = diagnostics.receipts
+    assert adapter.calls == 1
+    assert journal.payload["schema_version"] == MODEL_INVOCATION_V2_SCHEMA_VERSION
     assert recovered.termination == original.termination
     assert recovered.usage_evidence == original.usage_evidence
     assert recovered.idempotency_key == original.idempotency_key
+    assert dict(recovered.usage_evidence.reported) == {"input_tokens": 0, "output_tokens": 3}
+    assert recovered.usage_evidence.completeness["input_tokens"] == "complete"
+    assert recovered.usage_evidence.completeness["output_tokens"] == "complete"
+    assert recovered.usage_evidence.completeness["total_tokens"] == "unknown"
     print(json.dumps({"schema": journal.payload["schema_version"], "provider_calls": adapter.calls,
                       "known_usage": dict(recovered.usage_evidence.reported),
                       "total_coverage": recovered.usage_evidence.completeness["total_tokens"]}, indent=2))

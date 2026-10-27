@@ -1,4 +1,7 @@
-"""Run offline: python examples/model_call_facts.py. No provider credentials are needed."""
+"""Observe a completed call's reported usage: zero input, three output, unknown total.
+
+Install this checkout with python -m pip install .; run python examples/model_call_facts.py.
+"""
 
 import asyncio
 import json
@@ -36,7 +39,15 @@ async def main():
         adapter=ExampleAdapter(),
         subscriptions=(ModelIOSubscription(Diagnostics(), CapturePolicy(mode="none")),),
     )
-    await runner.acall(ModelRequest(instruction="hello", system_prompt="", tools=()))
+    turn, receipt = await runner.acall(ModelRequest(instruction="hello", system_prompt="", tools=()))
+    assert turn.final_text == "Ready"
+    assert receipt.termination.to_json() == {
+        "outcome": "completed", "requested_by": None, "ended_by": "provider_terminal",
+    }
+    assert dict(receipt.usage_evidence.reported) == {"input_tokens": 0, "output_tokens": 3}
+    assert receipt.usage_evidence.completeness["input_tokens"] == "complete"
+    assert receipt.usage_evidence.completeness["output_tokens"] == "complete"
+    assert receipt.usage_evidence.completeness["total_tokens"] == "unknown"
 
 
 if __name__ == "__main__":

@@ -1,23 +1,19 @@
 """Use domain models in a custom tool through one `from_tools` call.
 
-The shortest path from a `@tool` function to a run where the model actually invokes it. No
-hand-wrapped ToolProvider, no hand-written ToolBinding: `AgentLoop.from_tools` registers the
-tool and generates its binding for you. Runs offline with a scripted `FakeModelAdapter` (no
-gateway, no API key).
+`AgentLoop.from_tools` registers the tool and generates its binding. A scripted
+`FakeModelAdapter` invokes it offline and receives the typed result on its next request.
+Install this checkout: python -m pip install .
+Run: python examples/custom_tool_quickstart.py
 """
 
-import sys
 import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel
 
-# Make the example runnable from a checkout without installing the package.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel import AgentLoop, AgentRunSpec, tool  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
+from monoid_agent_kernel import AgentLoop, AgentRunSpec, tool
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 
 
 class Customer(BaseModel):
