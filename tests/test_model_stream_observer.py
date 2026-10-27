@@ -1024,9 +1024,11 @@ def test_interrupt_with_abort_drain_delivers_nothing_after_stop_to_observers_or_
 
 def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) -> None:
     """The run's cancel token (the RunStream/host Stop) drains too, and stays a cancellation."""
+    from monoid_agent_kernel.reference.backend.model_stream import LiveModelStreamBroker
 
     token = CancellationToken()
     observer = _RecordingObserver()
+    broker = LiveModelStreamBroker()
 
     class CancellingAdapter(_ScriptedStreamAdapter):
         yielded = 0
@@ -1042,7 +1044,10 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
                 yield chunk
 
     adapter = CancellingAdapter([])
-    loop = _loop(tmp_path, adapter, observer_factories=(lambda: observer,), stream_model_calls=True)
+    loop = _loop(
+        tmp_path, adapter, observer_factories=(lambda: observer, broker.observer_factory()),
+        stream_model_calls=True,
+    )
     loop.cancellation_token = token
     loop.async_model_abort_drain_s = 5.0
     loop.open()
@@ -1059,6 +1064,9 @@ def test_a_user_cancel_with_abort_drain_bills_the_cancelled_run(tmp_path: Path) 
             "ended_by": "provider_terminal",
         }
         assert outcome.usage_evidence.completeness["input_tokens"] == "unknown"
+        live = broker.subscribe(observer.contexts[0].root_run_id).poll()[-1].to_json()
+        assert live["termination"] == outcome.termination.to_json()
+        assert live["usage_evidence"] == outcome.usage_evidence.to_json()
         assert loop._session is not None
         assert dict(loop._session.state.total_usage) == _DRAINED_BILL
     finally:

@@ -700,3 +700,38 @@ bytes를 보존하며 v2를 append하는 회귀까지 보완했다(2 passed/2.46
 발동했다. 주입을 실제 settled invocation commit 진입에 한정해 저장 완료 후 응답 유실과
 sink의 canonical readback을 검증하도록 고쳤다. 제품 binary와 기존 wheel 근거는 유지한다.
 테스트 delta를 두 리뷰가 재검토하고 새 head의 전체 combined CI를 다시 검증한다.
+
+**03 완료.** 최종 `fe44f736ab7ca38b3394e9074e42a454a3c38415`는 두 독립 targeted 리뷰 PASS,
+L1 `40466682625`와 필수 combined L2 `40466739358` SUCCESS였다. 실제 PG16/18·ObjectStore·Temporal
+서비스까지 통과한 뒤 PR #159를 통합 `0171d032a1460ac64c615fb411f5711518dd9e79`에 merge commit으로 병합했다.
+
+### 9.5 P1P2-04 실제 base 사전조사
+
+`codex/v0.25-p1-p2-consumers`는 위 03 병합본에서 생성했다. 최신 develop은 재조회한 `d4e659c`다.
+`.tmp/v025/p1p2-04-preflight.md` SHA256
+`85002F1FAE2D9CB62ED3F8B202FEFFB72E4E2F2F659F05B84AA0E93A29CCDCEE`는 독립 검토 READY다.
+같은 날 갱신한 §3 외부 구현 근거와 실제 gateway·live·Studio·OTel 소비 코드를 대조했다.
+
+gateway는 dispatch observation을, live close는 logical-call aggregate를 전달한다. 기존 공개 raw-chunk
+assembly 검증을 유지하고 runner가 이미 정규화한 chunk는 내부 fold에서 재수집 없이 사용한다.
+반복 A→B terminal을 재정규화하면서 원래 collection이 덮이는 문제를 이 경계에서 해결한다.
+오류 envelope의 손상된 observation은 생략하고 기존 classified error와 숫자 사용량을 보존한다.
+
+live broker는 기존 byte 제한을 지킨다. 기존 콘텐츠가 들어가면 새 optional facts를 먼저 생략하며,
+기존 콘텐츠도 초과하면 compact marker에 facts를 함께 시도한다. Studio는 정확한 호출 identity의
+수신된 facts만 hydration 사이에 보존한다. 기존 terminal SSE 종료 fence를 유지하므로 durable terminal이
+먼저 도착한 경우 snapshot만으로는 unavailable이다. 새 durable content 형식을 추가하지 않는다.
+OTel은 기존 span의 bounded 속성만 추가하며 numeric meter·attempt child 생성 규칙을 유지한다.
+
+root는 Python 구현·공유 테스트/build runner를, `p1p2_01_research`는 Studio 네 source/script 파일을 담당한다.
+먼저 실제 소비자 회귀를 실패시킨 뒤 구현한다. 최초 400 기능/1,450 총 변경 줄 추정을 유지하며
+Studio 예상 230–300 기능/200–280 테스트 줄을 포함해 실제 누적 비용을 기록한다.
+완료 gate는 두 최종 코드 리뷰, actual old/new peer, UI check/build freshness, current/minimum wheel,
+PG16/18·ObjectStore·Temporal combined CI다. 릴리스·배포·CSP 변경은 포함하지 않는다.
+
+04 제품 수정 전 Python 회귀는 **24 failed/4 passed, 5.58s**였다
+(`.tmp/v025/p1p2-04-red-corrected.txt`). 최초 테스트의 acall 반환 tuple 해제를 고친 뒤 다시 실행했다.
+실패는 실제 HTTP/SSE 관측 누락, 반복 terminal의 drain→normal 변경, live close 정보 누락,
+실제 retry OTel 속성 누락이다. 기존 비용·malformed metadata 유지 검증 4개는 통과했다.
+Studio의 실제 모듈·RunView SSR·App 연결 검증 8그룹도 모두 실패했다
+(`.tmp/v025/p1p2-04-studio-red.txt`). 이때 Python·Studio 제품 source diff는 비어 있다.

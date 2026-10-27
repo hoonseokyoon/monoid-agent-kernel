@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import ts from "typescript";
+import { compile } from "svelte/compiler";
+import { render } from "svelte/server";
 
 const source = await readFile(new URL("../src/lib/model-stream.ts", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../src/App.svelte", import.meta.url), "utf8");
@@ -1528,4 +1530,217 @@ transport.close();
 assert.equal(replacementSource.closed, true);
 assert.deepEqual(connections, [false, true, false, true, false]);
 
-console.log("Live model-stream checks passed (13 protocol/reducer/transport/integration groups).");
+// Logical-call facts are independent of the final provider turn's numeric usage and chat text.
+const factCounters = [
+  "audio_input_tokens", "audio_output_tokens", "audio_tokens", "cached_input_tokens",
+  "cache_creation_tokens", "cache_read_tokens", "cache_write_tokens", "input_tokens",
+  "output_tokens", "reasoning_tokens", "total_tokens",
+];
+const factTermination = { outcome: "failed", requested_by: null, ended_by: "provider_error" };
+const factEvidence = {
+  reported: { input_tokens: 0, output_tokens: 4 },
+  completeness: Object.fromEntries(factCounters.map((key) => [
+    key, key === "input_tokens" ? "complete" : key === "output_tokens" ? "partial" : "unknown",
+  ])),
+  attempts: [
+    { index: 1, reported: { input_tokens: 0, output_tokens: 4 }, source: "provider", collection: "normal" },
+    { index: 2, reported: { input_tokens: 0 }, source: "adapter", collection: "drain" },
+  ],
+};
+const factClose = (sequence, overrides = {}) => closed(sequence, "failed", {
+  usage: { input_tokens: 0, output_tokens: 2 },
+  termination: factTermination,
+  usage_evidence: factEvidence,
+  ...overrides,
+});
+const factSnapshot = (overrides = {}) => ({
+  ...activeSnapshotPayload.streams[0],
+  turn_id: "turn-1", stream_id: "stream-1", status: "failed",
+  output_text: "", output_end_offset: 0, reasoning_text: "", reasoning_end_offset: 0,
+  partial: true, ...overrides,
+});
+function factHydrate(state, snapshots = [factSnapshot()]) {
+  const response = decodeModelContentResponse({
+    schema_version: "studio.model-content.v1", root_run_id: ROOT, streams: snapshots,
+  });
+  assert.ok(response);
+  return seedModelStreamSnapshot(state, response);
+}
+function factLive(overrides = {}) {
+  const initial = reduceModelStreamFrame(initialModelStreamState(ROOT), opened(1));
+  const frame = decodeModelStreamFrame(factClose(2, overrides));
+  assert.ok(frame, "valid aggregate facts need not equal final-turn numeric usage");
+  return reduceModelStreamFrame(initial, frame);
+}
+const factKey = modelStreamCallKey(ROOT, "stream-1");
+const factChecks = [
+  ["live close preserves explicit zero and whole-call evidence", () => {
+    const current = factLive();
+    assert.deepEqual(current.calls[factKey].termination, factTermination);
+    assert.deepEqual(current.calls[factKey].usageEvidence, factEvidence);
+    assert.equal(current.calls[factKey].output, "", "empty failures still have a call row");
+    const projected = projectModelStreamFrame(runState(), initialModelStreamState(ROOT), current, factClose(2));
+    assert.deepEqual(projected.usage, runState().usage, "evidence must never update the numeric meter");
+    const legacy = factLive({ termination: undefined, usage_evidence: undefined });
+    assert.equal(legacy.calls[factKey].termination, undefined);
+    assert.equal(legacy.calls[factKey].usageEvidence, undefined);
+    const noDispatch = {
+      reported: {}, attempts: [],
+      completeness: Object.fromEntries(factCounters.map((key) => [key, "no_dispatch"])),
+    };
+    assert.deepEqual(factLive({ usage_evidence: noDispatch }).calls[factKey].usageEvidence, noDispatch);
+  }],
+  ["decoder rejects malformed facts and unverified aggregate labels", () => {
+    const invalid = [
+      { termination: null },
+      { termination: { ...factTermination, outcome: "stopped" } },
+      { termination: { ...factTermination, requested_by: "provider" } },
+      { termination: { ...factTermination, ended_by: "stop_reason" } },
+      { termination: { ...factTermination, private_detail: "secret" } },
+      { usage_evidence: null },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: true } } },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: -1 } } },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: 0.5 } } },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: Number.MAX_SAFE_INTEGER + 1 } } },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: 0, private_counter: 4 } } },
+      { usage_evidence: { ...factEvidence, reported: { input_tokens: 0, output_tokens: 3 } } },
+      { usage_evidence: { ...factEvidence, completeness: { ...factEvidence.completeness, output_tokens: "complete" } } },
+      { usage_evidence: { ...factEvidence, completeness: { input_tokens: "complete" } } },
+      { usage_evidence: { ...factEvidence, attempts: [factEvidence.attempts[1]] } },
+      ...[
+        { source: "legacy_ambiguous" }, { collection: null }, { collection: "recovery" },
+        { reported: {}, source: "provider" }, { index: true }, { private_detail: "secret" },
+      ].map((patch) => ({ usage_evidence: {
+        ...factEvidence, attempts: [{ ...factEvidence.attempts[0], ...patch }, factEvidence.attempts[1]],
+      } })),
+      { usage_evidence: {
+        ...factEvidence,
+        reported: { input_tokens: Number.MAX_SAFE_INTEGER + 1 },
+        attempts: [
+          { ...factEvidence.attempts[0], reported: { input_tokens: Number.MAX_SAFE_INTEGER } },
+          { ...factEvidence.attempts[1], reported: { input_tokens: 1 } },
+        ],
+      } },
+    ];
+    for (const patch of invalid) assert.equal(decodeModelStreamFrame(factClose(2, patch)), null);
+    assert.ok(decodeModelStreamFrame(factClose(2, { additive_future_field: true })));
+  }],
+  ["hydration preserves live facts only for the full call identity", () => {
+    const current = factLive();
+    const hydratedFacts = factHydrate(current);
+    assert.deepEqual(hydratedFacts.calls[factKey].termination, factTermination);
+    assert.deepEqual(hydratedFacts.calls[factKey].usageEvidence, factEvidence);
+    for (const patch of [
+      { run_id: `${ROOT}.sub.other` }, { turn_id: "other-turn" }, { stream_id: "other-stream" },
+      { step: 2 }, { started_at: "2026-01-01T00:00:02Z" },
+    ]) {
+      const other = Object.values(factHydrate(current, [factSnapshot(patch)]).calls)[0];
+      assert.equal(other.termination, undefined, JSON.stringify(patch));
+      assert.equal(other.usageEvidence, undefined, JSON.stringify(patch));
+    }
+    const snapshotOnly = factHydrate(initialModelStreamState(ROOT), [factSnapshot({
+      termination: factTermination, usage_evidence: factEvidence,
+    })]);
+    assert.equal(snapshotOnly.calls[factKey].termination, undefined, "snapshot extras cannot assert live facts");
+    assert.equal(snapshotOnly.calls[factKey].usageEvidence, undefined);
+    const child = { run_id: `${ROOT}.sub.facts`, turn_id: "child-facts" };
+    let withChild = reduceModelStreamFrame(current, opened(3, child));
+    withChild = reduceModelStreamFrame(withChild, factClose(4, child));
+    const both = factHydrate(withChild, [factSnapshot(), factSnapshot(child)]);
+    assert.deepEqual(both.calls[modelStreamCallKey(child.run_id, "stream-1")].usageEvidence, factEvidence);
+    assert.deepEqual(both.calls[factKey].usageEvidence, factEvidence, "run lineage separates colliding stream ids");
+  }],
+  ["compact close retains facts before private content hydration", () => {
+    let current = reduceModelStreamFrame(initialModelStreamState(ROOT), opened(1));
+    current = reduceModelStreamFrame(current, factClose(2, { content_omitted: true }));
+    assert.equal(current.needsHydration, true);
+    assert.equal(current.resumeCursor, `${GENERATION}:2`);
+    assert.equal(current.calls[factKey].status, "running", "the sidecar still owns final content");
+    assert.deepEqual(current.calls[factKey].usageEvidence, factEvidence);
+    const restored = factHydrate(current, [factSnapshot({ final_text: "private final" })]);
+    assert.equal(restored.calls[factKey].output, "private final");
+    assert.deepEqual(restored.calls[factKey].termination, factTermination);
+    assert.deepEqual(restored.calls[factKey].usageEvidence, factEvidence);
+    assert.equal(reduceModelStreamFrame(restored, factClose(2, { content_omitted: true })), restored);
+  }],
+  ["stale and mismatched compact markers cannot hydrate or enrich a replacement", () => {
+    const newer = reduceModelStreamFrame(initialModelStreamState(ROOT), opened(1, {
+      step: 2, turn_id: "new-turn", stream_id: "new-stream",
+    }));
+    const stale = reduceModelStreamFrame(newer, factClose(2, { content_omitted: true }));
+    assert.equal(stale.needsHydration, false, "floor rejection precedes compact-marker hydration");
+    assert.deepEqual(stale.calls, newer.calls);
+    const wrongTurn = reduceModelStreamFrame(newer, factClose(2, {
+      step: 2, stream_id: "new-stream", content_omitted: true,
+    }));
+    assert.equal(wrongTurn.needsHydration, false, "same stream/floor with a different turn is a different call");
+    assert.deepEqual(wrongTurn.calls, newer.calls);
+    const replaced = reduceModelStreamFrame(factLive(), opened(3, {
+      step: 2, turn_id: "new-turn", stream_id: "new-stream",
+    }));
+    assert.equal(Object.values(replaced.calls).length, 1);
+    assert.equal(Object.values(replaced.calls)[0].usageEvidence, undefined);
+  }],
+  ["retained close enriches a terminal snapshot without replaying content or actions", () => {
+    const prior = factHydrate(initialModelStreamState(ROOT), [factSnapshot({ final_text: "saved" })]);
+    const frame = factClose(1, { final_text: "late replacement" });
+    const enriched = reduceModelStreamFrame(prior, frame);
+    assert.deepEqual(enriched.calls[factKey].usageEvidence, factEvidence);
+    assert.deepEqual(enriched.calls[factKey].termination, factTermination);
+    assert.equal(enriched.calls[factKey].output, "saved");
+    assert.equal(enriched.calls[factKey].status, "failed");
+    assert.equal(enriched.activeRootStreamId, null);
+    const terminalRun = { ...runState(), status: "failed" };
+    assert.equal(projectModelStreamFrame(terminalRun, prior, enriched, frame), terminalRun);
+    const repeated = reduceModelStreamFrame(enriched, factClose(2, {
+      termination: { outcome: "completed", requested_by: null, ended_by: "provider_terminal" },
+    }));
+    assert.deepEqual(repeated.calls[factKey].termination, factTermination, "known live facts cannot be overwritten");
+  }],
+  ["RunView renders empty failures, zero, coverage and unavailable descendant facts", async () => {
+    const viewSource = await readFile(new URL("../src/components/RunView.svelte", import.meta.url), "utf8");
+    // Render the real RunView markup. Unrelated child widgets are inert in this focused fixture.
+    const viewCode = compile(viewSource, { filename: "RunView.svelte", generate: "server" }).js.code
+      .replace(/import (\w+) from ['"]\.\/[^'"]+\.svelte['"];?/g, "const $1 = () => {};")
+      .replace(/(['"])(svelte(?:\/[^'"]*)?)\1/g, (_match, _quote, specifier) => JSON.stringify(import.meta.resolve(specifier)))
+      .replace(/(['"])\.\.\/lib\/model-stream\1/g, JSON.stringify(moduleUrl));
+    const { default: RunView } = await import(`data:text/javascript;base64,${Buffer.from(viewCode).toString("base64")}`);
+    const call = { ...factLive().calls[factKey], termination: factTermination, usageEvidence: factEvidence };
+    const html = render(RunView, { props: {
+      state: { ...runState(), status: "failed" }, connected: true, subagents: [],
+      modelCalls: [call, {
+        ...call, runId: `${ROOT}.sub.empty`, streamId: "child-empty",
+        termination: undefined, usageEvidence: undefined,
+      }],
+    } }).body;
+    const visible = html.replace(/<!--[\s\S]*?-->/g, "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+    assert.equal((html.match(/data-testid="model-call-details"/g) ?? []).length, 2);
+    assert.match(visible, /Root call/);
+    assert.match(visible, /Subagent call/);
+    assert.match(visible, /Outcome failed/);
+    assert.match(visible, /Requested by None/);
+    assert.match(visible, /Read ended by provider error/);
+    assert.match(visible, /Facts received live/);
+    assert.match(visible, /Usage across 2 kernel dispatches/);
+    assert.match(visible, /Input tokens 0 complete/);
+    assert.match(visible, /Output tokens 4 partial/);
+    assert.match(visible, /Total tokens Unreported unknown/);
+    assert.match(visible, /Termination facts unavailable/);
+    assert.match(visible, /Usage evidence unavailable/);
+  }],
+  ["App passes call state while retaining its terminal subscription fence and numeric meter", () => {
+    assert.match(appSource, /<RunView[\s\S]*?modelCalls=\{Object\.values\(modelStreamState\.calls\)\}/);
+    assert.match(appSource, /if \(runTerminalNeedsFence\) \{[\s\S]*?modelStream\?\.close\(\);\s+modelStream = null;/);
+    assert.match(appSource, /class="token-meter"[\s\S]*?run\.usage\.total\.toLocaleString\(\)/);
+  }],
+];
+const factFailures = [];
+for (const [name, check] of factChecks) {
+  try { await check(); } catch (error) {
+    console.error(`FAIL model facts: ${name}`);
+    factFailures.push(error);
+  }
+}
+if (factFailures.length) throw new AggregateError(factFailures, "Live model fact consumer regressions failed");
+
+console.log("Live model-stream checks passed (13 protocol/reducer/transport/integration groups; 8 fact consumer groups).");
