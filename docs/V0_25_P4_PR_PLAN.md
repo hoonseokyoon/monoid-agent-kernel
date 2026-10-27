@@ -2,8 +2,9 @@
 
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=2914c4366f8dfd7ed537f854388836a12a05f078`.
 P5·DX1·P3·P1/P2가 develop에 병합된 상태다. P1P2-I는 [#161](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/161)이다.
-**현재 승인은 조사·정책·PR 계획까지다. 제품 코드·테스트·CI 구현, PR 생성·push·병합은 진행하지 않는다.**
-로컬 계획 브랜치는 `codex/v0.25-p4-plan`이다. 아래 API·브랜치·검증은 향후 구현 작업 지시다.
+**2026-10-28 사용자가 P4-00·01 구현과 리뷰·CI 후 P4-02·최종 통합까지 순차 진행을 승인했다.**
+00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·CSP 제품 변경은 별도다.
+계획은 로컬 `e16c304`에 기록했다. 최신 구현 상태와 PR별 증거는 §9.1 이후에 둔다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#53-p4-실제-제어와-일치하는-종료-예산)의 G3과
 [개발자 API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#6-v025-api-예시-stop-이후-현재-대기-조회)을 구체화한다.
@@ -277,8 +278,8 @@ P4-02 offline recipe는 실제 `aopen → astream → Stop/early exit → snapsh
 
 ## 6. PR별 변경 범위와 의존성
 
-향후 구현 승인을 받은 뒤 `latest develop → P4-00 독립 PR → codex/v0.25-p4-termination-budget → P4-01 → P4-02 → P4-I → develop`
-순서로 진행한다. integration branch는 00 병합 뒤 최신 develop에서 만든다. 각 part도 실제 최신 integration head에서 조사한다.
+승인된 순서는 `latest develop → P4-00 독립 PR → codex/v0.25-p4-termination-budget → P4-01 → P4-02 → P4-I → develop`다.
+integration branch는 00 병합 뒤 최신 develop에서 만든다. 각 part도 실제 최신 integration head에서 조사한다.
 공유 `loop.py / model_call.py / _sync_bridge.py` 수정은 직렬화하고 매 단계 실제 소비자가 작동하게 한다.
 
 | PR | 변경 범위·의존성 | 완료·검증 기준 | 위험 |
@@ -346,9 +347,9 @@ hosting 담당은 전체 process shutdown SLA가 필요해질 때 host resource 
 Studio 담당은 P4 API가 구현된 뒤 UI 표시를 확장한다. 현재 DX2 offline recipe가 첫 실제 소비자다.
 P1/P2 unknown invocation의 종료 evidence slot, provider 내부 HTTP retry 회계는 기존 carry로 유지한다.
 
-## 9. 계획 검토와 현재 상태
+## 9. 계획 검토 기록
 
-현재: 최신 develop 조사·제한된 실패 재현·기존 기준선 완료. 제품 구현은 보류 중이다.
+2026-10-27 계획 단계: 최신 develop 조사·제한된 실패 재현·기존 기준선 완료. 당시 제품 구현은 보류했다.
 종료 전 다시 fetch한 develop도 `2914c4366f8dfd7ed537f854388836a12a05f078`로 동일하다.
 
 fresh reviewer `p4_plan_review`는 작성·조사에 참여하지 않고 네 문서와 실제 source·계약·기존 테스트·raw evidence를 검토했다.
@@ -367,9 +368,34 @@ legacy 비유한 값도 실제 hard cancel 요청 뒤에는 remaining=0을 우�
 targeted 최종 판정은 **ready**, 남은 blocking/nonblocking 지적은 없다.
 검토한 파일 SHA-256은 `ff02af1994188c3c1d8a82d4a2094d4b627a47d596fc2491cdcfc352f5d02016`이다.
 그 뒤 이 판정·검증 기록만 추가했다. 최초 fresh breadth와 수정 부분 targeted 확인을 함께 유지한다.
-계획 리뷰는 향후 구현 최종 head의 리뷰를 대체하지 않는다. 사용자 구현 보류도 계속 유효하다.
+계획 리뷰는 향후 구현 최종 head의 리뷰를 대체하지 않는다. 당시 구현 보류는 10/28 요청으로 해제됐다.
 
 문서 4개의 **로컬 링크·anchor 126개, Python 예시 7개 AST 문법 검사, git diff --check 통과**.
 첫 링크 검사에서 코드 안의 대괄호를 링크로 읽은 false positive는 fenced/inline code를 제외해 바로잡았다.
 AST 성공은 제안 API의 실행·타입 검증을 뜻하지 않는다. 기존 소스 기준선 209-pass는 계획 문서 수정에 영향받지 않아 재실행하지 않았다.
-최종 변경은 계획 문서 4개와 로컬 ignored 조사·memory 기록이다. 구현·CI 변경·PR 생성·push·병합·릴리스는 수행하지 않았다.
+계획 단계 변경은 문서 4개와 로컬 ignored 조사·memory 기록이다. 해당 단계에서는 구현·CI 변경·PR 생성·push·병합·릴리스를 수행하지 않았다.
+
+### 9.1 P4-00 사전조사 — 2026-10-28
+
+최신 fetch develop은 `2914c4366f8dfd7ed537f854388836a12a05f078`로 계획 base와 동일하다.
+`codex/v0.25-p4-ci`는 이 base와 계획 문서 commit `e16c304`에서 시작했다. root가 구현·공유 runner를 소유하고,
+`p4_01_research`가 다음 PR의 소스·소비자 조사를 병행한다. P4-00 독립 reviewer는 별도 `p4_00_review`다.
+
+현재 정확한 integration branch는 push allowlist에 없으며 terminal profile도 core로 fallback한다.
+기존 P1P2 등록 패턴대로 `.github/workflows/ci.yml`의 exact branch와 `CAMPAIGN_TERMINAL_PROFILES`의 combined 항목을 추가한다.
+기존 foundation tests의 default/explicit combined·weaker profile 거부·push 대상에 회귀를 보강한다.
+유사한 part/오타 branch는 기존 core fallback을 유지한다. wildcard·권한·SDK lock·제품 변경은 포함하지 않는다.
+실제 소비자는 push CI와 `pr-full.yml`의 head/label/profile resolver다. Ready/ci label의 required L2를 병합 근거로 쓰고
+manual diagnostic 또는 dormant 성공을 대체 근거로 사용하지 않는다.
+
+독립 사전조사 검토 후 red/green foundation, validate-lock·lint·diff, B 등급 코드 리뷰와 최종 L1/L2 core를 확인한다.
+상세 사전조사는 ignored `.tmp/v025/p4-00-preflight.md`다. 00 병합 뒤 최신 develop에서 통합 브랜치를 생성한다.
+01/02/I의 required combined, 각 PR의 독립 preflight·A 등급 두 코드 reviewer는 별도로 유지한다.
+
+독립 사전조사는 **READY**, 필수 수정 0건이다. 테스트-only `2a31e84`에서 **4 failed / 25 passed (9.57s)**:
+새 branch의 default가 core이고 weaker label/manual core가 허용되며 push allowlist에 없음을 확인했다.
+정확한 두 등록 지점을 수정한 뒤 **29 passed (6.08s)**, ruff 0.15.6·validate-lock·diff check가 통과했다.
+원본은 `.tmp/v025/p4-00-red.txt`, `p4-00-green.txt`다. mandatory pytest prefix와 네 worker, 단일 runner lock을 사용했다.
+[GitHub 이벤트 문서](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)를
+10/28 재확인했고 기존 Draft-fast/Ready-required 경계를 유지한다. 코드 리뷰와 최종 remote CI는 이어서 확인한다.
+기능 delta는 등록 2줄이고 계획 commit의 475줄 churn과 실행 기록을 누적 비용에 포함한다.

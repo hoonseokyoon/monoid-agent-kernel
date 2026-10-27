@@ -12,7 +12,7 @@ P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/referen
 P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model_call_facts.py)와
 [복구 예제](../examples/recover_model_call_facts.py)를 제공한다. 정책·저장 호환성·실행 기록은
 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4의 정책·외부 근거·변경 범위는 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 있다.
-P4 예산 조회는 설계 제안이며 현재 구현은 보류한다.
+P4 예산 조회는 설계 제안이며 2026-10-28부터 계획된 PR 순서로 구현을 진행한다.
 
 ## 1. 제품 방향과 릴리스 경계
 
