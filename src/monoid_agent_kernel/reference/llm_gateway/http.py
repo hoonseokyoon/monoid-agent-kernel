@@ -18,6 +18,8 @@ from monoid_agent_kernel.reference._shared.http_util import (
     redact_internal_error,
 )
 from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
+from monoid_agent_kernel.core.model_facts import UsageObservation
+from monoid_agent_kernel.providers._usage import usage_observation_of
 from monoid_agent_kernel.providers.base import provider_usage_of
 from monoid_agent_kernel.reference.llm_gateway.service import LlmGatewayBackend
 from monoid_agent_kernel.providers.gateway import (
@@ -117,6 +119,7 @@ def make_llm_gateway_handler(
             # zero for a turn the upstream generated and billed. ``_error_body`` omits the key
             # when it is empty, so the arms that never carry a cost keep their exact wire shape.
             usage = provider_usage_of(exc)
+            observation = usage_observation_of(exc)
             # Its sibling fact, read the same way and in the same place, because it belongs to
             # a type no more than the cost does. ``mark_provider_retried`` stamps an arbitrary
             # ``BaseException`` -- the gateway client's own ``_stamp_retry`` documents exactly
@@ -136,6 +139,7 @@ def make_llm_gateway_handler(
                     retryable=False,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
             elif isinstance(exc, ModelAdapterError):
                 status = _model_error_status(exc)
@@ -147,6 +151,7 @@ def make_llm_gateway_handler(
                     config_recoverable=exc.config_recoverable,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
             elif isinstance(exc, HttpRequestTooLarge):
                 self._write_error(
@@ -156,6 +161,7 @@ def make_llm_gateway_handler(
                     retryable=False,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
             elif isinstance(exc, ValueError):
                 self._write_error(
@@ -165,6 +171,7 @@ def make_llm_gateway_handler(
                     retryable=False,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
             elif isinstance(exc, NativeAgentError):
                 self._write_error(
@@ -174,6 +181,7 @@ def make_llm_gateway_handler(
                     retryable=False,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
             else:
                 self._write_error(
@@ -183,6 +191,7 @@ def make_llm_gateway_handler(
                     retryable=True,
                     provider_retried=retried,
                     usage=usage,
+                    usage_evidence=observation,
                 )
 
         def _write_error(
@@ -195,6 +204,7 @@ def make_llm_gateway_handler(
             config_recoverable: bool = False,
             provider_retried: bool = False,
             usage: Mapping[str, int] | None = None,
+            usage_evidence: UsageObservation | None = None,
         ) -> None:
             # Before the status, not after: the bytes have to leave the receive buffer before the
             # close, and the close follows this write immediately. This wire is the one where the
@@ -211,6 +221,7 @@ def make_llm_gateway_handler(
                     config_recoverable=config_recoverable,
                     provider_retried=provider_retried,
                     usage=usage,
+                    usage_evidence=usage_evidence,
                 ),
                 status=status,
             )
@@ -300,6 +311,7 @@ def _error_body(
     config_recoverable: bool = False,
     provider_retried: bool = False,
     usage: Mapping[str, int] | None = None,
+    usage_evidence: UsageObservation | None = None,
 ) -> dict[str, Any]:
     """The fields every gateway error carries, whatever transport reports it.
 
@@ -341,6 +353,8 @@ def _error_body(
     # raised on its own keeps its exact previous wire shape.
     if usage:
         body["usage"] = dict(usage)
+    if usage_evidence is not None:
+        body["usage_evidence"] = usage_evidence.to_json()
     return body
 
 
@@ -351,6 +365,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
     # the same reason: neither belongs to a type. See that writer for why the retry flag is
     # readable on a raw refusal, and read leniently there too.
     usage = provider_usage_of(exc)
+    observation = usage_observation_of(exc)
     retried = bool(getattr(exc, "provider_retried", False))
     if isinstance(exc, ModelAdapterError):
         return {
@@ -363,6 +378,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
                 config_recoverable=exc.config_recoverable,
                 provider_retried=retried,
                 usage=usage,
+                usage_evidence=observation,
             ),
         }
     return {
@@ -381,6 +397,7 @@ def _stream_error_frame(handler: BaseHTTPRequestHandler, exc: Exception) -> dict
             retryable=True,
             provider_retried=retried,
             usage=usage,
+            usage_evidence=observation,
         ),
     }
 

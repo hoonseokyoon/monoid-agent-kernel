@@ -26,6 +26,7 @@ from typing import Any, Literal, TypeAlias
 
 from monoid_agent_kernel.core._util import utc_timestamp
 from monoid_agent_kernel.core.json_ingress import normalize_json_ingress, normalize_unicode_scalars
+from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageEvidence
 from monoid_agent_kernel.core.model_stream import (
     NOOP_MODEL_STREAM_WRITER,
     ModelStreamChannel,
@@ -111,10 +112,21 @@ class LiveModelStreamFrame:
     reason: LiveModelStreamResetReason | None = None
     oldest_available_cursor: str | None = None
     latest_cursor: str | None = None
+    termination: ModelCallTermination | None = field(default=None, kw_only=True)
+    usage_evidence: UsageEvidence | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.usage is not None:
             object.__setattr__(self, "usage", dict(self.usage))
+        if self.termination is not None and (
+            not isinstance(self.termination, ModelCallTermination)
+            or self.kind != "closed" or self.termination.outcome != self.status
+        ):
+            raise ValueError("live termination must agree with closed status")
+        if self.usage_evidence is not None and (
+            not isinstance(self.usage_evidence, UsageEvidence) or self.kind != "closed"
+        ):
+            raise ValueError("live usage evidence requires a closed frame")
         if self.retryable is not None and type(self.retryable) is not bool:
             raise ValueError("model stream retryable must be a boolean")
         if self.config_recoverable is not None and type(self.config_recoverable) is not bool:
@@ -174,6 +186,8 @@ class LiveModelStreamFrame:
             "reason": self.reason,
             "oldest_available_cursor": self.oldest_available_cursor,
             "latest_cursor": self.latest_cursor,
+            "termination": None if self.termination is None else self.termination.to_json(),
+            "usage_evidence": None if self.usage_evidence is None else self.usage_evidence.to_json(),
         }
         payload.update({key: value for key, value in optional.items() if value is not None})
         if self.content_omitted:
@@ -437,10 +451,17 @@ class LiveModelStreamBroker:
                 **values,
             )
             size = _frame_size(frame)
+            if size > self.max_bytes and kind == "closed":
+                legacy = replace(frame, termination=None, usage_evidence=None)
+                if _frame_size(legacy) <= self.max_bytes:
+                    frame, size = legacy, _frame_size(legacy)
             if size > self.max_bytes and kind == "closed" and frame.final_text is not None:
                 # Preserve terminal state under the strict ring budget.  Reconnect/hydration obtains
                 # full content from the private sidecar when a single settled output is enormous.
                 frame = replace(frame, final_text=None, content_omitted=True)
+                size = _frame_size(frame)
+            if size > self.max_bytes and kind == "closed":
+                frame = replace(frame, termination=None, usage_evidence=None)
                 size = _frame_size(frame)
             if size <= self.max_bytes:
                 ring.frames.append((frame, size))
@@ -780,6 +801,8 @@ class _LiveModelStreamWriter(ModelStreamWriter):
                     else normalize_unicode_scalars(outcome.final_text)
                 ),
                 usage=usage,
+                termination=outcome.termination,
+                usage_evidence=outcome.usage_evidence,
                 error_code=outcome.error_code,
                 retryable=outcome.retryable,
                 config_recoverable=outcome.config_recoverable,

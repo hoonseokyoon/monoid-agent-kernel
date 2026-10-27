@@ -1882,6 +1882,21 @@ all validated descendant run ids. A delta includes separate output/reasoning-cha
 suffix without duplicating content. A `closed` frame and the corresponding Studio hydration
 snapshot carry the same optional boolean `retryable` signal, with absence interpreted as `false`.
 
+Live `closed` frames also carry optional `termination` and aggregate `usage_evidence` from the
+settled outcome. `termination` records outcome, first accepted stop requester, and read end;
+its outcome agrees with frame status. Evidence covers every kernel dispatch in the logical call,
+while a successful frame's numeric `usage` describes its final provider turn. Explicit zero is
+reported; absent counters remain unknown. Studio validates the closed vocabularies, portable
+integers, and evidence-derived sums/coverage before retaining these fields.
+
+The existing ring byte limit applies to facts. A fitting legacy closed frame retains its content
+when optional facts would exceed the limit. Oversized content uses the existing `content_omitted`
+marker, retaining facts when they fit and omitting them otherwise. Studio preserves received facts
+across hydration only for the same root/run/turn/stream/step/start identity. Private model-content
+snapshots keep their v1 projection and supply no new facts. Studio closes the live subscription on
+the durable terminal event; when that event wins the delivery race, snapshot-only facts display
+as unavailable. Late retained close metadata can enrich the same call without reopening content.
+
 Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
 least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
 oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
@@ -2244,6 +2259,18 @@ Successful response:
   "provider": "openai"
 }
 ```
+
+The optional `usage_evidence` key carries one dispatch observation on success bodies, terminal
+SSE frames, HTTP errors, and SSE errors: `{"reported":{"input_tokens":0},"source":"provider",
+"collection":"normal"}`. Gateway relays preserve its source and collection phase. The outer
+runner owns logical-call termination and aggregate evidence. Older peers omit the key and read as
+legacy ambiguous. The reference writer includes the normalized observation on success, including
+empty legacy observations; failure writers include it when the exception carries one.
+Malformed error observations are omitted while the original classified error and numeric usage
+remain readable. Malformed observations on a success response retain the existing bad-response
+refusal policy. A withheld terminal followed by a read error preserves the selected final snapshot,
+including explicit zero, and meters its numeric usage once. Applied-proof refusals carry the same
+observation through chained gateways. These fields preserve the existing v1 transport envelope.
 
 `reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim: the
 provider's output-item subsequence, adjacency-preserving — the `reasoning` items **plus the

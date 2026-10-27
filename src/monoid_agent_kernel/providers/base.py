@@ -1473,6 +1473,11 @@ def assemble_streamed_turn(chunks: list[ModelStreamChunk]) -> ModelTurn:
     for chunk in chunks:
         normalized_chunks.extend(ingress.normalize(chunk))
     normalized_chunks.extend(ingress.finish())
+    return _assemble_normalized_streamed_turn(normalized_chunks)
+
+
+def _assemble_normalized_streamed_turn(normalized_chunks: list[ModelStreamChunk]) -> ModelTurn:
+    """Fold ingress-validated chunks without collecting their observations a second time."""
 
     text_parts: list[str] = []
     slots: dict[int, dict[str, Any]] = {}

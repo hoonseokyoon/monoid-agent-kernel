@@ -43,6 +43,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolCallDelta,
     TurnComplete,
+    _assemble_normalized_streamed_turn,
     assemble_streamed_turn,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
@@ -591,7 +592,7 @@ def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
     guard, or downgrading the classification it states, goes red.
     """
 
-    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(assemble_streamed_turn))
+    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(_assemble_normalized_streamed_turn))
 
 
 def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
@@ -603,7 +604,7 @@ def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
     worst of both directions.
     """
 
-    source = inspect.getsource(assemble_streamed_turn)
+    source = inspect.getsource(_assemble_normalized_streamed_turn)
     _assert_the_fold_guard_binds_its_refusal(source)  # unmutated: green
 
     def _mutant(old: str, new: str) -> str:

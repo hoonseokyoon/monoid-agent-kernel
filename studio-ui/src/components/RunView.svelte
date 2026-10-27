@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ApprovalRequest, RunViewState, SubagentActivity } from "../lib/types";
+  import { MODEL_USAGE_COUNTERS, type LiveModelCallState } from "../lib/model-stream";
   import ApprovalCard from "./ApprovalCard.svelte";
   import ErrorPanel from "./ErrorPanel.svelte";
   import Icon from "./Icon.svelte";
@@ -7,9 +8,10 @@
   import StatusBadge from "./StatusBadge.svelte";
   import SubagentActivityCard from "./SubagentActivityCard.svelte";
 
-  let { state, subagents, connected, onStop, onPause, onResume, onRetry, onApproval, onOpenConfig } = $props<{
+  let { state, subagents, modelCalls, connected, onStop, onPause, onResume, onRetry, onApproval, onOpenConfig } = $props<{
     state: RunViewState;
     subagents: SubagentActivity[];
+    modelCalls: LiveModelCallState[];
     connected: boolean;
     onStop: () => Promise<void>;
     onPause: () => Promise<void>;
@@ -32,6 +34,10 @@
             ? "Run paused at a checkpoint."
             : "",
   );
+
+  function counterLabel(counter: string): string {
+    return counter[0].toUpperCase() + counter.slice(1).replaceAll("_", " ");
+  }
 </script>
 
 <section class="run-view">
@@ -102,6 +108,45 @@
         <SubagentActivityCard {activity} />
       {/each}
 
+      {#each modelCalls as call (JSON.stringify([call.runId, call.turnId, call.streamId, call.step, call.startedAt]))}
+        <details class="model-call-details" data-testid="model-call-details">
+          <summary>
+            <span>{call.runId === call.rootRunId ? "Root call" : "Subagent call"} · {call.model ?? call.provider ?? "Model"} · step {call.step}</span>
+            <small>{call.status.replaceAll("_", " ")}</small>
+          </summary>
+          <div class="call-facts">
+            <p class="call-identity">{call.runId}</p>
+            {#if call.termination || call.usageEvidence}<p>Facts received live</p>{/if}
+            {#if call.termination}
+              <dl>
+                <dt>Outcome</dt><dd>{call.termination.outcome.replaceAll("_", " ")}</dd>
+                <dt>Requested by</dt><dd>{call.termination.requested_by?.replaceAll("_", " ") ?? "None"}</dd>
+                <dt>Read ended by</dt><dd>{call.termination.ended_by.replaceAll("_", " ")}</dd>
+              </dl>
+            {:else}
+              <p>Termination facts unavailable</p>
+            {/if}
+            {#if call.usageEvidence}
+              <table>
+                <caption>Usage across {call.usageEvidence.attempts.length} kernel dispatches</caption>
+                <thead><tr><th scope="col">Counter</th><th scope="col">Reported</th><th scope="col">Coverage</th></tr></thead>
+                <tbody>
+                  {#each MODEL_USAGE_COUNTERS as counter (counter)}
+                    <tr>
+                      <th scope="row">{counterLabel(counter)}</th>
+                      <td>{call.usageEvidence.reported[counter]?.toLocaleString() ?? "Unreported"}</td>
+                      <td>{call.usageEvidence.completeness[counter].replaceAll("_", " ")}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {:else}
+              <p>Usage evidence unavailable</p>
+            {/if}
+          </div>
+        </details>
+      {/each}
+
       {#if activeApproval}
         <div class="approval-live">
           <ApprovalCard request={activeApproval} onAnswer={(answer) => onApproval(activeApproval, answer)} />
@@ -118,3 +163,30 @@
     </div>
   </div>
 </section>
+
+<style>
+  .model-call-details {
+    margin: 0 0 20px 39px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--fg-secondary);
+    font-size: 12px;
+  }
+  .model-call-details summary {
+    min-height: 44px;
+    padding: 12px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+  }
+  .model-call-details summary small { margin-left: 8px; color: var(--fg-muted); }
+  .call-facts { padding: 0 12px 12px; }
+  .call-facts p { margin: 0 0 10px; }
+  .call-identity { color: var(--fg-muted); overflow-wrap: anywhere; }
+  .call-facts dl { display: grid; grid-template-columns: 1fr 2fr; gap: 6px 12px; margin: 0 0 16px; }
+  .call-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .call-facts table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .call-facts caption { margin-bottom: 8px; text-align: left; color: var(--fg-primary); }
+  .call-facts th, .call-facts td { padding: 5px 4px; border-bottom: 1px solid var(--line); text-align: left; }
+  .call-facts th { font-weight: 500; }
+</style>
