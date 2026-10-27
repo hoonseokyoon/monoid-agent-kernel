@@ -184,6 +184,10 @@ def safe_failure_code(value: object, *, default: str) -> str:
 def mark_recovered_model_usage(
     error: BaseException,
     receipt: Mapping[str, Any],
+    *,
+    failure_code: str = "",
+    idempotency_key: str = "",
+    request_digest: str = "",
 ) -> None:
     """Carry checked settlement facts when its result or evidence projection fails."""
 
@@ -207,6 +211,16 @@ def mark_recovered_model_usage(
         checked = ModelCallReceipt(
             attempts=receipt["attempts"], usage=usage,
             termination=termination, usage_evidence=evidence,
+            error_code=failure_code,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            stop_reason=receipt.get("stop_reason", ""),
+            latency_ms=receipt.get("latency_ms", 0),
+            provider_error_code=receipt.get("provider_error_code", ""),
+            provider_retried=receipt.get("provider_retried", False),
+            retryable=receipt.get("retryable", False),
+            config_recoverable=receipt.get("config_recoverable", False),
+            http_status=receipt.get("http_status"),
         )
         mark_call_facts(error, termination, evidence)
         error._checked_recovery_receipt = checked  # type: ignore[attr-defined]
@@ -221,9 +235,19 @@ def recovered_model_failure_receipt(
     checked = getattr(error, "_checked_recovery_receipt", None)
     if not isinstance(checked, ModelCallReceipt):
         return None
+    projected = base.with_error(error)
+    if isinstance(error, ModelEvidenceUncommitted):
+        projected = replace(
+            base, error_code=checked.error_code, stop_reason=checked.stop_reason,
+            latency_ms=checked.latency_ms, provider_error_code=checked.provider_error_code,
+            provider_retried=checked.provider_retried, retryable=checked.retryable,
+            config_recoverable=checked.config_recoverable, http_status=checked.http_status,
+        )
     return replace(
-        base.with_error(error), attempts=checked.attempts, usage=checked.usage,
+        projected, attempts=checked.attempts, usage=checked.usage,
         termination=checked.termination, usage_evidence=checked.usage_evidence,
+        idempotency_key=checked.idempotency_key or base.idempotency_key,
+        request_digest=checked.request_digest or base.request_digest,
     )
 
 

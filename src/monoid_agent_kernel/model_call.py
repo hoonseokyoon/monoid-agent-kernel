@@ -1178,10 +1178,14 @@ class ModelCallRunner:
                             logical_call_id=logical_call_id,
                             request_digest=receipt.request_digest,
                         )
-                    except DurableModelCallError as recovery_error:
-                        recovered_failure_receipt = recovered_model_failure_receipt(
+                    except (DurableModelCallError, ModelEvidenceUncommitted) as recovery_error:
+                        checked_receipt = recovered_model_failure_receipt(
                             recovery_error, receipt,
                         )
+                        if isinstance(recovery_error, ModelEvidenceUncommitted):
+                            durable_outcome_receipt = checked_receipt
+                        else:
+                            recovered_failure_receipt = checked_receipt
                         raise
                     if recovered is not None:
                         # The recovery hook performs the fenced, idempotent settlement/evidence

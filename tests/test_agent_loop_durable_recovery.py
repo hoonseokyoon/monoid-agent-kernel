@@ -2558,12 +2558,15 @@ def test_changed_request_is_blocked_before_provider_reentry(tmp_path: Path) -> N
     assert len(adapter.requests) == 1
 
 
-@pytest.mark.parametrize("projection_only", [False, True])
-def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path, projection_only) -> None:
+@pytest.mark.parametrize("fault", ["integrity", "evidence_success", "evidence_refusal"])
+def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Path, fault) -> None:
     from support.fenced_hosting import _record_digest
     from support.model_facts import facts
     from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+    from monoid_agent_kernel.core.model_io import CapturePolicy, ModelIOSubscription
 
+    projection_only = fault != "integrity"
+    refusal = fault == "evidence_refusal"
     harness = DeterministicFencedRunHarness()
     turn = ModelTurn(
         final_text="first",
@@ -2574,19 +2577,23 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
             "cache_creation_tokens": 1,
         },
     )
-    adapter = _ScriptedAdapter(turn)
+    provider_result = ModelDispatchRefused("refused", error_code="rate_limited", retryable=True) if refusal else turn
+    if refusal:
+        mark_provider_usage(provider_result, turn.usage)
+    adapter = _ScriptedAdapter(provider_result)
     baseline, settled = _crash_at(tmp_path, harness, adapter, "settled")
     payload = settled.invocation.to_json()
     payload["schema_version"] = "monoid.model-invocation.v2"
     if projection_only:
         payload["evidence_policy"] = "required"
-    payload["receipt"].update(facts(dict(settled.invocation.receipt["usage"])))
+    payload["receipt"].update(facts(dict(settled.invocation.receipt["usage"]), outcome="failed" if refusal else "completed"))
     checked = decode_model_invocation(payload)
     assert checked.status == "loaded"
     coord = (RUN_ID, LOGICAL_CALL_ID, settled.revision)
     settled = replace(settled, invocation=checked.value)
     harness.sink._invocations[coord] = (_record_digest(payload), settled)
     outcomes = []
+    captures = []
 
     class Observer:
         def open(self, context):
@@ -2598,8 +2605,12 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
         def close(self, outcome):
             outcomes.append(outcome)
 
+        def on_model_call(self, capture):
+            captures.append(capture)
+
     result_sha = settled.invocation.result_ref.removeprefix("blob:")
-    assert hashlib.sha256(settled.blob(result_sha)).hexdigest() == result_sha
+    if not refusal:
+        assert hashlib.sha256(settled.blob(result_sha)).hexdigest() == result_sha
 
     suspension, checkpoint = _restore(
         tmp_path,
@@ -2609,19 +2620,28 @@ def test_tampered_settled_result_is_blocked_before_provider_reentry(tmp_path: Pa
         sink=_RejectModelEvidence(harness.sink) if projection_only else _TamperInvocationResultLoad(harness.sink),
         model_evidence_policy="required" if projection_only else "passive",
         model_stream_observer_factories=(Observer,),
+        model_io_subscriptions=(ModelIOSubscription(Observer(), CapturePolicy(mode="digest")),),
     )
 
     assert suspension.reason == ("turn_failed" if projection_only else "terminal")
     assert suspension.error_code == ("evidence_uncommitted" if projection_only else "durable_invocation_result_corrupt")
     assert checkpoint is not None and checkpoint.total_usage == turn.usage
     assert len(adapter.requests) == 1
-    assert outcomes[0].status == ("completed" if projection_only else "failed")
-    assert outcomes[0].error_code == (None if projection_only else "durable_invocation_result_corrupt")
-    assert outcomes[0].usage == (None if projection_only else turn.usage)
+    assert outcomes[0].status == ("completed" if projection_only and not refusal else "failed")
+    assert outcomes[0].error_code == ("evidence_uncommitted" if refusal else None if projection_only else "durable_invocation_result_corrupt")
+    assert outcomes[0].usage == (None if projection_only and not refusal else turn.usage)
     assert outcomes[0].final_text is None
-    assert outcomes[0].termination.ended_by == ("provider_terminal" if projection_only else "local_failure")
+    assert outcomes[0].termination.ended_by == ("provider_error" if refusal else "provider_terminal" if projection_only else "local_failure")
     assert outcomes[0].usage_evidence.to_json() == payload["receipt"]["usage_evidence"]
     assert harness.sink._invocations[coord][0] == _record_digest(payload)
+    assert len(captures) == 1
+    receipt = captures[0].receipt
+    assert receipt.usage == turn.usage and receipt.attempts == 1
+    assert receipt.usage_evidence.to_json() == payload["receipt"]["usage_evidence"]
+    assert receipt.termination == outcomes[0].termination
+    assert receipt.idempotency_key == payload["idempotency_key"]
+    assert receipt.request_digest == payload["request_digest"]
+    assert receipt.error_code == ("rate_limited" if refusal else "" if projection_only else "durable_invocation_result_corrupt")
 
 
 def test_stale_writer_cannot_expose_a_recovered_settlement(tmp_path: Path) -> None:

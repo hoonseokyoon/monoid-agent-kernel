@@ -614,3 +614,10 @@ required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함
 추가 회귀 원본은 `.tmp/v025/p1p2-02-*-red.txt`, 수정 후 관련 **884 passed / 22.71s**는
 `p1p2-02-review-green.txt`에 있다. source 변경 상한은 약 710줄(공백·주석 포함)로 갱신 예산 850 이내다.
 초기 600/1,900 추정과 누적 비용 기록은 유지한다. 최종 head 재검토·wheel·CI를 다시 확인한다.
+
+재검토 `ef50d9c`는 기존 지적을 해소했다. 남은 required-evidence 복구 재실패의 subscription 미전달도
+02의 공개 전달 계약에 포함했다. 실제 host에서 성공·refusal·손상 결과 세 회귀가 먼저 실패했다.
+같은 checked carrier를 기존 게시 경로에 연결하고 원래 invocation의 failure code·key·request digest를
+유지했다. 원래 provider receipt와 현재 projection 오류를 구분하며 콘텐츠는 생성하지 않는다.
+관련 **42 passed / 2.77s** (`p1p2-02-recovery-subscription-green.txt`), 전체 lint 통과.
+`ef50d9c` wheel audit과 current/minimum 설치 검증은 각각 151 tests PASS였고, 새 final candidate로 갱신한다.
