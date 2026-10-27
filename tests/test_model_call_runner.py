@@ -203,6 +203,83 @@ def test_p1p2_stream_callback_failure_is_local(callback):
     assert call_facts_of(failure)[0].ended_by == "local_failure"
 
 
+@pytest.mark.parametrize(("first", "during_cleanup"), [
+    ("turn_interrupt", False), ("user_cancel", False), (None, False), ("late_user_cancel", False),
+    ("turn_interrupt", True), ("user_cancel", True), ("repeated_caller", False),
+])
+def test_p1p2_caller_cancellation_preserves_request_order_before_cleanup(first, during_cleanup) -> None:
+    captures = []
+    seen = []
+    token = CancellationToken()
+
+    async def run():
+        before_second, release, drained, stopped = (asyncio.Event() for _ in range(4))
+        cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
+
+        class Adapter:
+            async def astream_turn(self, request):
+                try:
+                    yield TextDelta("visible")
+                    before_second.set()
+                    await release.wait()
+                    yield TurnComplete(usage={"output_tokens": 5}, usage_evidence=UsageObservation(
+                        reported={"output_tokens": 5}, source="adapter", collection="normal",
+                    ))
+                    drained.set()
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if first in {"late_user_cancel", "repeated_caller"}:
+                        token.cancel(InterruptionCause.USER_CANCEL)
+                        await asyncio.sleep(0)
+                    if during_cleanup or first == "repeated_caller":
+                        cleanup_started.set()
+                        await cleanup_release.wait()
+                    raise
+                finally:
+                    stopped.set()
+
+        runner = ModelCallRunner(
+            adapter=Adapter(), abort_drain_s=0.03 if during_cleanup else 2.0,
+            cancel_grace_s=0.5 if during_cleanup or first == "repeated_caller" else 0.03,
+            current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(
+            REQUEST, delta_consumer=seen.append,
+            should_abort=(lambda: True) if first == "turn_interrupt" else None,
+        ))
+        await asyncio.wait_for(before_second.wait(), 1)
+        if first == "user_cancel":
+            token.cancel(InterruptionCause.USER_CANCEL)
+        release.set()
+        await asyncio.wait_for(drained.wait(), 1)
+        if during_cleanup:
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+        task.cancel()
+        if first == "repeated_caller":
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+            task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            cleanup_release.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        expected = first if first in {"turn_interrupt", "user_cancel"} else "caller_cancel"
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", requested_by=expected, ended_by="stop_request",
+        )
+        assert captures[0].receipt.termination == facts
+        assert captures[0].receipt.usage["output_tokens"] == 5
+        assert provider_usage_of(caught.value)["output_tokens"] == 5
+        assert evidence.attempts[0].observation.collection == (
+            "drain" if expected != "caller_cancel" else "normal"
+        )
+        assert len(seen) == (1 if expected != "caller_cancel" else 2)
+
+    asyncio.run(run())
+
+
 def test_p1p2_caller_cancellation_is_distinct_from_provider_self_cancel() -> None:
     captures = []
 

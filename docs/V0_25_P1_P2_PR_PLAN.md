@@ -812,3 +812,21 @@ runtime·UI 추가 1,598/삭제 208(1,806줄), 예제 147, compatibility fixture
 최종 두 누적 리뷰, full CI·combined 서비스, current/minimum 설치 wheel·공개 예제·package audit을
 실제 수정 head에 연결한 뒤 develop에 merge commit으로 반영한다. 정확한 최종 head·CI·merge SHA는
 통합 PR과 같은 패스의 프로젝트 memory에 기록한다. 배포 전 dual-reader host inventory와 §8의 후속 범위는 유지한다.
+
+`f540d76`은 두 최종 누적 리뷰 PASS, installed wheel current/minimum 각각 **431 passed / 4 Windows skip**
+(9.33/9.01s), 공개 예제·audit·실제 구형/신형 gateway·v2 → reader-prep v1 → v2 binary 복구를 통과했다.
+필수 combined CI `40473753359`도 SUCCESS였다. 이어 자동 GitHub 리뷰의
+[최초 요청자 경합 지적](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/161#discussion_r4386472020)을
+실제 runner로 확인했다. 먼저 user_cancel/turn_interrupt를 수락한 drain에 caller task 취소가 도착하면
+requested_by가 caller_cancel로 바뀌었다. 기존 CancelledError·cancelled outcome·stop_request·사용량·출력 차단은 유지됐다.
+
+반대 순서도 확인했다. caller 취소 뒤 cleanup에서 user token을 취소하면 caller_cancel이 최초다.
+최종 drain.started만 읽는 수정은 이 경로를 깨뜨린다. 독립 targeted 사전 검토 READY에 따라 shared wait의
+caller 취소 관찰 지점에 optional callback을 연결하고, drain owner가 첫 관찰 때 요청자를 고정한다.
+wait와 drain owner의 cleanup await에서 추가 취소가 와도 같은 사실을 전달한다. 기존 예외·회수·권한 흐름은 유지한다.
+새 종료 상태 머신 없이 기존 stamp와 두 단계 wait 경계를 사용한다. 다른 wait 호출자는 callback 기본값을 유지한다.
+
+제품 수정 전 실제 runner 7개 경합 회귀는 **4 failed / 3 passed, 3.64s**였다
+(`.tmp/v025/p1p2-i-caller-order-expanded-red.txt`). 앞선 stop→caller 및 cleanup 중 첫 caller 4개가 실패하고,
+caller 단독·caller→cleanup의 user stop·반복 caller control은 통과했다. 이 회귀를 먼저 commit으로 고정한다.
+공유 wait primitive 변경이므로 기존 bridge·model/tool 취소·durable unknown/P5 계약과 두 리뷰를 갱신한다.
