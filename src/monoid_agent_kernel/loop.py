@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from monoid_agent_kernel.core import _deadline as deadline_clock
 from monoid_agent_kernel.core._deadline import _MonotonicDeadline
+from monoid_agent_kernel.core.termination_budget import TerminationBudgetSnapshot
 from monoid_agent_kernel.core._sync_bridge import (
     AbandonableSyncCall,
     CalleeCancelled,
@@ -1901,6 +1902,25 @@ class AgentLoop:
             raise TurnNotSettled(suspension)
         return suspension.turn
 
+    def termination_budget(self) -> TerminationBudgetSnapshot:
+        """Read this run's deadline and root model calls without evaluating host getters.
+
+        The immutable snapshot covers the current run resources. Tool waits, children and
+        host resource cleanup remain outside the model-call tuple.
+        """
+        return self._termination_budget_at()
+
+    def _termination_budget_at(self, now: float | None = None) -> TerminationBudgetSnapshot:
+        session = self._session
+        resources = session.res if session is not None else self._bootstrap_resources
+        if resources is None:
+            return TerminationBudgetSnapshot(
+                observed_at_monotonic_s=deadline_clock.monotonic() if now is None else now,
+            )
+        return resources.model_runner._termination_budgets.snapshot(
+            now=now, run_deadline=resources.deadline,
+        )
+
     def astream(self, user_input: str | tuple[ContentPart, ...]) -> RunStream:
         """Stream one user turn live: the async-CM analog of :meth:`asubmit`.
 
@@ -1927,37 +1947,41 @@ class AgentLoop:
             sink=sink,
             drive_factory=lambda: self._astream_drive(user_input),
             request_cancel=token.cancel,
-            current_extra_grace_s=self._run_stream_drain_grace_s,
+            _termination_budget=self._termination_budget_at,
+            _exit_extra_grace_s=self._run_stream_drain_grace_s,
         )
 
-    def _run_stream_drain_grace_s(self) -> float:
-        """What ``RunStream``'s early-exit wait adds so it outlasts a drain the exit itself starts.
+    def _run_stream_drain_grace_s(
+        self, snapshot: TerminationBudgetSnapshot | None = None,
+    ) -> float:
+        """Reserve exit allowance from active calls at the first exit wait.
 
-        Leaving the ``astream`` block early cancels the run with ``user_cancel``, which with
-        ``async_model_abort_drain_s`` set turns an in-flight stream into a drain lasting up to that
-        budget plus the model cancel grace. ``RunStream`` hard-cancels the drive after its own
-        fixed wait, and a hard cancel cuts the drain and loses its bill, so the drain and the
-        close are added to that wait.
-
-        Read when the exit's wait starts, not when ``astream()`` is called: the runner reads the
-        drain as each stream opens and the grace where it is spent, so a knob raised inside the
-        ``async with`` before the first call is a drain this wait must cover. The drain is the
-        larger of the knob now and the budget the in-flight stream opened with, which a knob
-        lowered since does not shorten. With neither on, nothing is added and ``RunStream`` keeps
-        its default.
+        Each call can spend drain then cleanup; concurrent calls share the largest
+        allowance. The current grace is an exit-policy candidate sampled once here.
+        Future drain configuration contributes no time.
         """
-
-        drain_s = _positive_seconds(lambda: self.async_model_abort_drain_s)
-        try:
-            session = self._session
-            resources = session.res if session is not None else self._bootstrap_resources
-            if resources is not None:
-                drain_s = max(drain_s, resources.model_runner._open_abort_drain_s())
-        except Exception:  # noqa: BLE001 - sizing an exit must not be what fails it
-            pass
-        if not drain_s:
-            return 0.0
-        return drain_s + _positive_seconds(lambda: self.async_model_cancel_grace_s)
+        snapshot = self.termination_budget() if snapshot is None else snapshot
+        eligible = {"waiting", "streaming", "draining"}
+        grace_candidate = (
+            _positive_seconds(lambda: self.async_model_cancel_grace_s)
+            if any(call.phase in eligible for call in snapshot.calls) else 0.0
+        )
+        extra = 0.0
+        for call in snapshot.calls:
+            drain = 0.0
+            if call.phase == "draining":
+                drain = call.drain_remaining_s or 0.0
+            elif call.phase == "streaming":
+                drain = call.drain_budget_s or 0.0
+                if call.deadline_remaining_s is not None:
+                    drain = min(drain, call.deadline_remaining_s)
+            grace = grace_candidate if call.phase in eligible else 0.0
+            for window in call.grace_windows:
+                value = window.remaining_s if window.remaining_s is not None else window.budget_s
+                if value is not None:
+                    grace = max(grace, value)
+            extra = max(extra, drain + grace)
+        return extra
 
     async def _astream_drive(
         self, user_input: str | tuple[ContentPart, ...]
