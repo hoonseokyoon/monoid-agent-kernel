@@ -513,7 +513,7 @@ Python 3.11/3.12는 각각 core **4,911 passed**, serial **741 passed**, 실제 
 actual base는 02 merge `be35567`, 다시 fetch한 develop은 `22aae18`이며 이미 ancestor다.
 독립 actual-base preflight는 **READY**, blocker 0건이다. 검토한 preflight SHA256은
 `668B5E7E32D85781124C5E849803A70755C3F7194C1F8963ACED4D8D4BD85E38`이다.
-root가 통합/문서/단일 runner를, 연구자가 실제 소비자 대조를 맡았다. I는 상태 문서와 기존 종료 대기 설명 5개 문서만 수정한다.
+root가 통합/문서/단일 runner를, 연구자가 실제 소비자 대조를 맡았다. I의 최초 후보는 상태 문서와 기존 종료 대기 설명 5개 문서를 수정했다.
 core 기능·schema·provider·Studio bundle은 02의 검토/설치 후보와 동일하게 유지한다.
 
 실제 CSP `pipeline_core/skills/llm_namespace.py`의 epoch 입력은 그대로 사용 가능하다.
@@ -531,3 +531,16 @@ P5 전달 권한 경계는 누적 코드와 기존 회귀·full/combined CI에 �
 운영 의미는 기존 범위를 유지한다. `calls=()`는 소유 model wait 부재, `hard_cancel_remaining_s=0`은 강제 취소 요청 사실이다.
 driver의 자원 정리·durable settlement는 계속 기다릴 수 있다. unbounded 실행의 과거 elapsed와 remaining=0 이후 초과 cleanup
 시간은 기존 checkpoint로 복원할 수 없다. 릴리스·배포·CSP pin 변경은 별도 작업이다.
+
+최초 I 후보 `44728a2`는 두 fresh 누적 코드 reviewer **PASS**, L1 `40556925253`과 required combined
+`40557033294` **SUCCESS**를 받았다. full push `40556908534`는 14개 중 13개 job이 통과했고,
+coverage job은 **81.16%**로 기준 80%를 충족했으나 기존 backend 복구 테스트의 fixture 경합 1건으로 실패했다.
+`run.finished` append 뒤 최종 status writer가 아직 살아 있는데 테스트가 `status.json`을 덮어써 같은 임시 파일을 경합했다.
+해당 fixture·backend·atomic writer는 P4 이전 develop과 동일하다. `shutdown()`은 이 writer 완료를 기다리는 API가 아니다.
+
+독립 targeted preflight는 기존 테스트 관리자가 보관한 실제 run Future의 완료를 기다리는 **test-only 수리 READY**였다.
+실제 최종 status replace를 barrier로 멈춘 probe에서 helper가 먼저 반환해 **1 failed (9.45s)**를 확인했다.
+`_closed_limited_run`이 추적 Future의 존재를 확인하고 `result(timeout=20)`으로 완료·오류를 받도록 수정했다.
+legacy terminal 거부·nonterminal 복구·중복 재개 방지 assertion을 보존했고, probe와 backend recovery 모듈은
+**37 passed (16.51s)**다. 원본 `.tmp/v025/p4-i-fixture-{red,green}.txt`; probe는 `test_p4_i_fixture_race.py`다.
+제품 코드와 설치 wheel 입력은 그대로다. 최종 수정에 대한 두 targeted 리뷰와 새 head의 L1·full push·required combined를 확인한다.
