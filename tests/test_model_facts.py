@@ -168,6 +168,19 @@ def test_with_error_preserves_an_explicit_zero_without_replacing_the_original_fa
     assert failed.usage_evidence.reported == {"output_tokens": 0}
 
 
+@pytest.mark.parametrize("reported", [{}, {"output_tokens": 0}])
+def test_with_error_keeps_numeric_stamps_compatible_with_existing_observations(reported) -> None:
+    from monoid_agent_kernel.providers.base import mark_provider_usage
+
+    receipt = ModelCallReceipt(usage_evidence=UsageEvidence.from_json(facts(reported)["usage_evidence"]))
+    error = RuntimeError("billed failure")
+    mark_provider_usage(error, {"input_tokens": 5})
+    failed = receipt.with_error(error)
+    assert failed.usage == {"input_tokens": 5}
+    assert failed.usage_evidence == receipt.usage_evidence
+    assert failed.usage_evidence.completeness["input_tokens"] == "unknown"
+
+
 def test_observer_cannot_mutate_shared_facts_or_stop_later_receipt_delivery() -> None:
     from monoid_agent_kernel.core.model_io import ModelIOSubscription, dispatch_model_call
 

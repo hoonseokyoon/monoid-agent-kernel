@@ -528,3 +528,9 @@ import가 site-packages임을 검사했고 Pydantic 2.14.1은 120 passed/3.75s, 
 현재 source Python diff 상한은 525줄(주석·공백 포함), 총 변경은 약 1,500줄이다. 초기 400/1,300과
 사전조사 500/1,700 추정에 함께 기록한다. G1 source 상한 예상은 1,995줄로 soft limit에 가깝다.
 02 사전조사에서 누적 실제 비용과 남은 범위를 다시 점검하며, 새 범용 serializer나 상태 머신은 추가하지 않는다.
+
+재검토 `e7bffea`에서는 보고값이 없는 evidence가 기존 numeric stamp 수집을 막는 경계가 추가로 발견됐다.
+빈 보고와 서로 다른 counter의 명시적 0 두 회귀를 먼저 실패시켰다(2 failed/2.75s).
+기존 stamped 후보를 evidence와 검증한 뒤 채택하도록 좁혀 unknown counter의 숫자와 확인된 0을 함께 보존한다.
+관련 receipt/facts **95 passed in 3.02s**. source 상한은 529줄, 누적 예상은 1,999줄이다.
+`e7bffea`의 갱신 wheel audit은 통과했고 독립 설치 환경은 current/minimum 각각 125 passed/2.96s·3.21s였다.
