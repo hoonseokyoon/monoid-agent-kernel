@@ -345,7 +345,9 @@ def test_the_replay_key_is_taken_after_normalization() -> None:
     rekeys every recorded call, and this is the only place that says so.
     """
 
-    source = inspect.getsource(ModelCallRunner.acall)
+    # acall owns registration and retirement; the delegated body owns request
+    # normalization, identity and dispatch in that order.
+    source = inspect.getsource(ModelCallRunner._acall_owned)
     normalized_at = source.index("request = normalize_model_request(request)")
     keyed_at = source.index("_request_payload(")
 

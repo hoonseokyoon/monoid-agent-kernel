@@ -135,6 +135,46 @@ def test_driver_natural_completion_marks_settled_without_creating_an_exit_timer(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_legacy_callback_runtime_precedes_the_first_exit_wait(monkeypatch, callback_raises):
+    now, reads, completed = [100.0], [], []
+    monkeypatch.setattr(deadline_clock, "monotonic", lambda: now[0])
+
+    async def run():
+        entered, stop = asyncio.Event(), asyncio.Event()
+
+        async def drive():
+            entered.set()
+            await stop.wait()
+            # A real timer distinguishes a cooperative wait from immediate cancellation.
+            await asyncio.sleep(0.01)
+            completed.append("cooperative")
+
+        def allowance():
+            reads.append(now[0])
+            now[0] += 2  # Deterministic elapsed callback time; asyncio's clock stays real.
+            if callback_raises:
+                raise RuntimeError("legacy callback failed after doing work")
+            return 0
+
+        stream = RunStream(sink=QueueEventSink(), drive_factory=drive, request_cancel=stop.set,
+                           cancel_grace_s=0.2, current_extra_grace_s=allowance)
+        await stream.__aenter__()
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.wait_for(stream.__aexit__(None, None, None), 3)
+            assert completed == ["cooperative"]
+            snapshot = stream.termination_budget().stream_exit
+            assert snapshot.phase == "settled" and snapshot.wait_budget_s == 0.2
+            assert snapshot.hard_cancel_remaining_s is None
+            assert reads == [100.0]
+        finally:
+            stop.set()
+            await asyncio.wait_for(stream.__aexit__(None, None, None), 3)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(("extra", "expected"), [
     ("raise", 0.2), (-1.0, 0.0), (float("nan"), None), (float("inf"), None),
     ("malformed", "error"),
