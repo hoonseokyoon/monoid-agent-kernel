@@ -1137,10 +1137,11 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 
 - **Window.** The same stream is read on until it ends or `min(stop + abort_drain_s, deadline)`
   passes (`stop + abort_drain_s` without a deadline), and is then closed within the ordinary cancel
-  grace. The worst-case wall time after the stop is `abort_drain_s + async_model_cancel_grace_s`.
-  `AgentLoop.astream`'s early exit waits that long plus its own 8 s before hard-cancelling the
-  drive, sized when the wait starts from the knobs then and never below the budget the in-flight
-  call opened with.
+  grace. Each drain and cleanup wait owns its own window. `AgentLoop.astream`'s early exit
+  adds the maximum remaining active-call allowance to its own 8 s, using the deadline-capped
+  drain and phase-specific cleanup windows described under termination budgets below.
+  It freezes that allowance once. After requesting hard cancellation it continues to await
+  the driver, including resource cleanup and durable settlement.
   The drain is raced outside the run-deadline race: a deadline that closes the window ends the
   drain and never turns the stop into `RunTimeout`.
 - **Delivery.** Nothing read after the stop reaches `delta_consumer`, the durable delta mirror, a
@@ -3286,7 +3287,7 @@ Host-owned event and terminal adapters apply the same result rule. A `fenced` re
 event and terminal storage remains a host responsibility; AgentLoop directly wires checkpoint and
 model-invocation sink operations in v0.22.
 
-Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
+Token-based `deadline` and monotonic run-duration `RunTimeout` share one terminal projection:
 `status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
 `interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
 run. A previously settled park keeps its single turn settlement; close adds the timeout terminal

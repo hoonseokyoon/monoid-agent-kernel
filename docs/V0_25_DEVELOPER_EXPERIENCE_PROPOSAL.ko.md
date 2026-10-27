@@ -12,7 +12,8 @@ P3 API는 이 브랜치의 [보고서 예제](../src/monoid_agent_kernel/referen
 P1/P2 종료·사용량 API는 구현됐으며 [실행 예제](../examples/model_call_facts.py)와
 [복구 예제](../examples/recover_model_call_facts.py)를 제공한다. 정책·저장 호환성·실행 기록은
 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다. P4의 정책·외부 근거·변경 범위는 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 있다.
-P4 예산 조회는 설계 제안이며 2026-10-28부터 계획된 PR 순서로 구현을 진행한다.
+P4 예산 조회와 monotonic 제어를 구현했다. [실행 예제](../examples/termination_budget.py)는 실제 Stop·진행 조회·receipt를 연결한다.
+[최종 통합 #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)에서 누적 검증과 develop 반영 결과를 확인한다.
 
 ## 1. 제품 방향과 릴리스 경계
 
@@ -281,13 +282,13 @@ Studio reader, OTel의 같은 사실을 대조한다. replay request identity와
 
 ## 6. v0.25 API 예시: Stop 이후 현재 대기 조회
 
-`CancellationToken.cancel`은 기존 API이고, `termination_budget()`은 **신규 제안**이다.
+`CancellationToken.cancel`로 중단을 요청하고, `termination_budget()`으로 현재 소유한 대기를 조회한다.
 [P4 PR 계획](V0_25_P4_PR_PLAN.md#4-채택할-제어-정책)이 clock·복구·phase·RunStream의 구체적인 계약을 정의한다.
 
 ```python
 def on_stop(loop, cancellation_token):
     cancellation_token.cancel()  # 기존 user_cancel 요청
-    snapshot = loop.termination_budget()  # 제안: 읽기 전용 snapshot
+    snapshot = loop.termination_budget()  # 읽기 전용 snapshot
     return [
         {
             "call_id": call.call_id,
@@ -446,8 +447,8 @@ BaseModel 반환 probe는 tool observation이 `tool_result_unportable`였다. �
 당시 Python 예시 5개는 AST 문법 검사를 통과했다. 구현된 P3의 실행 증거는 설치 wheel과 회귀 검사로 별도 기록했다.
 문서의 로컬 링크 대상을 확인했다. 기존 계약 정합성과 독립 설계 리뷰도 이 문서 단계의 확인 대상이다.
 
-G1 필드·codec은 구현됐고 G3 조회·clock·복구 정책은 P4 PR 계획으로 구체화했다.
-P4의 내부 cutoff 운반·hook 배치는 구현 preflight에서 실제 소비자와 대조한다.
+G1 필드·codec과 G3 조회·clock·복구 정책을 구현했다.
+P4의 내부 cutoff 운반·hook 배치는 실제 epoch 입력 소비자와 설치 wheel의 Stop·복구 예제로 검증했다.
 후속 web adapter의 request/history 및 cursor 계약은 해당 작업군에서 결정한다.
 P3 공개 이름과 동기 host adapter 프로토콜, DX1 JSON 변환 실패의 `tool_result_unportable` 분류는 구현에 반영했다.
 이 결정들은 설계 명칭·구현 선택이다. P1–P5 필수 범위나 사용자의 승인된 동작 보장을 줄이는 변경은 별도 범위 결정으로 남긴다.

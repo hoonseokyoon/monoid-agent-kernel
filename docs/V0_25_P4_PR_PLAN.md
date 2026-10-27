@@ -133,7 +133,7 @@ timeout 뒤 유료 재시도 정책을 새로 도입하지 않는다.
 
 ### 4.2 호출 상태와 읽기 계약
 
-`ModelCallRunner.termination_budget()`와 `AgentLoop.termination_budget()`는 동기·읽기 전용 API로 제안한다.
+`ModelCallRunner.termination_budget()`와 `AgentLoop.termination_budget()`는 동기·읽기 전용 API다.
 각 logical `acall` 진입부터 receipt/evidence 처리가 끝나거나 소유권을 내려놓는 finally까지 registry에 등록한다.
 drain=0, async/sync one-shot, sync→awaitable, stream, retry backoff, early error를 모두 포함한다.
 `calls=()`는 해당 owner가 기다리는 model call이 없다는 의미다. tool·host resource 정리·descendant 전체 완료는 별개다.
@@ -149,7 +149,7 @@ drain=0, async/sync one-shot, sync→awaitable, stream, retry backoff, early err
   source state는 finally에서 퇴역하고, detach 뒤 late callback이 퇴역한 호출을 다시 등록하지 못한다.
 - snapshot은 process-local 관측이다. 기록용 receipt·checkpoint·Studio wire에 새 형식으로 저장하지 않는다.
 
-제안 타입 `TerminationBudgetSnapshot`:
+공개 타입 `TerminationBudgetSnapshot`:
 
 | 필드 | 의미 |
 |---|---|
@@ -232,7 +232,7 @@ stalled provider thread가 외부에서 계속 실행되는 경우도 기존 det
 
 ## 5. 통합 개발자가 쓸 API 예시
 
-아래 API를 P4-02에서 구현한다. 공개 export·docstring·설치 wheel 예제를 함께 검증하며 실행 결과는 §9.3에 기록한다.
+아래 API를 P4-02에서 구현했다. 공개 export·docstring·설치 wheel 예제의 검증 결과는 §9.3에 기록한다.
 
 ```python
 def on_stop(loop, cancellation_token):
@@ -496,3 +496,38 @@ checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했�
 raw 경로의 최초 cutoff를 callback 평가 뒤에 잡고 managed snapshot 기준과 재진입 cutoff는 유지했다.
 수정 후 RunStream·request identity·stream observer **83 passed (12.92s)**다.
 원본 `.tmp/v025/p4-02-review-red.txt`, `p4-02-review-green.txt`. 두 독립 최종 검토·새 wheel·필수 CI를 이어서 확인한다.
+
+02 [PR #164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)의 최종 `08e6eba`는 두 독립 코드 reviewer의 **PASS**를 받았다.
+raw callback 지적은 정상/예외 fallback 모두 실제 cooperative completion을 다시 확인해 해소했다.
+[L1 40554818455](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40554818455)와
+[required combined L2 40554877403](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40554877403)는 **SUCCESS**다.
+Python 3.11/3.12는 각각 core **4,911 passed**, serial **741 passed**, 실제 services는 **234 passed**다.
+최종 설치 wheel은 Python 3.11.9 / 현재 Pydantic 2.14.1과 최소 2.6.4에서 각각 **766 passed**(20.42/20.59s),
+공개 DTO import·offline Stop/조회/receipt·audit를 통과했다. SHA256은
+`A52B6108FEC32613D57CB4B747E90215E45EC1416F714A170267FC80A74D999E`다.
+통합 merge는 `be35567dddfa62c32401b7062bbd9a2a1e54a43d`이며 fetch 뒤 reviewed head와 tree 동일성을 확인했다.
+
+### 9.4 P4-I 최종 통합 — 2026-10-28
+
+[PR #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)는 `codex/v0.25-p4-termination-budget`에서 develop을 대상으로 한다.
+actual base는 02 merge `be35567`, 다시 fetch한 develop은 `22aae18`이며 이미 ancestor다.
+독립 actual-base preflight는 **READY**, blocker 0건이다. 검토한 preflight SHA256은
+`668B5E7E32D85781124C5E849803A70755C3F7194C1F8963ACED4D8D4BD85E38`이다.
+root가 통합/문서/단일 runner를, 연구자가 실제 소비자 대조를 맡았다. I는 상태 문서와 기존 종료 대기 설명 5개 문서만 수정한다.
+core 기능·schema·provider·Studio bundle은 02의 검토/설치 후보와 동일하게 유지한다.
+
+실제 CSP `pipeline_core/skills/llm_namespace.py`의 epoch 입력은 그대로 사용 가능하다.
+기존 checkpoint는 remaining duration을 유지하고 복구 downtime을 제외한다. P1/P2 facts·usage, P3 resource cleanup,
+P5 전달 권한 경계는 누적 코드와 기존 회귀·full/combined CI에 연결했다. core 703줄·CI/profile 3줄,
+전체 3,212줄의 기존 누적 churn에 이번 문서 마감 비용을 더한다. 최초 추정은 기능 800줄·전체 2,450줄이다.
+
+02 wheel의 packaged source·metadata·asset·예제 입력 동일성을 확인해 현재/최소 환경의 766개 결과를 재사용한다.
+전체 명령·12개 테스트 모듈·source-only 제외 2개·checkout 밖 경로·실제 import provenance는
+`.tmp/v025/p4-02-final-wheel-evidence.md`에 묶었다. I에서 같은 설치 wheel로 facts·recovery·host resource 예제를
+두 환경 모두 추가 실행해 통과했다. 원본은 `.tmp/v025/p4-i-{facts,recovery,resources}-{current311,minimum311}.txt`다.
+새 source 검사를 중복 실행하지 않고 최종 head의 두 fresh 누적 리뷰, full push CI와 required combined CI를 확인한다.
+그 결과와 develop merge SHA는 #165의 최종 검증 기록에 둔다.
+
+운영 의미는 기존 범위를 유지한다. `calls=()`는 소유 model wait 부재, `hard_cancel_remaining_s=0`은 강제 취소 요청 사실이다.
+driver의 자원 정리·durable settlement는 계속 기다릴 수 있다. unbounded 실행의 과거 elapsed와 remaining=0 이후 초과 cleanup
+시간은 기존 checkpoint로 복원할 수 없다. 릴리스·배포·CSP pin 변경은 별도 작업이다.

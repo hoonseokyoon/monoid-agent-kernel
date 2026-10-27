@@ -865,8 +865,9 @@ window: a drain ends by `min(Stop + async_model_abort_drain_s, run deadline)` an
 as the Stop, never as a timeout. Nothing read after the Stop is delivered to the UI, observers,
 recorder or sidecars. The Stop's outcome is unchanged (the `interrupted` suspension, or the
 terminal `limited` result with `interruption_cause=user_cancel` that a `user_cancel` produces), only
-later: the stopped call ends at most `async_model_abort_drain_s + async_model_cancel_grace_s` after
-the Stop is observed.
+later: the owned drain and cleanup windows allow time to collect usage and close the stream.
+Use `termination_budget()` to observe those windows and the stream's hard-cancel request cutoff.
+The driver continues to await resource cleanup and durable settlement after that request.
 
 The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
 of `0`, so a token `cancel()` during a child's streamed call still cuts it and reports no usage for

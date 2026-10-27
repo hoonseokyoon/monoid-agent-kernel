@@ -1,13 +1,15 @@
 # v0.25 통합 개발 계획과 사전조사
 
-작성일: 2026-09-28. 통합 갱신: 2026-10-27. 최초 코드 기준: v0.24.0 / `8d56e0d`.
+작성일: 2026-09-28. 통합 갱신: 2026-10-28. 최초 코드 기준: v0.24.0 / `8d56e0d`.
 
 구현 기록: **P5 #148·DX1 #149·P3 #150–155·P1/P2 #156–161 develop 병합**.
 P1P2-I #161의 develop 반영은 `2914c4366f8dfd7ed537f854388836a12a05f078`이다.
 공개 API·v2 저장·복구·gateway·Studio·OTel 연결과 누적 검증을 마쳤다.
 구체적인 정책·외부 근거·PR 범위는 [P1·P2 PR 계획](V0_25_P1_P2_PR_PLAN.md)에 둔다.
-다음 작업군 P4의 최신 코드·외부 조사와 변경 범위는 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 정리했다.
-**2026-10-28 P4-00·01 구현과 리뷰·CI 후 02·최종 통합까지 순차 진행이 승인됐다.**
+P4-00 [#162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 develop에,
+P4-01·02 [#163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)·[#164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)는
+통합 브랜치 `be35567`에 병합했다. [P4-I #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)가 누적 변경을 develop에 통합한다.
+정책·외부 근거·회귀·리뷰·CI 기록은 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
 [개발자 경험 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)에 기록한다. 릴리스 범위의 기준은 이 문서다.
@@ -228,15 +230,15 @@ P3는 P8의 opt-in 중단·drain 정책과 독립적으로 새 capability의 권
 ### 5.3 P4: 실제 제어와 일치하는 종료 예산
 
 **2026-10-27 최신 develop 조사.** 실제 runner에서 wall clock 전진에 따른 조기 timeout과 후퇴에 따른
-기한 초과 재시도를 재현했다. 기존 관련 회귀 209개는 통과했으므로 새 clock 회귀를 먼저 고정해야 한다.
-`_open_drain_budgets`는 positive-drain stream만 담고 one-shot·drain=0·phase별 grace·남은 시간은 표현하지 못한다.
+기한 초과 재시도를 재현했다. 당시 기존 관련 회귀 209개는 통과했으며 01에서 수정 전 clock 실패 회귀를 고정했다.
+당시 `_open_drain_budgets`는 positive-drain stream만 담았다. 02에서 one-shot·drain=0·phase별 grace·남은 시간을 담는 owner registry로 교체했다.
 정책·외부 문제와 답안·파일 지도·PR별 검증은 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 둔다.
 
-**채택 방향.** P4-01에서 core run/call/drain/shared wait를 process monotonic cutoff로 정렬한다.
+**구현 결과.** P4-01에서 core run/call/drain/shared wait를 process monotonic cutoff로 정렬했다.
 공개 epoch deadline은 최초 소유 경계에서 한 번 변환하고 retry·validated repair에 같은 cutoff를 전달한다.
 checkpoint의 기존 `remaining_duration_s`와 parked downtime 제외 정책, 영속 wall timestamp는 유지한다.
 
-P4-02에서 runner가 소유한 모든 acall의 immutable snapshot을 공개하고 RunStream을 실제 소비자로 연결한다.
+P4-02에서 runner가 소유한 모든 acall의 immutable snapshot을 공개하고 RunStream을 실제 소비자로 연결했다.
 wait 진입·stream close·drain final cleanup의 기존 grace sampling 시점을 보존하며 현재 예약과 남은 창을 구별한다.
 여러 cleanup 창은 각각 표시한다. 조회는 host getter·취소·I/O를 실행하지 않는다.
 call ID는 process-local unique ID, 빈 calls는 해당 runner의 active model wait 부재다.
@@ -245,8 +247,8 @@ RunStream은 현재 call의 drain/cleanup 잔여와 exit 정책 후보에서 all
 최초 exit wait의 cutoff를 고정해 실제 `hard_cancel_remaining_s`를 표시한다. 강제 취소 뒤 driver 정리는 계속 await한다.
 exit waiter가 취소돼 timer 집행이 중단되면 `wait_interrupted/None`으로 표시한다. 재진입 시 최초 cutoff를 재사용한다.
 기존 raw `RunStream(current_extra_grace_s=)` 동작을 보존한다. 전체 driver 반환 시간이나 외부 provider 종료 ETA는 제공하지 않는다.
-P4-00은 CI 등록 독립 PR, 01→02는 `codex/v0.25-p4-termination-budget`에서 순차 진행하도록 계획한다.
-10/28 사용자 요청에 따라 00부터 구현·리뷰·CI·통합을 순차 진행한다. 릴리스·배포는 별도다.
+00 독립 PR과 01→02의 리뷰·필수 combined CI를 마쳤다. 실제 Stop→조회→receipt는
+[설치 패키지 실행 예제](../examples/termination_budget.py)로 검증했다. I의 최종 누적 검증·병합 결과는 #165에 기록한다.
 
 ### 5.4 P5: 스트림 전달 직전의 권한 검사
 
@@ -314,7 +316,7 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 |---|---|---|---|
 | G1 종료·사용량 | P1/P2 | P1P2-00 독립 PR, 01–04 순차 통합 브랜치 → develop | 타입·생산자·소비자·영속 형식·복구·fixture가 함께 일치 |
 | G2 도구 확장점 | P3 | 독립 작업군 → develop | 공개 주입 경로, 권한 상실·child/fork·복구·호환성 검증 |
-| G3 종료 예산 | P4 | P4-00 독립 PR, 01→02 통합 브랜치 → develop; 구현 승인 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
+| G3 종료 예산 | P4 | 00·01·02 병합, 최종 통합 #165 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
 | G4 출력 권한 수정 | P5 | PR-01, 독립 버그 수정 PR → develop | 일반·terminal·잔여 출력의 권한 검사와 정상 flush 보존 |
 | G6 typed 도구 | DX1 | PR-02, 독립 PR → develop | serializer 없는 입력 전달, JSON 결과·기존 envelope, 실제 loop 소비 |
 | G7 통합 예제 | DX2 | 소비하는 기능 PR에 동반하고 남은 조합만 별도 PR | 순수 도구·스트림·승인/복구, 공개 API·wheel 수용 검증 |
@@ -390,7 +392,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 | D02 | 독립 작업군 → develop → 적정 시점 릴리스 | 사용자 방향 반영 |
 | D03 | P1/P2 타입·저장 형식 | P1·P2 PR 계획: 기존 숫자+희소 증거, invocation/model-calls v2·dual-reader, 원본 hash 보존 복구, reader 유지 rollback; unknown 증거 slot 후속. 구현 승인 |
 | D04 | P3 주입·권한·수명 | P3-02/03 구현: 선택적 확장 Protocol, call별 lease, fresh child adapter와 parent lineage, restore 재주입 |
-| D05 | P4 clock·집계·조회 | P4 PR 계획: monotonic 제어·기존 remaining 복구, phase별 grace 창, 불변 owner snapshot, 최초 exit cutoff 고정. 10/28 구현 승인 |
+| D05 | P4 clock·집계·조회 | 01·02 구현: monotonic 제어·기존 remaining 복구, phase별 grace 창, 불변 owner snapshot, 최초 exit cutoff 고정. 최종 통합 #165 |
 | D06 | P5 | 10/25 재현에 따라 일반 delta·terminal 정규화·잔여 flush의 전달 경계로 보완; PR-01 |
 | D07 | P8 | 조건부. 준비된 완결 작업을 포함하고 필수 범위 출시를 대기시키지 않음 |
 | D08 | P6 bool TypeError | 현재 규칙 정비와 분리해 영향 조사 후 결정 |
