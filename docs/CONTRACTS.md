@@ -482,8 +482,11 @@ checked provider outcome; when no private turn has been loaded, the stream obser
 text and successful final-turn usage unavailable. Refusal replay preserves its facts alongside
 the existing accounting delta, which can be empty after the original usage was applied.
 Required-evidence recovery can precede request identity validation. If a failed projection belongs
-to a different stored request digest, public capture includes its checked historical receipt and
-omits the current request content, prompt digest and request preimage.
+to a different stored request digest, checked historical usage and facts remain on the exception
+and journal for accounting. The journal has no historical model configuration, so the runner
+withholds reconstructed subscription and ledger receipts. The current stream observer closes as
+`failed` / `evidence_uncommitted` with final text, usage, termination and usage evidence unavailable.
+This keeps historical usage separate from the replacement request's model and routing metadata.
 
 See the offline [subscription example](../examples/model_call_facts.py). In the P1P2-02 preparation
 stage, invocation/model-calls writers remain v1 and omit these facts. P1P2-03 activates v2 writers;
