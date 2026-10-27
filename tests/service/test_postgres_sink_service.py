@@ -64,7 +64,7 @@ from monoid_agent_kernel.core.outcome import (  # noqa: E402
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec  # noqa: E402
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
-from monoid_agent_kernel.errors import ModelAdapterError  # noqa: E402
+from monoid_agent_kernel.errors import ModelAdapterError, ModelDispatchRefused  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationCommand,
     ActivationDriver,
@@ -2126,7 +2126,7 @@ def _assert_runtime_invocation_facts(
                     final_text="stored runtime answer", stop_reason="stop",
                     usage={"input_tokens": 0}, usage_evidence=observation,
                 )
-            error = ModelAdapterError("runtime refusal", retryable=False)
+            error = ModelDispatchRefused("runtime refusal", retryable=False)
             mark_provider_usage(error, {"input_tokens": 0})
             if observation is not None:
                 mark_usage_observation(error, observation)

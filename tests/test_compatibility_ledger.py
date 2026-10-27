@@ -125,9 +125,7 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
                 artifact.reader_policy == "writer-only" and not artifact.supported_readers
             )
             for alias in artifact.namespace_aliases:
-                assert alias == artifact.current_writer.replace(
-                    "monoid.", "native-agent-runner.", 1
-                )
+                assert alias.replace("native-agent-runner.", "monoid.", 1) in artifact.supported_readers
         assert all(".v" in version for version in artifact.supported_readers)
         assert all(".v" in version for version in artifact.active_writers)
 

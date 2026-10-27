@@ -44,6 +44,7 @@ from monoid_agent_kernel.core.model_invocation import (
     MODEL_INVOCATION_RECEIPT_FIELDS,
     MODEL_INVOCATION_RECEIPT_USAGE_FIELDS,
     MODEL_INVOCATION_SCHEMA_VERSION,
+    MODEL_INVOCATION_V1_SCHEMA_VERSION,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
 )
@@ -92,7 +93,7 @@ _CONTRACT_ALTERNATE_DIGEST_GENERATION = next(
 _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION = next(
     schema
     for schema in ACCEPTED_MODEL_INVOCATION_SCHEMA_VERSIONS
-    if schema != MODEL_INVOCATION_SCHEMA_VERSION
+    if schema.startswith("native-agent-runner.")
 )
 _CONTRACT_ALTERNATE_CHECKPOINT_SCHEMA_VERSION = next(
     schema for schema in ACCEPTED_CHECKPOINT_SCHEMA_VERSIONS if schema != CHECKPOINT_SCHEMA_VERSION
@@ -595,6 +596,7 @@ def _contract_checkpoint_canonical_alias_status(
         run_id,
         revision=1,
         dispatch_state="reserved",
+        schema_version=MODEL_INVOCATION_V1_SCHEMA_VERSION,
     ).to_json()
     baseline = RunCheckpoint(
         run_id=run_id,
@@ -694,6 +696,7 @@ def _contract_invocation(
     evidence_policy: str = "passive",
     retryable: bool | None = False,
     succeeded: bool = False,
+    schema_version: str = MODEL_INVOCATION_SCHEMA_VERSION,
 ) -> DurableModelInvocation:
     if idempotency_key is None:
         idempotency_key = f"contract-{hashlib.sha256(run_id.encode()).hexdigest()}"
@@ -709,6 +712,7 @@ def _contract_invocation(
         else:
             failure_code = "provider_refused"
     return DurableModelInvocation(
+        schema_version=schema_version,
         run_id=run_id,
         logical_call_id=logical_call_id,
         revision=revision,
@@ -1658,6 +1662,7 @@ def _contract_invocation_canonical_alias_status(
         run_id,
         revision=1,
         dispatch_state="reserved",
+        schema_version=MODEL_INVOCATION_V1_SCHEMA_VERSION,
     )
     variants = {
         "schema_version": replace(
@@ -1698,6 +1703,7 @@ def _contract_invocation_canonical_alias_transition_status(
         run_id,
         revision=1,
         dispatch_state="reserved",
+        schema_version=MODEL_INVOCATION_V1_SCHEMA_VERSION,
     )
     alias_values = {
         "schema_version": _CONTRACT_ALTERNATE_INVOCATION_SCHEMA_VERSION,
@@ -1714,6 +1720,7 @@ def _contract_invocation_canonical_alias_transition_status(
         run_id,
         revision=2,
         dispatch_state="dispatch_started",
+        schema_version=MODEL_INVOCATION_V1_SCHEMA_VERSION,
     )
     if not legacy_first:
         started = replace(started, **{field_name: alias_values[field_name]})

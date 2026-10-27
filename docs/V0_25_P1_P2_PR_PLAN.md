@@ -664,3 +664,15 @@ root가 제품 소스와 단일 테스트 runner를 담당하고 별도 worker�
 `.tmp/v025/p1p2-03-red.txt`). 실제 fenced 복구 6개, recorder 성공·실패·retry 3개,
 historical v1/v2에서 새 revision 전이 2개다. service worker는 같은 경계를 기존 PG16/18,
 ObjectStore·Temporal 테스트에 연결했고 아직 실행하지 않았다. 아래 테스트 전용 commit으로 red를 고정한다.
+
+**03 후보.** 테스트 전용 commit은 `25c8fbf`다. 첫 red 중 outbox 2개에는 crash fixture의
+stage_evidence 전달 누락이 있었다. fixture를 보완하고 같은 base의 설치된 02 wheel에서 전체 11개를
+다시 실패시켰다(2.24s; `p1p2-03-red-base-wheel.txt`). 잘못된 동일 checkpoint 재사용도 고쳐서
+반복 evidence 검증은 실제 lifecycle.recover를 사용한다. 서비스 실패 fixture는 확정 refusal을 사용한다.
+제품 writer 수정 후 관련 **319 passed, 4 skipped / 4.65s** (`p1p2-03-related2.txt`)였다.
+skip은 Windows 파일 symlink 권한이며 Linux CI에서 계속 검증한다. 확장 계약 545개 중 10개는
+current version과 namespace alias를 같은 것으로 가정한 conformance fixture에서 실패했다.
+별칭 probe를 명시적 v1 쌍으로 고정하고 일반 probe는 v2를 유지했으며 관련 **275 passed / 9.34s**였다.
+bounded projection·두 closed schema·version registry를 갱신했고 공개 오프라인 JSON 복구 예제는
+provider 호출 1회, v2 facts 유지와 total unknown을 출력했다. 전체 lint/diff check 통과.
+두 독립 코드 리뷰·실제 binary rollback·설치 wheel·필수 combined CI를 이어간다.

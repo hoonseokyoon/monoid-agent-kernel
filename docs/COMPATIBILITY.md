@@ -94,12 +94,12 @@ for the current API, serialization failures, and control-exception limits.
 | `web-context` | wire | `monoid.web-context.v1` | permissive; missing id accepted | `monoid.web-context.v1`<br>`native-agent-runner.web-context.v1` |
 | `web-context-result` | wire | `monoid.web-context-result.v1` | permissive; missing id accepted | `monoid.web-context-result.v1`<br>`native-agent-runner.web-context-result.v1` |
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
-| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1`<br>`monoid.model-invocation.v2` |
+| `model-invocation` | durable | `monoid.model-invocation.v2` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1`<br>`monoid.model-invocation.v2` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
-| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1`<br>`monoid.model-calls.v2` |
+| `model-calls` | durable | `monoid.model-calls.v2` | json-schema | `monoid.model-calls.v1`<br>`monoid.model-calls.v2` |
 | `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
@@ -194,8 +194,8 @@ v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `
 the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
 writer because the earlier prerelease reader used a closed top-level vocabulary.
 
-The P1/P2 reader rollout also accepts canonical `monoid.model-invocation.v2` and
-`monoid.model-calls.v2`. Both default writers remain v1 during this stage. V2 adds optional
+Fresh invocation revisions and model-call ledger records use `monoid.model-invocation.v2` and
+`monoid.model-calls.v2`. Both readers retain v1 support. V2 adds optional
 `termination` and `usage_evidence` metadata; v1 retains its closed vocabulary. New Python types
 `ModelCallTermination`, `UsageObservation`, `UsageEvidenceAttempt`, and `UsageEvidence` are
 exported from the package root and `core.model_io`. Receipt/attempt JSON omits unavailable facts.
@@ -209,9 +209,19 @@ returning a detached original payload. Canonical `to_json()` remains available f
 New revisions explicitly select the current writer. Nested checkpoints preserve the invocation payload
 while keeping their own checkpoint.v1 envelope. No database schema or request digest changes are required.
 
-Settled v2 redelivery restores facts through the public receipt and subscriptions. During the reader-only
-stage, resuming a failed call into a new attempt clears working facts and preserves cumulative numeric
-usage and the immutable earlier record. The runtime rollout adds recovered-prefix observation composition.
+Settled v2 redelivery restores facts through the public receipt and subscriptions. Retrying a recovered
+call combines the historical observation prefix with new dispatch observations. The final private result
+retains final-turn usage; the public receipt retains cumulative usage. A v1 prefix stays legacy-ambiguous.
+
+Deploy a dual-reader build to every reader before enabling v2 writers. Rollback after v2 writes requires
+the reader-preparation binary (P1P2-01, source `74ff289` / integration `ec32ca8`) or a later verified
+dual reader. The released v0.24.0 reader rejects v2 as unsupported. The preparation binary can emit a new
+v1 revision while preserving existing v2 coordinates. Its new v1 receipts omit facts, so later readers
+keep that missing provenance unavailable. Development wheels share version 0.24.0: identify them by
+source commit and wheel SHA-256. This source change performs no deployment.
+
+`decode_model_invocation` dispatches between v1 and v2 readers. The exported `MODEL_INVOCATION_CODEC`
+retains its v1 identity for existing explicit v1 consumers. Use the dispatch function for mixed history.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
 `pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
