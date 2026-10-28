@@ -1,9 +1,9 @@
 # v0.25 Release Readiness Audit
 
-Status on 2026-10-28: implementation integrated; documentation qualification and delivery are
-recorded below. Release qualification remains pending.
-Package metadata remains `0.24.0`. Version change, release artifacts,
-release branch integration, tag, GitHub release, and package publication remain pending.
+Status on 2026-10-28: implementation, documentation, and final fact repairs are integrated.
+Package, fallback, and wheel-audit versions are `0.25.0`. The candidate qualification section
+below identifies the review and artifact evidence. Release branch integration, tag, GitHub release,
+and package publication remain pending.
 
 The [migration guide](migrations/v0.25.md) describes the upgrade and rollback requirements.
 The [compatibility ledger](COMPATIBILITY.md) owns the reader/writer inventory. This audit records
@@ -13,11 +13,12 @@ the source and artifact identities behind evidence and keeps each pending gate v
 
 | Item | Identity or state |
 |---|---|
-| Integrated implementation source | `b27a15c159465b978b50e89660fa5f7b7dd7d7b3` |
+| Original v0.25 implementation source | `b27a15c159465b978b50e89660fa5f7b7dd7d7b3` |
 | Final implementation integration | [PR #170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170), merged into `develop` |
 | Reviewed DX2 integration head | `07a84ae6dab971dd1ed13f554540f215b5af54dd` |
 | Reviewed head and merge tree | `92a4c23201ce9fa4ca9fdf87b3cfdb23cf3e3436` |
-| Current package/fallback version | `0.24.0` |
+| Final fact repair source | `f5a98dcbde0a1f07cf334ec03f2aebc4cb5634cf`, [PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) |
+| Current package/fallback version | `0.25.0` |
 | Qualified v0.25 release source, wheel, and sdist | Pending |
 | v0.25 tag and publication | Pending |
 
@@ -182,6 +183,22 @@ it preserves typed failure facts, including provider self-cancellation. After th
 diff is 664 changed lines; cumulative editing cost is 688, within the reassessed 654–688 range.
 
 ## Release qualification and delivery
+
+The version candidate starts from repair merge `f5a98dc`. Its tree matches reviewed head
+`1b1118a`; two independent reviews and the automatic review completed with no unresolved findings.
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40637386504) and
+[required combined L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40637388956)
+passed on that head. [Full develop CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40638354700)
+records integration and general serial coverage. The candidate PR will record its own final source,
+artifact digests, installed checks, review, and CI after tracked build inputs are frozen.
+
+Artifacts are built with the standard build frontend through the sdist. Qualification checks the
+wheel and sdist contents against the reviewed source, renders the README, and installs the same
+wheel outside the checkout in current and minimum dependency environments. Existing examples,
+approval recovery, conformance evidence, and retained v1/v2 readers supply the consumer checks.
+Source/tree identities and artifact hashes belong in the candidate PR and external checksum files;
+changing tracked build inputs requires new artifacts. The later publication workflow rebuilds
+distributions, so its published files need their own identity and content verification.
 
 | Gate | Status and required evidence |
 |---|---|

@@ -61,7 +61,7 @@ Reference assembly with its own recovery and lifecycle scope.
 
 Read [Upgrade from v0.24 to v0.25](migrations/v0.25.md) for typed tool changes, invocation/ledger v2,
 reader-first or coordinated deployment, and rollback. The [v0.25 audit](V0_25_RELEASE_AUDIT.md)
-separates integrated implementation from pending documentation and release gates.
+records the 0.25.0 candidate, qualification evidence, and publication status.
 For other format transitions, use the [compatibility playbook](COMPATIBILITY.md#upgrade-playbook).
 
 ## Contribute and inspect development records

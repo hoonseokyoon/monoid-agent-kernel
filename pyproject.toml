@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "monoid-agent-kernel"
-version = "0.24.0"
+version = "0.25.0"
 description = "Lightweight durable agent kernel for product integrations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -120,7 +120,7 @@ native-agent = "monoid_agent_kernel.cli:main"
 Homepage = "https://github.com/hoonseokyoon/monoid-agent-kernel"
 Repository = "https://github.com/hoonseokyoon/monoid-agent-kernel"
 Issues = "https://github.com/hoonseokyoon/monoid-agent-kernel/issues"
-Changelog = "https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/hoonseokyoon/monoid-agent-kernel/blob/v0.25.0/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/monoid_agent_kernel", "src/native_agent_runner"]

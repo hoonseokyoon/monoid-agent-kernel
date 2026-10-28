@@ -7,8 +7,8 @@ Both paths have offline examples using real kernel and Reference components.
 ## Install and choose an owner
 
 Use Python 3.11+ and install this checkout with `python -m pip install .`, or use a wheel from
-the same revision. Run the repository examples from the checkout root. These development
-examples require this revision's API; current package metadata still reports `0.24.0`.
+the same revision. Run the repository examples from the checkout root. These examples use the
+0.25.0 API; the [release audit](../V0_25_RELEASE_AUDIT.md) records artifacts and publication status.
 
 | Product interaction | Execution owner | Disconnect and Stop |
 |---|---|---|

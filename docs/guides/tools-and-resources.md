@@ -24,7 +24,7 @@ final_text : Prepared Ada's weekly report.
 tool_result: {'ok': True, 'result': {'customer': 'Ada', 'title': 'Weekly report'}}
 ```
 
-The v0.25 development API requires this revision's installation. Repository examples remain in
+The 0.25.0 API requires a matching installation. Repository examples remain in
 the checkout; the `monoid_agent_kernel.reference.host_tool_report` module is packaged.
 
 ## Use domain models

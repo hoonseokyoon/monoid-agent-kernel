@@ -10,7 +10,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 
-EXPECTED_VERSION = "0.24.0"
+EXPECTED_VERSION = "0.25.0"
 EXPECTED_BASE_DEPENDENCIES = {"click", "jsonschema", "pathspec", "pydantic"}
 REQUIRED_MEMBERS = {
     "monoid_agent_kernel/tools/host_bindings.py",
