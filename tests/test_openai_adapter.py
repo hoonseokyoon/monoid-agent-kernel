@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -30,6 +31,68 @@ from monoid_agent_kernel.providers.openai import (
     _model_error_from_openai,
     _stream_output_index,
 )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+@pytest.mark.parametrize("failure", ["disabled", "missing_sdk", "missing_key", "provider"])
+def test_openai_entry_guard_facts_preserve_failure_ownership(monkeypatch, stream, failure) -> None:
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append("request")
+        raise _FakeApiError(status_code=503, body={"error": {"code": "server_error"}})
+
+    async def acreate(**kwargs):
+        return create(**kwargs)
+
+    async def aclose():
+        calls.append("close")
+
+    def client(**kwargs):
+        calls.append("client")
+        return SimpleNamespace(
+            responses=SimpleNamespace(
+                create=acreate, with_raw_response=SimpleNamespace(create=create),
+            ),
+            close=aclose if stream else lambda: calls.append("close"),
+        )
+
+    monkeypatch.setattr("monoid_agent_kernel.providers.openai.getenv", lambda name: None)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setitem(
+        sys.modules, "openai",
+        None if failure == "missing_sdk" else SimpleNamespace(OpenAI=client, AsyncOpenAI=client),
+    )
+    adapter = OpenAIModelAdapter(
+        ModelConfig(), allow_direct_provider_api=failure != "disabled",
+        api_key="test" if failure in {"missing_sdk", "provider"} else None,
+    )
+    captures = []
+    runner = ModelCallRunner(adapter=adapter, settled_sink=captures.append)
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(runner.acall(
+            ModelRequest(instruction="hello", system_prompt="", tools=()),
+            delta_consumer=(lambda chunk: None) if stream else None,
+        ))
+    assert calls == (["client", "request", "close"] if failure == "provider" else [])
+    if failure == "missing_sdk":
+        assert isinstance(caught.value.__cause__, ImportError)
+    assert caught.value.retryable is (failure == "provider")
+    assert caught.value.http_status == (503 if failure == "provider" else None)
+    assert len(captures) == 1
+    receipt = captures[0].receipt
+    facts, evidence = call_facts_of(caught.value)
+    assert receipt.termination == facts
+    assert facts == ModelCallTermination(
+        outcome="failed", ended_by="provider_error" if failure == "provider" else "local_failure",
+    )
+    assert receipt.attempts == 1
+    assert receipt.usage == provider_usage_of(caught.value) == {}
+    assert evidence.reported == {}
 
 
 @pytest.mark.parametrize("raw", [None, {}, {"input_tokens": 0}, {"output_tokens_details": {"reasoning_tokens": 0}}])

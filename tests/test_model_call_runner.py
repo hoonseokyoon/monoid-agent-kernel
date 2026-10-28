@@ -80,6 +80,167 @@ from monoid_agent_kernel.tools.base import ToolSpec
 REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
 
 
+class _EofClosingStream:
+    """An iterator that exposes EOF before entering a separately gated close."""
+
+    def __init__(self, *chunks: Any) -> None:
+        self._chunks = iter(chunks)
+        self.reads = 0
+        self.eof = False
+        self.before_second_read = lambda: None
+        self.closing = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    def astream_turn(self, request: ModelRequest) -> _EofClosingStream:
+        return self
+
+    def __aiter__(self) -> _EofClosingStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if self.reads == 2:
+            self.before_second_read()
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self.eof = True
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closing.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.closed.set()
+
+
+@pytest.mark.parametrize("phase", ["ordinary", "drain_enabled", "turn_interrupt", "user_cancel"])
+@pytest.mark.parametrize("terminal", [False, True], ids=["eof_only", "terminal_eof"])
+@pytest.mark.parametrize("boundary", ["caller_cancel", "user_cancel", "deadline"])
+def test_natural_read_end_survives_a_later_close_boundary(phase, terminal, boundary) -> None:
+    async def run() -> None:
+        token = CancellationToken()
+        chunks = [TextDelta("answer")]
+        if terminal:
+            chunks.append(TurnComplete(usage={"output_tokens": 3}, usage_evidence=UsageObservation(
+                reported={"output_tokens": 3}, source="adapter", collection="normal",
+            )))
+        stream = _EofClosingStream(*chunks)
+        if phase == "user_cancel":
+            stream.before_second_read = token.cancel
+        seen, captures = [], []
+        runner = ModelCallRunner(
+            adapter=stream, settled_sink=captures.append,
+            current_cancellation_token=lambda: token,
+            abort_drain_s=0 if phase == "ordinary" else 0.2, cancel_grace_s=1,
+        )
+        task = asyncio.create_task(runner.acall(
+            REQUEST, delta_consumer=seen.append,
+            should_abort=(lambda: True) if phase == "turn_interrupt" else None,
+            deadline=time.time() + 0.1 if boundary == "deadline" else None,
+        ))
+        active_drain = phase in {"turn_interrupt", "user_cancel"}
+        error_type = (
+            asyncio.CancelledError if boundary == "caller_cancel" else
+            ModelCallAborted if phase == "turn_interrupt" else
+            RunCancelled if phase == "user_cancel" or boundary == "user_cancel" else RunTimeout
+        )
+        try:
+            await asyncio.wait_for(stream.closing.wait(), 2)
+            assert stream.eof
+            if boundary == "caller_cancel":
+                task.cancel()
+            elif boundary == "user_cancel":
+                token.cancel()
+            with pytest.raises(error_type) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            stream.release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(stream.closed.wait(), 2)
+
+        assert len(captures) == 1
+        receipt = captures[0].receipt
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome=(
+                "cancelled" if boundary == "caller_cancel" or error_type is RunCancelled else
+                "interrupted" if error_type is ModelCallAborted else "timed_out"
+            ),
+            requested_by=phase if active_drain else None if boundary == "deadline" else boundary,
+            ended_by="provider_terminal" if terminal else "provider_eof",
+        )
+        assert receipt.termination == facts
+        assert receipt.usage_evidence == evidence
+        assert receipt.attempts == 1
+        assert provider_usage_of(caught.value) == receipt.usage
+        assert evidence.reported == ({"output_tokens": 3} if terminal else {})
+        if terminal:
+            assert receipt.usage["output_tokens"] == 3
+            assert evidence.attempts[0].observation.collection == (
+                "drain" if active_drain else "normal"
+            )
+        assert len(seen) == (1 if active_drain or not terminal else 2)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("drain_s", [0, 0.2])
+@pytest.mark.parametrize("arguments", ["[", "[]"])
+def test_post_eof_tool_argument_validation_remains_a_local_failure(drain_s, arguments) -> None:
+    stream = _EofClosingStream(ToolCallDelta(
+        index=0, id="call", name="read", arguments_fragment=arguments,
+    ))
+    stream.release.set()
+    captures = []
+    runner = ModelCallRunner(adapter=stream, abort_drain_s=drain_s, settled_sink=captures.append)
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+    assert stream.eof and stream.closed.is_set()
+    assert caught.value.provider_error_code == "stream_bad_tool_args"
+    assert captures[0].receipt.termination == ModelCallTermination(
+        outcome="failed", ended_by="local_failure",
+    )
+    assert call_facts_of(caught.value)[0] == captures[0].receipt.termination
+
+
+@pytest.mark.parametrize("drain_s", [0, 0.2])
+def test_lease_loss_after_eof_during_close_keeps_authority_precedence(drain_s) -> None:
+    async def run() -> None:
+        stream = _EofClosingStream(TextDelta("answer"), TurnComplete())
+        token, authority = CancellationToken(), ActivationWriteAuthority()
+        captures = []
+        runner = ModelCallRunner(
+            adapter=stream, abort_drain_s=drain_s, settled_sink=captures.append,
+            current_cancellation_token=lambda: token, current_write_authority=lambda: authority,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+        try:
+            await asyncio.wait_for(stream.closing.wait(), 2)
+            assert stream.eof
+            authority.revoke()
+            token.cancel()
+            with pytest.raises(WriteAuthorityRevoked) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            stream.release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(stream.closed.wait(), 2)
+        assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+        assert call_facts_of(caught.value) == (None, None)
+        assert captures == []
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("reported_zero", [False, True])
 def test_p1p2_retry_coverage_counts_dispatches_and_keeps_known_totals(reported_zero: bool) -> None:
     from monoid_agent_kernel.providers._usage import mark_usage_observation
