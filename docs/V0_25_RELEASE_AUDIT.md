@@ -174,6 +174,13 @@ The cumulative source/test change is 593 lines across seven files, within the re
 [PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) records the final reviewed
 head, required CI, and integration result. General serial integration also runs in full develop CI.
 
+Final review then identified drain-wrapped failures whose existing error classification could be
+overwritten by the EOF observation. Tests-only commit `6d208f3` reproduced 14 failures with 44 passing
+controls. The final guard substitutes EOF only for `stop_request`, `deadline`, or `drain_timeout`;
+it preserves typed failure facts, including provider self-cancellation. After this correction,
+636 unit and 46 selected serial tests passed, alongside Ruff and diff checks. The final source/test
+diff is 664 changed lines; cumulative editing cost is 688, within the reassessed 654–688 range.
+
 ## Release qualification and delivery
 
 | Gate | Status and required evidence |
