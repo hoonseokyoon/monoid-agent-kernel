@@ -8,10 +8,9 @@ subcommands, not on the ``studio`` group — so following the instruction produc
 copied into four places, which is the point: proof-reading catches the site a reviewer happens to
 read, and this catches all of them.
 
-Deliberately **not** applied to ``CHANGELOG.md``. A changelog is a historical record: an entry for
-v0.9 describing a command that has since been renamed is correct as written, and failing on it would
-push the next author to either edit history or delete the test. README and ``docs/`` are living
-documentation — an invocation there is a present-tense instruction, so it has to work today.
+``CHANGELOG.md`` and the explicitly listed completed plans/audits preserve commands from their
+named revisions. Current README, guides, migrations, audits and Reference docs describe commands
+that must resolve today. Unknown and newly added files receive current-document coverage.
 
 Validation is by introspection, never execution: these commands start servers and touch workspaces.
 Only the command *path* and *option names* are checked, since option values and placeholders
@@ -30,6 +29,25 @@ from monoid_agent_kernel.cli import main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# These records are indexed in docs/history/README.md. Keep this list exact: the current release
+# audit and future versioned documents still need the current-command gate.
+_HISTORICAL_DOCS = frozenset({
+    "docs/V0_18_RELEASE_AUDIT.md",
+    "docs/V0_22_IMPLEMENTATION_PLAN.md",
+    "docs/V0_22_RELEASE_AUDIT.md",
+    "docs/V0_23_DEVELOPMENT_WORKFLOW.md",
+    "docs/V0_23_IMPLEMENTATION_PLAN.md",
+    "docs/V0_23_RELEASE_AUDIT.md",
+    "docs/V0_24_RELEASE_AUDIT.md",
+    "docs/V0_25_PRE_INVESTIGATION.md",
+    "docs/V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md",
+    "docs/V0_25_P5_DX1_PR_PLAN.md",
+    "docs/V0_25_P3_PR_PLAN.md",
+    "docs/V0_25_P1_P2_PR_PLAN.md",
+    "docs/V0_25_P4_PR_PLAN.md",
+    "docs/V0_25_DX2_PR_PLAN.md",
+})
+
 # Inline code spans and fenced-block lines both matter: the defect that prompted this was in an
 # inline span, and `docs/` teaches through fenced blocks.
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
@@ -37,15 +55,10 @@ _CONTINUATION = re.compile(r"\\\s*$")
 
 
 def _living_docs() -> list[Path]:
-    # The `reference/**/*.md` tree is what this actually adds: 8 invocations, all from the Studio
-    # reference README and DX notes, which document `serve|app|open|doctor|accept` and were checked
-    # by nothing. `docs` is globbed recursively for symmetry, not for coverage -- measured, it
-    # yields the same 31 either way, because no nested `docs/` file contains an invocation today.
-    # Only CHANGELOG is excluded on purpose: a changelog naming a since-renamed command is correct
-    # as written, because it describes the release it shipped in.
     return [
         REPO_ROOT / "README.md",
-        *sorted((REPO_ROOT / "docs").rglob("*.md")),
+        *(path for path in sorted((REPO_ROOT / "docs").rglob("*.md"))
+          if path.relative_to(REPO_ROOT).as_posix() not in _HISTORICAL_DOCS),
         *sorted((REPO_ROOT / "src" / "monoid_agent_kernel" / "reference").rglob("*.md")),
     ]
 
@@ -153,6 +166,33 @@ def _documented_invocations() -> list[tuple[str, str]]:
 
 
 INVOCATIONS = _documented_invocations()
+
+
+def test_discovery_keeps_new_guides_live_and_freezes_only_named_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_sources = (
+        "README.md",
+        "docs/guides/new-guide.md",
+        "docs/migrations/new-version.md",
+        "docs/V0_25_RELEASE_AUDIT.md",
+        "docs/V0_26_RELEASE_AUDIT.md",
+        "docs/history/README.md",
+        "src/monoid_agent_kernel/reference/example/README.md",
+    )
+    command = "monoid nonexistent-docs-command"
+    for source in (*live_sources, "docs/V0_24_RELEASE_AUDIT.md", "CHANGELOG.md"):
+        path = tmp_path / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# Documentation\n\n`{command}`\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+
+    # Recompute discovery: INVOCATIONS belongs to the real checkout at import time.
+    discovered = _documented_invocations()
+    assert sorted(discovered) == sorted((source, command) for source in live_sources)
+    for _, current_command in discovered:
+        with pytest.raises(AssertionError, match="no such command"):
+            _resolve(_tokens(current_command))
 
 
 def test_the_docs_actually_contain_invocations_to_check() -> None:

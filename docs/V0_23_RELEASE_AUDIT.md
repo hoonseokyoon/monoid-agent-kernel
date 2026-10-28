@@ -1,6 +1,10 @@
 # v0.23.0 Production Adapters Release Audit
 
-> 상태: implementation campaign qualified; release approval pending
+> Historical record: dates, status, commands, and results describe the named revisions.
+> Use the [documentation index](README.md) and [Contributing](../CONTRIBUTING.md) for current guidance.
+> Related records are in the [history index](history/README.md).
+
+> 기록 당시 상태: implementation campaign qualified; release approval pending
 >
 > 작성일: 2026-08-23
 >
@@ -312,7 +316,7 @@ evidence. The implementation evidence source is `510ffa8def8a5cae50136dbcf2d2aed
 - multi-region active-active authority
 - Redis/Kafka adapter and `LISTEN/NOTIFY` correctness
 - automatic repair and operator UI
-- host product product integration
+- host product integration
 - cloud credentials in blocking public CI
 
 These items require separate contracts, compatibility policy, qualification, and owner approval.

@@ -1,6 +1,10 @@
 # v0.23 Production Adapters 개발 workflow
 
-> 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+> 기록 당시 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
 >
 > 작성일: 2026-08-23
 >

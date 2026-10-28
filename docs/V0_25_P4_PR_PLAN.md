@@ -1,5 +1,12 @@
 # v0.25 P4: 종료 예산 조회와 시간 제어 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+현재 완료 상태: **P4-00–02과 최종 통합 완료**. [#165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)이 develop `973e474`에 병합됐다.
+현재 출시 준비는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 기록한다.
+
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=2914c4366f8dfd7ed537f854388836a12a05f078`.
 P5·DX1·P3·P1/P2가 develop에 병합된 상태다. P1P2-I는 [#161](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/161)이다.
 **2026-10-28 사용자가 P4-00·01 구현과 리뷰·CI 후 P4-02·최종 통합까지 순차 진행을 승인했다.**
@@ -8,7 +15,7 @@ P5·DX1·P3·P1/P2가 develop에 병합된 상태다. P1P2-I는 [#161](https://g
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#53-p4-실제-제어와-일치하는-종료-예산)의 G3과
 [개발자 API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#6-v025-api-예시-stop-이후-현재-대기-조회)을 구체화한다.
-상위 저장소의 `docs/operations/campaign-workflow.md`, `docs/operations/campaign-preflight-review.md`를 운영 권위로 따른다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했다. 현재 개발 절차는 [Contributing](../CONTRIBUTING.md)에 있다.
 
 ## 1. 전달할 결과와 범위
 
