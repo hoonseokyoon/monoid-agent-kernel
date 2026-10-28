@@ -1,7 +1,7 @@
 # Development history
 
 These records preserve design choices, findings, commands, and qualification for their named
-revisions. Their original paths and anchors remain available. Use the [documentation index](../README.md)
+revisions. Their original file paths remain available. Use the [documentation index](../README.md)
 for current integration guidance and [Contributing](../../CONTRIBUTING.md) for the current PR workflow.
 
 The [v0.25 release audit](../V0_25_RELEASE_AUDIT.md) remains a current document. It tracks source
