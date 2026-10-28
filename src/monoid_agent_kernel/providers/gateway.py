@@ -21,7 +21,9 @@ from monoid_agent_kernel.core.json_ingress import (
 )
 from monoid_agent_kernel.core.model_io import is_valid_idempotency_key
 from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end
-from monoid_agent_kernel.providers._usage import capture_usage, mark_usage_observation
+from monoid_agent_kernel.providers._usage import (
+    capture_usage, mark_usage_observation, report_stream_eof,
+)
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel._version import user_agent
 from monoid_agent_kernel.env import env_name_for_error, getenv
@@ -585,6 +587,9 @@ class GatewayModelAdapter:
                                             mark_usage_observation(unproven, chunk.usage_evidence)
                                         raise
                                 yield chunk
+                            # The SSE parser has exhausted its iterator and decoded any trailing
+                            # frame. Preserve that end before response/client context exit awaits.
+                            report_stream_eof(saw_terminal=saw_terminal)
                         if not saw_terminal:
                             # "Both transports enforce or neither does" has to include the
                             # stream that never sends the frame the checks above live on: a

@@ -2331,6 +2331,9 @@ class ModelCallRunner:
             # provider had no opportunity to stamp.
             if retried:
                 mark_provider_retried(exc)
+            # First-party adapters can observe their inner iterator's EOF while their own
+            # cleanup still holds back adapter EOF. The dispatch collector shares that fact.
+            natural_read_end = natural_read_end or read_end_of(current_usage_progress())
             known, evidence = call_facts_of(exc)
             requester = accepted_requester()
             if known is None and requester is not None:
