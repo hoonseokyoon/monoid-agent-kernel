@@ -1,4 +1,4 @@
-"""One dispatch's observed usage, retained across an abandoned wait and bounded cleanup."""
+"""One dispatch's observations, retained across an abandoned wait and bounded cleanup."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from threading import Lock
 from typing import Any
 
 from monoid_agent_kernel.core.json_ingress import is_portable_json_integer
-from monoid_agent_kernel.core.model_facts import UsageObservation
+from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end
 from monoid_agent_kernel.providers._common import normalize_usage, usage_reported_by
 
 
@@ -87,6 +87,15 @@ def capture_usage(
 
 def current_usage_progress() -> UsageProgress | None:
     return _USAGE_PROGRESS.get()
+
+
+def report_stream_eof(*, saw_terminal: bool) -> None:
+    """Retain observed iterator EOF before provider-owned cleanup can suspend the read owner."""
+    progress = _USAGE_PROGRESS.get()
+    if progress is not None:
+        with progress.lock:
+            if not progress.closed:
+                mark_read_end(progress, "provider_terminal" if saw_terminal else "provider_eof")
 
 
 def provider_snapshot(

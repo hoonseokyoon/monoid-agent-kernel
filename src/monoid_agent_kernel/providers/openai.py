@@ -23,7 +23,9 @@ from monoid_agent_kernel.providers._common import (
     reasoning_replay_window_start,
 )
 from monoid_agent_kernel.core.model_facts import UsageObservation, mark_read_end, read_end_of
-from monoid_agent_kernel.providers._usage import provider_snapshot, mark_usage_observation
+from monoid_agent_kernel.providers._usage import (
+    provider_snapshot, mark_usage_observation, report_stream_eof,
+)
 from monoid_agent_kernel.providers.base import (
     ModelRequest,
     ModelStreamChunk,
@@ -148,6 +150,12 @@ def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop |
         asyncio.run_coroutine_threadsafe(client.close(), loop)
     except RuntimeError:  # pragma: no cover - the loop stopped between the check and the handoff
         return
+
+
+def _local_openai_failure(error: ModelAdapterError) -> ModelAdapterError:
+    """Record a known local guard while preserving the original error."""
+    mark_read_end(error, "local_failure")
+    return error
 
 
 @dataclass
@@ -325,17 +333,19 @@ class OpenAIModelAdapter:
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
-            raise ModelAdapterError(
+            raise _local_openai_failure(ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
-            )
+            ))
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise ModelAdapterError("openai package is not installed") from exc
+            raise _local_openai_failure(ModelAdapterError("openai package is not installed")) from exc
 
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
-            raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
+            raise _local_openai_failure(ModelAdapterError(
+                "OPENAI_API_KEY is required for OpenAIModelAdapter"
+            ))
 
         config = request.model or self.config
         # The client owns an httpx connection pool and nothing else closes it, so whoever owns the
@@ -482,17 +492,19 @@ class OpenAIModelAdapter:
         path is unaffected. Provider errors map to a classified ``ModelAdapterError`` (no body
         leak), exactly like ``next_turn``."""
         if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
-            raise ModelAdapterError(
+            raise _local_openai_failure(ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
-            )
+            ))
         try:
             from openai import AsyncOpenAI
         except ImportError as exc:
-            raise ModelAdapterError("openai package is not installed") from exc
+            raise _local_openai_failure(ModelAdapterError("openai package is not installed")) from exc
 
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
-            raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
+            raise _local_openai_failure(ModelAdapterError(
+                "OPENAI_API_KEY is required for OpenAIModelAdapter"
+            ))
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}
@@ -502,10 +514,8 @@ class OpenAIModelAdapter:
         # still a stream that ended properly, and the two questions must not be conflated. The
         # gateway's streamed twin spells its own version of this ``saw_terminal``.
         saw_terminal_response = False
-        # Bound before the request for the reason ``stream`` is: the terminal chunk below is
-        # built outside the classified block, and it must read a defined name however early the
-        # block exited. False until the stream commits, which is exactly true of a call that
-        # never reached the provider.
+        # Bound before the request so classification can retain retry evidence on every exit.
+        # False until the stream commits, including a call that never reached the provider.
         provider_retried = False
         # An unscoped call owns its client for the same reason ``next_turn``'s does -- the pool --
         # but it has an exit path ``next_turn`` does not: a consumer that abandons the stream
@@ -646,6 +656,7 @@ class OpenAIModelAdapter:
                 # ``GeneratorExit`` at a yield above and never arrives here, which is right --
                 # that call has an outcome of its own.
                 if not saw_terminal_response:
+                    report_stream_eof(saw_terminal=False)
                     incomplete = ModelAdapterError(
                         "OpenAI stream ended without a terminal response",
                         provider_error_code="openai_bad_response",
@@ -654,6 +665,12 @@ class OpenAIModelAdapter:
                     )
                     mark_read_end(incomplete, "provider_eof")
                     raise incomplete
+                # Validate synchronously at observed EOF so only a valid terminal is reported.
+                # Delivery still waits for both cleanup owners below.
+                terminal = _terminal_chunk(
+                    final_data, provider_retried=provider_retried, observed=observed,
+                )
+                report_stream_eof(saw_terminal=True)
             finally:
                 # The response is released per call, whether or not this call owns the client.
                 # Leaving an `async for` does not close the iterator it drove, and closing the
@@ -695,13 +712,9 @@ class OpenAIModelAdapter:
             _stamp_openai_usage(dropped, final_data, observed=observed)
             raise dropped from exc
 
-        # Outside the block deliberately: the terminal chunk is built from ``final_data`` alone and
-        # needs nothing from the client, and a consumer that stops at it holds a suspended
-        # generator -- ``break`` does not close one -- which would pin the pool open for as long as
-        # it keeps the reference. The build is a named seam so its refusals carry their cost the
-        # way the one-shot reader's do; the ``yield`` stays out of it, so a consumer throwing into
-        # this generator is not mistaken for the payload being refused.
-        yield _terminal_chunk(final_data, provider_retried=provider_retried, observed=observed)
+        # A consumer can leave the generator suspended at this yield. Both cleanup owners have
+        # finished, and yielding outside the classifier keeps consumer exceptions in their owner.
+        yield terminal
 
     def _classified_payload(self, request: ModelRequest) -> dict[str, Any]:
         """Build the request body **and prove it serializes**, naming a failure what it is.

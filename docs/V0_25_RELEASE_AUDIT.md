@@ -115,6 +115,72 @@ ordinary commits. The inspected credential candidates were synthetic fixtures. P
 audience values were preserved. This inspection covers the current tree; Git history is retained.
 Release artifacts still need their own final source, digest, rendering, and installed checks.
 
+## Final review repairs and release candidate
+
+The final review compared released v0.24.0 (`8d56e0d`) with `develop` at
+`f7c98e163d4c253e19a0145b7c0f9f31d29a01e6`. Follow-up was approved on 2026-10-28:
+
+- **Read completion:** preserve observed terminal/EOF completion when cancellation or a deadline
+  arrives during iterator cleanup. Keep the later logical outcome and accepted requester.
+- **Local OpenAI failures:** identify direct-access, missing-key, and missing-package guards as
+  local failures while retaining provider-error attribution for actual provider failures.
+
+The implementation worker owns the repair preflight, failing-first regression commit, and bounded
+source changes. The orchestrator owns sequencing, current-base checks, release metadata, artifacts,
+and integration. Independent reviewers assess the preflight and final changes against the existing
+termination, accounting, authority, and recovery contracts.
+
+| Part | Base and scope | Completion evidence |
+|---|---|---|
+| [Repair PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175), `codex/v0.25-release-facts-fix` | Latest `develop`; the two termination-fact defects and their regressions | Failing tests committed before fixes; exception/receipt assertions; focused checks; independent review and required CI |
+| Release candidate PR, `codex/v0.25-release-candidate` | `develop` after the repair merges; version `0.25.0`, current release documentation and exact artifacts | Refreshed preflight; version consistency; audited wheel/sdist; rendered README; installed consumers; compatibility/service evidence; final review and CI |
+
+Both PRs target `develop` in order, as independent changes. This base already receives required
+PR checks and full push CI. The candidate depends on the reviewed repair; no workflow registration
+change is needed. Merge commits preserve the reviewed source identities.
+
+Initial estimate: 200–400 changed lines for repair/tests/records and 120–220 for release metadata
+and qualification records. Existing test suites, artifact audit, installed-consumer checks, and
+runner coordination supply verification. The release record tracks actual cost and any scope growth.
+
+The request-owned HTTP stream's optional usage-evidence projection remains a nonblocking carry.
+Its API maintainer reopens it when that transport is selected as an observation source. Numeric
+accounting, durable formats, public gateway audience values, and existing authority guarantees retain
+their current contracts. Tag creation, publication, and deployed-host upgrades follow artifact
+qualification as separate operations.
+
+The repair preflight was independently accepted against `f7c98e1`. Regression commit
+`7c3ae406fdf9feacbff8123497de719b6038f8f9` preceded source changes: 30 cases failed and 8 controls
+passed. The failures covered 24 EOF/cleanup boundaries and six OpenAI local guards; the controls
+preserved response-validation, authority-loss, and actual-provider-error behavior. Implementation
+`777f4199e1482515dba5f40f0ef4ab00b4869216` passed all 38 cases and the 580-test focused selection,
+plus Ruff and diff checks. The source/test change totals 283 changed lines. Final independent
+code review, required CI, and integration remain completion gates for this repair.
+
+Independent review also reproduced the same read-fact loss after OpenAI's raw iterator EOF,
+while response/client cleanup still runs inside the adapter. Gateway response contexts have the
+same ownership boundary. The repair therefore retains observed EOF in the existing dispatch
+observation owner, after terminal/trailing-frame validation, before adapter cleanup. Terminal
+delivery still follows its existing cleanup rules. Additional regressions precede this source
+extension; per-dispatch isolation, late cleanup, local failures, and authority remain controls.
+This additional producer boundary revises the author estimate from 185–295 to 533–633 changed
+lines, plus release prose and review/CI work. The existing observation owner supplies the required
+lifetime; no new collector, persistent format, public API, or wait policy is introduced.
+
+The additional tests-only commit `6a44de319267ca29dbc2d5a3ead55e4683866c0c` reproduced 37 failures
+with 27 passing controls before the extension. After repair, all 64 new cases passed, followed by
+612 focused unit tests and 42 selected serial adapter/consumer tests; Ruff and diff checks passed.
+The cumulative source/test change is 593 lines across seven files, within the revised estimate.
+[PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) records the final reviewed
+head, required CI, and integration result. General serial integration also runs in full develop CI.
+
+Final review then identified drain-wrapped failures whose existing error classification could be
+overwritten by the EOF observation. Tests-only commit `6d208f3` reproduced 14 failures with 44 passing
+controls. The final guard substitutes EOF only for `stop_request`, `deadline`, or `drain_timeout`;
+it preserves typed failure facts, including provider self-cancellation. After this correction,
+636 unit and 46 selected serial tests passed, alongside Ruff and diff checks. The final source/test
+diff is 664 changed lines; cumulative editing cost is 688, within the reassessed 654–688 range.
+
 ## Release qualification and delivery
 
 | Gate | Status and required evidence |
