@@ -1,5 +1,6 @@
-"""Observe Stop, drain and the final bill offline: python examples/termination_budget.py."""
+"""Request-owned streaming and reported usage, offline. Try --scenario silent_stop."""
 
+import argparse
 import asyncio
 import json
 import tempfile
@@ -16,21 +17,30 @@ from monoid_agent_kernel import (
     UsageObservation,
 )
 from monoid_agent_kernel.core.cancellation import CancellationToken
+from monoid_agent_kernel.errors import TurnNotSettled
 from monoid_agent_kernel.providers.base import TextDelta, TurnComplete
 
 
-async def main():
-    release_bill = asyncio.Event()
-    bill = {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
-    receipts = []
+async def run_request(scenario="break"):
+    """Own one request; a disconnected consumer receives its CancelledError after cleanup."""
+    if scenario not in {"silent_stop", "break", "consumer_cancel"}:
+        raise ValueError(f"unknown scenario: {scenario}")
+    entered, release, cancelled, stopped, exit_seen = (asyncio.Event() for _ in range(5))
+    reported = {"input_tokens": 0, "output_tokens": 3}  # The provider supplied no total.
+    receipts, delivered, during_exit = [], [], []
 
     class Adapter:
         async def astream_turn(self, request):
-            yield TextDelta("Working")
-            await release_bill.wait()
+            entered.set()
+            if scenario == "break":
+                yield TextDelta("Working")
+            await release.wait()
+            yield TextDelta("late output")
             yield TurnComplete(
-                usage=bill,
-                usage_evidence=UsageObservation(reported=bill, source="adapter", collection="normal"),
+                usage=reported,
+                usage_evidence=UsageObservation(
+                    reported=reported, source="adapter", collection="normal",
+                ),
             )
 
     class Diagnostics:
@@ -41,6 +51,7 @@ async def main():
         workspace = Path(folder) / "workspace"
         workspace.mkdir()
         token = CancellationToken()
+        remove_callback = token.add_cancel_callback(cancelled.set)
         loop = AgentLoop.from_config(
             AgentRunSpec(
                 workspace_root=workspace, run_root=Path(folder) / "runs",
@@ -53,48 +64,90 @@ async def main():
         )
         await loop.aopen()
         stream = loop.astream("Start a response")
-        during_exit = []
-        stopped = asyncio.Event()
+        owner = asyncio.current_task()
 
         async def progress():
-            # A host keeps this task alive while the stream context is exiting.
-            # Reading the snapshot starts no timer and requests no cancellation.
+            # Observation never changes the cancellation state or releases the provider.
             while not stopped.is_set():
                 snapshot = stream.termination_budget()
-                if snapshot.stream_exit.phase == "cooperative_wait":
+                if (snapshot.stream_exit.phase == "cooperative_wait" and not during_exit
+                        and any(call.drain_remaining_s is not None for call in snapshot.calls)):
                     during_exit.append(snapshot)
-                    release_bill.set()
-                    return
+                    exit_seen.set()
                 await asyncio.sleep(0.01)
 
-        watcher = asyncio.create_task(progress())
+        async def control():
+            await entered.wait()  # Stop works before the provider emits any text.
+            if scenario == "silent_stop":
+                token.cancel()
+            elif scenario == "consumer_cancel":
+                owner.cancel("request disconnected")
+            await cancelled.wait()  # Early break lets the stream context request cancellation.
+            try:
+                if scenario == "break":
+                    await asyncio.wait_for(exit_seen.wait(), 1)
+            finally:
+                release.set()
+
+        helpers = [asyncio.create_task(progress()), asyncio.create_task(control())]
+        failed = False
         try:
             async with stream:
                 async for item in stream:
                     if isinstance(item, TextDelta):
-                        token.cancel()  # The product's Stop button.
-                        break
-            await watcher
-            assert during_exit and during_exit[0].calls
-            assert during_exit[0].calls[0].drain_remaining_s is not None
-            assert stream.termination_budget().stream_exit.phase == "settled"
-            assert len(receipts) == 1
-            receipt = receipts[0]
-            assert receipt.termination.requested_by == "user_cancel"
-            assert receipt.termination.ended_by == "provider_terminal", receipt
-            assert dict(receipt.usage) == bill
-            print(json.dumps({
-                "during_exit": asdict(during_exit[0]),
-                "after_exit": asdict(stream.termination_budget()),
-                "termination": receipt.termination.to_json(),
-                "usage": dict(receipt.usage),
-            }, indent=2))
+                        delivered.append(item.text)
+                        if scenario == "break":
+                            break
+            if stream.suspension is not None:
+                raise TurnNotSettled(stream.suspension)
+        except BaseException:
+            failed = True
+            raise
         finally:
             stopped.set()
-            release_bill.set()
-            await watcher
-            await loop.aclose()
+            release.set()
+            remove_callback()
+            for helper in helpers:
+                if not helper.done():
+                    helper.cancel()
+            outcomes = await asyncio.gather(*helpers, return_exceptions=True)
+            try:
+                await loop.aclose()
+            except BaseException:
+                if not failed:
+                    raise
+            if not failed:
+                for outcome in outcomes:
+                    if isinstance(outcome, Exception):
+                        raise outcome
+
+        receipt, = receipts
+        assert delivered == (["Working"] if scenario == "break" else [])
+        assert receipt.termination.requested_by == "user_cancel"
+        assert receipt.termination.ended_by == "provider_terminal"
+        assert dict(receipt.usage_evidence.reported) == reported
+        return {
+            "scenario": scenario,
+            "delivered_text": delivered,
+            "during_exit": asdict(during_exit[0]) if during_exit else None,
+            "after_exit": asdict(stream.termination_budget()),
+            "termination": receipt.termination.to_json(),
+            "known_usage": dict(receipt.usage_evidence.reported),
+            "total_coverage": receipt.usage_evidence.completeness["total_tokens"],
+            "receipt_count": len(receipts),
+        }
+
+
+async def main(scenario="break"):
+    print(json.dumps(await run_request(scenario), indent=2))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=("break", "silent_stop", "consumer_cancel"), default="break")
+    args = parser.parse_args()
+    try:
+        asyncio.run(main(args.scenario))
+    except asyncio.CancelledError as exc:
+        # The CLI supervisor displays the cancellation received from its request owner.
+        print(json.dumps({"consumer_cancelled": str(exc)}))

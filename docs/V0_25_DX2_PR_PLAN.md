@@ -324,3 +324,37 @@ packaged host report를 checkout 밖에서 통과했다. wheel metadata는 기�
 현재 Python 3.11.9/Pydantic 2.14.1의 실행 근거는 `.tmp/v025/dx2-01-evidence.md`와 연결된 raw logs에 있다.
 초기 통합 base full CI `40602933913`의 14개 job이 모두 성공했다. 독립 `dx2_01_code_review`의 구현 검토는 PASS다.
 01 누적 변경은 약 630줄(예제·검사·문서·00 종료 기록 포함), 캠페인 누적 약 970줄이며 runtime core는 0줄이다.
+
+[PR #167](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/167)은 최종 `c32e359`의 독립 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605101733),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605101653) 성공 후
+통합 브랜치에 `a5b28e4`로 병합했다. 자동 리뷰도 지적이 없었고, 리뷰 head와 병합 tree가 같다.
+실제 00–01 누적 변경은 972줄이다.
+
+### 9.3 DX2-02 착수
+
+최신 develop `5fc49b2`, 통합 base `a5b28e4`에서 `codex/v0.25-dx2-stream-ownership`을 시작했다.
+runtime과 기존 종료 예제는 최초 조사와 같고, 01이 추가한 예제·설치 수용 검사를 확장한다.
+실제-base 사전조사는 `.tmp/v025/dx2-02-preflight.md`, 외부·코드 근거는 `dx2-02-research.md`다.
+`dx2_02_research`가 예제·검사를 구현하고 `dx2_02_preflight_review`가 독립 사전 검토를 맡는다.
+root는 runner·계획 기록·Git/리뷰/CI 통합을 소유한다.
+
+02 독립 사전 검토에서 passive 관측 실패 뒤 drain만 기다리면 최종 결과 게시 전에 임시 root가
+정리될 수 있는 P2를 확인했다. 성공·실패 경로 모두 공개 `result.ready` 장벽을 통과하고,
+fixture의 Future 회수 전에 예제 자체의 결과 준비·reader 종료를 검사하도록 보완해 ready 판정을 받았다.
+silent Stop은 context exit 전에 자연 정산될 수 있으므로 cooperative_wait snapshot은 의도적으로 붙잡은 break에만 요구한다.
+최종 preflight SHA256은 `795C3A0BE7D4F86A6BBA8A77DF2BE3AB13A6131594406B564B75C2751A6DFF5A`다.
+
+Tests-only `5aa9242`에서 실제 HTTP400 adapter를 주입한 기존 종료 예제는 **1 FAIL**이었다.
+3초 동안 실행 task를 취소하지 않고 관측했으며, 제공자 실패 후 Stop phase를 기다리는 hang을 확인했다.
+수정 뒤 기존·확장 예제 **28 PASS**: silent Stop, break, 소비자 취소·secondary cleanup 오류,
+provider 실패와 실제 backend의 구독 해제·재연결·reset·명시적 취소·관측 실패 정리를 포함한다.
+원본은 `.tmp/v025/dx2-02-red.txt`, `dx2-02-green.txt`다. 독립 `dx2_02_code_review`가 구현을 검토한다.
+01 병합 tree의 [full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605783431)는
+14개 job 모두 성공했다.
+
+02의 기존 async/종료 예산/live-stream 경계 검사 **113 PASS**, Ruff·diff·문서 120 links/14 Python blocks PASS.
+동일 후보 wheel `d7bbecf3bbbed3d50c98a874b3f43b11489667787379ab60579f0d5161393bb9`를 audit·설치하고,
+Python 3.11.9/Pydantic 2.14.1에서 checkout 밖의 복사된 예제 5개와 추가 종료 시나리오 2개를 통과했다.
+CI의 해당 Python block을 그대로 추출해 실행했으며 `.tmp/v025/dx2-02-evidence.md`에 명령·원본을 연결한다.
+새 background 예제는 142줄이며 runtime core 변경은 0줄이다.

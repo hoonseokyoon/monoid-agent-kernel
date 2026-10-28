@@ -223,7 +223,99 @@ def test_termination_budget_example_observes_stop_and_settlement(
     assert output["after_exit"]["stream_exit"]["phase"] == "settled"
     assert output["termination"]["requested_by"] == "user_cancel"
     assert output["termination"]["ended_by"] == "provider_terminal"
-    assert output["usage"] == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+    assert output["delivered_text"] == ["Working"]
+    assert output["known_usage"] == {"input_tokens": 0, "output_tokens": 3}
+    assert output["total_coverage"] == "unknown"
+    assert output["receipt_count"] == 1
+
+
+def test_termination_example_stops_before_the_first_delta() -> None:
+    module = _load("termination_budget.py")
+
+    async def check():
+        existing = asyncio.all_tasks()
+        output = await module.run_request("silent_stop")
+        assert output["delivered_text"] == []
+        assert output["known_usage"] == {"input_tokens": 0, "output_tokens": 3}
+        assert output["total_coverage"] == "unknown"
+        assert output["receipt_count"] == 1
+        assert output["termination"]["requested_by"] == "user_cancel"
+        assert output["termination"]["ended_by"] == "provider_terminal"
+        assert output["after_exit"]["stream_exit"]["phase"] == "settled"
+        assert not {item for item in asyncio.all_tasks() - existing if not item.done()}
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("scenario, close_fails", [
+    ("consumer_cancel", False), ("consumer_cancel", True), ("silent_stop", True),
+])
+def test_termination_example_preserves_request_cancellation_and_cleanup_errors(
+    monkeypatch: pytest.MonkeyPatch, scenario: str, close_fails: bool,
+) -> None:
+    from monoid_agent_kernel import CapturePolicy, LoopSession, ModelIOSubscription
+
+    module = _load("termination_budget.py")
+    original_from_config = module.AgentLoop.from_config
+    loops, receipts, closed = [], [], []
+    cleanup_error = RuntimeError("close failed after releasing the activation")
+
+    class Observer:
+        def on_model_call(self, capture):
+            receipts.append(capture.receipt)
+
+        def close(self):
+            closed.append(True)
+
+    def build_loop(spec, adapter, config, **kwargs):
+        kwargs["model_io_subscriptions"] += (
+            ModelIOSubscription(Observer(), CapturePolicy(mode="none")),
+        )
+        loop = original_from_config(spec, adapter, config, **kwargs)
+        original_close = loop.aclose
+
+        async def close():
+            result = await original_close()
+            if close_fails:
+                raise cleanup_error
+            return result
+
+        monkeypatch.setattr(loop, "aclose", close)
+        loops.append(loop)
+        return loop
+
+    monkeypatch.setattr(module.AgentLoop, "from_config", build_loop)
+
+    async def check():
+        existing = asyncio.all_tasks()
+        task = asyncio.create_task(module.run_request(scenario))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            assert task in done, "request cleanup did not finish"
+            expected = asyncio.CancelledError if scenario == "consumer_cancel" else RuntimeError
+            with pytest.raises(expected) as raised:
+                await task
+            if scenario == "consumer_cancel":
+                assert raised.value.args == ("request disconnected",)
+            else:
+                assert raised.value is cleanup_error
+            receipt, = receipts
+            assert receipt.termination.requested_by == "user_cancel"
+            assert receipt.termination.ended_by == "provider_terminal"
+            assert dict(receipt.usage_evidence.reported) == {"input_tokens": 0, "output_tokens": 3}
+            assert closed == [True]
+            loop, = loops
+            assert LoopSession(loop).health().alive is False
+            assert not {item for item in asyncio.all_tasks() - existing if not item.done()}
+        finally:
+            pending = [item for item in asyncio.all_tasks() - existing if not item.done()]
+            for item in pending:
+                item.cancel()
+            await asyncio.gather(task, *pending, return_exceptions=True)
+            for loop in loops:
+                await loop.adiscard_uncommitted()
+
+    asyncio.run(check())
 
 
 def test_termination_example_closes_after_a_provider_failure(
@@ -290,6 +382,60 @@ def test_termination_example_closes_after_a_provider_failure(
                 await loop.adiscard_uncommitted()
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("fail_observation", [False, True])
+def test_background_example_owns_run_cleanup_and_passive_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_factory, fail_observation: bool,
+) -> None:
+    module = _load("observe_background_run.py")
+    original_backend = module.RunnerBackend
+    backends, submissions, readers = [], [], []
+    observation_error = RuntimeError("reader failed while the run was active")
+
+    def build_backend(**kwargs):
+        backend = backend_factory.track(original_backend(**kwargs))
+        backends.append(backend)
+        original_submit, original_subscribe = backend.submit_run, backend.subscribe_model_stream
+
+        def submit(request):
+            submission = original_submit(request)
+            submissions.append(submission)
+            return submission
+
+        def subscribe(*args, **kwargs):
+            reader = original_subscribe(*args, **kwargs)
+            readers.append(reader)
+            if fail_observation and len(readers) == 2:
+                original_poll = reader.poll
+
+                def fail_poll(**options):
+                    original_poll(**options)
+                    raise observation_error
+
+                monkeypatch.setattr(reader, "poll", fail_poll)
+            return reader
+
+        monkeypatch.setattr(backend, "submit_run", submit)
+        monkeypatch.setattr(backend, "subscribe_model_stream", subscribe)
+        return backend
+
+    monkeypatch.setattr(module, "RunnerBackend", build_backend)
+    if fail_observation:
+        with pytest.raises(RuntimeError) as raised:
+            module.run_example(tmp_path)
+        assert raised.value is observation_error
+    else:
+        assert module.run_example(tmp_path) == {
+            "state": "cancelled", "reader_closed": True, "continued_after_disconnect": True,
+            "peer_text": "B", "replayed_text": "B", "reset_reason": "cursor_gap",
+            "history_complete": False, "retained_text": "CD", "cancel_requested": True,
+        }
+    # Assert the example's own completion before the managed fixture joins its Futures.
+    backend, = backends
+    submission, = submissions
+    assert backend.result(submission.run_id, submission.run_token)["ready"] is True
+    assert readers and all(reader.closed for reader in readers)
 
 
 def test_host_report_example_preserves_approval_and_child_paths(

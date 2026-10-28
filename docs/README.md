@@ -9,7 +9,8 @@ building against, and securing the kernel.
 - **I want to run an agent** → [Quickstart](../README.md#quickstart-no-servers),
   then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
 - **I'm embedding the kernel in a product** → run the [typed tool quickstart](../README.md#quickstart-no-servers),
-  then choose [local sessions, Stop or approval/restore](EMBEDDING.md#start-with-an-executable-recipe).
+  then choose [local sessions, streaming or approval/restore](EMBEDDING.md#start-with-an-executable-recipe).
+  Compare [request ownership and passive background observation](EMBEDDING.md#choose-who-owns-streamed-work).
   Follow [CONTRACTS.md](CONTRACTS.md) for the stable Python/HTTP surface and
   [CONFORMANCE.md](CONFORMANCE.md) to check your
   implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
