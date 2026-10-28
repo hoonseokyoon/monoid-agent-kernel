@@ -46,11 +46,14 @@ Choose the next integration step:
 | What you need | Run after installing this checkout | What to inspect |
 |---|---|---|
 | Builtin tools and a local session | `python examples/embedding_local_product.py` | Written release note, checked checkpoint, completed run |
-| Stop and request stream ownership | `python examples/termination_budget.py` | Stream exit progress, final termination facts, reported usage |
+| Stop and request stream ownership | `python examples/termination_budget.py` | Early break, Stop progress, final facts and sparse reported usage |
+| Observe a background run | `python examples/observe_background_run.py` | Passive disconnect, peer progress, cursor replay/reset and explicit cancel |
 | Tool resources, approval and restore | `python -m monoid_agent_kernel.reference.host_tool_report` | Park/release, fresh loop restoration, approved read, separate child resources |
 
 The approval recipe restores into a fresh loop in the same process. The
 [embedding handbook](docs/EMBEDDING.md) explains resource lifetime, permissions and recovery.
+The stream recipe also accepts `--scenario silent_stop` and `--scenario consumer_cancel`.
+It owns request cleanup; the background recipe keeps execution alive across reader disconnects.
 For individual seams, read the [builtin configuration](examples/minimal_quickstart.py),
 [custom model adapter](examples/custom_model_adapter.py),
 [call facts](examples/model_call_facts.py), and

@@ -293,11 +293,16 @@ jobs:
           env.pop("PYTHONPATH", None)
           with tempfile.TemporaryDirectory(prefix="monoid-installed-examples-") as directory:
               for name in ("custom_tool_quickstart.py", "model_call_facts.py",
-                           "recover_model_call_facts.py", "termination_budget.py"):
+                           "recover_model_call_facts.py", "termination_budget.py",
+                           "observe_background_run.py"):
                   copied = Path(directory) / name
                   shutil.copyfile(examples / name, copied)
                   subprocess.run([sys.executable, str(copied)], cwd=directory, env=env,
                                  check=True, timeout=60)
+                  if name == "termination_budget.py":
+                      for scenario in ("silent_stop", "consumer_cancel"):
+                          subprocess.run([sys.executable, str(copied), "--scenario", scenario],
+                                         cwd=directory, env=env, check=True, timeout=60)
           PY
       - name: Run installed host resource approval and recovery recipe
         if: matrix.install == 'minimal'
