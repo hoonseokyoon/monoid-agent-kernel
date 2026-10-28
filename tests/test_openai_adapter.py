@@ -98,22 +98,31 @@ def test_openai_entry_guard_facts_preserve_failure_ownership(monkeypatch, stream
 
 @pytest.mark.parametrize("terminal", ["valid", "missing", "malformed"])
 @pytest.mark.parametrize("close_at", ["response", "client"])
-@pytest.mark.parametrize("boundary", ["caller_cancel", "user_cancel", "deadline", "drain_timeout", "active_drain"])
+@pytest.mark.parametrize("boundary", [
+    "caller_cancel", "user_cancel", "deadline", "drain_timeout", "active_drain",
+    "user_cleanup_error", "turn_cleanup_error", "user_cleanup_cancel", "turn_cleanup_cancel",
+])
 def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, boundary) -> None:
     from monoid_agent_kernel.core.cancellation import CancellationToken
     from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
-    from monoid_agent_kernel.errors import RunCancelled, RunTimeout
+    from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled, RunTimeout
     from monoid_agent_kernel.model_call import ModelCallRunner
     from monoid_agent_kernel.providers.base import provider_usage_of
 
     async def run():
         closing, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
         token = CancellationToken()
+        cleanup_failure = "_cleanup_" in boundary
+        turn_interrupt = boundary.startswith("turn_cleanup_")
 
         async def blocked_close():
             closing.set()
             try:
                 await release.wait()
+                if cleanup_failure:
+                    if boundary.endswith("_cancel"):
+                        raise asyncio.CancelledError("provider cancelled its cleanup")
+                    raise RuntimeError("provider cleanup failed")
             finally:
                 closed.set()
 
@@ -123,7 +132,9 @@ def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, bo
 
             async def __anext__(self):
                 self.reads += 1
-                if self.reads == 2 and boundary == "active_drain":
+                if self.reads == 2 and (
+                    boundary == "active_drain" or boundary.startswith("user_cleanup_")
+                ):
                     token.cancel()
                 try:
                     return await super().__anext__()
@@ -144,18 +155,20 @@ def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, bo
         stream = Stream(events, response=SimpleNamespace(request=_RequestWithRetryCount("2")))
         _stub_async_openai(monkeypatch, stream, close=blocked_close if close_at == "client" else None)
         captures, seen = [], []
-        draining = boundary in {"drain_timeout", "active_drain"}
+        draining = cleanup_failure or boundary in {"drain_timeout", "active_drain"}
         runner = ModelCallRunner(
             adapter=_adapter(), settled_sink=captures.append,
             current_cancellation_token=lambda: token, cancel_grace_s=0.02,
-            abort_drain_s=0.05 if draining else 0,
+            abort_drain_s=1 if cleanup_failure else 0.05 if draining else 0,
         )
         task = asyncio.create_task(runner.acall(
             ModelRequest(instruction="hi", system_prompt="", tools=()),
             delta_consumer=seen.append, deadline=time.time() + 0.15 if boundary == "deadline" else None,
+            should_abort=lambda: turn_interrupt and bool(seen),
         ))
         error_type = (asyncio.CancelledError if boundary == "caller_cancel" else
-                      RunTimeout if boundary == "deadline" else RunCancelled)
+                      RunTimeout if boundary == "deadline" else
+                      ModelCallAborted if turn_interrupt else RunCancelled)
         try:
             await asyncio.wait_for(closing.wait(), 2)
             assert stream.eof
@@ -164,6 +177,8 @@ def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, bo
                 task.cancel()
             elif boundary in {"user_cancel", "drain_timeout"}:
                 token.cancel()
+            elif cleanup_failure:
+                release.set()
             with pytest.raises(error_type) as caught:
                 await asyncio.wait_for(task, 2)
         finally:
@@ -176,10 +191,18 @@ def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, bo
         expected_end = ("provider_terminal" if terminal == "valid" else "provider_eof")
         if terminal == "malformed":
             expected_end = "deadline" if boundary == "deadline" else "drain_timeout" if draining else "stop_request"
+        if cleanup_failure:
+            if boundary.endswith("_cancel"):
+                expected_end = "provider_cancelled"
+            elif close_at == "client":
+                expected_end = "provider_error"
+            elif terminal == "malformed":
+                expected_end = "local_failure"
         facts, evidence = call_facts_of(caught.value)
         assert facts == ModelCallTermination(
-            outcome="timed_out" if boundary == "deadline" else "cancelled",
-            requested_by=None if boundary == "deadline" else "caller_cancel" if boundary == "caller_cancel" else "user_cancel",
+            outcome="timed_out" if boundary == "deadline" else "interrupted" if turn_interrupt else "cancelled",
+            requested_by=(None if boundary == "deadline" else "caller_cancel" if boundary == "caller_cancel"
+                          else "turn_interrupt" if turn_interrupt else "user_cancel"),
             ended_by=expected_end,
         )
         assert len(captures) == 1
@@ -189,7 +212,7 @@ def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, bo
         assert evidence.reported == ({} if terminal == "missing" else {"output_tokens": 3})
         if terminal != "missing":
             assert evidence.attempts[0].observation.collection == (
-                "drain" if boundary == "active_drain" else "normal"
+                "drain" if boundary == "active_drain" or cleanup_failure else "normal"
             )
         assert receipt.provider_retried is True
 

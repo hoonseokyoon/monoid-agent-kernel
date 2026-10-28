@@ -230,6 +230,52 @@ def test_gateway_sse_eof_survives_context_exit(monkeypatch, terminal, close_at, 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("stop", ["user_cancel", "turn_interrupt"])
+@pytest.mark.parametrize("required_proof", [False, True])
+def test_gateway_eof_proof_failure_keeps_its_reason_during_drain(monkeypatch, stop, required_proof) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.core.spec import GenerationConfig
+    from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter, attempts = _retried_stream_adapter(monkeypatch, body=[
+        'data: {"type":"text_delta","text":"answer","provider_retried":true}', "",
+    ])
+    attempts["n"] = 1
+    token = CancellationToken()
+    captures, seen = [], []
+
+    def consume(chunk):
+        seen.append(chunk)
+        if stop == "user_cancel":
+            token.cancel()
+
+    runner = ModelCallRunner(
+        adapter=adapter, settled_sink=captures.append, abort_drain_s=1,
+        current_cancellation_token=lambda: token,
+    )
+    with pytest.raises(RunCancelled if stop == "user_cancel" else ModelCallAborted) as caught:
+        asyncio.run(runner.acall(
+            ModelRequest(
+                instruction="hi", system_prompt="", tools=(),
+                model=ModelConfig(generation=GenerationConfig(temperature=0.1)) if required_proof else None,
+            ),
+            delta_consumer=consume, should_abort=lambda: stop == "turn_interrupt" and bool(seen),
+        ))
+    facts, evidence = call_facts_of(caught.value)
+    assert facts == ModelCallTermination(
+        outcome="cancelled" if stop == "user_cancel" else "interrupted", requested_by=stop,
+        ended_by="local_failure" if required_proof else "provider_eof",
+    )
+    assert len(captures) == 1
+    receipt = captures[0].receipt
+    assert (receipt.termination, receipt.usage_evidence) == (facts, evidence)
+    assert receipt.usage == provider_usage_of(caught.value) == evidence.reported == {}
+    assert receipt.provider_retried is True
+
+
 # --- Gateway side (no httpx, no key) ---------------------------------------------------
 
 
