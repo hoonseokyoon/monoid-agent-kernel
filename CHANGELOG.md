@@ -50,6 +50,11 @@ upgrading persistent runs and the [release audit](docs/V0_25_RELEASE_AUDIT.md) f
 
 ### Fixed
 
+- Streamed calls retain observed provider terminal/EOF completion when cancellation or a
+  deadline arrives during iterator cleanup. Logical outcome, accepted stop requester, usage,
+  local response-validation failures, and writer-authority precedence retain their contracts.
+- OpenAI guards for disabled direct access, an unavailable SDK, or a missing API key report
+  `local_failure` before provider dispatch. Actual provider failures retain their attribution.
 - Child and fork workspaces inherit the parent's effective operator permission policy, including
   policies supplied through the `AgentLoop` constructor keyword.
 
