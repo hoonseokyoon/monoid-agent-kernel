@@ -16,6 +16,8 @@ import ast
 import asyncio
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -452,6 +454,125 @@ def test_host_report_example_preserves_approval_and_child_paths(
         {"status": "completed", "context": mode, "activations": 2, "proposal_only": True}
         for mode in ("fresh", "fork")
     ]
+
+
+def test_host_report_cli_restores_approval_in_a_fresh_process(tmp_path: Path) -> None:
+    from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+
+    root = tmp_path / "report"
+    env = os.environ.copy()
+    # conftest's sys.path affects only pytest; every CLI child must use this source revision.
+    env["PYTHONPATH"] = str((EXAMPLES_DIR.parent / "src").resolve())
+
+    def invoke(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "monoid_agent_kernel.reference.host_tool_report", *args],
+            cwd=tmp_path, env=env, text=True, capture_output=True, timeout=30, check=False,
+        )
+
+    preparation = invoke("--phase", "prepare", "--root", str(root))
+    assert preparation.returncode == 0, preparation.stderr
+    prepared = json.loads(preparation.stdout)
+    assert prepared.get("status") == "awaiting_tasks", prepared
+    assert isinstance(prepared["run_id"], str) and prepared["run_id"]
+    assert isinstance(prepared["task_id"], str) and prepared["task_id"]
+    assert isinstance(prepared["pid"], int) and prepared["pid"] > 0
+    assert prepared["pid"] != os.getpid()
+    assert prepared["resource_opens"] == 1
+    assert prepared["read_calls"] == 0
+    assert prepared["model_calls"] == 3
+    assert prepared["total_usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+    assert prepared["proposal_only"] is True
+    report_path = root / "workspace" / "reports" / "weekly.md"
+    assert not report_path.exists()
+
+    store = LocalFsCheckpointStore(root / "runs")
+    checked = store.latest_checked(prepared["run_id"])
+    assert checked.ok and checked.value is not None
+    record = checked.value
+    before_refusal = record.checkpoint.to_json()
+    assert record.checkpoint.run_id == prepared["run_id"]
+    assert record.checkpoint.total_usage == prepared["total_usage"]
+    assert record.checkpoint.last_suspension["reason"] == "awaiting_tasks"
+    assert record.checkpoint.last_suspension["awaiting_task_ids"] == [prepared["task_id"]]
+
+    refused = invoke(
+        "--phase", "resume", "--root", str(root), "--run-id", prepared["run_id"],
+        "--task-id", f"{prepared['task_id']}-wrong",
+    )
+    assert refused.returncode != 0, refused.stdout
+    assert "task is not awaiting approval" in refused.stderr
+    retained = store.latest_checked(prepared["run_id"])
+    assert retained.ok and retained.value is not None
+    assert retained.value.seq == record.seq
+    assert retained.value.checkpoint.to_json() == before_refusal
+    assert not report_path.exists()
+
+    completion = invoke(
+        "--phase", "resume", "--root", str(root), "--run-id", prepared["run_id"],
+        "--task-id", prepared["task_id"],
+    )
+    assert completion.returncode == 0, completion.stderr
+    resumed = json.loads(completion.stdout)
+    assert resumed["status"] == "completed"
+    assert resumed["run_id"] == prepared["run_id"]
+    assert resumed["task_id"] == prepared["task_id"]
+    assert isinstance(resumed["pid"], int) and resumed["pid"] > 0
+    assert resumed["pid"] not in {prepared["pid"], os.getpid()}
+    assert resumed["resource_opens"] == 1
+    assert resumed["read_calls"] == 1
+    assert resumed["model_calls"] == 1
+    assert resumed["total_usage"] == {"input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
+    assert resumed["duplicate_ignored"] is True
+    assert resumed["report_body"] == "# Weekly\n\nReady for approval.\n"
+    assert resumed["proposal_only"] is True
+    assert not report_path.exists()
+
+
+def test_host_report_restore_failure_preserves_error_and_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel import LoopSession
+    from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore
+    from monoid_agent_kernel.reference import host_tool_report as module
+
+    prepared = module.prepare_report(tmp_path)
+    store = LocalFsCheckpointStore(tmp_path / "runs")
+    before = store.latest_checked(prepared["run_id"])
+    assert before.ok and before.value is not None
+    original_from_config = module.AgentLoop.from_config
+    original_discard = module.AgentLoop.discard_uncommitted
+    loops = []
+    blob_error = OSError("saved report blob unavailable")
+
+    def observe_loop(*args, **kwargs):
+        loop = original_from_config(*args, **kwargs)
+        loops.append(loop)
+        return loop
+
+    def fail_blob(self, sha256):
+        raise blob_error
+
+    def discard_then_fail(loop):
+        original_discard(loop)
+        raise RuntimeError("cleanup failed after releasing the activation")
+
+    monkeypatch.setattr(module.AgentLoop, "from_config", observe_loop)
+    monkeypatch.setattr(CheckpointRecord, "blob", fail_blob)
+    monkeypatch.setattr(module.AgentLoop, "discard_uncommitted", discard_then_fail)
+    try:
+        with pytest.raises(OSError) as raised:
+            module.resume_report(tmp_path, prepared["run_id"], prepared["task_id"])
+        assert raised.value is blob_error
+        loop, = loops
+        assert LoopSession(loop).health().alive is False
+        after = store.latest_checked(prepared["run_id"])
+        assert after.ok and after.value is not None
+        assert after.value.seq == before.value.seq
+        assert after.value.checkpoint.to_json() == before.value.checkpoint.to_json()
+    finally:
+        for loop in loops:
+            original_discard(loop)
 
 
 def test_hosted_product_embedding_golden_path(tmp_path: Path) -> None:

@@ -358,3 +358,49 @@ provider 실패와 실제 backend의 구독 해제·재연결·reset·명시적 
 Python 3.11.9/Pydantic 2.14.1에서 checkout 밖의 복사된 예제 5개와 추가 종료 시나리오 2개를 통과했다.
 CI의 해당 Python block을 그대로 추출해 실행했으며 `.tmp/v025/dx2-02-evidence.md`에 명령·원본을 연결한다.
 새 background 예제는 142줄이며 runtime core 변경은 0줄이다.
+
+[PR #168](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/168)은 최종 `3f9a83c` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608432209),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608432266) 성공 후
+통합 브랜치에 `16a22a1`로 병합했다. 자동 리뷰도 지적이 없었고, 리뷰 head와 병합 tree가 같다.
+02 변경은 592줄, 최초 develop 대비 현재 누적 diff는 1,556줄이다.
+
+### 9.4 DX2-03 착수
+
+다시 fetch한 develop은 `5fc49b2`이고 실제 통합 base는 `16a22a1`이다.
+브랜치 `codex/v0.25-dx2-approval-resume`에서 03을 시작한다. host report·checkpoint·loop 소스는
+최초 조사와 같으며 `.tmp/v025/dx2-03-preflight.md`가 실제 base의 선택·실패 경계·검증을 기록한다.
+외부 LangGraph 문서·열린 issue #7780을 재확인했다. 명시적 실행 ID와 중복 실행 관측을 적용하고
+기존 checkpoint 복구를 사용한다. lazy blob 복원 실패와 잘못된 task 거부는 원래 오류를 보존하며 자원을 정리한다.
+`dx2_03_research`가 구현을 맡고 root가 runner·계획·Git/PR·통합을 맡는다. 독립 사전 검토 후 tests-only부터 진행한다.
+
+독립 `dx2_03_preflight_review`는 실제 source와 세 interpreter 수용 경로를 검토해 **READY**로 판정했다.
+최종 preflight SHA256은 `0AB3ACE6BAC7A4D541B583157E2B9F7953685F953851E973089873A7C4A74AF0`다.
+관련 core 변경 필요성이나 미해결 중대 지적은 없으며 tests-only 회귀를 먼저 작성한다.
+
+Tests-only `f6abe73`에서 실제 CLI 새 프로세스 수용 검사는 **1 FAIL**(29.13초)이었다.
+기존 CLI가 `--phase prepare`를 무시하고 전체 demo를 반환하여 승인 대기 결과 검사가 실패했다.
+원본은 `.tmp/v025/dx2-03-red.txt`이며, 이 커밋 뒤 packaged recipe·설치 CI·문서 구현에 착수했다.
+
+첫 수용 실행은 **4 FAIL / 199 PASS**였으며 준비 단계의 모델 호출 수 가정에서 실패했다.
+실제 예제를 계측해 자원 1개·승인 전 읽기 0회·모델 호출 **3회**를 확인했다. 세 번째 호출은
+pending approval 결과를 모델에 전달한 뒤 park하는 기존 흐름이었다. 최초 조사에서는 재개 호출 1회만 계측했다.
+기존 fake adapter의 암묵적 fallback을 명시적인 대기 응답·0 usage로 바꾸고 실제 3회를 그대로 표시한다.
+준비 누계 5/3/8과 재개 1회·승인된 읽기 1회 기준은 유지한다. 초기 실패는 `dx2-03-initial-count-failure.txt`,
+원인 실험은 `dx2-03-counter-probe.txt`에 보존하며 수정된 사전조사를 독립 재확인한다.
+
+독립 targeted 검토도 **READY**였다. 보정된 preflight SHA256은
+`E0E4D376253ACCE6CB9209A7BEF8309D97F95C0E6549B54747F1B54E778F84B6`다.
+세 번째 scripted 응답의 numeric usage와 제공자가 보고한 usage evidence를 구분하며 기존 숫자 누계만 검증한다.
+02 병합 tree의 [full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608906485)도
+전체 14개 job을 통과했다.
+
+03 수정 후 examples·host bindings·HITL·checkpoint 검사 **203 PASS**(38.84초), Ruff·diff·문서
+123 links/14 Python blocks PASS. 정확한 wheel
+`fea62fe2dd95ea5a7f61537287b451303c6f4156a0afa9682948cca4a912a0ab`를 audit·설치했다.
+Python 3.11.9/Pydantic 2.14.1에서 실제 부모 9개·gateway 자식 2개 provenance, 복사 예제 5개·종료 변형 2개,
+기존 host demo와 별도 prepare/resume 프로세스를 모두 통과했다. 실제 PID는 달랐고 읽기는 0→1회,
+모델 호출은 3→1회, 누계는 5/3/8→9/6/15, 원본 proposal 본문과 중복 승인 무시를 확인했다.
+명령·실패 보존·최종 원본은 `.tmp/v025/dx2-03-evidence.md`에 둔다.
+03 구현·검사·CI·진입 문서는 435줄로 추정 220–360줄을 75줄 넘었다. 실제 프로세스 검사와
+복원/정리 오류 검증이 주요 비용이다. 현재 계획 기록 포함 누적은 약 2,030줄이며 runtime core 변경은 0줄이다.

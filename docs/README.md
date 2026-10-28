@@ -11,6 +11,7 @@ building against, and securing the kernel.
 - **I'm embedding the kernel in a product** → run the [typed tool quickstart](../README.md#quickstart-no-servers),
   then choose [local sessions, streaming or approval/restore](EMBEDDING.md#start-with-an-executable-recipe).
   Compare [request ownership and passive background observation](EMBEDDING.md#choose-who-owns-streamed-work).
+  [Resume a parked approval in a new process](EMBEDDING.md#resume-approval-in-a-new-process) using the host's run/task IDs.
   Follow [CONTRACTS.md](CONTRACTS.md) for the stable Python/HTTP surface and
   [CONFORMANCE.md](CONFORMANCE.md) to check your
   implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
@@ -51,7 +52,7 @@ building against, and securing the kernel.
   The [DX2 PR plan](V0_25_DX2_PR_PLAN.md) defines the first-tool, request-stream and approval-restart journeys,
   example simplification, installed-wheel validation, external cases and PR boundaries; sequential implementation is authorized.
   The installed [host-resource report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py)
-  exercises approval, restart, and explicit fresh/fork child inheritance.
+  exercises prepare/resume across processes, cumulative usage and explicit fresh/fork child inheritance.
 
 ## All documents
 
