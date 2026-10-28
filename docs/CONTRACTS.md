@@ -6,6 +6,29 @@ deployment models. Import Python contracts from `monoid_agent_kernel.contracts`.
 Treat `monoid_agent_kernel.reference.*` as runnable examples for backend, LLM
 gateway, and web gateway integration.
 
+## Find a contract
+
+For a worked integration, start with the [embedding handbook](EMBEDDING.md) or the
+[practical guides](README.md#integrate-product-capabilities). Use this index for exact behavior:
+
+| Subject | Contract |
+|---|---|
+| Public roles and stability | [Boundary](#boundary), [stability](#stability) |
+| Run construction and configuration | [AgentLoop](#agentloop), [AgentRunSpec](#agentrunspec), [runtime configuration](#agentdefinition-and-runtime-config) |
+| Workspace and tools | [Workspace](#workspace), [tool surface](#tool-surface), [tool contract](#tool-contract) |
+| Model calls, usage, Stop, and wait budgets | [Model adapter](#model-adapter) |
+| Observing calls and streamed content | [Model-I/O subscriptions](#agentloop-model-io-subscriptions), [model-stream observers](#agentloop-model-stream-observers) |
+| Delegation and skills | [Subagents](#subagents-agent-as-tool), [skills](#skills-progressive-disclosure) |
+| Session and authenticated control | [Session lifecycle](#session-lifecycle-agentsession--fsm), [control protocol](#control-protocol), [durable command inbox](#durable-command-inbox) |
+| Events and diagnostics | [Event reads](#event-reads), [diagnostics](#diagnostics) |
+| Gateways and backend HTTP | [HTTP contracts](#http-contracts), [backend](#reference-backend), [multi-turn tasks](#multi-turn-sessions-and-tasks) |
+| Durable storage and recovery | [Durable persistence](#durable-persistence), [invocation lifecycle](#durable-modelcallrunner-lifecycle), [fenced recovery](#agentloop-fenced-recovery) |
+| Interruption and evidence delivery | [Worker drain](#typed-interruption-and-worker-drain), [model evidence policy](#model-evidence-delivery-policy) |
+| Operational invariants and artifacts | [Operational rules](#operational-rules), [run artifacts](#run-artifacts) |
+
+The [compatibility ledger](COMPATIBILITY.md) supplies writer/reader versions and migration rules;
+[Observability](OBSERVABILITY.md) describes recorded outputs and projections.
+
 ## Boundary
 
 The package is organized around four public roles:
