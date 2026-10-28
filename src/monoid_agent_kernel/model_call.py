@@ -2338,8 +2338,10 @@ class ModelCallRunner:
             requester = accepted_requester()
             if known is None and requester is not None:
                 known = replace(_termination_for(exc), requested_by=requester)
+            selected = known or _termination_for(exc)
             if (
                 natural_read_end is not None
+                and selected.ended_by in {"stop_request", "deadline", "drain_timeout"}
                 and isinstance(exc, (RunCancelled, RunTimeout, ModelCallAborted, asyncio.CancelledError))
                 and not (
                     isinstance(exc, RunCancelled)
@@ -2347,10 +2349,10 @@ class ModelCallRunner:
                 )
             ):
                 # Caller cancellation may already carry frozen outcome/requester facts. Retain
-                # those while preserving EOF through the later close boundary. Local assembly
-                # failures and authority loss keep their own attribution.
+                # those while correcting provisional stop facts. A drain can carry a classified
+                # provider/local failure on the same stop exception; preserve that read end.
                 mark_read_end(exc, natural_read_end)
-                known = replace(known or _termination_for(exc), ended_by=natural_read_end)
+                known = replace(selected, ended_by=natural_read_end)
             if known is not None:
                 mark_call_facts(exc, known, evidence)
             raise
