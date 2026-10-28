@@ -8,6 +8,7 @@ generic "provider call failed". It must never echo the body's prose (PII/prompt 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 import time
@@ -93,6 +94,142 @@ def test_openai_entry_guard_facts_preserve_failure_ownership(monkeypatch, stream
     assert receipt.attempts == 1
     assert receipt.usage == provider_usage_of(caught.value) == {}
     assert evidence.reported == {}
+
+
+@pytest.mark.parametrize("terminal", ["valid", "missing", "malformed"])
+@pytest.mark.parametrize("close_at", ["response", "client"])
+@pytest.mark.parametrize("boundary", ["caller_cancel", "user_cancel", "deadline", "drain_timeout", "active_drain"])
+def test_openai_raw_eof_survives_inner_close(monkeypatch, terminal, close_at, boundary) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.errors import RunCancelled, RunTimeout
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    async def run():
+        closing, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        token = CancellationToken()
+
+        async def blocked_close():
+            closing.set()
+            try:
+                await release.wait()
+            finally:
+                closed.set()
+
+        class Stream(_FakeAsyncStream):
+            reads = 0
+            eof = False
+
+            async def __anext__(self):
+                self.reads += 1
+                if self.reads == 2 and boundary == "active_drain":
+                    token.cancel()
+                try:
+                    return await super().__anext__()
+                except StopAsyncIteration:
+                    self.eof = True
+                    raise
+
+            async def close(self):
+                if close_at == "response":
+                    await blocked_close()
+
+        events = [SimpleNamespace(type="response.output_text.delta", delta="answer")]
+        if terminal != "missing":
+            events.append(SimpleNamespace(type="response.completed", response={
+                "id": 42 if terminal == "malformed" else "response", "output": [],
+                "usage": {"output_tokens": 3},
+            }))
+        stream = Stream(events, response=SimpleNamespace(request=_RequestWithRetryCount("2")))
+        _stub_async_openai(monkeypatch, stream, close=blocked_close if close_at == "client" else None)
+        captures, seen = [], []
+        draining = boundary in {"drain_timeout", "active_drain"}
+        runner = ModelCallRunner(
+            adapter=_adapter(), settled_sink=captures.append,
+            current_cancellation_token=lambda: token, cancel_grace_s=0.02,
+            abort_drain_s=0.05 if draining else 0,
+        )
+        task = asyncio.create_task(runner.acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()),
+            delta_consumer=seen.append, deadline=time.time() + 0.15 if boundary == "deadline" else None,
+        ))
+        error_type = (asyncio.CancelledError if boundary == "caller_cancel" else
+                      RunTimeout if boundary == "deadline" else RunCancelled)
+        try:
+            await asyncio.wait_for(closing.wait(), 2)
+            assert stream.eof
+            assert [type(chunk) for chunk in seen] == [TextDelta]
+            if boundary == "caller_cancel":
+                task.cancel()
+            elif boundary in {"user_cancel", "drain_timeout"}:
+                token.cancel()
+            with pytest.raises(error_type) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(closed.wait(), 2)
+        expected_end = ("provider_terminal" if terminal == "valid" else "provider_eof")
+        if terminal == "malformed":
+            expected_end = "deadline" if boundary == "deadline" else "drain_timeout" if draining else "stop_request"
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="timed_out" if boundary == "deadline" else "cancelled",
+            requested_by=None if boundary == "deadline" else "caller_cancel" if boundary == "caller_cancel" else "user_cancel",
+            ended_by=expected_end,
+        )
+        assert len(captures) == 1
+        receipt = captures[0].receipt
+        assert (receipt.termination, receipt.usage_evidence) == (facts, evidence)
+        assert receipt.usage == provider_usage_of(caught.value)
+        assert evidence.reported == ({} if terminal == "missing" else {"output_tokens": 3})
+        if terminal != "missing":
+            assert evidence.attempts[0].observation.collection == (
+                "drain" if boundary == "active_drain" else "normal"
+            )
+        assert receipt.provider_retried is True
+
+    asyncio.run(run())
+
+
+def test_openai_malformed_terminal_after_raw_eof_stays_local(monkeypatch) -> None:
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.model_call import ModelCallRunner
+
+    _stub_async_openai(monkeypatch, _FakeAsyncStream([SimpleNamespace(
+        type="response.completed", response={"id": 42, "usage": {"output_tokens": 3}},
+    )]))
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(ModelCallRunner(adapter=_adapter()).acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()), delta_consumer=lambda chunk: None,
+        ))
+    assert call_facts_of(caught.value)[0] == ModelCallTermination(
+        outcome="failed", ended_by="local_failure",
+    )
+
+
+def test_openai_eof_reports_are_dispatch_scoped_and_reject_closed_contexts(monkeypatch) -> None:
+    from contextvars import copy_context
+    from monoid_agent_kernel.core.model_facts import read_end_of
+    from monoid_agent_kernel.providers._usage import collect_usage_reports
+
+    stream = _FakeAsyncStream([_terminal_event()])
+    _stub_async_openai(monkeypatch, stream)
+    with collect_usage_reports() as original:
+        _drain(_adapter())
+        stale_context = copy_context()
+    assert read_end_of(original) == "provider_terminal"
+    with collect_usage_reports() as following:
+        assert read_end_of(following) is None
+        stream._events = []
+        with pytest.raises(ModelAdapterError):
+            stale_context.run(_drain, _adapter())
+        assert read_end_of(original) == "provider_terminal"
+        assert read_end_of(following) is None
 
 
 @pytest.mark.parametrize("raw", [None, {}, {"input_tokens": 0}, {"output_tokens_details": {"reasoning_tokens": 0}}])
@@ -594,7 +731,9 @@ class _FakeAsyncStream:
             raise StopAsyncIteration from None
 
 
-def _stub_async_openai(monkeypatch: pytest.MonkeyPatch, stream: _FakeAsyncStream) -> None:
+def _stub_async_openai(
+    monkeypatch: pytest.MonkeyPatch, stream: _FakeAsyncStream, *, close: Any = None,
+) -> None:
     pytest.importorskip("openai")
 
     class _Responses:
@@ -605,7 +744,8 @@ def _stub_async_openai(monkeypatch: pytest.MonkeyPatch, stream: _FakeAsyncStream
         responses = _Responses()
 
         async def close(self) -> None:
-            return None
+            if close is not None:
+                await close()
 
     monkeypatch.setattr("openai.AsyncOpenAI", lambda **_kwargs: _Client())
 
