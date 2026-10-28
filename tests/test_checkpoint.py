@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -474,7 +475,7 @@ def test_checkpoint_writer_refuses_a_cyclic_container_at_its_boundary(tmp_path: 
         write_checkpoint(tmp_path, RunCheckpoint(run_id="run_1", messages=[cyclic]))
 
 
-def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: Path) -> None:
+def test_checkpoint_writer_preserves_nested_invocation_storage_identity(tmp_path: Path) -> None:
     invocation = DurableModelInvocation(
         run_id="run_1",
         logical_call_id="call_1",
@@ -495,9 +496,7 @@ def test_checkpoint_writer_canonicalizes_nested_invocation_namespace(tmp_path: P
     )
     payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
 
-    assert payload["last_model_invocation"]["schema_version"] == (
-        "monoid.model-invocation.v1"
-    )
+    assert payload["last_model_invocation"] == invocation_payload
 
 
 @pytest.mark.parametrize(
@@ -1338,8 +1337,105 @@ def test_restore_carries_remaining_deadline(tmp_path: Path) -> None:
     res = loop._session.res  # type: ignore[union-attr]
     # Downtime does not count against max_duration_s: the resumed deadline is ~now+remaining,
     # so the run is not immediately limited even though it was parked for a long time.
-    assert 290.0 < (res.deadline - time.time()) < 300.5
+    assert 290.0 < (res.deadline - time.monotonic()) < 300.5
     loop.close()
+
+
+@pytest.mark.parametrize(("shift", "report_delay", "expected"), [
+    (0.0, 0.05, True), (3600.0, 0.05, True),
+    (0.0, 0.4, False), (-3600.0, 0.4, False),
+])
+def test_pending_task_wait_keeps_its_budget_after_wall_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shift: float,
+    report_delay: float, expected: bool,
+) -> None:
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+    spec = AgentRunSpec(workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs")
+    loop, task_id, _, _ = _hitl_parked_loop(spec)
+    manager = loop._session.res.context._job_manager
+    original_wait = manager.wait_for_reentry
+    first_wait = True
+    report_errors = []
+
+    def report():
+        try:
+            loop.report_task_result(task_id, {"answer": "reported"})
+        except BaseException as exc:
+            report_errors.append(exc)
+
+    reporter = threading.Timer(report_delay, report)
+    watchdog = threading.Timer(3, lambda: offset.__setitem__(0, 0.0))
+
+    def wait(timeout_s):
+        nonlocal first_wait
+        if first_wait:
+            first_wait = False
+            offset[0] = shift
+            reporter.start()
+            return False  # A spurious notification forces the next budget check.
+        return original_wait(timeout_s)
+
+    monkeypatch.setattr(manager, "wait_for_reentry", wait)
+    watchdog.start()
+    try:
+        ready = loop.wait_for_pending_tasks(0.2)
+    finally:
+        reporter.cancel()
+        if reporter.ident is not None:
+            reporter.join(3)
+        watchdog.cancel()
+        watchdog.join(3)
+        loop.discard_uncommitted()
+    assert not reporter.is_alive()
+    assert report_errors == []
+    assert ready is expected
+
+
+@pytest.mark.parametrize("remaining", [None, 0.0, 300.0])
+@pytest.mark.parametrize("shift", [3600.0, -3600.0])
+def test_restored_remaining_and_bounded_elapsed_ignore_later_wall_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remaining: float | None, shift: float,
+) -> None:
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+    maximum = None if remaining is None else 1000
+    spec = AgentRunSpec(
+        workspace_root=_mk(tmp_path / "ws"), run_root=tmp_path / "runs",
+        limits=RunLimits(max_duration_s=maximum),
+    )
+    loop = AgentLoop(
+        spec=spec, model_adapter=FakeModelAdapter(turns=[ModelTurn(final_text="answer")]),
+        runtime_config_provider=runtime_provider(runtime_config("fs.write")),
+    )
+    checkpoint = RunCheckpoint(
+        run_id=spec.run_id, status="completed", remaining_duration_s=remaining,
+    )
+    # A historical JSON record carries durations; its process clock is unavailable here.
+    checkpoint = RunCheckpoint.from_json(checkpoint.to_json())
+    before = time.monotonic()
+    loop.restore(checkpoint)
+    try:
+        offset[0] = shift
+        observed = loop.snapshot()
+        sampled = time.monotonic()
+        assert observed is not None
+        if remaining is None:
+            assert observed.remaining_duration_s is None
+        else:
+            # Bracket with the actual test duration instead of a sleep tolerance.
+            assert max(0, remaining - (sampled - before)) <= observed.remaining_duration_s
+            assert observed.remaining_duration_s <= remaining
+        result = loop.close()
+        after = time.monotonic()
+    finally:
+        if loop._session is not None:
+            loop.discard_uncommitted()
+    elapsed_before_restore = 0 if remaining is None else maximum - remaining
+    assert elapsed_before_restore <= result.metrics["duration_s"]
+    assert result.metrics["duration_s"] <= elapsed_before_restore + (after - before)
 
 
 def test_restore_reads_pre_v020_runtime_config_scope_from_checkpoint(tmp_path: Path) -> None:

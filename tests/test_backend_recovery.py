@@ -34,6 +34,8 @@ from support.backend_harness import (
 )
 import dataclasses
 
+from support.backend_factory import current_backend_factory
+
 from monoid_agent_kernel.errors import NativeAgentError
 from monoid_agent_kernel.reference.backend.recovery import ResumeOutcome
 from monoid_agent_kernel.reference.backend.service import _read_run_meta
@@ -446,8 +448,8 @@ def test_recover_runs_skips_terminal_and_metaless_checkpoints(tmp_path: Path) ->
 
 
 def _closed_limited_run(run_root: Path, workspace: Path, adapters: list) -> tuple:
-    """Drive one real backend run to a closed LIMITED terminal (max_steps=1), then stop the
-    backend — the run dir this leaves behind is the exact shape finding 1 resurrects: a
+    """Drive one real backend run to a closed LIMITED terminal (max_steps=1), then wait for
+    its final publication — the run dir is the exact shape finding 1 resurrects: a
     non-terminal park checkpoint, no failure.json, and a terminal status artifact."""
     backend = _recoverable_backend(
         run_root,
@@ -475,14 +477,15 @@ def _closed_limited_run(run_root: Path, workspace: Path, adapters: list) -> tupl
     )
     run_id = submission.run_id
     assert backend.wait_for_run(run_id, timeout_s=20) is SessionState.LIMITED
-    # ``wait_for_run`` answers off the record, which the drive marks LIMITED at the park
-    # promotion — BEFORE ``aclose()`` appends ``run.finished`` to events.jsonl. Reading the
-    # event log immediately after it lost that race once on a coverage-slowed CI box, so wait
-    # for the close's durable statement too before handing the dir to the caller.
-    deadline = time.monotonic() + 20
-    while _finished_count(run_root, run_id) < 1:
-        assert time.monotonic() < deadline, "run.finished never reached events.jsonl"
-        time.sleep(0.05)
+    # The terminal record and run.finished append precede the final status write.
+    # Wait for the existing tracked run future before callers rewrite that artifact.
+    factory = current_backend_factory()
+    assert factory is not None
+    futures = factory._futures.get(id(backend), [])
+    assert futures, "the closed-run fixture must own a tracked backend run"
+    for future in tuple(futures):
+        future.result(timeout=20)
+    assert _finished_count(run_root, run_id) == 1
     stored = backend.checkpoint_store.latest(run_id)
     assert stored is not None and stored.checkpoint.terminal is False  # the resurrection bait
     assert not (run_root / run_id / "failure.json").exists()

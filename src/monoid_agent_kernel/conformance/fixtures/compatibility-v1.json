@@ -248,8 +248,16 @@
               {
                 "observation_id": "event_sequence_contiguous",
                 "passed": true,
-                "expected": [1, 2, 3],
-                "actual": [1, 2, 3],
+                "expected": [
+                  1,
+                  2,
+                  3
+                ],
+                "actual": [
+                  1,
+                  2,
+                  3
+                ],
                 "detail": ""
               }
             ]
@@ -455,6 +463,154 @@
         "rollover_count": 0,
         "duplicate_signal_count": 0,
         "last_error_code": ""
+      }
+    },
+    {
+      "fixture_id": "model-invocation-v022-historical-v1",
+      "artifact": "model-invocation",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "native-agent-runner.model-invocation.v1",
+        "run_id": "fixture_run",
+        "logical_call_id": "fixture_call",
+        "revision": 3,
+        "dispatch_id": "fixture_dispatch",
+        "dispatch_attempt": 1,
+        "idempotency_key": "fixture_key",
+        "dispatch_state": "settled",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "native-agent-runner.model-request-digest.v1",
+        "requires_evidence": true,
+        "receipt": {
+          "attempts": 1,
+          "usage": {
+            "input_tokens": 0
+          }
+        },
+        "failure_code": "provider_refused"
+      }
+    },
+    {
+      "fixture_id": "model-invocation-v025-facts-v2",
+      "artifact": "model-invocation",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.model-invocation.v2",
+        "run_id": "fixture_run",
+        "logical_call_id": "fixture_call",
+        "revision": 3,
+        "dispatch_id": "fixture_dispatch",
+        "dispatch_attempt": 1,
+        "idempotency_key": "fixture_key",
+        "dispatch_state": "settled",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "digest_generation": "monoid.model-request-digest.v1",
+        "receipt": {
+          "attempts": 1,
+          "usage": {
+            "input_tokens": 0
+          },
+          "termination": {
+            "outcome": "failed",
+            "requested_by": null,
+            "ended_by": "provider_error"
+          },
+          "usage_evidence": {
+            "reported": {
+              "input_tokens": 0
+            },
+            "completeness": {
+              "audio_input_tokens": "unknown",
+              "audio_output_tokens": "unknown",
+              "audio_tokens": "unknown",
+              "cached_input_tokens": "unknown",
+              "cache_creation_tokens": "unknown",
+              "cache_read_tokens": "unknown",
+              "cache_write_tokens": "unknown",
+              "input_tokens": "complete",
+              "output_tokens": "unknown",
+              "reasoning_tokens": "unknown",
+              "total_tokens": "unknown"
+            },
+            "attempts": [
+              {
+                "index": 1,
+                "reported": {
+                  "input_tokens": 0
+                },
+                "source": "provider",
+                "collection": "normal"
+              }
+            ]
+          }
+        },
+        "failure_code": "provider_refused",
+        "evidence_policy": "required",
+        "result_ref": ""
+      }
+    },
+    {
+      "fixture_id": "checkpoint-v025-facts-v1",
+      "artifact": "checkpoint",
+      "expected_status": "loaded",
+      "payload": {
+        "schema_version": "monoid.checkpoint.v1",
+        "run_id": "fixture_run",
+        "seq": 1,
+        "last_model_invocation": {
+          "schema_version": "monoid.model-invocation.v2",
+          "run_id": "fixture_run",
+          "logical_call_id": "fixture_call",
+          "revision": 3,
+          "dispatch_id": "fixture_dispatch",
+          "dispatch_attempt": 1,
+          "idempotency_key": "fixture_key",
+          "dispatch_state": "settled",
+          "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "digest_generation": "monoid.model-request-digest.v1",
+          "receipt": {
+            "attempts": 1,
+            "usage": {
+              "input_tokens": 0
+            },
+            "termination": {
+              "outcome": "failed",
+              "requested_by": null,
+              "ended_by": "provider_error"
+            },
+            "usage_evidence": {
+              "reported": {
+                "input_tokens": 0
+              },
+              "completeness": {
+                "audio_input_tokens": "unknown",
+                "audio_output_tokens": "unknown",
+                "audio_tokens": "unknown",
+                "cached_input_tokens": "unknown",
+                "cache_creation_tokens": "unknown",
+                "cache_read_tokens": "unknown",
+                "cache_write_tokens": "unknown",
+                "input_tokens": "complete",
+                "output_tokens": "unknown",
+                "reasoning_tokens": "unknown",
+                "total_tokens": "unknown"
+              },
+              "attempts": [
+                {
+                  "index": 1,
+                  "reported": {
+                    "input_tokens": 0
+                  },
+                  "source": "provider",
+                  "collection": "normal"
+                }
+              ]
+            }
+          },
+          "failure_code": "provider_refused",
+          "evidence_policy": "required",
+          "result_ref": ""
+        }
       }
     }
   ]

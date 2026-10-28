@@ -22,6 +22,12 @@ as an agent-facing tool.
 
 ## ToolBinding
 
+Host resources are supplied separately through `AgentLoop.host_tool_bindings`; they add no
+model-visible tools or schema fields. The optional `require_host_tool_binding(ctx, key)` helper
+uses the actual admitted invocation. Its workspace view checks both `scope` and `surface_scope`
+for computed paths on every operation. The existing approval and capability gates still decide
+whether the handler runs. See the [host resource recipe](EMBEDDING.md#inject-host-resources-into-tools-v025).
+
 ```json
 {
   "binding_id": "read_notes",

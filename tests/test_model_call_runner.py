@@ -19,6 +19,7 @@ from monoid_agent_kernel.core._sync_bridge import CalleeCancelled
 from monoid_agent_kernel.core.authority import ActivationWriteAuthority, WriteAuthorityRevoked
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.invocation import InvocationContext
+from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageObservation, call_facts_of
 from monoid_agent_kernel.core.model_io import (
     CapturePolicy,
     ModelCallCapture,
@@ -77,6 +78,693 @@ from monoid_agent_kernel.providers.gateway import GatewayModelAdapter
 from monoid_agent_kernel.tools.base import ToolSpec
 
 REQUEST = ModelRequest(instruction="hi", system_prompt="sys", tools=())
+
+
+class _EofClosingStream:
+    """An iterator that exposes EOF before entering a separately gated close."""
+
+    def __init__(self, *chunks: Any) -> None:
+        self._chunks = iter(chunks)
+        self.reads = 0
+        self.eof = False
+        self.before_second_read = lambda: None
+        self.closing = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    def astream_turn(self, request: ModelRequest) -> _EofClosingStream:
+        return self
+
+    def __aiter__(self) -> _EofClosingStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        self.reads += 1
+        if self.reads == 2:
+            self.before_second_read()
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self.eof = True
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closing.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.closed.set()
+
+
+@pytest.mark.parametrize("phase", ["ordinary", "drain_enabled", "turn_interrupt", "user_cancel"])
+@pytest.mark.parametrize("terminal", [False, True], ids=["eof_only", "terminal_eof"])
+@pytest.mark.parametrize("boundary", ["caller_cancel", "user_cancel", "deadline"])
+def test_natural_read_end_survives_a_later_close_boundary(phase, terminal, boundary) -> None:
+    async def run() -> None:
+        token = CancellationToken()
+        chunks = [TextDelta("answer")]
+        if terminal:
+            chunks.append(TurnComplete(usage={"output_tokens": 3}, usage_evidence=UsageObservation(
+                reported={"output_tokens": 3}, source="adapter", collection="normal",
+            )))
+        stream = _EofClosingStream(*chunks)
+        if phase == "user_cancel":
+            stream.before_second_read = token.cancel
+        seen, captures = [], []
+        runner = ModelCallRunner(
+            adapter=stream, settled_sink=captures.append,
+            current_cancellation_token=lambda: token,
+            abort_drain_s=0 if phase == "ordinary" else 0.2, cancel_grace_s=1,
+        )
+        task = asyncio.create_task(runner.acall(
+            REQUEST, delta_consumer=seen.append,
+            should_abort=(lambda: True) if phase == "turn_interrupt" else None,
+            deadline=time.time() + 0.1 if boundary == "deadline" else None,
+        ))
+        active_drain = phase in {"turn_interrupt", "user_cancel"}
+        error_type = (
+            asyncio.CancelledError if boundary == "caller_cancel" else
+            ModelCallAborted if phase == "turn_interrupt" else
+            RunCancelled if phase == "user_cancel" or boundary == "user_cancel" else RunTimeout
+        )
+        try:
+            await asyncio.wait_for(stream.closing.wait(), 2)
+            assert stream.eof
+            if boundary == "caller_cancel":
+                task.cancel()
+            elif boundary == "user_cancel":
+                token.cancel()
+            with pytest.raises(error_type) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            stream.release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(stream.closed.wait(), 2)
+
+        assert len(captures) == 1
+        receipt = captures[0].receipt
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome=(
+                "cancelled" if boundary == "caller_cancel" or error_type is RunCancelled else
+                "interrupted" if error_type is ModelCallAborted else "timed_out"
+            ),
+            requested_by=phase if active_drain else None if boundary == "deadline" else boundary,
+            ended_by="provider_terminal" if terminal else "provider_eof",
+        )
+        assert receipt.termination == facts
+        assert receipt.usage_evidence == evidence
+        assert receipt.attempts == 1
+        assert provider_usage_of(caught.value) == receipt.usage
+        assert evidence.reported == ({"output_tokens": 3} if terminal else {})
+        if terminal:
+            assert receipt.usage["output_tokens"] == 3
+            assert evidence.attempts[0].observation.collection == (
+                "drain" if active_drain else "normal"
+            )
+        assert len(seen) == (1 if active_drain or not terminal else 2)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("drain_s", [0, 0.2])
+@pytest.mark.parametrize("arguments", ["[", "[]"])
+def test_post_eof_tool_argument_validation_remains_a_local_failure(drain_s, arguments) -> None:
+    stream = _EofClosingStream(ToolCallDelta(
+        index=0, id="call", name="read", arguments_fragment=arguments,
+    ))
+    stream.release.set()
+    captures = []
+    runner = ModelCallRunner(adapter=stream, abort_drain_s=drain_s, settled_sink=captures.append)
+    with pytest.raises(ModelAdapterError) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+    assert stream.eof and stream.closed.is_set()
+    assert caught.value.provider_error_code == "stream_bad_tool_args"
+    assert captures[0].receipt.termination == ModelCallTermination(
+        outcome="failed", ended_by="local_failure",
+    )
+    assert call_facts_of(caught.value)[0] == captures[0].receipt.termination
+
+
+@pytest.mark.parametrize("drain_s", [0, 0.2])
+def test_lease_loss_after_eof_during_close_keeps_authority_precedence(drain_s) -> None:
+    async def run() -> None:
+        stream = _EofClosingStream(TextDelta("answer"), TurnComplete())
+        token, authority = CancellationToken(), ActivationWriteAuthority()
+        captures = []
+        runner = ModelCallRunner(
+            adapter=stream, abort_drain_s=drain_s, settled_sink=captures.append,
+            current_cancellation_token=lambda: token, current_write_authority=lambda: authority,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+        try:
+            await asyncio.wait_for(stream.closing.wait(), 2)
+            assert stream.eof
+            authority.revoke()
+            token.cancel()
+            with pytest.raises(WriteAuthorityRevoked) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            stream.release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(stream.closed.wait(), 2)
+        assert caught.value.interruption_cause is InterruptionCause.LEASE_LOST
+        assert call_facts_of(caught.value) == (None, None)
+        assert captures == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reported_zero", [False, True])
+def test_p1p2_retry_coverage_counts_dispatches_and_keeps_known_totals(reported_zero: bool) -> None:
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    class Adapter:
+        calls = 0
+
+        def next_turn(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                error = ModelAdapterError("retry", retryable=True)
+                mark_provider_usage(error, {"input_tokens": 5})
+                mark_usage_observation(error, UsageObservation(
+                    reported={"input_tokens": 5}, source="adapter", collection="normal",
+                ))
+                raise error
+            return ModelTurn(final_text="ok", usage={"input_tokens": 0}, usage_evidence=(
+                UsageObservation(reported={"input_tokens": 0}, source="adapter", collection="normal")
+                if reported_zero else None
+            ))
+
+    turn, receipt = asyncio.run(ModelCallRunner(adapter=Adapter()).acall(
+        replace(REQUEST, model=_kernel_model()),
+    ))
+    assert turn.usage["input_tokens"] == 0
+    assert receipt.usage["input_tokens"] == 5
+    assert receipt.usage_evidence.reported == {"input_tokens": 5}
+    assert receipt.usage_evidence.completeness["input_tokens"] == (
+        "complete" if reported_zero else "partial"
+    )
+    assert receipt.usage_evidence.completeness["output_tokens"] == "unknown"
+    assert len(receipt.attempt_log) == len(receipt.usage_evidence.attempts) == 2
+
+
+@pytest.mark.parametrize("boundary", ["user_cancel", "deadline_token", "elapsed"])
+def test_p1p2_refused_before_dispatch_has_no_observed_usage(boundary: str) -> None:
+    token = CancellationToken()
+    deadline = None
+    if boundary == "elapsed":
+        deadline = time.time() - 1
+    else:
+        token.cancel(InterruptionCause.DEADLINE if boundary == "deadline_token" else InterruptionCause.USER_CANCEL)
+    outcome = _drain_call(_DrainStream(TurnComplete()), token=token, deadline=deadline)
+    assert outcome.receipt.attempts == 0
+    assert set(outcome.receipt.usage_evidence.completeness.values()) == {"no_dispatch"}
+    assert outcome.receipt.termination.requested_by == (
+        None if boundary == "elapsed" else "deadline" if boundary == "deadline_token" else "user_cancel"
+    )
+
+
+@pytest.mark.parametrize("deadline_wins", [False, True])
+def test_p1p2_drain_window_and_deadline_keep_distinct_read_ends(deadline_wins: bool) -> None:
+    outcome = _drain_call(
+        _DrainStream(TextDelta("x"), _STALL), should_abort=_Polls(1),
+        drain_s=0.2 if deadline_wins else 0.03,
+        deadline=time.time() + 0.03 if deadline_wins else None,
+        grace_s=0.02,
+    )
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
+    assert outcome.receipt.termination.ended_by == ("deadline" if deadline_wins else "drain_timeout")
+
+
+@pytest.mark.parametrize("unreported", [{}, {"output_tokens": 0}])
+def test_p1p2_legacy_drain_snapshot_survives_a_later_unreported_terminal(unreported) -> None:
+    outcome = _drain_call(_DrainStream(
+        TurnComplete(usage={"output_tokens": 3}),
+        TurnComplete(usage={"output_tokens": 9}),
+        TurnComplete(usage={"output_tokens": 5}),
+        TurnComplete(usage=unreported),
+    ), should_abort=_Polls(1))
+
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert provider_usage_of(outcome.error)["output_tokens"] == 5
+    assert outcome.receipt.usage["output_tokens"] == 5
+    assert outcome.receipt.attempt_log[0].usage["output_tokens"] == 5
+    assert outcome.receipt.usage_evidence.reported == {}
+    assert outcome.receipt.usage_evidence.completeness["output_tokens"] == "unknown"
+    assert outcome.receipt.usage_evidence.attempts[0].observation.source == "legacy_ambiguous"
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
+    assert outcome.receipt.termination.ended_by == "provider_terminal"
+    assert len(outcome.seen) == 1
+
+
+def test_p1p2_explicit_zero_received_during_drain_replaces_prior_report() -> None:
+    def terminal(count):
+        return TurnComplete(usage={"output_tokens": count}, usage_evidence=UsageObservation(
+            reported={"output_tokens": count}, source="adapter", collection="normal",
+        ))
+
+    outcome = _drain_call(_DrainStream(terminal(5), terminal(0), TurnComplete()), should_abort=_Polls(1))
+    assert outcome.receipt.usage["output_tokens"] == 0
+    entry = outcome.receipt.usage_evidence.attempts[0]
+    assert entry.observation.reported == {"output_tokens": 0}
+    assert entry.observation.collection == "drain"
+    assert call_facts_of(outcome.error) == (outcome.receipt.termination, outcome.receipt.usage_evidence)
+
+
+def test_p1p2_requester_capture_reuses_the_stream_owners_token() -> None:
+    token = CancellationToken()
+    accepted = False
+    captures, seen = [], []
+
+    def current_token():
+        if accepted:
+            raise RuntimeError("host token accessor changed after stop acceptance")
+        return token
+
+    def should_abort():
+        nonlocal accepted
+        accepted = True
+        return True
+
+    runner = ModelCallRunner(
+        adapter=_DrainStream(TextDelta("visible"), TurnComplete(usage={"output_tokens": 5})),
+        current_cancellation_token=current_token, abort_drain_s=1, settled_sink=captures.append,
+    )
+    with pytest.raises(ModelCallAborted) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=seen.append, should_abort=should_abort))
+
+    assert captures[0].receipt.termination == ModelCallTermination(
+        outcome="interrupted", requested_by="turn_interrupt", ended_by="provider_terminal",
+    )
+    assert captures[0].receipt.usage["output_tokens"] == 5
+    assert provider_usage_of(caught.value)["output_tokens"] == 5
+    assert [chunk.text for chunk in seen] == ["visible"]
+
+
+@pytest.mark.parametrize(("replace_token", "stale_wake"), [(False, False), (True, False), (True, True)])
+def test_p1p2_a_live_boundary_request_precedes_caller_cancellation(replace_token, stale_wake) -> None:
+    captures = []
+
+    async def run():
+        current = [CancellationToken()]
+        original = current[0]
+        cause = InterruptionCause.HOST_SHUTDOWN if stale_wake else InterruptionCause.USER_CANCEL
+        entered, accepted, cleanup, release, stopped = (asyncio.Event() for _ in range(5))
+
+        class Adapter:
+            async def anext_turn(self, request):
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup.set()
+                    try:
+                        await release.wait()
+                    finally:
+                        stopped.set()
+
+        class Runner(ModelCallRunner):
+            def _check_cancel_or_deadline(self, deadline):
+                try:
+                    super()._check_cancel_or_deadline(deadline)
+                except RunCancelled as exc:
+                    assert exc.interruption_cause is cause
+                    accepted.set()
+                    raise
+
+        runner = Runner(
+            adapter=Adapter(), current_cancellation_token=lambda: current[0],
+            cancel_grace_s=0.5, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, deadline=time.time() + 0.08))
+        await asyncio.wait_for(entered.wait(), 1)
+        if replace_token:
+            current[0] = CancellationToken()
+        current[0].cancel(cause)
+        if stale_wake:
+            original.cancel(InterruptionCause.USER_CANCEL)
+        await asyncio.wait_for(accepted.wait(), 1)
+        await asyncio.wait_for(cleanup.wait(), 1)
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            release.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        facts, _evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", requested_by=cause.value, ended_by="stop_request",
+        )
+        assert captures[0].receipt.termination == facts
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("chunk", [TextDelta(42), ReasoningDelta(42), ToolCallDelta(index=-1)])
+def test_p1p2_malformed_fragments_end_at_local_validation(chunk):
+    outcome = _drain_call(_DrainStream(chunk), drain_s=0)
+    assert isinstance(outcome.error, ModelAdapterError)
+    assert outcome.receipt.termination.ended_by == "local_failure"
+
+
+@pytest.mark.parametrize("callback", ["delta_consumer", "should_abort"])
+def test_p1p2_stream_callback_failure_is_local(callback):
+    failure = RuntimeError("local callback failed")
+
+    def refuse(*args):
+        raise failure
+
+    async def run():
+        return await ModelCallRunner(adapter=_DrainStream(TextDelta("a"))).acall(
+            REQUEST, **{"delta_consumer": lambda chunk: None, callback: refuse},
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(run())
+    assert caught.value is failure
+    assert call_facts_of(failure)[0].ended_by == "local_failure"
+
+
+@pytest.mark.parametrize(("first", "during_cleanup"), [
+    ("turn_interrupt", False), ("user_cancel", False), (None, False), ("late_user_cancel", False),
+    ("turn_interrupt", True), ("user_cancel", True), ("repeated_caller", False),
+])
+def test_p1p2_caller_cancellation_preserves_request_order_before_cleanup(first, during_cleanup) -> None:
+    captures = []
+    seen = []
+    token = CancellationToken()
+
+    async def run():
+        before_second, release, drained, stopped = (asyncio.Event() for _ in range(4))
+        cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
+
+        class Adapter:
+            async def astream_turn(self, request):
+                try:
+                    yield TextDelta("visible")
+                    before_second.set()
+                    await release.wait()
+                    yield TurnComplete(usage={"output_tokens": 5}, usage_evidence=UsageObservation(
+                        reported={"output_tokens": 5}, source="adapter", collection="normal",
+                    ))
+                    drained.set()
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if first in {"late_user_cancel", "repeated_caller"}:
+                        token.cancel(InterruptionCause.USER_CANCEL)
+                        await asyncio.sleep(0)
+                    if during_cleanup or first == "repeated_caller":
+                        cleanup_started.set()
+                        await cleanup_release.wait()
+                    raise
+                finally:
+                    stopped.set()
+
+        runner = ModelCallRunner(
+            adapter=Adapter(), abort_drain_s=0.03 if during_cleanup else 2.0,
+            cancel_grace_s=0.5 if during_cleanup or first == "repeated_caller" else 0.03,
+            current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(
+            REQUEST, delta_consumer=seen.append,
+            should_abort=(lambda: True) if first == "turn_interrupt" else None,
+        ))
+        await asyncio.wait_for(before_second.wait(), 1)
+        if first == "user_cancel":
+            token.cancel(InterruptionCause.USER_CANCEL)
+        release.set()
+        await asyncio.wait_for(drained.wait(), 1)
+        if during_cleanup:
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+        task.cancel()
+        if first == "repeated_caller":
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+            task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            cleanup_release.set()
+        await asyncio.wait_for(stopped.wait(), 1)
+        expected = first if first in {"turn_interrupt", "user_cancel"} else "caller_cancel"
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", requested_by=expected, ended_by="stop_request",
+        )
+        assert captures[0].receipt.termination == facts
+        assert captures[0].receipt.usage["output_tokens"] == 5
+        assert provider_usage_of(caught.value)["output_tokens"] == 5
+        assert evidence.attempts[0].observation.collection == (
+            "drain" if expected != "caller_cancel" else "normal"
+        )
+        assert len(seen) == (1 if expected != "caller_cancel" else 2)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("shape", "drain_s", "cause"), [
+    ("stream", 0, "turn_interrupt"), ("stream", 0, "user_cancel"), ("stream", 0, "predicate_user"),
+    ("stream", 1, "graceful_drain"), ("stream", 1, "host_shutdown"), ("stream", 1, "deadline"),
+    ("async", 0, "user_cancel"), ("async", 0, "deadline"), ("async", 0, "elapsed"),
+    ("sync", 0, "user_cancel"),
+])
+def test_p1p2_all_model_waits_preserve_an_accepted_request_before_caller_cancel(shape, drain_s, cause):
+    captures, seen = [], []
+    token = CancellationToken()
+
+    async def run():
+        entered, cleanup, release, stopped = (asyncio.Event() for _ in range(4))
+        worker_release, worker_stopped = threading.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+
+        async def finish():
+            cleanup.set()
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+
+        class Stream:
+            async def astream_turn(self, request):
+                try:
+                    entered.set()
+                    yield TurnComplete(usage={"output_tokens": 5})
+                    await asyncio.Event().wait()
+                finally:
+                    await finish()
+
+        class Async:
+            async def anext_turn(self, request):
+                try:
+                    entered.set()
+                    await asyncio.Event().wait()
+                finally:
+                    await finish()
+
+        class Sync:
+            def next_turn(self, request):
+                loop.call_soon_threadsafe(entered.set)
+                try:
+                    assert worker_release.wait(2)
+                    return ModelTurn(final_text="discarded")
+                finally:
+                    worker_stopped.set()
+
+        runner = ModelCallRunner(
+            adapter={"stream": Stream, "async": Async, "sync": Sync}[shape](),
+            abort_drain_s=drain_s, cancel_grace_s=0.5,
+            current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+
+        def stop():
+            if cause == "predicate_user":
+                token.cancel(InterruptionCause.USER_CANCEL)
+            return True
+
+        task = asyncio.create_task(runner.acall(
+            REQUEST, deadline=time.time() + 0.03 if cause == "elapsed" else None,
+            delta_consumer=seen.append if shape == "stream" else None,
+            should_abort=stop if cause in {"turn_interrupt", "predicate_user"} else None,
+        ))
+        await asyncio.wait_for(entered.wait(), 1)
+        if cause not in {"turn_interrupt", "predicate_user", "elapsed"}:
+            token.cancel(InterruptionCause(cause))
+        if shape != "sync":
+            await asyncio.wait_for(cleanup.wait(), 1)
+        task.cancel()
+        worker_release.set()
+        try:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+        finally:
+            release.set()
+        if shape == "sync":
+            assert await asyncio.to_thread(worker_stopped.wait, 1)
+        else:
+            await asyncio.wait_for(stopped.wait(), 1)
+        facts, _ = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="cancelled", ended_by="stop_request",
+            requested_by=("caller_cancel" if cause == "elapsed" else
+                          "user_cancel" if cause == "predicate_user" else cause),
+        )
+        assert captures[0].receipt.termination == facts
+        assert len(seen) == (1 if shape == "stream" else 0)
+
+    asyncio.run(run())
+
+
+def test_p1p2_accepted_interrupt_precedes_a_cancel_in_remainder_delivery():
+    token = CancellationToken()
+    captures, seen = [], []
+
+    def consume(chunk):
+        seen.append(chunk)
+        if isinstance(chunk, TextDelta) and chunk.text == "\ufffd":
+            token.cancel(InterruptionCause.USER_CANCEL)
+
+    runner = ModelCallRunner(
+        adapter=_DrainStream(TextDelta("x\ud83d"), TurnComplete(usage={"output_tokens": 5})),
+        abort_drain_s=1, current_cancellation_token=lambda: token, settled_sink=captures.append,
+    )
+    with pytest.raises(RunCancelled) as caught:
+        asyncio.run(runner.acall(REQUEST, delta_consumer=consume, should_abort=lambda: True))
+    assert caught.value.interruption_cause is InterruptionCause.USER_CANCEL
+    assert captures[0].receipt.termination.requested_by == "turn_interrupt"
+    assert call_facts_of(caught.value)[0].requested_by == "turn_interrupt"
+    assert captures[0].receipt.usage["output_tokens"] == 5
+    assert [chunk.text for chunk in seen] == ["x", "\ufffd"]
+
+
+def test_p1p2_backoff_preserves_token_request_before_caller_cancel():
+    token = CancellationToken()
+    captures = []
+
+    async def run():
+        backoff = asyncio.Event()
+
+        class Runner(ModelCallRunner):
+            async def _abackoff(self, delay_s, deadline):
+                backoff.set()
+                await super()._abackoff(delay_s, deadline)
+
+        class Adapter:
+            def next_turn(self, request):
+                raise ModelAdapterError("retry", retryable=True)
+
+        runner = Runner(
+            adapter=Adapter(), current_cancellation_token=lambda: token, settled_sink=captures.append,
+        )
+        task = asyncio.create_task(runner.acall(replace(REQUEST, model=ModelConfig(
+            retry=ModelRetryConfig(layer="kernel", max_attempts=2, initial_delay_s=2, jitter_s=0),
+        ))))
+        await asyncio.wait_for(backoff.wait(), 1)
+        token.cancel(InterruptionCause.USER_CANCEL)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert call_facts_of(caught.value)[0].requested_by == "user_cancel"
+        assert captures[0].receipt.attempts == 1
+        assert captures[0].receipt.termination.requested_by == "user_cancel"
+
+    asyncio.run(run())
+
+
+def test_p1p2_caller_cancellation_is_distinct_from_provider_self_cancel() -> None:
+    captures = []
+
+    async def run():
+        entered = asyncio.Event()
+        runner = ModelCallRunner(
+            adapter=_DrainStream(entered.set, _STALL), settled_sink=captures.append,
+            cancel_grace_s=0.02,
+        )
+        task = asyncio.create_task(runner.acall(REQUEST, delta_consumer=lambda chunk: None))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert call_facts_of(caught.value)[0].requested_by == "caller_cancel"
+
+    asyncio.run(run())
+    assert captures[-1].receipt.termination.outcome == "cancelled"
+    assert captures[-1].receipt.termination.ended_by == "stop_request"
+
+
+@pytest.mark.parametrize("last", [None, 0, 5])
+def test_p1p2_stream_selects_last_explicit_snapshot_without_zero_fill(last: int | None) -> None:
+    from monoid_agent_kernel.providers.openai import _terminal_chunk
+
+    first = _terminal_chunk({"usage": {"input_tokens": 5}}, provider_retried=False)
+    final = _terminal_chunk(
+        {"usage": {} if last is None else {"input_tokens": last}}, provider_retried=False
+    )
+    outcome = _drain_call(_DrainStream(TextDelta("answer"), first, final))
+    assert outcome.error is None
+    expected = 5 if last is None else last
+    assert outcome.receipt.usage["input_tokens"] == expected
+    assert outcome.receipt.usage_evidence.reported == {"input_tokens": expected}
+    assert outcome.receipt.usage_evidence.completeness["input_tokens"] == "complete"
+    assert outcome.receipt.termination.ended_by == "provider_terminal"
+
+
+@pytest.mark.parametrize(
+    ("tail", "ended_by"),
+    [((), "provider_eof"), ((TurnComplete(),), "provider_terminal"),
+     ((ModelAdapterError("read failed"),), "provider_error"),
+     ((asyncio.CancelledError(),), "provider_cancelled")],
+)
+def test_p1p2_drain_keeps_first_stop_and_actual_read_end(tail: tuple, ended_by: str) -> None:
+    outcome = _drain_call(_DrainStream(TextDelta("partial"), *tail), should_abort=_Polls(1))
+    assert isinstance(outcome.error, ModelCallAborted)
+    assert outcome.receipt.termination.to_json() == {
+        "outcome": "interrupted", "requested_by": "turn_interrupt", "ended_by": ended_by,
+    }
+    assert outcome.texts == ["partial"]
+    assert len(outcome.receipt.usage_evidence.attempts) == 1
+
+
+@pytest.mark.parametrize("hard_crash", [False, True])
+def test_p1p2_durable_retry_then_unknown_preserves_original_error_and_single_sum(hard_crash) -> None:
+    from monoid_agent_kernel.providers._usage import mark_usage_observation
+
+    class Adapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            self.calls += 1
+            error = (
+                ModelDispatchRefused("refused", retryable=True, http_status=429)
+                if self.calls == 1 else _HardLifecycleCrash() if hard_crash else ModelAdapterError("read failed")
+            )
+            mark_provider_usage(error, {"input_tokens": 5 if self.calls == 1 else 2})
+            mark_usage_observation(error, UsageObservation(
+                reported={"input_tokens": 5 if self.calls == 1 else 2},
+                source="adapter", collection="normal",
+            ))
+            raise error
+
+    captures = []
+    lifecycle = _JournalLifecycle(DeterministicFencedRunHarness())
+    with pytest.raises(_HardLifecycleCrash if hard_crash else DurableModelCallError) as caught:
+        asyncio.run(ModelCallRunner(
+            adapter=Adapter(), lifecycle_hook=lifecycle, settled_sink=captures.append,
+        ).acall(replace(REQUEST, model=_kernel_model()), logical_call_id="call-durable-1"))
+    if not hard_crash:
+        assert caught.value.error_code == "dispatch_unknown"
+    assert provider_usage_of(caught.value) == {"input_tokens": 7}
+    assert captures[-1].receipt.usage == {"input_tokens": 7}
+    assert len(captures[-1].receipt.usage_evidence.attempts) == 2
+    assert captures[-1].receipt.usage_evidence.reported == {"input_tokens": 7}
 
 
 def _raises(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -3558,7 +4246,7 @@ def test_a_call_refused_before_its_key_hands_the_sink_no_preimage() -> None:
         adapter=SyncAdapter(), settled_sink=recorded.append, capture_request_preimage=True
     )
     with pytest.raises(RunTimeout):
-        asyncio.run(runner.acall(REQUEST, deadline=time.monotonic() - 1.0))
+        asyncio.run(runner.acall(REQUEST, deadline=time.time() - 1.0))
 
     assert len(recorded) == 1
     assert recorded[0].request_preimage is None
@@ -4029,7 +4717,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
         stamps = any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "mark_provider_usage"
+            and node.func.id == "_stamp_refused_turn"
             for node in ast.walk(handler)
         )
         if leaves and not stamps:
@@ -4037,7 +4725,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
 
     assert unstamped == {}, {
         "arms_that_leave_without_carrying_the_bill": unstamped,
-        "hint": "mark_provider_usage(<escaping error>, _refused_turn_usage(turn))",
+        "hint": "_stamp_refused_turn(<escaping error>, turn)",
     }
 
     # Both arms exist, so deleting one cannot pass by deleting the shape above.
@@ -4046,7 +4734,7 @@ def test_every_arm_of_the_turn_normalizer_carries_what_the_turn_was_billed() -> 
         for node in ast.walk(normalizer)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "mark_provider_usage"
+        and node.func.id == "_stamp_refused_turn"
     ]
     assert len(stamp_sites) == 2, {"stamp_sites": stamp_sites}
 
@@ -6122,6 +6810,7 @@ def test_abort_drain_is_off_by_default_and_closes_at_the_abort_point() -> None:
 
         assert isinstance(outcome.error, ModelCallAborted), outcome.error
         assert len(stream.yielded) == 1, "a zero budget must not read past the stop"
+        assert outcome.receipt.termination.ended_by == "stop_request"
         assert stream.closed is True
         assert outcome.texts == ["a"]
         assert outcome.receipt.usage == {}
@@ -6245,6 +6934,7 @@ def test_a_run_boundary_during_drain_stops_it_immediately(cause: InterruptionCau
 
     assert type(outcome.error) is RunCancelled, outcome.error
     assert outcome.error.interruption_cause is cause
+    assert outcome.receipt.termination.requested_by == "turn_interrupt"
     assert outcome.elapsed < 3.0
     assert len(stream.yielded) == 1, "the drain read on after the boundary fired"
     assert stream.closed is True
@@ -6363,6 +7053,18 @@ def test_a_drained_read_raising_a_process_exit_escapes_unmapped(failure: BaseExc
 
     assert outcome.error is failure, outcome.error
     assert outcome.texts == ["a"]
+
+
+def test_base_exception_unwinding_the_runner_keeps_observed_usage():
+    failure = _HardLifecycleCrash()
+    stream = _DrainStream(TextDelta("a"), TurnComplete(
+        usage={"input_tokens": 0}, usage_evidence=UsageObservation(
+            reported={"input_tokens": 0}, source="adapter", collection="normal",
+        ),
+    ), failure)
+    outcome = _drain_call(stream, should_abort=_Polls(1), timeout_s=5.0)
+    assert outcome.error is failure
+    assert call_facts_of(failure)[1].reported == {"input_tokens": 0}
 
 @pytest.mark.parametrize("drain_s", [0.0, 5.0], ids=["drain_off", "drain_on"])
 def test_a_stream_finished_at_the_abort_point_bills_what_it_already_reported(
@@ -6519,6 +7221,11 @@ def test_durable_abort_drain_carries_usage_on_dispatch_unknown() -> None:
 
     assert caught.value.error_code == "dispatch_unknown"
     assert isinstance(caught.value.__cause__ or caught.value.__context__, ModelCallAborted)
+    termination, evidence = call_facts_of(caught.value)
+    assert termination == ModelCallTermination(
+        outcome="failed", requested_by="turn_interrupt", ended_by="provider_terminal",
+    )
+    assert len(evidence.attempts) == 1
     assert provider_usage_of(caught.value) == _BILL
     assert lifecycle.states == ["reserved", "dispatch_started", "unknown"]
     assert len(stream.yielded) == 3
@@ -6853,6 +7560,8 @@ def test_a_user_cancel_before_the_stream_is_entered_stays_an_ordinary_cancel(
     assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
     assert provider_usage_of(outcome.error) == {}
     assert outcome.receipt.usage == {}
+    assert outcome.receipt.attempts == 0
+    assert stream.yielded == []
 
 
 def test_the_drain_window_is_measured_from_the_stop_not_the_stream_opening() -> None:
@@ -6935,6 +7644,104 @@ def test_a_user_cancel_drain_that_ends_in_its_first_tick_still_settles_the_held_
     assert outcome.error.interruption_cause is InterruptionCause.USER_CANCEL
     assert outcome.texts == ["x", "\ufffd"]
     assert outcome.receipt.error_code == "cancelled"
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+@pytest.mark.parametrize("ending", ["stalls", "finished", "provider_cancel"])
+def test_lease_loss_before_drain_blocks_the_held_back_remainder(
+    drain_s: float, ending: str
+) -> None:
+    """A revoked activation cannot flush a suffix while a configured drain has not started."""
+
+    authority = ActivationWriteAuthority()
+    token = CancellationToken()
+
+    def revoke() -> None:
+        authority.revoke()
+        if ending == "stalls":
+            # A standalone, drain-off runner needs its host's stop signal to wake an idle read.
+            # Trigger that wake explicitly so the test watchdog is never its cancellation source.
+            token.cancel(InterruptionCause.HOST_SHUTDOWN)
+
+    steps = (TextDelta("x\ud83d"), revoke)
+    if ending == "stalls":
+        stream: Any = _DrainStream(*steps, _STALL)
+    elif ending == "finished":
+        stream = _NoCloseStream(*steps)
+    else:
+        stream = _NoCloseStream(*steps, asyncio.CancelledError())
+
+    outcome = _drain_call(
+        stream, drain_s=drain_s, authority=authority, token=token, timeout_s=5.0
+    )
+
+    assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.texts == ["x"], "a revoked activation received the held-back suffix"
+    assert outcome.settled == []
+    assert outcome.elapsed < 3.0, "the test watchdog supplied the stream's missing stop"
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+def test_lease_loss_before_drain_blocks_the_next_regular_delta(drain_s: float) -> None:
+    authority = ActivationWriteAuthority()
+    stream = _DrainStream(TextDelta("x"), authority.revoke, TextDelta("late"), _STALL)
+
+    outcome = _drain_call(stream, drain_s=drain_s, authority=authority, timeout_s=5.0)
+
+    assert isinstance(outcome.error, WriteAuthorityRevoked), outcome.error
+    assert outcome.error.interruption_cause is InterruptionCause.LEASE_LOST
+    assert outcome.texts == ["x"], "a revoked activation received a new provider delta"
+    assert outcome.settled == []
+    assert stream.closed
+    assert outcome.elapsed < 3.0, "the test watchdog supplied the stream's missing stop"
+
+
+@pytest.mark.parametrize("drain_s", [0.0, 5.0])
+@pytest.mark.parametrize("ending", ["terminal", "eof"])
+def test_consumer_revocation_blocks_the_rest_of_a_normalized_batch(
+    drain_s: float, ending: str
+) -> None:
+    """One terminal or EOF flush can publish several channels; each piece spends authority."""
+
+    authority = ActivationWriteAuthority()
+    pieces: list[Any] = [
+        TextDelta("x\ud83d"),
+        ReasoningDelta("r\ud83d"),
+        ToolCallDelta(index=0, arguments_fragment="\ud83d"),
+    ]
+    if ending == "terminal":
+        pieces.append(TurnComplete(usage=_BILL))
+    stream = _DrainStream(*pieces)
+    seen: list[Any] = []
+    settled: list[SettledModelCall] = []
+
+    def consume(chunk: Any) -> None:
+        seen.append(chunk)
+        if isinstance(chunk, TextDelta) and chunk.text == "\ufffd":
+            authority.revoke()
+
+    runner = ModelCallRunner(
+        adapter=stream,
+        abort_drain_s=drain_s,
+        current_write_authority=lambda: authority,
+        settled_sink=settled.append,
+    )
+
+    async def run() -> None:
+        with pytest.raises(WriteAuthorityRevoked):
+            await asyncio.wait_for(runner.acall(REQUEST, delta_consumer=consume), timeout=5.0)
+
+    asyncio.run(run())
+
+    assert seen == [
+        TextDelta("x"),
+        ReasoningDelta("r"),
+        ToolCallDelta(index=0, arguments_fragment=""),
+        TextDelta("\ufffd"),
+    ]
+    assert settled == []
+    assert stream.closed
 
 
 @pytest.mark.parametrize("ending", ["stalls", "finished", "provider_cancel"])

@@ -6,6 +6,29 @@ deployment models. Import Python contracts from `monoid_agent_kernel.contracts`.
 Treat `monoid_agent_kernel.reference.*` as runnable examples for backend, LLM
 gateway, and web gateway integration.
 
+## Find a contract
+
+For a worked integration, start with the [embedding handbook](EMBEDDING.md) or the
+[practical guides](README.md#integrate-product-capabilities). Use this index for exact behavior:
+
+| Subject | Contract |
+|---|---|
+| Public roles and stability | [Boundary](#boundary), [stability](#stability) |
+| Run construction and configuration | [AgentLoop](#agentloop), [AgentRunSpec](#agentrunspec), [runtime configuration](#agentdefinition-and-runtime-config) |
+| Workspace and tools | [Workspace](#workspace), [tool surface](#tool-surface), [tool contract](#tool-contract) |
+| Model calls, usage, Stop, and wait budgets | [Model adapter](#model-adapter) |
+| Observing calls and streamed content | [Model-I/O subscriptions](#agentloop-model-io-subscriptions), [model-stream observers](#agentloop-model-stream-observers) |
+| Delegation and skills | [Subagents](#subagents-agent-as-tool), [skills](#skills-progressive-disclosure) |
+| Session and authenticated control | [Session lifecycle](#session-lifecycle-agentsession--fsm), [control protocol](#control-protocol), [durable command inbox](#durable-command-inbox) |
+| Events and diagnostics | [Event reads](#event-reads), [diagnostics](#diagnostics) |
+| Gateways and backend HTTP | [HTTP contracts](#http-contracts), [backend](#reference-backend), [multi-turn tasks](#multi-turn-sessions-and-tasks) |
+| Durable storage and recovery | [Durable persistence](#durable-persistence), [invocation lifecycle](#durable-modelcallrunner-lifecycle), [fenced recovery](#agentloop-fenced-recovery) |
+| Interruption and evidence delivery | [Worker drain](#typed-interruption-and-worker-drain), [model evidence policy](#model-evidence-delivery-policy) |
+| Operational invariants and artifacts | [Operational rules](#operational-rules), [run artifacts](#run-artifacts) |
+
+The [compatibility ledger](COMPATIBILITY.md) supplies writer/reader versions and migration rules;
+[Observability](OBSERVABILITY.md) describes recorded outputs and projections.
+
 ## Boundary
 
 The package is organized around four public roles:
@@ -445,6 +468,58 @@ adapter still counts as 1: the kernel did begin the call there. Under the kernel
 layer each re-dispatch adds one, so N means N adapter calls for one logical request. A payload that omits the field reads
 as 1, which is what older records mean.
 
+`ModelCallReceipt.termination` separates the logical outcome, the first accepted stop request
+(`requested_by`), and the actual end of reading (`ended_by`). A cancelled call that drains to a
+valid terminal and EOF has `cancelled / user_cancel / provider_terminal`; a deadline ending that
+drain changes `ended_by` to `deadline`. A terminal received before a later read error remains
+`provider_error`. An elapsed deadline has no requester; an accepted deadline token names `deadline`.
+Provider self-cancellation is `provider_cancelled`; caller task cancellation names `caller_cancel`.
+Authority loss continues to block observer and durable publication by the stale owner.
+
+`UsageObservation` carries explicitly reported canonical counters, including zero, plus source
+and collection. An adapter can append it as `ModelTurn.usage_evidence` or
+`TurnComplete.usage_evidence`, with `source="adapter"`. First-party raw ingress records
+`source="provider"`. A custom adapter or old gateway without this metadata is `legacy_ambiguous`;
+its numeric usage continues to count. New observations must agree with the numeric projection.
+The built-in normalizer's supported input/output/total/cache/reasoning/audio fields retain their
+existing aliases; the larger durable counter vocabulary can remain unknown for a given adapter.
+
+`ModelCallReceipt.usage_evidence` covers every kernel dispatch, including recovered history.
+Its `reported` contains known sums; `completeness` is counter-specific: `no_dispatch`, `complete`,
+`partial`, or `unknown`. A repeated snapshot replaces the prior snapshot within one dispatch.
+An explicit zero can replace a positive count; a usage-less terminal preserves the last report.
+Only distinct dispatch contributions are added. SDK-internal HTTP retries are outside this
+coverage guarantee. The numeric `usage` remains the accounting input.
+
+OpenAI captures usage before response/client cleanup while preserving cleanup-before-terminal
+delivery. First-party streaming adapters retain observed iterator EOF before their inner cleanup;
+a validated terminal followed by EOF remains `provider_terminal` through later cancellation.
+A terminal received before EOF leaves reading in progress. Failures already classified during a
+drain retain their read-end attribution. The bounded dispatch collector carries
+already-received reports through cancellation and rejects reports after dispatch settlement.
+Collection records the original receipt phase (`normal` or `drain`), including a terminal
+delivered later. Escaping runner exceptions carry `model_call_termination` and
+`model_usage_evidence`; existing numeric `provider_usage` stamps continue to serve accounting.
+`ValidatedCallRunner.receipts` contains completed calls; the failed call keeps its own exception facts.
+
+Recovery verification failures report a current `failed` / `local_failure` outcome while keeping
+checked historical attempts, numeric usage and usage evidence. The immutable stored settlement
+retains its original termination and hash. A required-evidence projection failure retains the
+checked provider outcome; when no private turn has been loaded, the stream observer leaves final
+text and successful final-turn usage unavailable. Refusal replay preserves its facts alongside
+the existing accounting delta, which can be empty after the original usage was applied.
+Required-evidence recovery can precede request identity validation. If a failed projection belongs
+to a different stored request digest, checked historical usage and facts remain on the exception
+and journal for accounting. The journal has no historical model configuration, so the runner
+withholds reconstructed subscription and ledger receipts. The current stream observer closes as
+`failed` / `evidence_uncommitted` with final text, usage, termination and usage evidence unavailable.
+This keeps historical usage separate from the replacement request's model and routing metadata.
+
+See the offline [subscription example](../examples/model_call_facts.py) and
+[JSON recovery example](../examples/recover_model_call_facts.py). Fresh invocation revisions and
+model-call ledger entries use v2 and preserve these facts. Existing v1 history stays readable with
+unavailable observations. P1P2-04 completes gateway-server, live/Studio and OTel projections.
+
 `ModelCallReceipt.attempt_log` itemizes what `attempts` counts: per dispatch, the index, the
 elapsed time, the failure taxonomy `with_error` reads, that attempt's own billed usage, whether
 the adapter's loop reported *during that dispatch* (the receipt's `provider_retried` stays the
@@ -806,7 +881,9 @@ recovery correctness.
 `AgentLoop.stream_model_calls=True` selects `astream_turn` without selecting an egress surface.
 This keeps token-boundary interruption responsive while durable events remain compact. With
 `async_model_abort_drain_s` set, an interrupted stream is drained for its usage before the turn
-parks; the observer outcome stays `interrupted` with no usage (see the stopped-stream drain above).
+parks; the observer outcome stays `interrupted` and carries the recovered usage and call facts.
+Successful stream `usage` describes the final provider turn, while failure `usage` describes the
+logical call. `usage_evidence` always covers the logical call, including prior retries.
 `emit_output_deltas=True` preserves the legacy opt-in behavior that writes raw
 `model.output.delta` and `model.reasoning.delta` events. `AgentLoop.astream` keeps its existing
 execution-owning stream contract, continues to expose all `ModelStreamChunk` variants, and takes
@@ -823,7 +900,7 @@ remain side-effect free. A `stream_closed` record carries the boolean `retryable
 treat its absence as `false` for records written before that field was introduced.
 
 `AgentLoop.model_calls_file=True` writes the optional private `model_calls.jsonl` ledger: one
-`monoid.model-calls.v1` record of kind `model_call` per settled call, **including failed ones**.
+`monoid.model-calls.v2` record of kind `model_call` per settled call, **including failed ones**.
 Existing run directories may omit the file, and it is independent of `model_content_file` and
 `stream_model_calls` — a ledger of what was called selects no provider streaming. A subagent
 inherits the switch and records into its own run directory, so every record carries `root_run_id`
@@ -1044,6 +1121,24 @@ node configured differently records differently from there on. The CLI exposes t
 switches on both shapes, as `monoid run --model-calls-file` / `monoid run --model-payload-file`
 and `monoid backend serve --model-calls-file` / `monoid backend serve --model-payload-file`.
 
+**Deadline clocks.** Public `ModelCallRunner.acall(deadline=...)` and
+`ValidatedCallRunner.acall(deadline=...)` accept absolute Unix epoch seconds. They convert
+once at call entry to a process-monotonic cutoff shared by retries and validated repairs.
+`None` and positive infinity mean unbounded; past values, zero and negative infinity
+expire immediately. NaN, booleans, nonnumeric values and unrepresentably large integers
+raise `ValueError` before adapter access, invocation creation, attempt callbacks or receipts.
+A valid expired deadline preserves authoritative recovery and evidence publication before
+the existing boundary check; it does not permit a new dispatch.
+
+An `AgentLoop` starts its monotonic duration budget after workspace and host resources open.
+Run guards, model/tool waits, drain windows, turn remaining time and duration metrics use
+that clock. Wall-clock changes during a run cannot replenish or exhaust those budgets.
+Checkpoint `remaining_duration_s` keeps its existing format: restore creates a new local
+cutoff and excludes parked downtime. Bounded elapsed time is reconstructed from the configured
+duration and remaining budget; historical `None`/zero values carry their existing information
+limits. Process-monotonic timestamps are never persisted as portable deadlines. Capability
+expiry, host leases and provider I/O timeouts retain their own clock contracts.
+
 Run cancellation and the session deadline cancel an in-flight native `anext_turn`, coroutine
 `next_turn`, or `astream_turn` — except a `user_cancel` of a streamed call that has entered the
 provider under a positive `abort_drain_s`, which drains first (below). Stream cancellation closes
@@ -1069,10 +1164,11 @@ positive finite number, means no drain. `0` (the default) keeps closing at the s
 
 - **Window.** The same stream is read on until it ends or `min(stop + abort_drain_s, deadline)`
   passes (`stop + abort_drain_s` without a deadline), and is then closed within the ordinary cancel
-  grace. The worst-case wall time after the stop is `abort_drain_s + async_model_cancel_grace_s`.
-  `AgentLoop.astream`'s early exit waits that long plus its own 8 s before hard-cancelling the
-  drive, sized when the wait starts from the knobs then and never below the budget the in-flight
-  call opened with.
+  grace. Each drain and cleanup wait owns its own window. `AgentLoop.astream`'s early exit
+  adds the maximum remaining active-call allowance to its own 8 s, using the deadline-capped
+  drain and phase-specific cleanup windows described under termination budgets below.
+  It freezes that allowance once. After requesting hard cancellation it continues to await
+  the driver, including resource cleanup and durable settlement.
   The drain is raced outside the run-deadline race: a deadline that closes the window ends the
   drain and never turns the stop into `RunTimeout`.
 - **Delivery.** Nothing read after the stop reaches `delta_consumer`, the durable delta mirror, a
@@ -1113,6 +1209,58 @@ their default `async_model_abort_drain_s` of `0`, so a token `cancel()` during a
 call still cuts it at once and reports no usage for that call; passing the knob to children is a
 follow-up. `interrupt_turn()` never reaches a child: the child streams its call to completion and
 bills it in full, unchanged from earlier releases.
+
+**Termination budget observation (v0.25).** `ModelCallRunner.termination_budget()`,
+`AgentLoop.termination_budget()` and `RunStream.termination_budget()` synchronously return a
+frozen `TerminationBudgetSnapshot`. The four DTOs are exported from the package root and
+`contracts`. A query samples process-monotonic time once, copies owned state under a lock,
+and invokes no host configuration getter. It starts no wait and requests no cancellation.
+
+| Snapshot field | Meaning |
+|---|---|
+| `observed_at_monotonic_s` | Process-local observation time; portable records use the existing receipt/checkpoint formats |
+| `run_deadline_remaining_s` | Remaining active run time; None for a standalone runner, unbounded run or absent run resources |
+| `calls` | Immutable tuple of the root runner's currently owned logical model calls |
+| `stream_exit` | `StreamExitBudget` on RunStream; None on a runner or loop |
+
+Each `CallTerminationBudget` has an ephemeral unique `call_id`, optional existing `logical_call_id`,
+and `attempt_index` for the current or latest kernel dispatch. Provider-free recovery has no local
+dispatch index. Retries retain the call ID; separate validated repair calls receive separate IDs.
+`phase` is `preparing`, `waiting`, `streaming`, `draining`, `backoff`, `closing` or `settling`.
+Calls remain visible through durable settlement and receipt publication, and retire in the call's
+finally. The tuple covers model calls; tools, child runs and host-resource cleanup have separate owners.
+
+`deadline_remaining_s` reads the call cutoff. `drain_budget_s` is None until the dispatch shape is
+known, zero for a one-shot or drain-disabled stream, and the committed budget for an enabled stream.
+`drain_remaining_s` exists from accepted stop until its wait owner releases, including time when the
+stream is closing. A delayed stop callback cannot reopen a released window.
+
+`grace_windows` is a tuple of `GraceBudget(source, budget_s, remaining_s)` for independent
+`wait_cancel`, `stream_close` and `drain_detach` owners. Finite budget with remaining=None means
+reserved at wait entry; a started window reports its remaining seconds. None/None means unbounded
+grace. Negative and NaN grace retain their effective zero timeout. Unrepresentable/custom reservations
+are omitted until the actual wait produces a safely representable timeout; existing errors and
+fallbacks keep their timing. Queries never perform user-defined numeric operations. Phase-specific
+getter sampling stays intact, and overlapping cleanup windows retain separate entries.
+
+Managed RunStream exit freezes one allowance after requesting cooperative cancellation. For each call,
+drain contributes its remaining window in `draining`, or its committed budget capped by the remaining
+deadline in `streaming`; other phases contribute zero drain. Cleanup contributes the maximum of
+started finite grace remaining, unstarted finite reservations, and one current exit-policy grace
+candidate for `waiting`/`streaming`/`draining`. Concurrent calls use the largest drain-plus-cleanup
+allowance. The stream adds its base wait (8 seconds for AgentLoop); no active calls adds nothing.
+Unbounded grace adds no finite allowance. Future drain configuration adds nothing, and later knob
+changes or repeated Stop do not extend the frozen cutoff. Raw `current_extra_grace_s` keeps its
+legacy calculation and fallback behavior.
+
+`StreamExitBudget` reports `idle`, `cooperative_wait`, `wait_interrupted`,
+`hard_cancel_requested` or `settled`. `wait_budget_s` records the first selected finite wait.
+`hard_cancel_remaining_s` counts down only while that waiter owns its timer; cancelling or failing
+the waiter changes it to None and `wait_interrupted`. Direct exit re-entry uses the original cutoff.
+Once hard cancellation was requested, remaining stays zero through settlement. Cooperative completion
+uses settled/None. Legacy nonfinite waits expose numeric None while preserving their execution;
+an actual hard-cancel request still reports zero. The driver is awaited after cancellation, so host
+resource cleanup and durable settlement can continue while remaining is zero.
 
 Independently of the drain, a `should_abort` stop observed after the terminal chunk was delivered
 now carries that chunk's usage (previously discarded); a run-token cancel with the drain off still
@@ -1832,6 +1980,21 @@ all validated descendant run ids. A delta includes separate output/reasoning-cha
 suffix without duplicating content. A `closed` frame and the corresponding Studio hydration
 snapshot carry the same optional boolean `retryable` signal, with absence interpreted as `false`.
 
+Live `closed` frames also carry optional `termination` and aggregate `usage_evidence` from the
+settled outcome. `termination` records outcome, first accepted stop requester, and read end;
+its outcome agrees with frame status. Evidence covers every kernel dispatch in the logical call,
+while a successful frame's numeric `usage` describes its final provider turn. Explicit zero is
+reported; absent counters remain unknown. Studio validates the closed vocabularies, portable
+integers, and evidence-derived sums/coverage before retaining these fields.
+
+The existing ring byte limit applies to facts. A fitting legacy closed frame retains its content
+when optional facts would exceed the limit. Oversized content uses the existing `content_omitted`
+marker, retaining facts when they fit and omitting them otherwise. Studio preserves received facts
+across hydration only for the same root/run/turn/stream/step/start identity. Private model-content
+snapshots keep their v1 projection and supply no new facts. Studio closes the live subscription on
+the durable terminal event; when that event wins the delivery race, snapshot-only facts display
+as unavailable. Late retained close metadata can enrich the same call without reopening content.
+
 Each root ring retains at most 1,024 frames and 512 KiB. The broker retains 64 root rings with
 least-recently-used eviction. A missing sequence, stale/ahead cursor, generation replacement, or
 oversized frame produces a `reset` with the retained baseline and latest cursor. The client hydrates
@@ -2195,6 +2358,18 @@ Successful response:
 }
 ```
 
+The optional `usage_evidence` key carries one dispatch observation on success bodies, terminal
+SSE frames, HTTP errors, and SSE errors: `{"reported":{"input_tokens":0},"source":"provider",
+"collection":"normal"}`. Gateway relays preserve its source and collection phase. The outer
+runner owns logical-call termination and aggregate evidence. Older peers omit the key and read as
+legacy ambiguous. The reference writer includes the normalized observation on success, including
+empty legacy observations; failure writers include it when the exception carries one.
+Malformed error observations are omitted while the original classified error and numeric usage
+remain readable. Malformed observations on a success response retain the existing bad-response
+refusal policy. A withheld terminal followed by a read error preserves the selected final snapshot,
+including explicit zero, and meters its numeric usage once. Applied-proof refusals carry the same
+observation through chained gateways. These fields preserve the existing v1 transport envelope.
+
 `reasoning` carries the upstream provider's own reasoning artifacts, relayed verbatim: the
 provider's output-item subsequence, adjacency-preserving — the `reasoning` items **plus the
 `function_call` or `message` items they are paired with**, because the provider validates that
@@ -2543,6 +2718,12 @@ competing input.
   durable boundary commit. It preserves the checkpoint and hosted-task state and emits no
   `run.finished`. A non-terminal boundary can be restored by the next activation in a fresh
   process. Terminal artifact finalization remains the caller's responsibility.
+- Escaping bootstrap and restore failures release activation-owned handles, including when a
+  recorder constructor's authority postcheck rejects its result. Ordinary bootstrap failures
+  that produce a recordable failed session keep its recorder alive until `close()` returns that
+  failed result. Subscription cleanup failure still tears down the session, authority callback,
+  and owned loop on the first attempt. Cleanup preserves an already-escaping failure and the
+  existing authority-loss precedence; stale cleanup performs only local handle disposal.
 - **Failure bundle:** on failure the core writes `run_dir/failure.json`
   (`{error, error_code, provider_error_code, http_status, retryable, config_recoverable, type,
   last_good_seq, restore_hint}`) —
@@ -3066,6 +3247,15 @@ may finish its own in-flight operation; no later subscriber, sidecar, delta writ
 runs under the stale activation. Best-effort diagnostic publication contains extension failures
 while always re-raising lease-loss control flow.
 
+Standalone `ModelCallRunner` delta consumers use the same before/after authority boundary for
+each normalized piece. This includes ordinary provider deltas, all pieces emitted by a terminal
+chunk, and held-back Unicode suffixes flushed at EOF or an error. A revoked activation appends
+and delivers no new piece after its authority check observes the loss, whether drain is disabled
+or configured but not yet started. A consumer that revokes the lease stops the rest of that batch.
+Normal Unicode finalization and user-cancel drain behavior remain unchanged while authority is
+active. An already entered consumer may finish its own external effect; its callback runs without
+holding the authority lock.
+
 Bootstrap applies the same operation boundary before a session exists. It checks authority before
 workspace and recorder creation, around each extension callback, and around workspace-index,
 workspace-base, manifest, and `run.started` publication. `AgentRecorder` checks between its own
@@ -3124,7 +3314,7 @@ Host-owned event and terminal adapters apply the same result rule. A `fenced` re
 event and terminal storage remains a host responsibility; AgentLoop directly wires checkpoint and
 model-invocation sink operations in v0.22.
 
-Token-based `deadline` and wall-clock `RunTimeout` share one terminal projection:
+Token-based `deadline` and monotonic run-duration `RunTimeout` share one terminal projection:
 `status="limited"`, `error_code="run_timeout"`, the max-duration final text, and
 `interruption_cause="deadline"`. The same rule applies when close observes a deadline at a parked
 run. A previously settled park keeps its single turn settlement; close adds the timeout terminal
@@ -3225,6 +3415,27 @@ Typed `user_cancel` and `deadline` interruptions project to `cancelled` with for
 host still applies ownership fencing before resuming or settling a run.
 
 ## Run Artifacts
+
+Host tool bindings are process-local activation resources. `inherit_to_children=True` opts a binding
+into fresh adapter creation at every child/fork hop. Resource access checks the original parent
+lifetime and writer chain; normal parent termination leaves the host writer active while ending
+descendant resource access. Child cleanup affects its own adapters. Restored parents create fresh
+lineage tokens. Child workspaces inherit the parent's effective operator policy. These resource
+checks leave general child dispatch and model cancellation/drain under their existing controls.
+The optional extension in
+`monoid_agent_kernel.tools.host_bindings` keeps required `ToolContext` members unchanged.
+Factories return fresh synchronous adapters; views are bound to one admitted call and expire
+on every call exit. Local workspace operations serialize with call/activation end and writer
+revocation; entered effects may finish and subsequent success publication is fenced. Factories,
+binders, validators and local disposers run outside authority locks. Disposers run once in reverse
+order even after partial acquisition, close failure or committed park release. A fresh restore
+opens fresh adapters and reads workspace contents after rehydration. Ordinary callback diagnostics
+contain fixed messages. Shared host writer authority survives normal cleanup.
+
+Kernel persistence never serializes binding keys, resources or clients. Their introduction changes
+no artifact schema or model tool schema. General host client adapters enforce their own per-method
+lease checks and external fencing. The complete contract and runnable report are in
+[EMBEDDING](EMBEDDING.md#inject-host-resources-into-tools-v025).
 
 Manifest and transcript are binding-aware. Streamed model content has a separate private sidecar:
 

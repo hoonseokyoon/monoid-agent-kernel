@@ -11,15 +11,16 @@ and ``loop`` imports ``model_call``, so leaving it in ``loop`` would close a cyc
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import threading
-import time
 from collections.abc import Callable
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from monoid_agent_kernel.core import _deadline as deadline_clock
 from monoid_agent_kernel.core.cancellation import CancellationToken
 from monoid_agent_kernel.core.outcome import InterruptionCause
 from monoid_agent_kernel.errors import RunCancelled, RunTimeout
@@ -310,6 +311,8 @@ async def await_abandonable_call(
     grace_s: float,
     check_boundary: Callable[[float | None], None],
     on_discarded: Callable[[Any], None] | None = None,
+    on_caller_cancelled: Callable[[asyncio.CancelledError], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> Any:
     """Await a call while propagating run cancellation and the run deadline.
 
@@ -323,6 +326,7 @@ async def await_abandonable_call(
     of which boundaries are terminal *while this kind of call is in flight*: a model call answers to
     cancellation and the deadline only, a tool handler also answers to interrupt and pause.
     `grace_s` is how long an abandoned worker gets to settle.
+    `deadline` is an absolute process-monotonic cutoff, shared with `check_boundary`.
 
     A synchronous callee cannot be interrupted: its thread keeps running to completion. Cancelling
     its future therefore *abandons* the call -- the run stops waiting within `grace_s` and the
@@ -363,10 +367,16 @@ async def await_abandonable_call(
     def remove_callback() -> None:
         return None
 
+    def observe_caller_cancelled(error: asyncio.CancelledError) -> None:
+        # The owner can freeze diagnostic facts before cleanup accepts another stop.
+        if on_caller_cancelled is not None:
+            with contextlib.suppress(Exception):
+                on_caller_cancelled(error)
+
     try:
         if token is not None:
             remove_callback = token.add_cancel_callback(signal_cancelled)
-        timeout = None if deadline is None else max(0.0, deadline - time.time())
+        timeout = None if deadline is None else max(0.0, deadline - deadline_clock.monotonic())
         await asyncio.wait({task, cancelled}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         # Checked before the result is read, so a boundary that lands in the same tick as a
         # completed call still wins. A run told to stop must not report work it decided not to do.
@@ -399,14 +409,22 @@ async def await_abandonable_call(
                 ),
             )
         raise RunTimeout("run exceeded max duration")
+    except asyncio.CancelledError as exc:
+        observe_caller_cancelled(exc)
+        raise
     finally:
         remove_callback()
         if not cancelled.done():
             cancelled.cancel()
         if not task.done():
-            await detach_unfinished_call(
-                task, sync_call, grace_s=grace_s, on_discarded=on_discarded
-            )
+            try:
+                await detach_unfinished_call(
+                    task, sync_call, grace_s=grace_s, on_discarded=on_discarded,
+                    _on_cleanup_started=_on_cleanup_started,
+                )
+            except asyncio.CancelledError as exc:
+                observe_caller_cancelled(exc)
+                raise
         elif not outcome_consumed:
             # The callee finished -- possibly by raising -- in the same loop turn that made a run
             # boundary observable, so ``check_boundary`` raised before anything read the outcome.
@@ -419,7 +437,8 @@ async def await_abandonable_call(
 
 
 async def abandon_unwaited_call(
-    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None
+    pending: Any, *, grace_s: float, on_discarded: Callable[[Any], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> None:
     """Release a call that was started but whose wait will never be entered.
 
@@ -446,7 +465,10 @@ async def abandon_unwaited_call(
         # Both halves, not just the detach: a blocking worker still inside the provider delivers
         # through `deliver`, which reads this hook and never the argument below.
         sync_call.set_discard_hook(on_discarded)
-    await detach_unfinished_call(task, sync_call, grace_s=grace_s, on_discarded=on_discarded)
+    await detach_unfinished_call(
+        task, sync_call, grace_s=grace_s, on_discarded=on_discarded,
+        _on_cleanup_started=_on_cleanup_started,
+    )
 
 
 async def detach_unfinished_call(
@@ -455,6 +477,7 @@ async def detach_unfinished_call(
     *,
     grace_s: float,
     on_discarded: Callable[[Any], None] | None = None,
+    _on_cleanup_started: Callable[[float], None] | None = None,
 ) -> None:
     """Release the awaiter's hold on a call that outlived a run boundary.
 
@@ -476,7 +499,11 @@ async def detach_unfinished_call(
 
     task.cancel()
     watched: asyncio.Future[Any] = task if sync_call is None else sync_call.settled
-    done, _pending = await asyncio.wait({watched}, timeout=max(0.0, grace_s))
+    timeout = max(0.0, grace_s)
+    if _on_cleanup_started is not None:
+        with contextlib.suppress(Exception):
+            _on_cleanup_started(timeout)
+    done, _pending = await asyncio.wait({watched}, timeout=timeout)
     if watched not in done:
         if sync_call is not None:
             sync_call.warn_if_unsettled()

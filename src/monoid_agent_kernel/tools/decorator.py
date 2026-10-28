@@ -15,19 +15,23 @@ already a dependency) and wrap the return value in a :class:`ToolResult`.
 If the first parameter is annotated :class:`ToolContext` (or named ``ctx`` / ``context``),
 the engine's tool context is injected and the remaining parameters are filled from the
 validated tool arguments. Synchronous and ``async def`` functions are supported. The function
-may return a ``ToolResult`` (used as-is), a ``dict`` (wrapped as ``content``), or any other
-value (wrapped as ``{"result": value}``).
+receives validated Python values, including nested models. It may return a ``ToolResult``
+(used as-is), a top-level pydantic ``BaseModel`` (serialized in JSON mode), a ``dict``
+(wrapped as ``content``), or another value (wrapped as ``{"result": value}``).
 """
 
 from __future__ import annotations
 
+import builtins
 import inspect
 from collections.abc import Callable
 from typing import Any, get_type_hints
 
-from pydantic import ValidationError, create_model
+from pydantic import BaseModel, ValidationError, create_model
+from pydantic_core import PydanticSerializationError
 
 from monoid_agent_kernel.core.json_ingress import exact_text, portable_type_name
+from monoid_agent_kernel.errors import RunCancelled, RunTimeout, ToolExecutionError, TurnInterrupted
 from monoid_agent_kernel.tools.base import (
     ToolContext,
     ToolResult,
@@ -134,11 +138,31 @@ def _spec_from_function(
                 error_code="invalid_tool_args",
                 category="tool",
             )
-        return validated.model_dump()
+        # Handlers consume Python values. Dumping here flattens models and runs input serializers.
+        return {name: getattr(validated, name) for name in fields}
 
     def normalize_result(result: Any) -> ToolResult:
         if isinstance(result, ToolResult):
             return result
+        if isinstance(result, BaseModel):
+            try:
+                result = result.model_dump(mode="json")
+            except Exception as exc:
+                # Pydantic wraps serializer exceptions, including cancellation. Preserve available
+                # control causes without treating an ordinary domain error's cause as control flow.
+                cause: BaseException | None = exc
+                seen: set[int] = set()
+                while isinstance(cause, PydanticSerializationError) and builtins.id(cause) not in seen:
+                    seen.add(builtins.id(cause))
+                    cause = cause.__cause__
+                if isinstance(cause, (RunCancelled, RunTimeout, TurnInterrupted)) or (
+                    isinstance(cause, BaseException) and not isinstance(cause, Exception)
+                ):
+                    raise cause
+                raise ToolExecutionError(
+                    "tool result model could not be serialized as JSON",
+                    error_code="tool_result_unportable",
+                ) from exc
         if isinstance(result, dict):
             return ToolResult(ok=True, content=result)
         return ToolResult(ok=True, content={"result": result})

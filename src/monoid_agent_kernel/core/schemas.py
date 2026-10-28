@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
@@ -17,6 +18,7 @@ from monoid_agent_kernel.core.model_calls import (
     MODEL_CALL_KIND,
     MODEL_CALLS_FILENAME,
     MODEL_CALLS_SCHEMA_VERSION,
+    MODEL_CALLS_V1_SCHEMA_VERSION,
 )
 from monoid_agent_kernel.core.model_content import MODEL_CONTENT_FILENAME
 from monoid_agent_kernel.core.model_payloads import (
@@ -35,11 +37,17 @@ from monoid_agent_kernel.core.model_payloads import (
 )
 from monoid_agent_kernel.core._verified_file import read_verified_bytes
 from monoid_agent_kernel.core.model_io import (
+    ModelCallAttempt,
+    ModelCallReceipt,
     DESTINATION_STATUSES,
     DIGEST_STATUSES,
     IDEMPOTENCY_KEY_JSON_PATTERN,
     MAX_MODEL_PAYLOAD_BYTES,
     RECORDED_DIGEST_BODY,
+)
+from monoid_agent_kernel.core.model_facts import (
+    CallOutcome, ModelCallTermination, ReadEnd, StopRequester, USAGE_COUNTERS,
+    UsageCollection, UsageEvidence, UsageSource,
 )
 from monoid_agent_kernel.identifiers import namespaced_id, schema_version_property
 from monoid_agent_kernel.workspace.paths import normalize_workspace_path
@@ -1017,7 +1025,7 @@ _MODEL_CALL_CONFIG_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
+MODEL_CALLS_V1_RECORD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
         "schema_version",
@@ -1047,7 +1055,7 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
         "capture_downgrades",
     ],
     "properties": {
-        "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
+        "schema_version": {"enum": [MODEL_CALLS_V1_SCHEMA_VERSION]},
         "kind": {"const": MODEL_CALL_KIND},
         "run_id": {"type": "string", "minLength": 1},
         "root_run_id": {"type": "string", "minLength": 1},
@@ -1170,6 +1178,51 @@ MODEL_CALLS_RECORD_SCHEMA: dict[str, Any] = {
     },
     "additionalProperties": False,
 }
+
+
+_USAGE_OBSERVATION_PROPERTIES = {
+    "reported": {"type": "object", "properties": {
+        key: {"type": "integer", "minimum": 0} for key in USAGE_COUNTERS
+    }, "additionalProperties": False},
+    "source": {"enum": [*get_args(UsageSource), None]},
+    "collection": {"enum": [*get_args(UsageCollection), None]},
+}
+USAGE_OBSERVATION_SCHEMA = {
+    "type": "object", "required": list(_USAGE_OBSERVATION_PROPERTIES),
+    "properties": _USAGE_OBSERVATION_PROPERTIES, "additionalProperties": False,
+}
+MODEL_CALL_TERMINATION_SCHEMA = {
+    "type": "object", "required": ["outcome", "requested_by", "ended_by"],
+    "properties": {
+        "outcome": {"enum": list(get_args(CallOutcome))},
+        "requested_by": {"enum": [*get_args(StopRequester), None]},
+        "ended_by": {"enum": list(get_args(ReadEnd))},
+    }, "additionalProperties": False,
+}
+USAGE_EVIDENCE_SCHEMA = {
+    "type": "object", "required": ["reported", "completeness", "attempts"],
+    "properties": {
+        "reported": _USAGE_OBSERVATION_PROPERTIES["reported"],
+        "completeness": {"type": "object", "required": list(USAGE_COUNTERS), "properties": {
+            key: {"enum": ["no_dispatch", "complete", "partial", "unknown"]} for key in USAGE_COUNTERS
+        }, "additionalProperties": False},
+        "attempts": {"type": "array", "items": {
+            "type": "object", "required": ["index", *_USAGE_OBSERVATION_PROPERTIES],
+            "properties": {"index": {"type": "integer", "minimum": 1}, **_USAGE_OBSERVATION_PROPERTIES},
+            "additionalProperties": False,
+        }},
+    }, "additionalProperties": False,
+}
+# Both generations retain closed vocabularies; fresh records select v2.
+MODEL_CALLS_V2_RECORD_SCHEMA = deepcopy(MODEL_CALLS_V1_RECORD_SCHEMA)
+MODEL_CALLS_V2_RECORD_SCHEMA["properties"].update({
+    "schema_version": {"enum": [MODEL_CALLS_SCHEMA_VERSION]},
+    "termination": MODEL_CALL_TERMINATION_SCHEMA,
+    "usage_evidence": USAGE_EVIDENCE_SCHEMA,
+})
+MODEL_CALLS_V2_RECORD_SCHEMA["properties"]["attempt_log"]["items"]["properties"]["usage_evidence"] = USAGE_OBSERVATION_SCHEMA
+MODEL_CALLS_RECORD_SCHEMA = MODEL_CALLS_V2_RECORD_SCHEMA
+MODEL_CALLS_READ_SCHEMA = {"oneOf": [MODEL_CALLS_V1_RECORD_SCHEMA, MODEL_CALLS_V2_RECORD_SCHEMA]}
 
 
 def _payloads_envelope(kind: str) -> dict[str, Any]:
@@ -1657,7 +1710,7 @@ def validate_run_dir(run_dir: Path) -> list[ValidationIssue]:
     # claims that span two of its own values, and a schema cannot relate one entry to another.
     model_calls_path = run_dir / MODEL_CALLS_FILENAME
     if model_calls_path.exists():
-        _validate_jsonl_file(model_calls_path, MODEL_CALLS_RECORD_SCHEMA, issues)
+        _validate_jsonl_file(model_calls_path, MODEL_CALLS_READ_SCHEMA, issues)
         _validate_model_call_attempt_logs(model_calls_path, issues)
     # Optional for the same reason as its two sidecar siblings. Unlike the ledger, this one DOES
     # get a recomputation pass: the corpus's whole contract is that every request record
@@ -1771,6 +1824,18 @@ def _validate_model_call_attempt_logs(path: Path, issues: list[ValidationIssue])
             continue  # already reported by the schema pass
         if not isinstance(record, dict):
             continue
+        if record.get("schema_version") == "monoid.model-calls.v2":
+            try:
+                ModelCallReceipt(
+                    usage=record.get("usage", {}), attempts=record.get("attempts", 0),
+                    termination=(ModelCallTermination.from_json(record["termination"])
+                                 if "termination" in record else None),
+                    usage_evidence=(UsageEvidence.from_json(record["usage_evidence"])
+                                    if "usage_evidence" in record else None),
+                    attempt_log=tuple(ModelCallAttempt.from_json(item) for item in record.get("attempt_log", [])),
+                )
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                issues.append(ValidationIssue(f"{path.name}:{index}", "termination/usage_evidence contradicts call or attempt facts"))
         entries = record.get("attempt_log")
         if not isinstance(entries, list):
             continue  # absent, or shape the schema already refused

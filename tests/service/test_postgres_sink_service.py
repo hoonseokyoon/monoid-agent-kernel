@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import os
@@ -51,6 +52,8 @@ from monoid_agent_kernel.core.checkpoint import (  # noqa: E402
     RunCheckpoint,
 )
 from monoid_agent_kernel.core.events import AgentEvent, make_agent_event  # noqa: E402
+from monoid_agent_kernel.core.invocation import InvocationContext  # noqa: E402
+from monoid_agent_kernel.core.model_facts import UsageObservation  # noqa: E402
 from monoid_agent_kernel.core.model_invocation import (  # noqa: E402
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
@@ -61,7 +64,7 @@ from monoid_agent_kernel.core.outcome import (  # noqa: E402
 )
 from monoid_agent_kernel.core.spec import AgentRunSpec  # noqa: E402
 from monoid_agent_kernel.conformance import run_fenced_run_sink_contract  # noqa: E402
-from monoid_agent_kernel.errors import ModelAdapterError  # noqa: E402
+from monoid_agent_kernel.errors import ModelAdapterError, ModelDispatchRefused  # noqa: E402
 from monoid_agent_kernel.hosting import (  # noqa: E402
     ActivationCommand,
     ActivationDriver,
@@ -73,8 +76,10 @@ from monoid_agent_kernel.hosting import (  # noqa: E402
 )
 from monoid_agent_kernel.hosting.model_calls import FencedModelCallLifecycle  # noqa: E402
 from monoid_agent_kernel.loop import AgentLoop  # noqa: E402
+from monoid_agent_kernel.model_call import ModelCallRunner  # noqa: E402
 from monoid_agent_kernel.model_lifecycle import ModelDispatchReservation  # noqa: E402
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
+from monoid_agent_kernel.providers._usage import mark_usage_observation  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelRequest, ModelTurn, mark_provider_usage  # noqa: E402
 
 
 _POSTGRES_TARGETS = [
@@ -1992,6 +1997,246 @@ def _rewrite_record(
                 ).format(sql.Identifier(harness.database.config.schema, table)),
                 (Json(changed), changed["schema_version"], digest, *identity_parameters),
             )
+
+
+def _assert_historical_invocation_recovery(harness, policy: str, v2: bool, *, success: bool = False) -> None:
+    from support.model_facts import facts
+    from monoid_agent_kernel.model_lifecycle import ModelDispatchRecoveryQuery, durable_model_result_blob
+
+    run_id = "run-historical-facts"
+    token = harness.claim(run_id)
+    blob = durable_model_result_blob(ModelTurn(final_text="stored answer", stop_reason="stop"))
+    sha = hashlib.sha256(blob).hexdigest()
+    blobs = {sha: blob} if success else {}
+    for revision, state in ((1, "reserved"), (2, "dispatch_started"), (3, "settled")):
+        invocation = _invocation(run_id, revision, state, evidence_policy=policy,
+                                 succeeded_blob=sha if success else "")
+        invocation = replace(invocation, schema_version="monoid.model-invocation.v1")
+        if state == "settled":
+            invocation = replace(invocation, receipt={"attempts": 1, "usage": {"input_tokens": 0}})
+        assert harness.sink.commit_invocation(
+            invocation, blobs if state == "settled" else {}, writer_token=token,
+            stage_evidence=policy == "outbox" and state == "settled",
+        ).status == "committed"
+    payload = invocation.to_json()
+    if v2:
+        payload["schema_version"] = "monoid.model-invocation.v2"
+        payload["receipt"].update(facts({"input_tokens": 0}, outcome="completed" if success else "failed"))
+    else:
+        payload["schema_version"] = "native-agent-runner.model-invocation.v1"
+        payload["digest_generation"] = "native-agent-runner.model-request-digest.v1"
+        del payload["failure_code" if success else "result_ref"]
+        if policy != "outbox":
+            payload["requires_evidence"] = policy == "required"
+            del payload["evidence_policy"]
+    # Import a historical row with its original hash and typed spellings. Never derive the
+    # expected stored identity from the new reader's serialization.
+    original_digest = canonical_sha256({"record": payload, "blobs": {key: hashlib.sha256(value).hexdigest() for key, value in blobs.items()}})
+    evidence_digest = canonical_sha256({"record": payload, "blobs": {}})
+    with harness.database.transaction() as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(sql.SQL("UPDATE {} SET payload = %s, schema_version = %s, digest_generation = %s, content_digest = %s WHERE run_id = %s AND revision = 3").format(
+                sql.Identifier(harness.database.config.schema, "invocation_record")),
+                (Json(payload), payload["schema_version"], payload["digest_generation"], original_digest, run_id))
+            if policy == "outbox":
+                cursor.execute(sql.SQL("UPDATE {} SET payload = %s, schema_version = %s, content_digest = %s WHERE run_id = %s").format(
+                    sql.Identifier(harness.database.config.schema, "model_evidence_outbox")),
+                    (Json(payload), payload["schema_version"], evidence_digest, run_id))
+    query = ModelDispatchRecoveryQuery(logical_call_id="call-1", request_digest="a" * 64,
+                                      digest_generation=MODEL_REQUEST_DIGEST_GENERATION)
+    lifecycle = FencedModelCallLifecycle(harness.sink, token)
+    for _ in range(2):
+        recovered = lifecycle.recover(query)
+        assert recovered is not None
+        assert recovered.result_blob == (blob if success else None)
+        assert recovered.receipt == payload["receipt"]
+    checked = harness.sink.load_invocation(run_id, "call-1")
+    assert checked.status == "loaded"
+    assert harness.sink.commit_invocation(checked.value.invocation, blobs, writer_token=token,
+                                         stage_evidence=policy == "outbox").content_digest == original_digest
+    assert harness.sink.commit_checkpoint(RunCheckpoint(run_id=run_id, seq=1, last_model_invocation=payload),
+                                         {}, writer_token=token).status == "committed"
+    assert harness.sink.latest_checked(run_id).value.checkpoint.last_model_invocation == payload
+    if policy != "passive":
+        table = "model_evidence_record" if policy == "required" else "model_evidence_outbox"
+        with harness.database.transaction() as connection:
+            with harness.database.cursor(connection) as cursor:
+                cursor.execute(sql.SQL("SELECT content_digest, payload FROM {} WHERE run_id = %s").format(
+                    sql.Identifier(harness.database.config.schema, table)), (run_id,))
+                assert cursor.fetchall() == [(evidence_digest, payload)]
+    # Valid hashes still require binding to the authoritative typed row.
+    _rewrite_record(harness, "invocation_record", "run_id = %s AND revision = %s", (run_id, 3),
+                    lambda raw: {**raw, "dispatch_attempt": 2})
+    assert harness.sink.load_invocation(run_id, "call-1").status == "corrupt"
+
+
+@pytest.mark.parametrize("policy", ["passive", "required", "outbox"])
+@pytest.mark.parametrize("v2", [False, True])
+def test_postgres_historical_invocation_hash_and_typed_binding(sink_harness: _SinkHarness, policy: str, v2: bool) -> None:
+    _assert_historical_invocation_recovery(sink_harness, policy, v2)
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_object_store_historical_success_recovers_original_blob_and_evidence(external_sink_harness, v2: bool) -> None:
+    _assert_historical_invocation_recovery(external_sink_harness, "required", v2, success=True)
+
+
+def _assert_runtime_invocation_facts(
+    harness: _SinkHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    policy: Literal["required", "outbox"],
+    reported_zero: bool,
+    success: bool = False,
+) -> None:
+    from monoid_agent_kernel.model_lifecycle import ModelDispatchRecoveryQuery, durable_model_turn
+
+    run_id = "run-runtime-facts"
+    token = harness.claim(run_id)
+    observation = (
+        UsageObservation(reported={"input_tokens": 0}, source="adapter", collection="normal")
+        if reported_zero else None
+    )
+    armed = False
+    lost_replies = 0
+    original_transaction = harness.database.transaction
+    original_commit = harness.sink.commit_invocation
+
+    @contextmanager
+    def transaction(**kwargs: Any) -> Iterator[Any]:
+        nonlocal armed, lost_replies
+        with original_transaction(**kwargs) as connection:
+            yield connection
+        if armed and not kwargs.get("read_only", False):
+            armed = False
+            lost_replies += 1
+            raise psycopg.OperationalError("injected settlement response loss after commit")
+
+    def commit_invocation(
+        invocation: DurableModelInvocation, blobs: Mapping[str, bytes], **kwargs: Any,
+    ) -> CommitResult:
+        nonlocal armed
+        # load_invocation also opens a default transaction. Arm only at the actual
+        # settlement write so the sink can reconcile a committed, lost response.
+        armed = not success and invocation.dispatch_state == "settled" and lost_replies == 0
+        return original_commit(invocation, blobs, **kwargs)
+
+    class Adapter:
+        calls = 0
+
+        def next_turn(self, request: ModelRequest) -> ModelTurn:
+            del request
+            self.calls += 1
+            if success:
+                return ModelTurn(
+                    final_text="stored runtime answer", stop_reason="stop",
+                    usage={"input_tokens": 0}, usage_evidence=observation,
+                )
+            error = ModelDispatchRefused("runtime refusal", retryable=False)
+            mark_provider_usage(error, {"input_tokens": 0})
+            if observation is not None:
+                mark_usage_observation(error, observation)
+            raise error
+
+    adapter = Adapter()
+    received = []
+    runner = ModelCallRunner(
+        adapter=adapter,
+        lifecycle_hook=FencedModelCallLifecycle(harness.sink, token, evidence_policy=policy),
+        settled_sink=received.append,
+    )
+    request = ModelRequest(instruction="persist runtime facts", system_prompt="service", tools=())
+    with monkeypatch.context() as patch:
+        patch.setattr(harness.database, "transaction", transaction)
+        patch.setattr(harness.sink, "commit_invocation", commit_invocation)
+        call = runner.acall(
+            request, context=InvocationContext(run_id=run_id), logical_call_id="facts-call",
+        )
+        if success:
+            asyncio.run(call)
+        else:
+            with pytest.raises(ModelAdapterError):
+                asyncio.run(call)
+    assert lost_replies == (0 if success else 1)
+    assert adapter.calls == 1 and len(received) == 1
+    receipt = received[0].receipt
+    assert receipt.usage_evidence.reported == ({"input_tokens": 0} if reported_zero else {})
+    assert receipt.usage_evidence.completeness["input_tokens"] == (
+        "complete" if reported_zero else "unknown"
+    )
+    assert receipt.usage_evidence.completeness["output_tokens"] == "unknown"
+    assert receipt.usage_evidence.attempts[0].observation.source == (
+        "adapter" if reported_zero else "legacy_ambiguous"
+    )
+
+    reopened = harness.reopen()
+    checked = reopened.sink.load_invocation(run_id, "facts-call")
+    assert checked.status == "loaded" and checked.value is not None
+    invocation = checked.value.invocation
+    payload = invocation.to_json()
+    assert payload["schema_version"] == "monoid.model-invocation.v2"
+    assert payload["receipt"]["termination"] == receipt.termination.to_json()
+    assert payload["receipt"]["usage_evidence"] == receipt.usage_evidence.to_json()
+    assert payload["receipt"]["usage"] == dict(receipt.usage)
+    query = ModelDispatchRecoveryQuery(
+        logical_call_id="facts-call", request_digest=receipt.request_digest,
+        digest_generation=MODEL_REQUEST_DIGEST_GENERATION,
+    )
+    lifecycle = FencedModelCallLifecycle(reopened.sink, token, evidence_policy=policy)
+    blobs = {}
+    for _ in range(2):
+        recovered = lifecycle.recover(query)
+        assert recovered is not None and recovered.receipt == payload["receipt"]
+        if success:
+            assert recovered.result_blob is not None
+            assert durable_model_turn(recovered.result_blob).final_text == "stored runtime answer"
+            blobs[hashlib.sha256(recovered.result_blob).hexdigest()] = recovered.result_blob
+        else:
+            assert recovered.result_blob is None and recovered.failure_code
+    repeated = reopened.sink.commit_invocation(
+        invocation, blobs, writer_token=token, stage_evidence=policy == "outbox",
+    )
+    assert repeated.status == "already_committed"
+    assert repeated.content_digest == canonical_sha256({
+        "record": payload, "blobs": {key: hashlib.sha256(value).hexdigest() for key, value in blobs.items()},
+    })
+    assert adapter.calls == 1
+    assert _table_count(harness, "invocation_record", run_id) == 3
+    table = "model_evidence_record" if policy == "required" else "model_evidence_outbox"
+    with harness.database.transaction(read_only=True) as connection:
+        with harness.database.cursor(connection) as cursor:
+            cursor.execute(
+                sql.SQL("SELECT payload, content_digest FROM {} WHERE run_id = %s").format(
+                    sql.Identifier(harness.database.config.schema, table),
+                ),
+                (run_id,),
+            )
+            assert cursor.fetchall() == [(payload, canonical_sha256({"record": payload, "blobs": {}}))]
+
+
+@pytest.mark.parametrize("policy", ["required", "outbox"])
+@pytest.mark.parametrize("reported_zero", [False, True], ids=["unreported", "reported-zero"])
+def test_postgres_runtime_facts_survive_reconciliation_and_evidence_recovery(
+    sink_harness: _SinkHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: Literal["required", "outbox"],
+    reported_zero: bool,
+) -> None:
+    _assert_runtime_invocation_facts(
+        sink_harness, monkeypatch, policy=policy, reported_zero=reported_zero,
+    )
+
+
+@pytest.mark.parametrize("reported_zero", [False, True], ids=["unreported", "reported-zero"])
+def test_object_store_runtime_success_recovers_facts_and_private_result(
+    external_sink_harness: _ExternalSinkHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_zero: bool,
+) -> None:
+    _assert_runtime_invocation_facts(
+        external_sink_harness, monkeypatch, policy="required", reported_zero=reported_zero,
+        success=True,
+    )
 
 
 def test_checked_readers_classify_future_and_corrupt_payloads(

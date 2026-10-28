@@ -73,6 +73,20 @@ def test_put_latest_seq_isolation_and_delete(store: CheckpointStore) -> None:
     assert store.latest("run_2") is not None
 
 
+def test_nested_v2_facts_and_historical_invocation_survive_store_roundtrip(store: CheckpointStore) -> None:
+    from monoid_agent_kernel.conformance.fixtures import load_compatibility_fixtures
+    from monoid_agent_kernel.core.model_invocation import decode_model_invocation, model_invocation_payload_for_write
+
+    for index, name in enumerate(("model-invocation-v022-historical-v1", "model-invocation-v025-facts-v2"), 1):
+        raw = next(item.payload for item in load_compatibility_fixtures() if item.fixture_id == name)
+        store.put(RunCheckpoint(run_id=raw["run_id"], seq=index, last_model_invocation=raw))
+        checked = load_latest_checked(store, raw["run_id"])
+        assert checked.status == "loaded"
+        nested = checked.value.checkpoint.last_model_invocation
+        assert nested == raw
+        assert model_invocation_payload_for_write(decode_model_invocation(nested).value) == raw
+
+
 @pytest.mark.parametrize("factory", STORE_FACTORIES)
 def test_legacy_stores_declare_only_single_writer_checkpoint_capabilities(
     factory: StoreFactory, tmp_path: Path

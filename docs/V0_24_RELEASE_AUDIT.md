@@ -1,6 +1,10 @@
 # v0.24.0 Stopped-Stream Drain Release Audit
 
-> 상태: release candidate qualified on `develop`; release approval pending
+> Historical record: dates, status, commands, and results describe the named revisions.
+> Use the [documentation index](README.md) and [Contributing](../CONTRIBUTING.md) for current guidance.
+> Related records are in the [history index](history/README.md).
+
+> 기록 당시 상태: release candidate qualified on `develop`; release approval pending
 >
 > 작성일: 2026-09-27
 >

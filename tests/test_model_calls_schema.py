@@ -95,6 +95,22 @@ def _errors(record: dict[str, object]) -> list[str]:
     ]
 
 
+def test_mixed_v1_v2_ledger_reads_facts_without_an_itemized_attempt_log(tmp_path: Path) -> None:
+    from support.model_facts import facts
+
+    old = {**_record(), "schema_version": "monoid.model-calls.v1"}
+    new = {**old, "schema_version": "monoid.model-calls.v2", **facts(old["usage"])}
+    assert {old["schema_version"], new["schema_version"]} == {"monoid.model-calls.v1", "monoid.model-calls.v2"}
+    path = tmp_path / MODEL_CALLS_FILENAME
+    path.write_text(json.dumps(old) + "\n" + json.dumps(new) + "\n", encoding="utf-8")
+    assert not [issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)]
+    # The semantic pass must run even when durable recovery cannot restore the private log.
+    new["usage_evidence"]["reported"]["input_tokens"] = 99
+    path.write_text(json.dumps(new) + "\n", encoding="utf-8")
+    issues = [issue for issue in validate_run_dir(tmp_path) if issue.path.startswith(MODEL_CALLS_FILENAME)]
+    assert any("usage_evidence" in issue.message for issue in issues)
+
+
 # --- what the record must never carry ------------------------------------------------------
 
 
@@ -239,19 +255,24 @@ def test_the_writer_and_the_schema_declare_the_same_keys() -> None:
     """
     from monoid_agent_kernel.core.model_io import ModelCallAttempt
 
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation
+
+    observation = UsageObservation(reported={"input_tokens": 12, "output_tokens": 3}, source="adapter", collection="normal")
     itemized = _record(
         attempts=1,
         attempt_log=(
-            ModelCallAttempt(index=1, usage={"input_tokens": 12, "output_tokens": 3}),
+            ModelCallAttempt(index=1, usage={"input_tokens": 12, "output_tokens": 3}, usage_evidence=observation),
         ),
+        termination=ModelCallTermination(outcome="completed", ended_by="provider_terminal"),
+        usage_evidence=UsageEvidence(attempts=(UsageEvidenceAttempt(index=1, observation=observation),)),
     )
     record = _record()
 
     assert set(itemized) == set(MODEL_CALLS_RECORD_SCHEMA["properties"])
-    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - {"attempt_log"}
+    assert set(record) == set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - {"attempt_log", "termination", "usage_evidence"}
     assert set(MODEL_CALLS_RECORD_SCHEMA["properties"]) - set(
         MODEL_CALLS_RECORD_SCHEMA["required"]
-    ) == {"attempt_log", "idempotency_key"}
+    ) == {"attempt_log", "idempotency_key", "termination", "usage_evidence"}
     assert _errors(itemized) == []
     assert _errors(record) == []
     assert record["schema_version"] == MODEL_CALLS_SCHEMA_VERSION
@@ -361,7 +382,7 @@ def test_the_schema_advertises_one_namespace_because_the_ledger_has_only_ever_ha
     existed under it. The registry pin refuses the mismatch; this states the reason."""
 
     assert MODEL_CALLS_RECORD_SCHEMA["properties"]["schema_version"] == {
-        "enum": ["monoid.model-calls.v1"]
+        "enum": ["monoid.model-calls.v2"]
     }
 
 
@@ -904,6 +925,8 @@ _PROJECTION_ALLOWLIST = {
     "elapsed_ms",
     "stream_committed",
     "backoff_ms",
+    "termination", "outcome", "requested_by", "ended_by",
+    "usage_evidence", "reported", "completeness", "observation", "source", "collection",
 }
 
 

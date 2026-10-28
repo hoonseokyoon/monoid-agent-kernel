@@ -34,7 +34,7 @@ from monoid_agent_kernel.core.json_ingress import (
 )
 from monoid_agent_kernel.core.lifecycle import SessionState
 from monoid_agent_kernel.core.media import BLOB_SCHEME, blob_shas_in_messages
-from monoid_agent_kernel.core.model_invocation import decode_model_invocation
+from monoid_agent_kernel.core.model_invocation import decode_model_invocation, model_invocation_payload_for_write
 from monoid_agent_kernel.core.model_io import is_recorded_digest
 from monoid_agent_kernel.core.outcome import (
     InterruptionCause,
@@ -681,7 +681,7 @@ def checkpoint_payload_for_write(checkpoint: RunCheckpoint) -> dict[str, Any]:
         invocation = decode_model_invocation(payload["last_model_invocation"])
         if not invocation.ok or invocation.value is None:
             raise ValueError("checkpoint last_model_invocation is invalid")
-        payload["last_model_invocation"] = invocation.value.to_json()
+        payload["last_model_invocation"] = model_invocation_payload_for_write(invocation.value)
     _validate_checkpoint_payload(payload)
     return payload
 

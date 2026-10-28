@@ -47,6 +47,7 @@ from monoid_agent_kernel.core.schemas import (
     JOB_SCHEMA,
     MANIFEST_SCHEMA,
     MODEL_CALLS_RECORD_SCHEMA,
+    MODEL_CALLS_READ_SCHEMA,
     MODEL_PAYLOADS_RECORD_SCHEMA,
     MODEL_CONTENT_RECORD_SCHEMA,
     PACKAGE_SCHEMA,
@@ -124,9 +125,7 @@ def test_registry_is_unique_serializable_and_canonically_namespaced() -> None:
                 artifact.reader_policy == "writer-only" and not artifact.supported_readers
             )
             for alias in artifact.namespace_aliases:
-                assert alias == artifact.current_writer.replace(
-                    "monoid.", "native-agent-runner.", 1
-                )
+                assert alias.replace("native-agent-runner.", "monoid.", 1) in artifact.supported_readers
         assert all(".v" in version for version in artifact.supported_readers)
         assert all(".v" in version for version in artifact.active_writers)
 
@@ -235,13 +234,19 @@ def test_json_schema_reader_versions_match_registry() -> None:
         # Single-namespace, unlike every neighbour: the ledger has never existed under the legacy
         # prefix, so its schema uses a literal enum rather than ``schema_version_property``. This
         # map is what refuses the mismatch if someone reaches for the helper later.
-        "model-calls": MODEL_CALLS_RECORD_SCHEMA,
     }
 
     for key, schema in schemas.items():
         registered = compatibility_artifact(key)
         assert registered.reader_policy == "json-schema"
         assert tuple(schema["properties"]["schema_version"]["enum"]) == registered.supported_readers
+
+    model_calls = compatibility_artifact("model-calls")
+    assert model_calls.supported_readers == tuple(
+        version for schema in MODEL_CALLS_READ_SCHEMA["oneOf"]
+        for version in schema["properties"]["schema_version"]["enum"]
+    )
+    assert model_calls.active_writers == tuple(MODEL_CALLS_RECORD_SCHEMA["properties"]["schema_version"]["enum"])
 
     model_content = compatibility_artifact("model-content")
     assert model_content.reader_policy == "json-schema"

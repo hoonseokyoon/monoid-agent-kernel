@@ -86,7 +86,15 @@ EXPECTED_CONTRACTS_ALL = [
     "Redactor",
     "DefaultRedactor",
     "DEFAULT_SECRET_KEY_PARTS",
+    "TerminationBudgetSnapshot",
+    "CallTerminationBudget",
+    "GraceBudget",
+    "StreamExitBudget",
     "ModelCallReceipt",
+    "ModelCallTermination",
+    "UsageObservation",
+    "UsageEvidenceAttempt",
+    "UsageEvidence",
     "ModelCallCapture",
     "ModelIOObserver",
     "ClosableModelIOObserver",
@@ -183,6 +191,18 @@ EXPECTED_CONTRACTS_ALL = [
     "SkillDefinition",
     "SkillProvider",
 ]
+
+
+def test_host_tool_bindings_are_an_optional_context_extension() -> None:
+    from monoid_agent_kernel import AgentLoop, ToolContext
+    from monoid_agent_kernel.tools import host_bindings
+
+    assert set(host_bindings.__all__) == {
+        "HostToolActivation", "HostToolBinding", "HostToolCallLease", "HostToolKey",
+        "HostToolResource", "ToolWorkspace", "require_host_tool_binding",
+    }
+    assert not hasattr(ToolContext, "_require_host_tool_binding")
+    assert inspect.signature(AgentLoop).parameters["host_tool_bindings"].kind is inspect.Parameter.KEYWORD_ONLY
 
 REMOVED_PUBLIC_SURFACE_NAMES = [
     "WriterAuthority",

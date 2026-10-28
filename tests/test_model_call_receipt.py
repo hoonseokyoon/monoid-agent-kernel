@@ -18,6 +18,10 @@ from monoid_agent_kernel.core.model_io import (
     _ATTEMPT_OPTIONAL_WIRE_KEYS,
     ModelCallAttempt,
     ModelCallReceipt,
+    ModelCallTermination,
+    UsageObservation,
+    UsageEvidence,
+    UsageEvidenceAttempt,
 )
 from monoid_agent_kernel.core.spec import ModelConfig
 from monoid_agent_kernel.core.wire_validation import WireValidationError
@@ -300,6 +304,11 @@ def test_json_round_trip_preserves_every_field() -> None:
             ),
         ),
         idempotency_key="idem_e33075f0f24b4e58a15fc5261576ab60",
+        termination=ModelCallTermination(outcome="failed", ended_by="provider_error"),
+        usage_evidence=UsageEvidence(attempts=(
+            UsageEvidenceAttempt(index=1, observation=UsageObservation()),
+            UsageEvidenceAttempt(index=2, observation=UsageObservation()),
+        )),
     )
 
     assert ModelCallReceipt.from_json(json.loads(json.dumps(receipt.to_json()))) == receipt
@@ -321,9 +330,13 @@ def test_the_round_trip_above_names_every_field_there_is() -> None:
     """
 
     declared = {field_.name for field_ in fields(ModelCallReceipt)}
-    itemized = ModelCallReceipt(attempts=1, attempt_log=(ModelCallAttempt(index=1),))
+    itemized = ModelCallReceipt(
+        attempts=1, attempt_log=(ModelCallAttempt(index=1),),
+        termination=ModelCallTermination(outcome="completed", ended_by="provider_terminal"),
+        usage_evidence=UsageEvidence(attempts=(UsageEvidenceAttempt(index=1, observation=UsageObservation()),)),
+    )
     assert set(itemized.to_json()) == declared
-    assert set(ModelCallReceipt().to_json()) == declared - {"attempt_log"}
+    assert set(ModelCallReceipt().to_json()) == declared - {"attempt_log", "termination", "usage_evidence"}
 
     source = inspect.getsource(test_json_round_trip_preserves_every_field)
     missing = sorted(name for name in declared if f"{name}=" not in source)
@@ -434,9 +447,9 @@ def test_the_attempt_entry_wire_shape_names_every_field_there_is() -> None:
     existed" expressible, or a legacy line stops round-tripping the day it is re-serialized."""
 
     declared = {field_.name for field_ in fields(ModelCallAttempt)}
-    assert set(ModelCallAttempt(backoff_ms=0).to_json()) == declared
+    assert set(ModelCallAttempt(backoff_ms=0, usage_evidence=UsageObservation()).to_json()) == declared
     assert set(ModelCallAttempt().to_json()) == declared - _ATTEMPT_OPTIONAL_WIRE_KEYS
-    assert _ATTEMPT_OPTIONAL_WIRE_KEYS == {"backoff_ms"}
+    assert _ATTEMPT_OPTIONAL_WIRE_KEYS == {"backoff_ms", "usage_evidence"}
 
 
 def test_the_attempt_log_is_empty_or_names_every_attempt() -> None:
@@ -583,11 +596,12 @@ def test_an_attempt_entry_is_read_whole_or_refused() -> None:
 
     from dataclasses import fields as dataclass_fields
 
-    whole = ModelCallAttempt(index=1, backoff_ms=0).to_json()
+    entry = ModelCallAttempt(index=1, backoff_ms=0, usage_evidence=UsageObservation())
+    whole = entry.to_json()
     declared = {field.name for field in dataclass_fields(ModelCallAttempt)}
 
     assert set(whole) == declared, {"projection_and_fields_disagree": set(whole) ^ declared}
-    assert ModelCallAttempt.from_json(whole) == ModelCallAttempt(index=1, backoff_ms=0)
+    assert ModelCallAttempt.from_json(whole) == entry
 
     for key in sorted(declared - _ATTEMPT_OPTIONAL_WIRE_KEYS):
         partial = {name: value for name, value in whole.items() if name != key}

@@ -1,71 +1,75 @@
 # Monoid Documentation
 
-Start with the top-level [README](../README.md) for the product position,
-install, and the no-server quickstart. This index goes deeper on using,
-building against, and securing the kernel.
+Start with the [offline quickstart](../README.md#quickstart-no-servers): install this revision,
+run a typed tool, and inspect its result in the model's next request. Choose the next guide by
+what your product needs to do.
 
-## Find your path
+## Start and choose a topology
 
-- **I want to run an agent** → [Quickstart](../README.md#quickstart-no-servers),
-  then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
-- **I'm embedding the kernel in a product** → [CONTRACTS.md](CONTRACTS.md) for the
-  stable Python/HTTP surface, [EMBEDDING.md](EMBEDDING.md) for portable responsibilities and
-  executable local and hosted paths, [CONFORMANCE.md](CONFORMANCE.md) to check your
-  implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
-  [COMPATIBILITY.md](COMPATIBILITY.md) for version and upgrade obligations.
-- **I'm writing tools** → [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
-  exposure, authorization, scope, and quota.
-- **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
-  wiring and token boundary, [OBSERVABILITY.md](OBSERVABILITY.md) for outputs,
-  event sinks, and OTel, [DBOS_REFERENCE.md](DBOS_REFERENCE.md) for the experimental
-  finite-activation recovery and private single-runtime composition proof.
-- **I'm reviewing security** → [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md)
-  for verified invariants and boundaries, [security/THREAT_MODEL.md](security/THREAT_MODEL.md)
-  for the threat-by-threat breakdown, [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md)
-  before deploying, [SECURITY.md](../SECURITY.md) for reporting.
-- **I'm extending with delegation/skills** → [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md),
-  [SKILLS_DESIGN.md](SKILLS_DESIGN.md), [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md).
-- **I'm contributing** → [CONTRIBUTING.md](../CONTRIBUTING.md), then
-  [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) and
-  [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) for how behavior is verified. The
-  [v0.22 implementation plan](V0_22_IMPLEMENTATION_PLAN.md) records the approved production-boundary
-  design, crash windows, file map, and review sequence. The
-  [v0.22 release audit](V0_22_RELEASE_AUDIT.md) records the shipped boundary and release gates. The
-  [v0.23 development workflow](V0_23_DEVELOPMENT_WORKFLOW.md) defines the sequential PR, review, and
-  cost-controlled CI routine. The [v0.23 implementation plan](V0_23_IMPLEMENTATION_PLAN.md) records
-  the PostgreSQL, ObjectStore, Temporal, durable-stream scope and owner decisions. The
-  [v0.23 release audit](V0_23_RELEASE_AUDIT.md) is the evidence gate for that campaign. The
-  [v0.24 release audit](V0_24_RELEASE_AUDIT.md) records the stopped-stream drain release evidence.
+| Task | Read or run | Result |
+|---|---|---|
+| Run the first tool | [Quickstart](../README.md#quickstart-no-servers), [example](../examples/custom_tool_quickstart.py) | Completed run and typed result observation |
+| Embed a local session | [Local product example](../examples/embedding_local_product.py) | File output and checked checkpoint |
+| Choose execution and storage ownership | [Embedding handbook](EMBEDDING.md#choose-a-product-topology) | Embedded or hosted composition with explicit owners |
+| Run through the CLI | [CLI reference](CLI.md) | Runtime configuration, modes, proposals, jobs and streaming JSON |
+| Explore Studio and Reference services | [Reference guide](REFERENCE.md) | Runnable examples of the contracts |
 
-## All documents
+Development examples use the same-revision installation described in the quickstart. Repository
+scripts live in `examples/`; the report recipe also ships as an importable package module.
 
-| Doc | What it covers |
-|-----|----------------|
-| [CLI.md](CLI.md) | Full `monoid` CLI: `run`, `builder`, `watch`, `proposal`, `jobs`, modes, custom workspace backends, streaming, and path permissions. |
-| [BACKEND.md](BACKEND.md) | Reference backend + LLM/Web gateway walkthrough: starting the services, creating a run over HTTP, and the token boundary. |
-| [DBOS_REFERENCE.md](DBOS_REFERENCE.md) | Experimental DBOS activation recovery, private shared-host lifecycle, stable-slot crash invariant, ownership boundary, and v0.19.2 non-goals. |
-| [OBSERVABILITY.md](OBSERVABILITY.md) | Run-directory artifact set, custom event sinks, OpenTelemetry tracing, live streaming, and metrics. |
-| [security/SECURITY_MODEL.md](security/SECURITY_MODEL.md) | Intended security boundaries, non-goals, actors/trust zones, and verified core invariants (each mapped to an operational rule and its tests). |
-| [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Trust boundaries, the permissive-by-default warning, threat-by-threat defenses, and integrator responsibilities. |
-| [security/PRODUCTION_CHECKLIST.md](security/PRODUCTION_CHECKLIST.md) | Actionable pre-deployment checklist for gateways, workspace, tool surface, artifacts, and conformance. |
-| [CONTRACTS.md](CONTRACTS.md) | The stable integration surface: Python contracts, HTTP wire contracts, wiring rules, operational rules, and the contract/core/reference boundary. |
-| [EMBEDDING.md](EMBEDDING.md) | Portable production responsibilities plus executable local and hosted/multi-tenant golden paths using one explicit Reference assembly. |
-| [CONFORMANCE.md](CONFORMANCE.md) | Profile-based conformance tests, harness roles, executable assertions, testing policy, and the Reference full profile. |
-| [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) | Supported helper modules and validation/library policy for contract-aligned implementations. |
-| [COMPATIBILITY.md](COMPATIBILITY.md) | Machine-checked wire/durable version ledger, aliases, deprecation policy, mixed-version operation, and upgrade/rollback playbooks. |
-| [REFERENCE.md](REFERENCE.md) | Runnable Reference services, Studio, gateway examples, and the public Reference conformance harness. |
-| [OPERATIONAL_RULE_COVERAGE.md](OPERATIONAL_RULE_COVERAGE.md) | Current rule-to-helper-to-profile-to-test coverage matrix and Phase 2S hardening matrix for OR-01 through OR-13. |
-| [RUNNER_BACKEND_RESPONSIBILITY_MAP.md](RUNNER_BACKEND_RESPONSIBILITY_MAP.md) | RunnerBackend facade/service split, private service responsibilities, and remaining runtime ownership. |
-| [PHASE_4_CLOSURE.md](PHASE_4_CLOSURE.md) | Phase 4 completion criteria, CI status, remaining flake risk, and structural closure position. |
-| [V0_18_RELEASE_AUDIT.md](V0_18_RELEASE_AUDIT.md) | Frozen-range multi-agent release audit, cross-challenges, dispositions, and hardening evidence. |
-| [V0_22_IMPLEMENTATION_PLAN.md](V0_22_IMPLEMENTATION_PLAN.md) | Pre-implementation audit and concrete plan for terminal outcomes, durable model invocation identity, fenced hosting contracts, sink policy, typed interruption, conformance, and release sequencing. |
-| [V0_22_RELEASE_AUDIT.md](V0_22_RELEASE_AUDIT.md) | v0.22 production-boundary scope, compatibility and package gates, rollout obligations, exclusions, and validation evidence. |
-| [V0_23_DEVELOPMENT_WORKFLOW.md](V0_23_DEVELOPMENT_WORKFLOW.md) | Sequential PR and review routine, Draft/Ready CI checkpoints, actual-service profiles, cost controls, and release workflow. |
-| [V0_23_IMPLEMENTATION_PLAN.md](V0_23_IMPLEMENTATION_PLAN.md) | Pre-implementation audit, recommended PostgreSQL/ObjectStore/Temporal and durable-stream architecture, PR sequence, risks, and owner approval matrix. |
-| [V0_23_RELEASE_AUDIT.md](V0_23_RELEASE_AUDIT.md) | Qualified storage, orchestration, stream, crash/restart, compatibility, privacy, operations, and exact release-delivery evidence. |
-| [V0_24_RELEASE_AUDIT.md](V0_24_RELEASE_AUDIT.md) | Stopped-stream drain release scope, known limits, no-migration statement, CI and exact-wheel evidence, and the release-delivery gate. |
-| [PHASE_1S_COVERAGE.md](PHASE_1S_COVERAGE.md) | Historical Phase 1S coverage pointer. |
-| [TOOL_SURFACE.md](TOOL_SURFACE.md) | The dynamic, binding-based tool surface — `ToolBinding`, model-name aliasing, exposure/authorization/guidance/scope/quota, and how bindings resolve against the registry. |
-| [SUBAGENT_DESIGN.md](SUBAGENT_DESIGN.md) | Agent-as-tool delegation — isolated child runs via the `agent.spawn` tool, progressive disclosure through dynamic context providers. |
-| [SKILLS_DESIGN.md](SKILLS_DESIGN.md) | Agent Skills — procedural knowledge delivered through a `ContextProvider`, complementing subagents (execution) and MCP (integration). |
-| [FIRST_SKILL_TUTORIAL.md](FIRST_SKILL_TUTORIAL.md) | Create and smoke-test a minimal `SKILL.md` skill locally. |
+## Integrate product capabilities
+
+| Task | Practical path | Detailed reference |
+|---|---|---|
+| Write typed tools and inject resources | [Tools and resources](guides/tools-and-resources.md) | [Tool surface](TOOL_SURFACE.md), [tool contract](CONTRACTS.md#tool-contract) |
+| Stream a request, show Stop progress, or observe background work | [Streaming and Stop](guides/streaming-and-stop.md) | [Model adapter](CONTRACTS.md#model-adapter), [observability](OBSERVABILITY.md) |
+| Resume approval in a new process | [Approval and recovery](guides/approval-and-recovery.md) | [Checked recovery](EMBEDDING.md#checkpoints-recovery-and-upgrades), [control contract](CONTRACTS.md#control-protocol) |
+| Supply your model adapter | [Custom adapter example](../examples/custom_model_adapter.py) | [Model adapter contract](CONTRACTS.md#model-adapter) |
+| Connect a backend and gateways | [Backend walkthrough](BACKEND.md), [full-stack example](../examples/full_stack_integration.py) | [HTTP contracts](CONTRACTS.md#http-contracts) |
+| Delegate to child agents | [Subagent design](SUBAGENT_DESIGN.md) | [Subagent contract](CONTRACTS.md#subagents-agent-as-tool) |
+| Attach skills | [First skill tutorial](FIRST_SKILL_TUTORIAL.md), [skills design](SKILLS_DESIGN.md) | [Skills contract](CONTRACTS.md#skills-progressive-disclosure) |
+| Attach memory tools | [Memory example](../examples/memory_quickstart.py) | [Tool surface](TOOL_SURFACE.md) |
+
+The [embedding handbook](EMBEDDING.md) connects these paths to workspace/run storage, host authority,
+resource factories, runtime configuration, and transports. It also covers production PostgreSQL,
+ObjectStore, and Temporal composition. The [DBOS profile](DBOS_REFERENCE.md) remains an experimental
+Reference assembly with its own recovery and lifecycle scope.
+
+## Look up a contract
+
+- [Integration contracts](CONTRACTS.md#find-a-contract): Python APIs, model/tool behavior, HTTP,
+  durable state, control, and operational invariants.
+- [Compatibility ledger](COMPATIBILITY.md): current writers, retained readers, aliases, and
+  upgrade/rollback rules.
+- [Core Helper Kit](CORE_HELPER_KIT.md): supported implementations and validation/library policy.
+- [Conformance](CONFORMANCE.md): profiles, harnesses, and checks for your implementation.
+- [Operational rule coverage](OPERATIONAL_RULE_COVERAGE.md): rule-to-helper-to-test evidence.
+- [RunnerBackend responsibility map](RUNNER_BACKEND_RESPONSIBILITY_MAP.md): Reference service ownership.
+
+## Operate and secure a deployment
+
+| Need | Reference |
+|---|---|
+| Startup, migration, draining, backup/restore, retention, incident response | [Production operations](PRODUCTION_OPERATIONS.md) |
+| Events, artifacts, usage, tracing and live streams | [Observability](OBSERVABILITY.md) |
+| Gateway startup, submission, tokens and result retrieval | [Backend walkthrough](BACKEND.md) |
+| Verified boundaries and integrator responsibilities | [Security model](security/SECURITY_MODEL.md), [threat model](security/THREAT_MODEL.md) |
+| Deployment readiness | [Production checklist](security/PRODUCTION_CHECKLIST.md) |
+| Report a vulnerability | [Security policy](../SECURITY.md) |
+
+## Upgrade retained runs
+
+Read [Upgrade from v0.24 to v0.25](migrations/v0.25.md) for typed tool changes, invocation/ledger v2,
+reader-first or coordinated deployment, and rollback. The [v0.25 audit](V0_25_RELEASE_AUDIT.md)
+records the 0.25.0 candidate, qualification evidence, and publication status.
+For other format transitions, use the [compatibility playbook](COMPATIBILITY.md#upgrade-playbook).
+
+## Contribute and inspect development records
+
+Follow [Contributing](../CONTRIBUTING.md) for development setup, test selection, and PR workflow.
+Current contract coverage remains in [Conformance](CONFORMANCE.md) and
+[Operational rule coverage](OPERATIONAL_RULE_COVERAGE.md).
+
+The [development history index](history/README.md) groups prior plans, design choices, and
+qualification records by version while preserving their original paths. The
+[v0.25 release audit](V0_25_RELEASE_AUDIT.md) tracks the current release preparation.

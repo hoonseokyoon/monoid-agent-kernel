@@ -6,7 +6,6 @@ import pytest
 
 from monoid_agent_kernel.core.model_invocation import (
     LOGICAL_MODEL_CALL_GENERATION,
-    MODEL_INVOCATION_SCHEMA_VERSION,
     MODEL_DISPATCH_GENERATION,
     MODEL_REQUEST_DIGEST_GENERATION,
     DurableModelInvocation,
@@ -202,7 +201,7 @@ def test_model_invocation_reads_legacy_namespace_and_writes_canonical_namespace(
     assert checked.status == "loaded"
     assert checked.value is not None
     assert checked.value.schema_version == "native-agent-runner.model-invocation.v1"
-    assert checked.value.to_json()["schema_version"] == MODEL_INVOCATION_SCHEMA_VERSION
+    assert checked.value.to_json()["schema_version"] == "monoid.model-invocation.v1"
     assert checked.value.to_json()["digest_generation"] == MODEL_REQUEST_DIGEST_GENERATION
 
 

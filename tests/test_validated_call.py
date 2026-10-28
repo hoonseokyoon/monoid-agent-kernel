@@ -954,4 +954,13 @@ def test_validated_call_abort_drain_usage_rides_the_escaping_exception() -> None
     assert provider_usage_of(caught.value) == drained_bill
     receipts = caught.value.receipts  # type: ignore[attr-defined]
     assert [receipt.usage for receipt in receipts] == [first_bill]
+    from monoid_agent_kernel.core.model_facts import call_facts_of
+
+    termination, evidence = call_facts_of(caught.value)
+    assert termination.outcome == "interrupted"
+    assert termination.requested_by == "turn_interrupt"
+    assert termination.ended_by == "provider_terminal"
+    assert len(evidence.attempts) == 1
+    assert receipts[0].termination.outcome == "completed"
+    assert len(receipts[0].usage_evidence.attempts) == 1
     assert [getattr(event, "text", None) for attempt, event in seen if attempt == 1][1:] == ["{"]

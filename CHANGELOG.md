@@ -7,6 +7,74 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-28
+
+v0.25 improves tool integration, resource ownership, recovery, and model-call observation.
+See the [v0.25 migration guide](docs/migrations/v0.25.md) before
+upgrading persistent runs and the [release audit](docs/V0_25_RELEASE_AUDIT.md) for evidence.
+
+### Added
+
+- Model-call termination facts identify the logical outcome, first accepted stop requester,
+  and actual end of provider reading. Usage evidence preserves explicitly reported zero,
+  missing counters, and per-counter coverage across kernel dispatches. Receipts, subscriptions,
+  durable invocations, and the private model-call ledger carry available facts through recovery.
+  Gateway, Studio, and tracing consumers expose the facts they receive. Numeric `usage` remains
+  the accounting input; provider reports describe observed usage, with billing reconciliation
+  owned by the host.
+- Read-only `termination_budget()` on `ModelCallRunner`, `AgentLoop`, and `RunStream` exposes
+  model-call phases, deadline/drain/grace windows, and the stream-exit cancellation cutoff.
+  Snapshots use process-local monotonic time. The `hard_cancel_requested` phase records the request;
+  a cooperative countdown can reach zero before that request runs. Driver cleanup and settlement
+  can continue afterward. Tools, child runs, and host resources have separate
+  cleanup lifetimes.
+- Typed host tool bindings with activation-owned adapters and call-scoped views. The optional
+  helper preserves the existing ToolContext interface; workspace views enforce admitted write
+  intent, binding/surface path scopes, operator permissions and writer authority on each operation.
+  Resources close once on failure, close or committed park release, and restore uses fresh factories.
+  Run the installed `monoid_agent_kernel.reference.host_tool_report` recipe for typed proposal,
+  approval, recovery and child/fork delegation. `inherit_to_children=True` opens fresh adapters
+  at each child/fork hop with the original parent activation and writer authority chain.
+- Executable integration paths for the first typed tool, request-owned streaming, passive
+  background observation, and approval recovery in a fresh process. The installed report recipe
+  restores the original run/task IDs, creates a fresh resource, and ignores duplicate approval.
+  Source examples use an installation from the same revision; the package's
+  `monoid_agent_kernel.reference.host_tool_report` recipe also runs directly from an installed wheel.
+
+### Changed
+
+- New durable invocation revisions and private model-call ledger records use
+  `monoid.model-invocation.v2` and `monoid.model-calls.v2`. Current readers retain v1 support,
+  and checkpoints keep their `monoid.checkpoint.v1` envelope. The released v0.24.0 reader rejects
+  v2. Upgrade all readers before v2 writers run; rollback after v2 writes requires a verified
+  dual reader or a coordinated pre-upgrade backup. The [migration guide](docs/migrations/v0.25.md)
+  covers both deployment paths and identifies the prepared development reader.
+
+### Fixed
+
+- Streamed calls retain observed provider terminal/EOF completion when cancellation or a
+  deadline arrives during iterator cleanup. Logical outcome, accepted stop requester, usage,
+  local response-validation failures, and writer-authority precedence retain their contracts.
+- OpenAI guards for disabled direct access, an unavailable SDK, or a missing API key report
+  `local_failure` before provider dispatch. Actual provider failures retain their attribution.
+- Child and fork workspaces inherit the parent's effective operator permission policy, including
+  policies supplied through the `AgentLoop` constructor keyword.
+
+- Release activation-owned recorder handles when authority is lost during construction or before
+  bootstrap publishes its resources. Subscription cleanup failures now finish session, callback,
+  and owned-loop teardown on the first attempt. Escaping bootstrap, restore, and finalization
+  errors keep their original cause; recordable failed sessions retain their recorder until close.
+- Preserve validated Python values in `@tool` inputs, including nested Pydantic models, without
+  running input serializers. Serialize top-level model returns in JSON mode using the existing
+  tool observation envelope; serialization failures remain controlled tool errors and available
+  cancellation causes retain their classification. Handlers with model annotations should use
+  attribute access. See the [typed custom tool quickstart](examples/custom_tool_quickstart.py)
+  and [source migration notes](docs/migrations/v0.25.md#update-application-code).
+- Fence each streamed model delta and buffered Unicode suffix before delivery to a standalone
+  `ModelCallRunner` consumer, including when drain is configured but has not started. Lease loss
+  during one callback prevents the remaining normalized pieces from reaching the consumer.
+  Normal Unicode flush, cancellation, drain usage settlement, and wire formats are preserved.
+
 ## [0.24.0] - 2026-09-27
 
 ### Added — stopped-stream drain

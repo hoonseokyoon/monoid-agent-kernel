@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, codex/v0.23-production-adapters]
+    branches: [main, develop, codex/v0.23-production-adapters, codex/v0.25-p3-host-resources, codex/v0.25-p1-p2-call-facts, codex/v0.25-p4-termination-budget, codex/v0.25-dx2-integration-recipes]
 
 permissions:
   contents: read
@@ -206,6 +206,146 @@ jobs:
       - name: Verify optional dependencies
         if: matrix.install == 'all-extras'
         run: python -c "import boto3, dbos, openai, httpx, opentelemetry.sdk, psycopg, psycopg_pool, temporalio"
+      - name: Verify installed example and gateway import provenance
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          examples = Path(os.environ["GITHUB_WORKSPACE"]) / "examples"
+          env = os.environ.copy()
+          env.pop("PYTHONPATH", None)
+          probe = r'''
+          import runpy
+          import subprocess
+          import sys
+          import sysconfig
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import patch
+
+          expected = Path(distribution("monoid-agent-kernel").locate_file(
+              "monoid_agent_kernel/__init__.py")).resolve()
+          assert expected.is_relative_to(Path(sysconfig.get_paths()["purelib"]).resolve())
+          namespace = runpy.run_path(sys.argv[1], run_name="example_import_probe")
+          if sys.argv[2] == "parent":
+              import monoid_agent_kernel
+              assert Path(monoid_agent_kernel.__file__).resolve() == expected
+          else:
+              helper = namespace["_start_real_gateway_subprocess"]
+              launches = []
+              def capture(command, **kwargs):
+                  launches.append((command, kwargs))
+                  return SimpleNamespace(poll=lambda: 0)
+              with patch.dict(helper.__globals__, {
+                  "_free_port": lambda: 40123, "_wait_for_health": lambda *args: None,
+              }), patch("subprocess.Popen", capture):
+                  _, stop, _ = helper(token_secret="example-token", admin_token="example-admin",
+                                      openai_api_key="example-key")
+                  stop()
+              (command, options), = launches
+              assert command[:5] == [sys.executable, "-m", "monoid_agent_kernel.cli",
+                                     "llm-gateway", "serve"]
+              subprocess.run([
+                  command[0], "-c", "import sys; from pathlib import Path; "
+                  "import monoid_agent_kernel as package; "
+                  "assert Path(package.__file__).resolve() == Path(sys.argv[1])", str(expected),
+              ], cwd=options["cwd"], env=options["env"], check=True, timeout=30)
+          print(f"{sys.argv[2]} {Path(sys.argv[1]).name}: {expected}")
+          '''
+          parents = (
+              "custom_model_adapter.py", "custom_tool_quickstart.py", "embedding_hosted_product.py",
+              "embedding_local_product.py", "full_stack_integration.py", "memory_quickstart.py",
+              "messy_workspace_cleanup.py", "minimal_quickstart.py", "otel_tracing.py",
+          )
+          failures = []
+          for mode, names in (("parent", parents), ("child", (
+              "full_stack_integration.py", "messy_workspace_cleanup.py",
+          ))):
+              for name in names:
+                  result = subprocess.run([sys.executable, "-c", probe, str(examples / name), mode],
+                                          env=env, text=True, capture_output=True, timeout=60)
+                  print(result.stdout, end="")
+                  if result.returncode:
+                      failures.append(f"{mode}:{name}")
+                      print(result.stderr, end="")
+          assert not failures, failures
+          PY
+      - name: Run copied integration examples from installed package
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          examples = Path(os.environ["GITHUB_WORKSPACE"]) / "examples"
+          env = os.environ.copy()
+          env.pop("PYTHONPATH", None)
+          with tempfile.TemporaryDirectory(prefix="monoid-installed-examples-") as directory:
+              for name in ("custom_tool_quickstart.py", "model_call_facts.py",
+                           "recover_model_call_facts.py", "termination_budget.py",
+                           "observe_background_run.py"):
+                  copied = Path(directory) / name
+                  shutil.copyfile(examples / name, copied)
+                  subprocess.run([sys.executable, str(copied)], cwd=directory, env=env,
+                                 check=True, timeout=60)
+                  if name == "termination_budget.py":
+                      for scenario in ("silent_stop", "consumer_cancel"):
+                          subprocess.run([sys.executable, str(copied), "--scenario", scenario],
+                                         cwd=directory, env=env, check=True, timeout=60)
+          PY
+      - name: Run installed host resource approval and recovery recipe
+        if: matrix.install == 'minimal'
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          command = [sys.executable, "-m", "monoid_agent_kernel.reference.host_tool_report"]
+          env = os.environ.copy()
+          env.pop("PYTHONPATH", None)
+          with tempfile.TemporaryDirectory(prefix="monoid-installed-approval-") as directory:
+              subprocess.run(command, cwd=directory, env=env, check=True, timeout=30)
+              root = Path(directory) / "report"
+              prepared = json.loads(subprocess.check_output(
+                  command + ["--phase", "prepare", "--root", str(root)],
+                  cwd=directory, env=env, text=True, timeout=30,
+              ))
+              resumed = json.loads(subprocess.check_output(
+                  command + ["--phase", "resume", "--root", str(root),
+                             "--run-id", prepared["run_id"], "--task-id", prepared["task_id"]],
+                  cwd=directory, env=env, text=True, timeout=30,
+              ))
+              assert prepared["status"] == "awaiting_tasks" and resumed["status"] == "completed"
+              assert prepared["pid"] != resumed["pid"]
+              assert resumed["run_id"] == prepared["run_id"]
+              assert resumed["task_id"] == prepared["task_id"]
+              assert (prepared["resource_opens"], resumed["resource_opens"]) == (1, 1)
+              assert (prepared["read_calls"], resumed["read_calls"]) == (0, 1)
+              assert (prepared["model_calls"], resumed["model_calls"]) == (3, 1)
+              assert prepared["total_usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+              assert resumed["total_usage"] == {"input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
+              assert resumed["duplicate_ignored"] is True
+              assert resumed["report_body"] == "# Weekly\n\nReady for approval.\n"
+              assert prepared["proposal_only"] and resumed["proposal_only"]
+              assert not (root / "workspace/reports/weekly.md").exists()
+              print(json.dumps({"prepared": prepared, "resumed": resumed}, sort_keys=True))
+          PY
       - name: Run installed conformance evidence smoke
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}

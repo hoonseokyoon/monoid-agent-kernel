@@ -114,6 +114,12 @@ from monoid_agent_kernel.core.context import ContextProvider, TurnContext
 from monoid_agent_kernel.core.invocation import InvocationContext
 
 # Model I/O capture (per-consumer policy for prompt/output disclosure)
+from monoid_agent_kernel.core.termination_budget import (
+    TerminationBudgetSnapshot,
+    CallTerminationBudget,
+    GraceBudget,
+    StreamExitBudget,
+)
 from monoid_agent_kernel.core.model_io import (
     DEFAULT_SECRET_KEY_PARTS,
     CapturePolicy,
@@ -121,6 +127,10 @@ from monoid_agent_kernel.core.model_io import (
     DefaultRedactor,
     ModelCallCapture,
     ModelCallReceipt,
+    ModelCallTermination,
+    UsageObservation,
+    UsageEvidenceAttempt,
+    UsageEvidence,
     ModelIOObserver,
     ModelIOSubscription,
     RedactionPolicy,
@@ -383,7 +393,15 @@ __all__ = [
     "Redactor",
     "DefaultRedactor",
     "DEFAULT_SECRET_KEY_PARTS",
+    "TerminationBudgetSnapshot",
+    "CallTerminationBudget",
+    "GraceBudget",
+    "StreamExitBudget",
     "ModelCallReceipt",
+    "ModelCallTermination",
+    "UsageObservation",
+    "UsageEvidenceAttempt",
+    "UsageEvidence",
     "ModelCallCapture",
     "ModelIOObserver",
     "ClosableModelIOObserver",

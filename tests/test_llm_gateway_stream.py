@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import io
 import json
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,7 @@ from monoid_agent_kernel.providers.base import (
     TextDelta,
     ToolCallDelta,
     TurnComplete,
+    _assemble_normalized_streamed_turn,
     assemble_streamed_turn,
 )
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, FakeStreamingModelAdapter
@@ -111,6 +114,166 @@ async def _collect(agen) -> list[Any]:
 
 def _adapter(base_url: str, token: str) -> GatewayModelAdapter:
     return GatewayModelAdapter(ModelConfig(), gateway_url=f"{base_url}/internal/llm/turns", token=token)
+
+
+@pytest.mark.parametrize("terminal", ["valid", "missing", "malformed", "hung_eof"])
+@pytest.mark.parametrize("close_at", ["response", "client"])
+@pytest.mark.parametrize("boundary", ["caller_cancel", "user_cancel", "deadline", "drain_timeout"])
+def test_gateway_sse_eof_survives_context_exit(monkeypatch, terminal, close_at, boundary) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.errors import RunCancelled, RunTimeout
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    httpx = pytest.importorskip("httpx")
+
+    async def run():
+        closing, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        before_eof = asyncio.Event()
+        token = CancellationToken()
+
+        async def blocked_close():
+            closing.set()
+            try:
+                await release.wait()
+            finally:
+                closed.set()
+
+        class Response:
+            status_code = 200
+            eof = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                if close_at == "response":
+                    await blocked_close()
+
+            async def aiter_lines(self):
+                yield 'data: {"type":"text_delta","text":"answer","provider_retried":true}'
+                yield ""
+                if terminal in {"valid", "hung_eof"}:
+                    yield 'data: {"type":"turn_complete","usage":{"output_tokens":3}}'
+                elif terminal == "malformed":
+                    yield 'data: {"type":"turn_complete"'
+                if terminal == "hung_eof":
+                    yield ""
+                    before_eof.set()
+                    await asyncio.Event().wait()
+                self.eof = True
+
+        response = Response()
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                if close_at == "client":
+                    await blocked_close()
+
+            def stream(self, *args, **kwargs):
+                return response
+
+        monkeypatch.setattr(httpx, "AsyncClient", Client)
+        captures = []
+        runner = ModelCallRunner(
+            adapter=_adapter("http://gateway.local", "token"), settled_sink=captures.append,
+            current_cancellation_token=lambda: token, cancel_grace_s=0.02,
+            abort_drain_s=0.05 if boundary == "drain_timeout" else 0,
+        )
+        task = asyncio.create_task(runner.acall(
+            ModelRequest(instruction="hi", system_prompt="", tools=()),
+            delta_consumer=lambda chunk: None,
+            deadline=time.time() + 0.15 if boundary == "deadline" else None,
+        ))
+        error_type = (asyncio.CancelledError if boundary == "caller_cancel" else
+                      RunTimeout if boundary == "deadline" else RunCancelled)
+        try:
+            await asyncio.wait_for((before_eof if terminal == "hung_eof" else closing).wait(), 2)
+            assert response.eof is (terminal != "hung_eof")
+            if boundary == "caller_cancel":
+                task.cancel()
+            elif boundary in {"user_cancel", "drain_timeout"}:
+                token.cancel()
+            with pytest.raises(error_type) as caught:
+                await asyncio.wait_for(task, 2)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(closed.wait(), 2)
+        expected_end = "provider_terminal" if terminal == "valid" else "provider_eof"
+        if terminal in {"malformed", "hung_eof"}:
+            expected_end = ("deadline" if boundary == "deadline" else
+                            "drain_timeout" if boundary == "drain_timeout" else "stop_request")
+        facts, evidence = call_facts_of(caught.value)
+        assert facts == ModelCallTermination(
+            outcome="timed_out" if boundary == "deadline" else "cancelled",
+            requested_by=None if boundary == "deadline" else "caller_cancel" if boundary == "caller_cancel" else "user_cancel",
+            ended_by=expected_end,
+        )
+        assert len(captures) == 1
+        receipt = captures[0].receipt
+        assert (receipt.termination, receipt.usage_evidence) == (facts, evidence)
+        assert receipt.usage == provider_usage_of(caught.value)
+        assert receipt.usage.get("output_tokens", 0) == (3 if terminal in {"valid", "hung_eof"} else 0)
+        assert receipt.provider_retried is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop", ["user_cancel", "turn_interrupt"])
+@pytest.mark.parametrize("required_proof", [False, True])
+def test_gateway_eof_proof_failure_keeps_its_reason_during_drain(monkeypatch, stop, required_proof) -> None:
+    from monoid_agent_kernel.core.cancellation import CancellationToken
+    from monoid_agent_kernel.core.model_facts import ModelCallTermination, call_facts_of
+    from monoid_agent_kernel.core.spec import GenerationConfig
+    from monoid_agent_kernel.errors import ModelCallAborted, RunCancelled
+    from monoid_agent_kernel.model_call import ModelCallRunner
+    from monoid_agent_kernel.providers.base import provider_usage_of
+
+    adapter, attempts = _retried_stream_adapter(monkeypatch, body=[
+        'data: {"type":"text_delta","text":"answer","provider_retried":true}', "",
+    ])
+    attempts["n"] = 1
+    token = CancellationToken()
+    captures, seen = [], []
+
+    def consume(chunk):
+        seen.append(chunk)
+        if stop == "user_cancel":
+            token.cancel()
+
+    runner = ModelCallRunner(
+        adapter=adapter, settled_sink=captures.append, abort_drain_s=1,
+        current_cancellation_token=lambda: token,
+    )
+    with pytest.raises(RunCancelled if stop == "user_cancel" else ModelCallAborted) as caught:
+        asyncio.run(runner.acall(
+            ModelRequest(
+                instruction="hi", system_prompt="", tools=(),
+                model=ModelConfig(generation=GenerationConfig(temperature=0.1)) if required_proof else None,
+            ),
+            delta_consumer=consume, should_abort=lambda: stop == "turn_interrupt" and bool(seen),
+        ))
+    facts, evidence = call_facts_of(caught.value)
+    assert facts == ModelCallTermination(
+        outcome="cancelled" if stop == "user_cancel" else "interrupted", requested_by=stop,
+        ended_by="local_failure" if required_proof else "provider_eof",
+    )
+    assert len(captures) == 1
+    receipt = captures[0].receipt
+    assert (receipt.termination, receipt.usage_evidence) == (facts, evidence)
+    assert receipt.usage == provider_usage_of(caught.value) == evidence.reported == {}
+    assert receipt.provider_retried is True
 
 
 # --- Gateway side (no httpx, no key) ---------------------------------------------------
@@ -591,7 +754,7 @@ def test_the_folds_usage_renormalization_stays_structurally_guarded() -> None:
     guard, or downgrading the classification it states, goes red.
     """
 
-    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(assemble_streamed_turn))
+    _assert_the_fold_guard_binds_its_refusal(inspect.getsource(_assemble_normalized_streamed_turn))
 
 
 def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
@@ -603,7 +766,7 @@ def test_the_fold_guard_pin_moves_on_the_edits_it_claims_to_catch() -> None:
     worst of both directions.
     """
 
-    source = inspect.getsource(assemble_streamed_turn)
+    source = inspect.getsource(_assemble_normalized_streamed_turn)
     _assert_the_fold_guard_binds_its_refusal(source)  # unmutated: green
 
     def _mutant(old: str, new: str) -> str:

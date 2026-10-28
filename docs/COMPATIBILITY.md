@@ -5,6 +5,10 @@ namespace aliases, and source aliases. The machine-readable source is
 `monoid_agent_kernel.core.compatibility.PUBLIC_ARTIFACT_COMPATIBILITY`; the table below is
 checked against it in CI.
 
+For the current release transition, start with [Upgrade from v0.24 to v0.25](migrations/v0.25.md).
+It covers typed tools, v2 durable records, deployment choices, and rollback. The
+[release audit](V0_25_RELEASE_AUDIT.md) records implementation and release qualification separately.
+
 Experimental optional Reference profiles sit outside this stable inventory. v0.19.2 treats
 `DbosResumeCommand`, `DbosRunReceipt`, and the DBOS-specific control envelope as experimental
 Reference operational records for the finite-activation profile. Their compatibility belongs to
@@ -30,6 +34,38 @@ profile.
 lists every identifier this release can emit; most artifacts contain only `current_writer`.
 `Missing id accepted` records an existing compatibility behavior. New producers write
 `current_writer` unless a documented variant selects another active writer.
+
+## Typed tool source compatibility (v0.25)
+
+`host_tool_bindings` is an optional keyword on AgentLoop and its convenience constructors.
+`monoid_agent_kernel.tools.host_bindings` provides the typed key, synchronous resource contracts
+and optional context helper. Existing ToolContext implementations keep their required methods.
+Keys use process-local identity; restore requires host injection again. No wire/durable version
+changes, automatic client serialization or migration of existing workspace providers accompany
+this seam. Existing providers can adopt the [recipe](EMBEDDING.md#inject-host-resources-into-tools-v025)
+one handler at a time.
+
+`HostToolBinding.inherit_to_children` is a keyword-only boolean, defaulting to False. Opt-in
+factories rerun for children and forks with fresh adapters and original parent authority checks.
+Children inherit the effective parent operator policy, including a constructor-level override.
+
+`@tool` now delivers validated Python values to handlers. A parameter annotated with a Pydantic
+model receives that model, including nested fields and models in lists or dictionaries. Handlers
+that kept a model annotation but accessed `draft["title"]` should use `draft.title`, or choose a
+dictionary annotation when dictionary access is intended. Input serializers are no longer called.
+Validation errors retain `invalid_tool_args` and skip the handler.
+
+Top-level model returns are serialized in JSON mode before entering the existing `ToolResult`
+envelope. The actual dump shape determines object versus scalar/list wrapping. Existing dictionaries,
+scalars, explicit `ToolResult`, and domain keys such as `ok`, `error`, and `result` keep their existing
+envelopes. Automatic conversion is limited to the top-level model. The return annotation adds no
+validation or field filtering; standard serialization rules of the returned instance apply.
+
+This change uses the existing tool observation wire format and requires no durable-data migration.
+To run a newly typed tool on an older kernel, accept dictionary arguments, validate them explicitly
+with `Model.model_validate()`, and return `result.model_dump(mode="json")`. Deploy that compatibility
+version of the tool together with a kernel rollback. See [the embedding example](EMBEDDING.md#use-domain-models-in-tools)
+for the current API, serialization failures, and control-exception limits.
 
 ## Versioned artifact inventory
 
@@ -62,12 +98,12 @@ lists every identifier this release can emit; most artifacts contain only `curre
 | `web-context` | wire | `monoid.web-context.v1` | permissive; missing id accepted | `monoid.web-context.v1`<br>`native-agent-runner.web-context.v1` |
 | `web-context-result` | wire | `monoid.web-context-result.v1` | permissive; missing id accepted | `monoid.web-context-result.v1`<br>`native-agent-runner.web-context-result.v1` |
 | `checkpoint` | durable | `monoid.checkpoint.v1` | checked | `monoid.checkpoint.v1`<br>`native-agent-runner.checkpoint.v1` |
-| `model-invocation` | durable | `monoid.model-invocation.v1` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1` |
+| `model-invocation` | durable | `monoid.model-invocation.v2` | checked | `monoid.model-invocation.v1`<br>`native-agent-runner.model-invocation.v1`<br>`monoid.model-invocation.v2` |
 | `backend-run` | durable | `monoid.backend-run.v1` | checked | `monoid.backend-run.v1`<br>`native-agent-runner.backend-run.v1` |
 | `event` | durable | `monoid.event.v1` | json-schema | `monoid.event.v1`<br>`native-agent-runner.event.v1` |
 | `transcript` | durable | `monoid.transcript.v1` | json-schema; missing id accepted | `monoid.transcript.v1` |
 | `model-content` | durable | `monoid.model-content.v1` | json-schema | `monoid.model-content.v1`<br>`native-agent-runner.model-content.v1` |
-| `model-calls` | durable | `monoid.model-calls.v1` | json-schema | `monoid.model-calls.v1` |
+| `model-calls` | durable | `monoid.model-calls.v2` | json-schema | `monoid.model-calls.v1`<br>`monoid.model-calls.v2` |
 | `model-payloads` | durable | `monoid.model-payloads.v1` | json-schema | `monoid.model-payloads.v1` |
 | `manifest` | durable | `monoid.manifest.v1` | json-schema | `monoid.manifest.v1`<br>`native-agent-runner.manifest.v1` |
 | `workspace-base` | durable | `monoid.workspace-base.v1` | json-schema | `monoid.workspace-base.v1`<br>`native-agent-runner.workspace-base.v1` |
@@ -161,6 +197,39 @@ the first reservation through every later revision and retry. The checked reader
 v0.22 prerelease `requires_evidence` boolean and maps `false` to `passive` and `true` to `required`;
 the canonical writer emits only `evidence_policy`. Deploy the current checked reader before this
 writer because the earlier prerelease reader used a closed top-level vocabulary.
+
+Fresh invocation revisions and model-call ledger records use `monoid.model-invocation.v2` and
+`monoid.model-calls.v2`. Both readers retain v1 support. V2 adds optional
+`termination` and `usage_evidence` metadata; v1 retains its closed vocabulary. New Python types
+`ModelCallTermination`, `UsageObservation`, `UsageEvidenceAttempt`, and `UsageEvidence` are
+exported from the package root and `core.model_io`. Receipt/attempt JSON omits unavailable facts.
+Explicit zero reports survive, and per-counter coverage is derived from ordered dispatch observations.
+Known counts agree with numeric usage; numeric usage remains the accounting input.
+
+Recovery preserves the original submitted invocation payload for a committed revision, including
+accepted namespace/digest aliases, omitted defaults, and the legacy evidence flag. The storage helper
+`model_invocation_payload_for_write` verifies that its checked semantic value has not changed before
+returning a detached original payload. Canonical `to_json()` remains available for semantic projection.
+New revisions explicitly select the current writer. Nested checkpoints preserve the invocation payload
+while keeping their own checkpoint.v1 envelope. No database schema or request digest changes are required.
+
+Settled v2 redelivery restores facts through the public receipt and subscriptions. Retrying a recovered
+call combines the historical observation prefix with new dispatch observations. The final private result
+retains final-turn usage; the public receipt retains cumulative usage. A v1 prefix stays legacy-ambiguous.
+
+Before any v2 writer runs, upgrade every reader. A coordinated upgrade stops writers, takes a
+consistent backup, and replaces all readers and writers before resuming. A rolling upgrade first
+deploys a verified dual-reader build that still writes v1. The
+[v0.25 migration guide](migrations/v0.25.md#choose-a-deployment-path) describes both paths.
+Rollback after v2 writes requires the reader-preparation binary (P1P2-01, source `74ff289` /
+integration `ec32ca8`) or a later verified dual reader, or restoration of the coordinated pre-upgrade
+backup. The released v0.24.0 reader rejects v2 as unsupported. The preparation binary is a development
+build and can emit a new v1 revision while preserving existing v2 coordinates. Its new v1 receipts omit
+facts, so later readers keep that missing provenance unavailable. Development wheels share version
+0.24.0: identify them by source commit and wheel SHA-256. Deployment remains an operator action.
+
+`decode_model_invocation` dispatches between v1 and v2 readers. The exported `MODEL_INVOCATION_CODEC`
+retains its v1 identity for existing explicit v1 consumers. Use the dispatch function for mixed history.
 
 `monoid.checkpoint.v1` adds optional `last_model_invocation`, `interruption_cause`, `plan`,
 `pending_finish`, and `pending_tool_loads` fields. Its optional `last_suspension` object also carries
@@ -287,7 +356,7 @@ compatibility window, settled text is written to both it and `transcript.jsonl`;
 the sidecar first and falls back to the transcript for any unresolved digest.
 
 `model_calls.jsonl` is optional in the same way, and single-namespace: it has never existed under
-`native-agent-runner.*`, so `monoid.model-calls.v1` is the only accepted reader version. A record
+`native-agent-runner.*`; its readers accept canonical v1 and v2. A record
 is a declared projection of the in-process `ModelCallReceipt` rather than its serialization, so
 the two shapes are deliberately not interchangeable — a recorded line does not round-trip through
 `ModelCallReceipt.from_json`, which would supply transport defaults the call never ran under.

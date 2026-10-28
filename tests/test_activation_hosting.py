@@ -46,6 +46,7 @@ from monoid_agent_kernel.loop import AgentLoop
 from monoid_agent_kernel.providers.base import ModelTurn
 from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
 from monoid_agent_kernel.recorder import AgentRecorder
+from monoid_agent_kernel.tools.host_bindings import HostToolBinding, HostToolKey
 
 
 _PRIVATE_FINAL_TEXT = "private final text that must stay out of the activation receipt"
@@ -271,6 +272,7 @@ def _loop_factory(
     *,
     run_root_name: str = "replacement-runs",
     limits: RunLimits | None = None,
+    host_tool_bindings: tuple[HostToolBinding[Any], ...] = (),
 ):
     def build(command: ActivationCommand, runtime: ActivationRuntime) -> AgentLoop:
         factory_calls.append(command.identity_sha256)
@@ -282,6 +284,7 @@ def _loop_factory(
                 limits=limits or spec.limits,
             ),
             model_adapter=adapter,
+            host_tool_bindings=host_tool_bindings,
             runtime_config_provider=runtime_provider(runtime_config("fs.write")),
             run_sink=runtime.run_sink,
             writer_token=runtime.writer_token,
@@ -413,6 +416,33 @@ def test_activation_replacement_returns_same_content_free_receipt(tmp_path: Path
     assert adapter.calls == 1
     assert len(factory_calls) == 1
     assert harness.sink.latest_event_sequence(command.run_id) == first.event_cursor
+
+
+def test_host_resource_factories_skip_duplicate_activation_commands(tmp_path: Path) -> None:
+    harness, token, checkpoint, spec = _seed_checkpoint(tmp_path, run_id="host-resources")
+    opened, closed = [], []
+
+    class Resource:
+        def bind_call(self, lease: Any) -> Any:
+            return lease
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def open_resource(activation: Any) -> Resource:
+        opened.append(activation.run_id)
+        return Resource()
+
+    factory = _loop_factory(
+        tmp_path, spec, _CountingFinalAdapter(), [],
+        host_tool_bindings=(HostToolBinding(HostToolKey("client", accepts=lambda _: True), open=open_resource),),
+    )
+    command = _command(checkpoint)
+    first = ActivationDriver(sink=harness.sink, writer_token=token, loop_factory=factory).drive(command)
+    assert opened == [spec.run_id] and closed == [True]
+    replacement = harness.claim_writer(command.run_id, "owner-b")
+    duplicate = ActivationDriver(sink=harness.sink, writer_token=replacement, loop_factory=factory).drive(command)
+    assert duplicate == first and opened == [spec.run_id] and closed == [True]
 
 
 def test_older_command_keeps_exact_receipt_after_later_input(tmp_path: Path) -> None:
