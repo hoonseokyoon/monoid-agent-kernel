@@ -1,7 +1,7 @@
 # v0.25 Release Readiness Audit
 
-Status on 2026-10-28: implementation integrated; documentation changes prepared and locally
-qualified, with final review/integration tracked below. Release qualification remains pending.
+Status on 2026-10-28: implementation integrated; documentation qualification and delivery are
+recorded below. Release qualification remains pending.
 Package metadata remains `0.24.0`. Version change, release artifacts,
 release branch integration, tag, GitHub release, and package publication remain pending.
 
@@ -85,11 +85,15 @@ Existing handbook headings remain available. Current contribution and CI instruc
 |---|---|
 | Release narrative, migration guide, and audit (DOC-01) | [PR #171](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/171), reviewed `f023600`, merged as `4aa189d`; [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40620745652) and [required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40620745649) passed |
 | User entry points and practical guides (DOC-02) | [PR #172](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/172), reviewed `39b7a67`, merged as `f41d95b`; [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40623017325) and [required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40623017335) passed |
-| History navigation, contribution flow, and current-document validation (DOC-03) | Implemented at `5e1fcde`; final independent review and required CI pending |
+| History navigation, contribution flow, and current-document validation (DOC-03) | [PR #173](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/173), reviewed `c32c07a`, merged as `981aeb3`; [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40625614329) and [required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40625614407) passed |
 | Documented CLI, compatibility ledger, packaging, and carriage checks | 118 passed at `5e1fcde` on Python 3.11.9 |
-| Local/candidate-mapped links and code blocks | 503 links and 44 Python blocks passed across 45 documents; historical signature sketches are labelled as text |
+| Local/candidate-mapped links and code blocks | 508 links and 44 Python blocks passed across 45 documents; historical signature sketches are labelled as text |
 | README rendering and exact development wheel | GitHub GFM and package-description rendering passed; wheel/installed evidence below |
-| Final documentation integration | Pending final review and required CI for `codex/v0.25-release-docs` |
+| Final documentation integration | [PR #174](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/174) records the final head, review, required CI, and `develop` integration status |
+
+Fresh cumulative review covered the full change from `b27a15c` through `c32c07a` with no unresolved
+findings. Integration merge `981aeb3` has the same tree. The final PR also covers this audit record
+update and preserves the release qualification gates below.
 
 The discovery regression first failed because a frozen v0.24 command was treated as current.
 The bounded repair excludes 14 exact historical paths. The same regression proves invalid commands
