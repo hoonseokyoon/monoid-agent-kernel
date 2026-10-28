@@ -7,8 +7,8 @@ this flow with typed tools, a checked filesystem checkpoint, fresh resources, an
 ## Install and prepare
 
 Use Python 3.11+ and install this checkout with `python -m pip install .`, or install its matching
-wheel. The recipe module is included in the package. These commands use the v0.25 development
-API; package metadata currently reports `0.24.0`.
+wheel. The recipe module is included in the package. These commands use the 0.25.0 API;
+the [release audit](../V0_25_RELEASE_AUDIT.md) records qualified artifacts and publication status.
 
 Choose a root to retain between commands, then run:
 

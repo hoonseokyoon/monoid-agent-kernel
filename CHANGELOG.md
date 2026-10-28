@@ -7,8 +7,10 @@ out in commit messages and here.
 
 ## [Unreleased]
 
-The v0.25 implementation is integrated. Package metadata remains `0.24.0` while release
-qualification is pending. See the [v0.25 migration guide](docs/migrations/v0.25.md) before
+## [0.25.0] - 2026-10-28
+
+v0.25 improves tool integration, resource ownership, recovery, and model-call observation.
+See the [v0.25 migration guide](docs/migrations/v0.25.md) before
 upgrading persistent runs and the [release audit](docs/V0_25_RELEASE_AUDIT.md) for evidence.
 
 ### Added
