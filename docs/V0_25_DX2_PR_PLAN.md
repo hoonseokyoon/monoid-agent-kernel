@@ -404,3 +404,32 @@ Python 3.11.9/Pydantic 2.14.1에서 실제 부모 9개·gateway 자식 2개 prov
 명령·실패 보존·최종 원본은 `.tmp/v025/dx2-03-evidence.md`에 둔다.
 03 구현·검사·CI·진입 문서는 435줄로 추정 220–360줄을 75줄 넘었다. 실제 프로세스 검사와
 복원/정리 오류 검증이 주요 비용이다. 현재 계획 기록 포함 누적은 약 2,030줄이며 runtime core 변경은 0줄이다.
+
+[PR #169](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/169)은 최종 `8d8277d` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40611415794),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40611415729) 성공 후
+통합 브랜치에 `3bd3095`로 병합했다. 리뷰 head와 병합 tree가 같다.
+병합 시 자동 GitHub 리뷰는 진행 중이었고 게시된 지적은 없었다. 최종 통합 전에 후속 피드백을 확인한다.
+
+### 9.5 DX2-I 최종 통합
+
+실제 통합 base `3bd3095`, 다시 fetch한 develop `5fc49b2`에서 누적 검증을 시작했다.
+브랜치는 `codex/v0.25-dx2-integration-recipes`이며 runtime·설치 입력·예제·CI block은 검증된 `8d8277d`와 같다.
+현재 환경의 정확한 wheel 증거를 재사용하고 같은 wheel을 Pydantic 2.6.4 환경에서 검증한다.
+`.tmp/v025/dx2-i-preflight.md`를 독립 검토한 뒤 기존 계획·설계·문서 index의 구현 상태를 갱신한다.
+최종 head의 누적 독립 코드 리뷰·L1·required combined L2·full push CI와 병합 tree 확인을 완료 조건으로 둔다.
+
+독립 `dx2_i_preflight_review`는 **READY**, preflight SHA256
+`B4D2F498E769D6770A6CE0935DEECDDAF533E98D9F76026D3D510144215E790F`다.
+최종 변경은 기존 상태 문서 4개로 한정한다. `dx2_i_code_review`가 develop 대비 누적 실제 소비 경로를 독립 검토한다.
+현재 wheel 증거와 관련 소스 검사는 입력 동일성을 확인해 재사용하고, 같은 wheel의 최소 계열 실행을 추가한다.
+
+동일 wheel `fea62fe2dd95ea5a7f61537287b451303c6f4156a0afa9682948cca4a912a0ab`를
+Python 3.11.9/Pydantic **2.6.4**에 설치했다. checkout 밖·PYTHONPATH 없는 실제 CI block 3개가 모두 통과했다:
+부모 9개·자식 2개 provenance, 복사 예제 5개·종료 변형 2개, 기존 host demo와 새 프로세스 승인 재개다.
+prepare/resume PID는 34136/11096으로 달랐으며 원래 ID·자원 1개씩·읽기 0→1회·모델 3→1회·누계·본문을 확인했다.
+Pydantic **2.14.1**의 동일 wheel 결과와 함께 세 학습 경로의 설치 소비 검증을 마쳤다.
+현재/최소 실행 증거와 재사용 입력 대조는 `.tmp/v025/dx2-i-evidence.md`에 기록한다.
+새 runtime·저장·권한 정책 변경은 없다. 최초 1,350–1,950줄 대비 최종 누적 변경은 약 2,070줄이며,
+증가분은 실제 프로세스·실패 정리 검사와 실행 기록이다. 별도 예제 프레임워크나 검증 플랫폼은 추가하지 않았다.
+최종 문서 6개의 local link/anchor 179개와 Python block 20개, diff 검사를 통과했다.

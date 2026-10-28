@@ -50,7 +50,7 @@ building against, and securing the kernel.
   The [P4 PR plan](V0_25_P4_PR_PLAN.md) specifies monotonic control, remaining-duration recovery,
   owned-call snapshots, RunStream escalation budgets, external evidence, and completed implementation evidence.
   The [DX2 PR plan](V0_25_DX2_PR_PLAN.md) defines the first-tool, request-stream and approval-restart journeys,
-  example simplification, installed-wheel validation, external cases and PR boundaries; sequential implementation is authorized.
+  example simplification, installed-wheel validation, external cases and the completed DX2-00–03 parts; its execution record tracks final integration.
   The installed [host-resource report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py)
   exercises prepare/resume across processes, cumulative usage and explicit fresh/fork child inheritance.
 
