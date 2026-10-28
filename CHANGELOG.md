@@ -22,8 +22,9 @@ upgrading persistent runs and the [release audit](docs/V0_25_RELEASE_AUDIT.md) f
   owned by the host.
 - Read-only `termination_budget()` on `ModelCallRunner`, `AgentLoop`, and `RunStream` exposes
   model-call phases, deadline/drain/grace windows, and the stream-exit cancellation cutoff.
-  Snapshots use process-local monotonic time. A zero hard-cancel remainder records the request;
-  driver cleanup and settlement can continue. Tools, child runs, and host resources have separate
+  Snapshots use process-local monotonic time. The `hard_cancel_requested` phase records the request;
+  a cooperative countdown can reach zero before that request runs. Driver cleanup and settlement
+  can continue afterward. Tools, child runs, and host resources have separate
   cleanup lifetimes.
 - Typed host tool bindings with activation-owned adapters and call-scoped views. The optional
   helper preserves the existing ToolContext interface; workspace views enforce admitted write
