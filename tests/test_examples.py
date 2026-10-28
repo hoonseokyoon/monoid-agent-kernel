@@ -226,6 +226,72 @@ def test_termination_budget_example_observes_stop_and_settlement(
     assert output["usage"] == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
+def test_termination_example_closes_after_a_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel import CapturePolicy, LoopSession, ModelIOSubscription
+    from monoid_agent_kernel.errors import ModelAdapterError, TurnNotSettled
+
+    module = _load("termination_budget.py")
+    original_from_config = module.AgentLoop.from_config
+    loops, receipts, closed = [], [], []
+
+    class FailingAdapter:
+        async def astream_turn(self, request):
+            raise ModelAdapterError("bad configuration", http_status=400)
+            yield  # Make the failing method an async generator, like a real stream adapter.
+
+    class Observer:
+        def on_model_call(self, capture):
+            receipts.append(capture.receipt)
+
+        def close(self):
+            closed.append(True)
+
+    def build_loop(spec, adapter, config, **kwargs):
+        kwargs["model_io_subscriptions"] += (
+            ModelIOSubscription(Observer(), CapturePolicy(mode="none")),
+        )
+        loop = original_from_config(spec, FailingAdapter(), config, **kwargs)
+        loops.append(loop)
+        return loop
+
+    monkeypatch.setattr(module.AgentLoop, "from_config", build_loop)
+
+    async def check():
+        existing = asyncio.all_tasks()
+        task = asyncio.create_task(module.main())
+        try:
+            # Observe the old watcher hang before timeout cancellation can hide its cause.
+            done, _ = await asyncio.wait({task}, timeout=3)
+            assert task in done, "example waited for a Stop phase after the provider had failed"
+            with pytest.raises(TurnNotSettled) as raised:
+                await task
+            assert raised.value.suspension.reason == "turn_failed"
+            assert raised.value.suspension.http_status == 400
+            assert "bad configuration" in raised.value.suspension.error
+            receipt, = receipts
+            assert receipt.termination.to_json() == {
+                "outcome": "failed", "requested_by": None, "ended_by": "provider_error",
+            }
+            assert dict(receipt.usage_evidence.reported) == {}
+            assert receipt.usage_evidence.completeness["total_tokens"] == "unknown"
+            assert closed == [True]
+            loop, = loops
+            assert LoopSession(loop).health().alive is False
+            assert not {item for item in asyncio.all_tasks() - existing if not item.done()}
+        finally:
+            # This fallback keeps a deliberately red test from leaking its real activation.
+            pending = [item for item in asyncio.all_tasks() - existing if not item.done()]
+            for item in pending:
+                item.cancel()
+            await asyncio.gather(task, *pending, return_exceptions=True)
+            for loop in loops:
+                await loop.adiscard_uncommitted()
+
+    asyncio.run(check())
+
+
 def test_host_report_example_preserves_approval_and_child_paths(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
