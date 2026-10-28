@@ -19,7 +19,7 @@ the source and artifact identities behind evidence and keeps each pending gate v
 | Reviewed head and merge tree | `92a4c23201ce9fa4ca9fdf87b3cfdb23cf3e3436` |
 | Final fact repair source | `f5a98dcbde0a1f07cf334ec03f2aebc4cb5634cf`, [PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) |
 | Current package/fallback version | `0.25.0` |
-| Qualified v0.25 release source, wheel, and sdist | Pending |
+| v0.25 candidate source, wheel, and sdist qualification | [PR #176](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/176) owns final identities and results |
 | v0.25 tag and publication | Pending |
 
 ## Integrated behavior
@@ -134,7 +134,7 @@ termination, accounting, authority, and recovery contracts.
 | Part | Base and scope | Completion evidence |
 |---|---|---|
 | [Repair PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175), `codex/v0.25-release-facts-fix` | Latest `develop`; the two termination-fact defects and their regressions | Failing tests committed before fixes; exception/receipt assertions; focused checks; independent review and required CI |
-| Release candidate PR, `codex/v0.25-release-candidate` | `develop` after the repair merges; version `0.25.0`, current release documentation and exact artifacts | Refreshed preflight; version consistency; audited wheel/sdist; rendered README; installed consumers; compatibility/service evidence; final review and CI |
+| [Release candidate PR #176](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/176), `codex/v0.25-release-candidate` | `develop` after the repair merges; version `0.25.0`, current release documentation and exact artifacts | Refreshed preflight; version consistency; audited wheel/sdist; rendered README; installed consumers; compatibility/service evidence; final review and CI |
 
 Both PRs target `develop` in order, as independent changes. This base already receives required
 PR checks and full push CI. The candidate depends on the reviewed repair; no workflow registration
@@ -155,8 +155,8 @@ The repair preflight was independently accepted against `f7c98e1`. Regression co
 passed. The failures covered 24 EOF/cleanup boundaries and six OpenAI local guards; the controls
 preserved response-validation, authority-loss, and actual-provider-error behavior. Implementation
 `777f4199e1482515dba5f40f0ef4ab00b4869216` passed all 38 cases and the 580-test focused selection,
-plus Ruff and diff checks. The source/test change totals 283 changed lines. Final independent
-code review, required CI, and integration remain completion gates for this repair.
+plus Ruff and diff checks. The initial source/test change totalled 283 changed lines.
+Subsequent reviews extended the repair as recorded below.
 
 Independent review also reproduced the same read-fact loss after OpenAI's raw iterator EOF,
 while response/client cleanup still runs inside the adapter. Gateway response contexts have the
@@ -171,7 +171,7 @@ lifetime; no new collector, persistent format, public API, or wait policy is int
 The additional tests-only commit `6a44de319267ca29dbc2d5a3ead55e4683866c0c` reproduced 37 failures
 with 27 passing controls before the extension. After repair, all 64 new cases passed, followed by
 612 focused unit tests and 42 selected serial adapter/consumer tests; Ruff and diff checks passed.
-The cumulative source/test change is 593 lines across seven files, within the revised estimate.
+The first-party extension brought the source/test change to 593 lines across seven files.
 [PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) records the final reviewed
 head, required CI, and integration result. General serial integration also runs in full develop CI.
 
@@ -189,8 +189,9 @@ The version candidate starts from repair merge `f5a98dc`. Its tree matches revie
 [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40637386504) and
 [required combined L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40637388956)
 passed on that head. [Full develop CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40638354700)
-records integration and general serial coverage. The candidate PR will record its own final source,
-artifact digests, installed checks, review, and CI after tracked build inputs are frozen.
+records integration and general serial coverage. [PR #176](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/176)
+owns the candidate's final source/tree, artifact digests, installed checks, review, and CI results.
+Its qualification record is updated after the tracked build inputs are frozen.
 
 Artifacts are built with the standard build frontend through the sdist. Qualification checks the
 wheel and sdist contents against the reviewed source, renders the README, and installs the same
@@ -199,16 +200,18 @@ approval recovery, conformance evidence, and retained v1/v2 readers supply the c
 Source/tree identities and artifact hashes belong in the candidate PR and external checksum files;
 changing tracked build inputs requires new artifacts. The later publication workflow rebuilds
 distributions, so its published files need their own identity and content verification.
+README and package Changelog links target `v0.25.0`. Candidate checks resolve those paths locally;
+remote tag and link availability are publication gates.
 
 | Gate | Status and required evidence |
 |---|---|
-| Select final release source and update version metadata | Pending; record source SHA and verify all version locations |
-| Build and audit exact wheel/sdist | Pending; record filenames, SHA-256, package contents, metadata, and README rendering |
-| Install exact release wheel | Pending; verify imports and documented consumer paths in supported dependency environments |
-| Compatibility and production qualification | Pending for release candidate; retain v1/v2, recovery, authority, and required service coverage |
-| Final review and required CI | Pending on release source |
+| Select final release source and update version metadata | Version `0.25.0`; final source/tree and consistency results recorded in #176 |
+| Build and audit exact wheel/sdist | Filenames, SHA-256, source/content comparison, metadata, and README results recorded in #176 |
+| Install exact release wheel | Exact-wheel provenance and current/minimum consumer results recorded in #176 |
+| Compatibility and production qualification | Retained-reader, recovery, authority, and service coverage with source/CI identities recorded in #176 |
+| Final review and required CI | Final-head review, required checks, and develop integration results recorded in #176 |
 | Release branch integration, tag, and publication | Pending |
-| Published artifact verification | Pending; match published artifacts and metadata to the qualified digests |
+| Published artifact verification | Pending; record published digests and verify actual contents against the qualified source and metadata |
 
 The release gate must retain the migration limits: released v0.24 rejects v2; rollback needs a
 verified dual reader or coordinated backup; missing usage provenance stays unavailable; numeric
