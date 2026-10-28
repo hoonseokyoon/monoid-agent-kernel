@@ -132,7 +132,7 @@ termination, accounting, authority, and recovery contracts.
 
 | Part | Base and scope | Completion evidence |
 |---|---|---|
-| Repair PR, `codex/v0.25-release-facts-fix` | Latest `develop`; the two termination-fact defects and their regressions | Failing tests committed before fixes; exception/receipt assertions; focused checks; independent review and required CI |
+| [Repair PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175), `codex/v0.25-release-facts-fix` | Latest `develop`; the two termination-fact defects and their regressions | Failing tests committed before fixes; exception/receipt assertions; focused checks; independent review and required CI |
 | Release candidate PR, `codex/v0.25-release-candidate` | `develop` after the repair merges; version `0.25.0`, current release documentation and exact artifacts | Refreshed preflight; version consistency; audited wheel/sdist; rendered README; installed consumers; compatibility/service evidence; final review and CI |
 
 Both PRs target `develop` in order, as independent changes. This base already receives required
@@ -156,6 +156,23 @@ preserved response-validation, authority-loss, and actual-provider-error behavio
 `777f4199e1482515dba5f40f0ef4ab00b4869216` passed all 38 cases and the 580-test focused selection,
 plus Ruff and diff checks. The source/test change totals 283 changed lines. Final independent
 code review, required CI, and integration remain completion gates for this repair.
+
+Independent review also reproduced the same read-fact loss after OpenAI's raw iterator EOF,
+while response/client cleanup still runs inside the adapter. Gateway response contexts have the
+same ownership boundary. The repair therefore retains observed EOF in the existing dispatch
+observation owner, after terminal/trailing-frame validation, before adapter cleanup. Terminal
+delivery still follows its existing cleanup rules. Additional regressions precede this source
+extension; per-dispatch isolation, late cleanup, local failures, and authority remain controls.
+This additional producer boundary revises the author estimate from 185–295 to 533–633 changed
+lines, plus release prose and review/CI work. The existing observation owner supplies the required
+lifetime; no new collector, persistent format, public API, or wait policy is introduced.
+
+The additional tests-only commit `6a44de319267ca29dbc2d5a3ead55e4683866c0c` reproduced 37 failures
+with 27 passing controls before the extension. After repair, all 64 new cases passed, followed by
+612 focused unit tests and 42 selected serial adapter/consumer tests; Ruff and diff checks passed.
+The cumulative source/test change is 593 lines across seven files, within the revised estimate.
+[PR #175](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/175) records the final reviewed
+head, required CI, and integration result. General serial integration also runs in full develop CI.
 
 ## Release qualification and delivery
 

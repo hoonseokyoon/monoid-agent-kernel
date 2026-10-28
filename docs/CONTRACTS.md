@@ -492,7 +492,10 @@ Only distinct dispatch contributions are added. SDK-internal HTTP retries are ou
 coverage guarantee. The numeric `usage` remains the accounting input.
 
 OpenAI captures usage before response/client cleanup while preserving cleanup-before-terminal
-delivery. A bounded dispatch collector carries already-received reports through cancellation.
+delivery. First-party streaming adapters retain observed iterator EOF before their inner cleanup;
+a validated terminal followed by EOF remains `provider_terminal` through later cancellation.
+A terminal received before EOF leaves reading in progress. The bounded dispatch collector carries
+already-received reports through cancellation and rejects reports after dispatch settlement.
 Collection records the original receipt phase (`normal` or `drain`), including a terminal
 delivered later. Escaping runner exceptions carry `model_call_termination` and
 `model_usage_evidence`; existing numeric `provider_usage` stamps continue to serve accounting.
