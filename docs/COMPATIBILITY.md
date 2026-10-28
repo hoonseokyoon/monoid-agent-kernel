@@ -5,6 +5,10 @@ namespace aliases, and source aliases. The machine-readable source is
 `monoid_agent_kernel.core.compatibility.PUBLIC_ARTIFACT_COMPATIBILITY`; the table below is
 checked against it in CI.
 
+For the current release transition, start with [Upgrade from v0.24 to v0.25](migrations/v0.25.md).
+It covers typed tools, v2 durable records, deployment choices, and rollback. The
+[release audit](V0_25_RELEASE_AUDIT.md) records implementation and release qualification separately.
+
 Experimental optional Reference profiles sit outside this stable inventory. v0.19.2 treats
 `DbosResumeCommand`, `DbosRunReceipt`, and the DBOS-specific control envelope as experimental
 Reference operational records for the finite-activation profile. Their compatibility belongs to
@@ -213,12 +217,16 @@ Settled v2 redelivery restores facts through the public receipt and subscription
 call combines the historical observation prefix with new dispatch observations. The final private result
 retains final-turn usage; the public receipt retains cumulative usage. A v1 prefix stays legacy-ambiguous.
 
-Deploy a dual-reader build to every reader before enabling v2 writers. Rollback after v2 writes requires
-the reader-preparation binary (P1P2-01, source `74ff289` / integration `ec32ca8`) or a later verified
-dual reader. The released v0.24.0 reader rejects v2 as unsupported. The preparation binary can emit a new
-v1 revision while preserving existing v2 coordinates. Its new v1 receipts omit facts, so later readers
-keep that missing provenance unavailable. Development wheels share version 0.24.0: identify them by
-source commit and wheel SHA-256. This source change performs no deployment.
+Before any v2 writer runs, upgrade every reader. A coordinated upgrade stops writers, takes a
+consistent backup, and replaces all readers and writers before resuming. A rolling upgrade first
+deploys a verified dual-reader build that still writes v1. The
+[v0.25 migration guide](migrations/v0.25.md#choose-a-deployment-path) describes both paths.
+Rollback after v2 writes requires the reader-preparation binary (P1P2-01, source `74ff289` /
+integration `ec32ca8`) or a later verified dual reader, or restoration of the coordinated pre-upgrade
+backup. The released v0.24.0 reader rejects v2 as unsupported. The preparation binary is a development
+build and can emit a new v1 revision while preserving existing v2 coordinates. Its new v1 receipts omit
+facts, so later readers keep that missing provenance unavailable. Development wheels share version
+0.24.0: identify them by source commit and wheel SHA-256. Deployment remains an operator action.
 
 `decode_model_invocation` dispatches between v1 and v2 readers. The exported `MODEL_INVOCATION_CODEC`
 retains its v1 identity for existing explicit v1 consumers. Use the dispatch function for mixed history.

@@ -312,7 +312,7 @@ evidence. The implementation evidence source is `510ffa8def8a5cae50136dbcf2d2aed
 - multi-region active-active authority
 - Redis/Kafka adapter and `LISTEN/NOTIFY` correctness
 - automatic repair and operator UI
-- common-skill-pipeline product integration
+- host product product integration
 - cloud credentials in blocking public CI
 
 These items require separate contracts, compatibility policy, qualification, and owner approval.

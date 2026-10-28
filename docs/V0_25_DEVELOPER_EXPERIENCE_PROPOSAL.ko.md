@@ -2,6 +2,10 @@
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
+현재 상태: **P1–P5·DX1·DX2 구현 완료**, 최종 develop 통합은 `b27a15c` / [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)이다.
+이 문서는 설계 배경과 후속 제안을 보존한다. 현재 사용법은 [통합 안내](EMBEDDING.md),
+출시 준비와 호환성은 [release audit](V0_25_RELEASE_AUDIT.md)와 [migration guide](migrations/v0.25.md)를 따른다.
+
 구현 기록: **2026-10-27 P5·DX1·P3·P1/P2 develop 병합** (`2914c43`). 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.
@@ -43,9 +47,8 @@ v0.26 이후 배치는 우선순위 제안이다. 날짜나 출시 확약을 두
 | `RunStream`과 passive model subscription이 이미 별도로 존재 | 통합자가 연결 단절·Stop·재접속 정책을 직접 해석해야 함 | DX2에서 두 수명을 예제로 설명; 후속 어댑터에 보존 |
 | `from_tools`, `from_config`, `AgentLoop.validate`, 구조화 출력, checkpoint/approval, replay가 이미 존재 | 새 편의 계층을 크게 만들면 같은 기능의 유지 지점이 늘어남 | 기존 진입점을 개선하고 실행 조합을 지원 |
 
-실제 소비 사례는 CSP의 `pipeline_core/agents/modular_kernel.py`에서 확인했다. provider에 workspace를 보관하고
-`workspace_factory`를 감싸는 경로가 P3의 필요성을 보여준다. 커널 예제와 CI는 커널 소유 도구로 같은 통합 요구를 검증한다.
-CSP 저장소 의존성·핀·운영 기능의 변경은 소비 프로젝트의 별도 작업이다.
+통합 도구는 호스트 자원을 주입받고 호출 권한이 적용된 view로 사용한다.
+자원 접근과 복구 검증은 커널 소유 실행 예제로 제공한다. 제품별 adapter와 배포는 호스트가 소유한다.
 
 ## 3. 우선순위와 변경 범위
 

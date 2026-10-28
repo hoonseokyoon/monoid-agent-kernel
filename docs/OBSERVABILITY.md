@@ -20,7 +20,7 @@ The run-directory artifact set is:
   settled text (`monoid.model-content.v1`)
 - `model_calls.jsonl`: optional private ledger of settled model calls, one record per call
   including failed ones — metadata, taxonomy, and the replay key, no content
-  (`monoid.model-calls.v1`)
+  (`monoid.model-calls.v2`; readers also accept retained v1 records)
 - `model_payloads.jsonl` + `model_payloads/`: optional private replay corpus — request preimages
   as verified reassembly recipes whose chunks deduplicate per tool definition, per message and per
   observation, and settled response bodies including provider reasoning
