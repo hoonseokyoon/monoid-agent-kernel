@@ -1,6 +1,10 @@
 # v0.22.0 Release Audit
 
-Status: PR 7 release candidate.
+> Historical record: dates, status, commands, and results describe the named revisions.
+> Use the [documentation index](README.md) and [Contributing](../CONTRIBUTING.md) for current guidance.
+> Related records are in the [history index](history/README.md).
+
+Recorded status: PR 7 release candidate.
 
 The v0.22 campaign adds portable production boundaries for durable model invocation, fenced
 checkpoint and run sinks, evidence delivery policy, typed interruption, activation-scoped write

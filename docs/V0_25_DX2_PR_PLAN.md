@@ -1,5 +1,9 @@
 # v0.25 DX2: 통합 예제와 개발자 경험 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
 현재 상태: **DX2-00–03과 최종 통합 완료**. [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)이
 2026-10-28 develop `b27a15c159465b978b50e89660fa5f7b7dd7d7b3`에 병합됐다.
 아래는 조사·실행 당시 기록이다. 현재 출시 준비 상태는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 둔다.
@@ -12,7 +16,7 @@ P5·DX1·P3·P1/P2·P4는 develop에 병합됐다. P4 최종 통합은 [#165](ht
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)의 G7과
 [개발자 경험 설계 §7](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#7-dx2-실제-통합-흐름을-릴리스의-증거로-삼기)을 구체화한다.
-운영 절차는 상위 저장소의 `docs/operations/campaign-workflow.md`와 `campaign-preflight-review.md`를 따른다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했다. 현재 개발 절차는 [Contributing](../CONTRIBUTING.md)에 있다.
 
 ## 1. 개발자에게 제공할 경험
 

@@ -1,6 +1,10 @@
 # v0.22 Production Boundaries 구현 전 조사와 실행 계획
 
-> 상태: 구현 기준안
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+> 기록 당시 상태: 구현 기준안
 >
 > 작성일: 2026-08-21
 >
@@ -819,7 +823,7 @@ receipt usage를 오류에 보존한다.
 `required`와 `outbox`는 기존 callable을 강화하지 않는다. `FencedRunSink`가 다음 두 mutation을
 제공한다.
 
-```python
+```text
 commit_model_evidence(invocation, *, writer_token) -> CommitResult
 commit_invocation(
     invocation,

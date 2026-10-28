@@ -70,13 +70,6 @@ Follow [Contributing](../CONTRIBUTING.md) for development setup, test selection,
 Current contract coverage remains in [Conformance](CONFORMANCE.md) and
 [Operational rule coverage](OPERATIONAL_RULE_COVERAGE.md).
 
-The records below explain prior decisions and qualification at their named source revisions.
-Current user guidance is in the guides and references above.
-
-| Period | Development records |
-|---|---|
-| Early coverage and closure | [Phase 1S coverage](PHASE_1S_COVERAGE.md), [Phase 4 closure](PHASE_4_CLOSURE.md), [v0.18 audit](V0_18_RELEASE_AUDIT.md) |
-| v0.22 | [Implementation plan](V0_22_IMPLEMENTATION_PLAN.md), [release audit](V0_22_RELEASE_AUDIT.md) |
-| v0.23 | [Development workflow](V0_23_DEVELOPMENT_WORKFLOW.md), [implementation plan](V0_23_IMPLEMENTATION_PLAN.md), [release audit](V0_23_RELEASE_AUDIT.md) |
-| v0.24 | [Release audit](V0_24_RELEASE_AUDIT.md) |
-| v0.25 | [Release readiness and implementation records](V0_25_RELEASE_AUDIT.md), [original investigation](V0_25_PRE_INVESTIGATION.md), [developer API design and later proposals](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md) |
+The [development history index](history/README.md) groups prior plans, design choices, and
+qualification records by version while preserving their original paths. The
+[v0.25 release audit](V0_25_RELEASE_AUDIT.md) tracks the current release preparation.

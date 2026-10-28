@@ -1,30 +1,31 @@
 # Contributing
 
-Thanks for your interest in improving Monoid Agent Kernel. This is a pre-1.0
-(`0.x`) agent kernel, so the public surface may still change. Contributions,
-issues, and design feedback are welcome.
+Monoid Agent Kernel is a pre-1.0 (`0.x`) agent kernel. Contributions, issues, and design feedback
+are welcome. Public behavior changes are recorded in the changelog and compatibility ledger.
 
 ## Ground rules
 
-- Be respectful. This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
-- By contributing, you agree your contributions are licensed under the project's
-  license (see `LICENSE`).
-- Keep the layering intact: **core never imports `reference`**. New example
-  services belong under `monoid_agent_kernel.reference.*`; the supported surface is
-  `monoid_agent_kernel.contracts`.
+- Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+- Contributions use the project's [license](LICENSE).
+- Keep the layering intact: **core never imports `reference`**. Example services belong under
+  `monoid_agent_kernel.reference.*`; the supported surface is `monoid_agent_kernel.contracts`.
 
 ## Development setup
 
-Requires Python 3.11+. Frontend development uses the Node.js version pinned in
-`.nvmrc` and the npm version pinned in `studio-ui/package.json`.
+Requires Python 3.11+. Use a virtual environment:
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-pip install ruff==0.15.6                             # linter (configured in pyproject.toml); CI pins the same version
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m pip install ruff==0.15.6
 ```
 
-Activate the pinned Node.js version from the repository root before working on Studio UI:
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`. Ruff is configured in
+`pyproject.toml`; CI uses the same pinned version.
+
+Studio development uses the Node.js version in `.nvmrc` and the npm version in
+`studio-ui/package.json`. From the repository root:
 
 ```bash
 nvm install
@@ -33,46 +34,76 @@ node --version  # v24.18.0
 npm --version   # 11.16.0
 ```
 
-With nvm-windows, run `nvm install 24.18.0` followed by `nvm use 24.18.0` from an
-elevated terminal.
+With nvm-windows, use `nvm install 24.18.0` and `nvm use 24.18.0` from an elevated terminal.
+
+## Choose focused checks
+
+Use tests closest to the changed behavior during development. For documentation changes:
+
+```bash
+ruff check src tests tools/v023_ci.py
+python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread \
+  tests/test_documented_cli_invocations.py tests/test_compatibility_ledger.py \
+  tests/test_release_packaging.py
+```
+
+Set `PYTEST_XDIST_AUTO_NUM_WORKERS=4` to bound the parallel runner on a shared machine.
+[tests/support/test_tiers.py](tests/support/test_tiers.py) assigns every test a primary tier:
+`unit`, `contract`, or `integration`. `slow`, `live`, `serial`, and `service` are additional traits.
+Run serial/integration selections without xdist. The workflow files below contain the exact
+parallel and serial shard commands used in CI.
+
+- Add or update tests for behavior changes. Custom adapters, workspaces, and stores should join
+  existing parametrized contract suites such as `test_workspace_contract.py` and
+  `test_checkpoint_store_contract.py`.
+- Backend tests use `backend_factory` or `tests/support/backend_harness.py`; the fixture owns
+  spawned futures and detects leaked runs.
+- Add `--durations=30` when a change could affect suite runtime. Keep expensive and live-provider
+  coverage in the corresponding explicit selections.
+- Commands in README, current `docs/` files, and Reference Markdown resolve against the real
+  Click tree. [Historical records](docs/history/README.md) have an exact exclusion list in the
+  existing test; new guides, migrations, and versioned audits stay covered.
+- README supplies the package description. After editing it, check rendered Markdown and built
+  wheel metadata. Existing install-smoke CI exercises copied examples outside the checkout.
+- Match the surrounding code style and keep changes focused. Describe breaking behavior in the
+  PR and `CHANGELOG.md`.
 
 ## Before you open a PR
 
-```bash
-ruff check src tests       # lint (line-length 100, target py311)
-python -m pytest -n 4 -q -m "(unit or contract) and not serial"  # parallel shard
-python -m pytest -q -m "(integration or serial) and not live"  # serial shard
-```
+State the user-visible change, actual base revision, affected contracts, and validation results.
+For related PRs, keep dependencies and integration order in a shared plan, refresh each part's
+preflight against its actual base, and obtain independent review before integration. Use merge
+commits for campaign integration. Retain valid evidence when its relevant inputs are unchanged.
 
-- Add or update tests for any behavior change. Custom adapters/workspaces/stores
-  should plug into the existing parametrized contract suites in `tests/`
-  (e.g. `test_workspace_contract.py`, `test_checkpoint_store_contract.py`).
-- Backend tests that create `RunnerBackend` should use the `backend_factory`
-  fixture or the helpers in `tests/support/backend_harness.py`; the fixture owns
-  spawned futures and fails the test if a backend leaves live runs behind.
-- Use `python -m pytest --durations=30` when a change could affect suite runtime.
-- Every test receives exactly one primary tier from `tests/support/test_tiers.py`:
-  `unit`, `contract`, or `integration`. Update that policy when a new module crosses
-  a different boundary. `slow`, `live`, and `serial` are orthogonal traits.
-- Mark deliberate timeout or live-provider coverage with `slow` or `live`. Integration
-  and serial contract tests run in the required serial shard; worker-safe unit and
-  contract tests run under xdist.
-- CI requires both shards, branch coverage, minimal/all-extras install smoke, and a
-  small Windows/macOS platform-sensitive smoke matrix.
-- To profile without unrelated pytest plugins, run
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p xdist -n 4 -q -m "not slow and not live"`.
-- Match the surrounding code style: typed, small functions, comment density and
-  naming consistent with the file you are editing.
-- Keep changes focused; note any breaking change to the public surface in the PR
-  description and in `CHANGELOG.md`.
+The current CI entry points are:
+
+| Gate | When it runs | Coverage |
+|---|---|---|
+| [L1](.github/workflows/pr-fast.yml) | PR opened, reopened, synchronized, or converted to draft | Lock validation, Ruff, deterministic unit/contract tests on Python 3.12 |
+| [Required L2](.github/workflows/pr-full.yml) | Eligible non-draft open/reopen, Ready for review, or CI-profile label event | Core unit/contract tests on Python 3.11/3.12, serial core shard, selected services, required gate |
+| [Full CI](.github/workflows/ci.yml) | Push to the workflow's listed branches, including `develop` and `main` | Integration, coverage, platforms, exact-wheel installs, services, and Studio build checks |
+
+Ordinary branches default to the `core` L2 profile. Select at most one of `ci:core`, `ci:postgres`,
+`ci:objectstore`, `ci:temporal`, or `ci:combined` when the changed boundary needs it. Named campaign
+branches can require a particular profile; [tools/v023_ci.py](tools/v023_ci.py) resolves and validates
+that choice. [Service test setup](tests/service/README.md) describes the local prerequisites.
+
+A push to an already-ready PR refreshes L1. Refresh required L2 for the new head by returning the
+PR to draft and marking it ready, or by changing the relevant CI-profile label. Manual workflow
+dispatch creates diagnostic L2 evidence. Before merging, confirm independent review and required
+checks cover the final head and its current base; a dormant or diagnostic run has its named scope.
+Automatic review comments are additional evidence to assess against the actual changed behavior.
+
+The [history index](docs/history/README.md) links versioned workflow records. This guide and the
+current workflow sources define the contributor path. Version bumps, release artifacts, tags,
+and publication follow the [current release audit](docs/V0_25_RELEASE_AUDIT.md).
 
 ## Reporting bugs / proposing features
 
-Open a GitHub issue with a clear description and, for bugs, a minimal reproduction.
-For security issues, follow [SECURITY.md](SECURITY.md) instead of filing a public
-issue.
+Open a GitHub issue with a clear description and a minimal reproduction for bugs.
+For security issues, follow [SECURITY.md](SECURITY.md).
 
 ## Commit messages
 
-Conventional, imperative style is appreciated (e.g. `feat(studio): ...`,
-`fix(tasks): ...`), with breaking changes called out explicitly.
+Use conventional, imperative messages (for example `feat(studio): ...` or `fix(tasks): ...`)
+and call out breaking changes explicitly.

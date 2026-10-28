@@ -1,5 +1,9 @@
 # v0.18.0 Release Audit
 
+> Historical record: dates, status, commands, and results describe the named revisions.
+> Use the [documentation index](README.md) and [Contributing](../CONTRIBUTING.md) for current guidance.
+> Related records are in the [history index](history/README.md).
+
 Status: completed for the release-hardening pull request.
 
 The audit froze this range before fixes:

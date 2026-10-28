@@ -1,5 +1,9 @@
 # v0.25 통합 개발자 경험: API 설계와 후속 방향
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
 현재 상태: **P1–P5·DX1·DX2 구현 완료**, 최종 develop 통합은 `b27a15c` / [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)이다.

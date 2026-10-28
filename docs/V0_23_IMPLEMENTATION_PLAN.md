@@ -1,6 +1,10 @@
 # v0.23 PostgreSQL·ObjectStore·Temporal 구현 전 조사와 실행 계획
 
-> 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+> 기록 당시 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
 >
 > 작성일: 2026-08-23
 >
@@ -291,7 +295,7 @@ locking/query에 필요한 값은 typed column으로 둔다. private bytes는 by
 
 추가할 neutral contract는 다음 의미를 가진다.
 
-```python
+```text
 claim(run_id, owner_id, ttl) -> WriterLease
 renew(writer_token, ttl) -> RenewResult
 release(writer_token) -> ReleaseResult

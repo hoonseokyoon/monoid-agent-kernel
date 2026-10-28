@@ -1,5 +1,12 @@
 # v0.25 P3: 호스트 자원 주입·권한·수명·복구 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+현재 완료 상태: **P3-00–03과 최종 통합 완료**. [#155](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/155)이 develop `4e14618`에 병합됐다.
+현재 출시 준비는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 기록한다.
+
 작성·조사일: 2026-10-27 KST. 최초 기준은 `develop=5b08b10` (P5 #148, DX1 #149 병합),
 최종 통합 사전조사 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`다.
 구현 기록: **P3-00/01 develop 병합, P3-02/03 통합 브랜치 병합.** 사용자는 P3-00·01부터 진행하고,
@@ -24,8 +31,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 | 독립 계획 검토 | 작성·조사에 참여하지 않은 fresh reviewer; §8에 대상과 판정 기록 |
 | 구현 | root가 P3-00·01을 소유하고 runner·공유 파일 편집을 직렬화. 후속 PR도 착수 시 담당 기록 |
 
-상위 저장소의 현재 운영 권위인 `docs/operations/campaign-workflow.md`와
-`docs/operations/campaign-preflight-review.md`를 따른다. 권한·수명 변경은 A 등급이다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했고, 권한·수명 변경을 A 등급으로 분류했다.
 각 구현 PR은 최신 실제 base에서 사전조사를 갱신하고 독립 사전 검토 및 서로 다른 두 코드 reviewer를 거친다.
 계획 검토는 향후 코드 검토를 대체하지 않는다. 공유 파일 편집과 무거운 검사는 root가 직렬화한다.
 

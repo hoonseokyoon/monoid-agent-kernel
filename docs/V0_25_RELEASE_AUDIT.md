@@ -1,7 +1,8 @@
 # v0.25 Release Readiness Audit
 
-Status on 2026-10-28: implementation integrated; documentation cleanup in progress; release
-qualification pending. Package metadata remains `0.24.0`. Version change, release artifacts,
+Status on 2026-10-28: implementation integrated; documentation changes prepared and locally
+qualified, with final review/integration tracked below. Release qualification remains pending.
+Package metadata remains `0.24.0`. Version change, release artifacts,
 release branch integration, tag, GitHub release, and package publication remain pending.
 
 The [migration guide](migrations/v0.25.md) describes the upgrade and rollback requirements.
@@ -74,23 +75,41 @@ own source and digest records.
 
 ## Documentation qualification
 
-The approved documentation cleanup covers release/migration guidance, user entry points and
-three practical guides, then history navigation and contribution instructions. Runtime and API
-changes are outside this work.
+The documentation cleanup adds release/migration guidance, task-oriented entry points,
+[tools and resources](guides/tools-and-resources.md), [streaming and Stop](guides/streaming-and-stop.md),
+[approval and recovery](guides/approval-and-recovery.md), and [development history](history/README.md).
+Existing handbook headings remain available. Current contribution and CI instructions are in
+[Contributing](../CONTRIBUTING.md). Runtime and API inputs are unchanged by this work.
 
 | Gate | Status |
 |---|---|
-| Release narrative, migration guide, and audit (DOC-01) | In progress |
-| User entry points and practical guides (DOC-02) | Pending |
-| History navigation, contribution flow, and current-document validation (DOC-03) | Pending |
-| Final documentation head and independent review | Pending |
-| Documented CLI, compatibility ledger, packaging, and carriage checks | Pending on final documentation head |
-| Changed local links/anchors, code blocks, and README rendering | Pending on final documentation head |
-| Required CI for the final documentation head | Pending |
+| Release narrative, migration guide, and audit (DOC-01) | [PR #171](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/171), reviewed `f023600`, merged as `4aa189d`; [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40620745652) and [required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40620745649) passed |
+| User entry points and practical guides (DOC-02) | [PR #172](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/172), reviewed `39b7a67`, merged as `f41d95b`; [L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40623017325) and [required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40623017335) passed |
+| History navigation, contribution flow, and current-document validation (DOC-03) | Implemented at `5e1fcde`; final independent review and required CI pending |
+| Documented CLI, compatibility ledger, packaging, and carriage checks | 118 passed at `5e1fcde` on Python 3.11.9 |
+| Local/candidate-mapped links and code blocks | 503 links and 44 Python blocks passed across 45 documents; historical signature sketches are labelled as text |
+| README rendering and exact development wheel | GitHub GFM and package-description rendering passed; wheel/installed evidence below |
+| Final documentation integration | Pending final review and required CI for `codex/v0.25-release-docs` |
 
-Record final results here with their source identity. Reuse executable evidence only when its
-relevant inputs are unchanged. README edits affect packaged metadata and need a fresh artifact
-and rendering check before release.
+The discovery regression first failed because a frozen v0.24 command was treated as current.
+The bounded repair excludes 14 exact historical paths. The same regression proves invalid commands
+in new guides, migrations, current/future audits, the history index, README, and Reference docs
+still reach the real Click tree. The parser and option validation are unchanged.
+
+README edits required a fresh development wheel at `39b7a670d46b8c67419790c7022db4c80ffefce4`.
+Its SHA-256 is `fd5040d191c4601bbcc09b292a096e22bc91b74ae25364939913b250db3e34f8`, version `0.24.0`.
+Package audit passed and wheel metadata matched the candidate README. The exact wheel passed
+the existing installed-consumer blocks on Python 3.11.9 with Pydantic 2.14.1 and 2.6.4 outside the
+checkout, with `PYTHONPATH` removed: 9 parent and 2 gateway-child import provenances, 5 copied
+examples and 2 Stop variants, and the packaged no-argument report plus separate prepare/resume.
+Original IDs, resource lifetimes, approved-read count, duplicate handling, proposal, and usage
+assertions passed. DOC-03 leaves these packaged source, metadata, example, and CI inputs unchanged.
+
+Current tracked text and seven documentation images were inspected for private information.
+Private integration descriptions, internal references, and workstation paths were removed through
+ordinary commits. The inspected credential candidates were synthetic fixtures. Public gateway
+audience values were preserved. This inspection covers the current tree; Git history is retained.
+Release artifacts still need their own final source, digest, rendering, and installed checks.
 
 ## Release qualification and delivery
 

@@ -1,5 +1,12 @@
 # v0.25 P1·P2: 종료 사실·사용량 관측·저장·복구 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+현재 완료 상태: **P1P2-00–04과 최종 통합 완료**. [#161](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/161)이 develop `2914c43`에 병합됐다.
+현재 출시 준비는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 기록한다.
+
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`.
 P5·DX1·P3가 병합된 상태다. 계획은 로컬 `94ea35a`에 기록했다.
 **2026-10-27 사용자가 P1P2-00·01 구현과 리뷰·CI 후 02·03·04 순차 진행을 승인했다.**
@@ -9,7 +16,7 @@ P5·DX1·P3가 병합된 상태다. 계획은 로컬 `94ea35a`에 기록했다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#51-p1p2-종료-사실과-사용량-증거)의 G1을 구체화한다.
 기존 [API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md)의 P1·P2 예시는 아래 계약을 따른다.
-상위 저장소의 `docs/operations/campaign-workflow.md`, `docs/operations/campaign-preflight-review.md`를 운영 권위로 사용한다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했다. 현재 개발 절차는 [Contributing](../CONTRIBUTING.md)에 있다.
 
 ## 1. 전달할 결과와 책임
 
