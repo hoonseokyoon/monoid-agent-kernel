@@ -150,6 +150,12 @@ def _release_foreign_async_client(client: Any, loop: asyncio.AbstractEventLoop |
         return
 
 
+def _local_openai_failure(error: ModelAdapterError) -> ModelAdapterError:
+    """Record a known local guard while preserving the original error."""
+    mark_read_end(error, "local_failure")
+    return error
+
+
 @dataclass
 class OpenAIModelAdapter:
     """Direct OpenAI adapter for local smoke tests.
@@ -325,17 +331,19 @@ class OpenAIModelAdapter:
 
     def next_turn(self, request: ModelRequest) -> ModelTurn:
         if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
-            raise ModelAdapterError(
+            raise _local_openai_failure(ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
-            )
+            ))
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise ModelAdapterError("openai package is not installed") from exc
+            raise _local_openai_failure(ModelAdapterError("openai package is not installed")) from exc
 
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
-            raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
+            raise _local_openai_failure(ModelAdapterError(
+                "OPENAI_API_KEY is required for OpenAIModelAdapter"
+            ))
 
         config = request.model or self.config
         # The client owns an httpx connection pool and nothing else closes it, so whoever owns the
@@ -482,17 +490,19 @@ class OpenAIModelAdapter:
         path is unaffected. Provider errors map to a classified ``ModelAdapterError`` (no body
         leak), exactly like ``next_turn``."""
         if not self.allow_direct_provider_api and getenv("MONOID_ALLOW_DIRECT_PROVIDER_API") != "1":
-            raise ModelAdapterError(
+            raise _local_openai_failure(ModelAdapterError(
                 "direct provider API access is disabled; use GatewayModelAdapter for container runs"
-            )
+            ))
         try:
             from openai import AsyncOpenAI
         except ImportError as exc:
-            raise ModelAdapterError("openai package is not installed") from exc
+            raise _local_openai_failure(ModelAdapterError("openai package is not installed")) from exc
 
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
-            raise ModelAdapterError("OPENAI_API_KEY is required for OpenAIModelAdapter")
+            raise _local_openai_failure(ModelAdapterError(
+                "OPENAI_API_KEY is required for OpenAIModelAdapter"
+            ))
 
         config = request.model or self.config
         final_data: dict[str, Any] = {}

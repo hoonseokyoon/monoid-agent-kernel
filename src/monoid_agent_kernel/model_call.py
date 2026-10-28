@@ -81,7 +81,7 @@ from monoid_agent_kernel.core.model_io import (
 )
 from monoid_agent_kernel.core.model_stream import ModelStreamOutcome
 from monoid_agent_kernel.core.model_facts import (
-    ModelCallTermination, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
+    ModelCallTermination, ReadEnd, UsageEvidence, UsageEvidenceAttempt, UsageObservation,
     call_facts_of, mark_call_facts, mark_read_end, read_end_of,
 )
 from monoid_agent_kernel.core.outcome import InterruptionCause
@@ -2135,6 +2135,7 @@ class ModelCallRunner:
         driving = True
         chunks: list[ModelStreamChunk] = []
         saw_terminal = False
+        natural_read_end: ReadEnd | None = None
         ingress = ModelStreamIngressNormalizer()
         drain = _AbortDrain(budget_s, chunks) if budget_s > 0 else None
         accepted_stream_requester: str | None = None
@@ -2183,7 +2184,7 @@ class ModelCallRunner:
             # Everything the provider still sends goes through a normalizer of its own and is
             # dropped after the fold: no delivery, no assembly (a truncated tool argument must not
             # become a `stream_bad_tool_args` failure, nor unread text a buffer), no abort poll.
-            nonlocal retried
+            nonlocal retried, natural_read_end
             normalizer = ModelStreamIngressNormalizer()
 
             def fold(raw: Any) -> None:
@@ -2212,12 +2213,13 @@ class ModelCallRunner:
                 try:
                     raw = await anext(agen)
                 except StopAsyncIteration:
+                    natural_read_end = "provider_terminal" if drain.saw_terminal else "provider_eof"
                     break
                 fold(raw)
             raise drain.outcome()
 
         async def consume() -> ModelTurn:
-            nonlocal retried, accepted_stream_requester
+            nonlocal retried, accepted_stream_requester, natural_read_end
             if drain is not None:
                 drain.entered = True
             try:
@@ -2253,6 +2255,10 @@ class ModelCallRunner:
                         aborted = ModelCallAborted("model call aborted")
                         mark_provider_usage(aborted, _streamed_usage(chunks))
                         raise aborted
+                else:
+                    # EOF is known before iterator cleanup starts. A detached-driver break has
+                    # no natural read end, even if a terminal was delivered before it detached.
+                    natural_read_end = "provider_terminal" if saw_terminal else "provider_eof"
                 if drain is not None and drain.started:
                     return await drain_rest(drain, None)
                 deliver_remainder()
@@ -2296,7 +2302,9 @@ class ModelCallRunner:
                     with contextlib.suppress(Exception):
                         await self._aclose_within_grace(aclose, budget)
             turn = _assemble_normalized_streamed_turn(chunks)
-            mark_read_end(turn, "provider_terminal" if saw_terminal else "provider_eof")
+            mark_read_end(turn, natural_read_end or (
+                "provider_terminal" if saw_terminal else "provider_eof"
+            ))
             return turn
 
         def settle_cancelled_remainder() -> None:
@@ -2326,7 +2334,22 @@ class ModelCallRunner:
             known, evidence = call_facts_of(exc)
             requester = accepted_requester()
             if known is None and requester is not None:
-                mark_call_facts(exc, replace(_termination_for(exc), requested_by=requester), evidence)
+                known = replace(_termination_for(exc), requested_by=requester)
+            if (
+                natural_read_end is not None
+                and isinstance(exc, (RunCancelled, RunTimeout, ModelCallAborted, asyncio.CancelledError))
+                and not (
+                    isinstance(exc, RunCancelled)
+                    and exc.interruption_cause is InterruptionCause.LEASE_LOST
+                )
+            ):
+                # Caller cancellation may already carry frozen outcome/requester facts. Retain
+                # those while preserving EOF through the later close boundary. Local assembly
+                # failures and authority loss keep their own attribution.
+                mark_read_end(exc, natural_read_end)
+                known = replace(known or _termination_for(exc), ended_by=natural_read_end)
+            if known is not None:
+                mark_call_facts(exc, known, evidence)
             raise
         finally:
             # A `finally` rather than a line in the handler above, and deliberately *not* because a
