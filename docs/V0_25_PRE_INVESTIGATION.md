@@ -2,6 +2,10 @@
 
 작성일: 2026-09-28. 통합 갱신: 2026-10-28. 최초 코드 기준: v0.24.0 / `8d56e0d`.
 
+현재 상태: **P1–P5·DX1·DX2 구현과 develop 통합 완료** (`b27a15c`, [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)).
+아래는 최초 조사와 구현 과정의 기록이다. 출시 준비 상태는 [release audit](V0_25_RELEASE_AUDIT.md),
+사용자의 업그레이드 절차는 [v0.25 migration guide](migrations/v0.25.md)에 둔다.
+
 구현 기록: **P5 #148·DX1 #149·P3 #150–155·P1/P2 #156–161 develop 병합**.
 P1P2-I #161의 develop 반영은 `2914c4366f8dfd7ed537f854388836a12a05f078`이다.
 공개 API·v2 저장·복구·gateway·Studio·OTel 연결과 누적 검증을 마쳤다.

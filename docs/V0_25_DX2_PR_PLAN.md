@@ -1,5 +1,9 @@
 # v0.25 DX2: 통합 예제와 개발자 경험 PR 계획
 
+현재 상태: **DX2-00–03과 최종 통합 완료**. [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)이
+2026-10-28 develop `b27a15c159465b978b50e89660fa5f7b7dd7d7b3`에 병합됐다.
+아래는 조사·실행 당시 기록이다. 현재 출시 준비 상태는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 둔다.
+
 조사일: 2026-10-28 KST. 기준: fetch한 `origin/develop=973e47492ab0c7ff0747af25776476f22704fcb5`.
 P5·DX1·P3·P1/P2·P4는 develop에 병합됐다. P4 최종 통합은 [#165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)다.
 **2026-10-28 사용자가 DX2-00·01 구현과 리뷰·CI 후 02·03·최종 통합까지 순차 진행을 승인했다.**
@@ -432,3 +436,11 @@ Pydantic **2.14.1**의 동일 wheel 결과와 함께 세 학습 경로의 설치
 새 runtime·저장·권한 정책 변경은 없다. 최초 1,350–1,950줄 대비 최종 누적 변경은 약 2,070줄이며,
 증가분은 실제 프로세스·실패 정리 검사와 실행 기록이다. 별도 예제 프레임워크나 검증 플랫폼은 추가하지 않았다.
 최종 문서 6개의 local link/anchor 179개와 Python block 20개, diff 검사를 통과했다.
+
+최종 후보 `07a84ae6dab971dd1ed13f554540f215b5af54dd`의 누적 독립 리뷰와
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40613655101),
+[required combined L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40613655177),
+[full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40612881392)가 통과했다.
+[#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)을 develop `b27a15c`로 병합했고,
+리뷰 후보와 병합 결과의 tree `92a4c23201ce9fa4ca9fdf87b3cfdb23cf3e3436`가 일치함을 확인했다.
+DX2 구현·통합은 완료됐다. 패키지 버전 확정과 릴리스 artifact 검증은 별도 출시 단계에서 기록한다.

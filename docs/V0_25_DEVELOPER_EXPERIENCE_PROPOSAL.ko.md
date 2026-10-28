@@ -2,6 +2,10 @@
 
 작성일: 2026-10-25. 코드 기준: v0.24.0, `8d56e0df790a0ca518295545a0439b214d7b2d80`.
 
+현재 상태: **P1–P5·DX1·DX2 구현 완료**, 최종 develop 통합은 `b27a15c` / [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)이다.
+이 문서는 설계 배경과 후속 제안을 보존한다. 현재 사용법은 [통합 안내](EMBEDDING.md),
+출시 준비와 호환성은 [release audit](V0_25_RELEASE_AUDIT.md)와 [migration guide](migrations/v0.25.md)를 따른다.
+
 구현 기록: **2026-10-27 P5·DX1·P3·P1/P2 develop 병합** (`2914c43`). 대상 사용자는 제품에 에이전트를 통합하는 개발자다.
 사용자의 통합 요청에 따라 DX1·DX2를 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md)에 포함했다.
 P1–P5 필수, P8 조건부, P6/P9 독립 유지보수, P7 후속이라는 기존 경계는 유지한다.

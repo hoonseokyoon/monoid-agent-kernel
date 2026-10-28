@@ -7,8 +7,24 @@ out in commit messages and here.
 
 ## [Unreleased]
 
+The v0.25 implementation is integrated. Package metadata remains `0.24.0` while release
+qualification is pending. See the [v0.25 migration guide](docs/migrations/v0.25.md) before
+upgrading persistent runs and the [release audit](docs/V0_25_RELEASE_AUDIT.md) for evidence.
+
 ### Added
 
+- Model-call termination facts identify the logical outcome, first accepted stop requester,
+  and actual end of provider reading. Usage evidence preserves explicitly reported zero,
+  missing counters, and per-counter coverage across kernel dispatches. Receipts, subscriptions,
+  durable invocations, and the private model-call ledger carry available facts through recovery.
+  Gateway, Studio, and tracing consumers expose the facts they receive. Numeric `usage` remains
+  the accounting input; provider reports describe observed usage, with billing reconciliation
+  owned by the host.
+- Read-only `termination_budget()` on `ModelCallRunner`, `AgentLoop`, and `RunStream` exposes
+  model-call phases, deadline/drain/grace windows, and the stream-exit cancellation cutoff.
+  Snapshots use process-local monotonic time. A zero hard-cancel remainder records the request;
+  driver cleanup and settlement can continue. Tools, child runs, and host resources have separate
+  cleanup lifetimes.
 - Typed host tool bindings with activation-owned adapters and call-scoped views. The optional
   helper preserves the existing ToolContext interface; workspace views enforce admitted write
   intent, binding/surface path scopes, operator permissions and writer authority on each operation.
@@ -16,6 +32,20 @@ out in commit messages and here.
   Run the installed `monoid_agent_kernel.reference.host_tool_report` recipe for typed proposal,
   approval, recovery and child/fork delegation. `inherit_to_children=True` opens fresh adapters
   at each child/fork hop with the original parent activation and writer authority chain.
+- Executable integration paths for the first typed tool, request-owned streaming, passive
+  background observation, and approval recovery in a fresh process. The installed report recipe
+  restores the original run/task IDs, creates a fresh resource, and ignores duplicate approval.
+  Source examples use an installation from the same revision; the package's
+  `monoid_agent_kernel.reference.host_tool_report` recipe also runs directly from an installed wheel.
+
+### Changed
+
+- New durable invocation revisions and private model-call ledger records use
+  `monoid.model-invocation.v2` and `monoid.model-calls.v2`. Current readers retain v1 support,
+  and checkpoints keep their `monoid.checkpoint.v1` envelope. The released v0.24.0 reader rejects
+  v2. Upgrade all readers before v2 writers run; rollback after v2 writes requires a verified
+  dual reader or a coordinated pre-upgrade backup. The [migration guide](docs/migrations/v0.25.md)
+  covers both deployment paths and identifies the prepared development reader.
 
 ### Fixed
 
@@ -30,7 +60,8 @@ out in commit messages and here.
   running input serializers. Serialize top-level model returns in JSON mode using the existing
   tool observation envelope; serialization failures remain controlled tool errors and available
   cancellation causes retain their classification. Handlers with model annotations should use
-  attribute access. See the typed custom tool quickstart and compatibility migration notes.
+  attribute access. See the [typed custom tool quickstart](examples/custom_tool_quickstart.py)
+  and [source migration notes](docs/migrations/v0.25.md#update-application-code).
 - Fence each streamed model delta and buffered Unicode suffix before delivery to a standalone
   `ModelCallRunner` consumer, including when drain is configured but has not started. Lease loss
   during one callback prevents the remaining normalized pieces from reaching the consumer.
