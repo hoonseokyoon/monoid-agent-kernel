@@ -1,17 +1,14 @@
 # Monoid Agent Kernel
 
-*A lightweight durable agent kernel for embedding product-grade agents anywhere: contract-first, observable, permission-aware, and replaceable at every seam.*
+*A durable agent runtime for embedding tools, model calls, and recoverable workflows in your product.*
 
 [![CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/pyproject.toml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/pyproject.toml)
 
-Monoid is the small runtime core you put inside a larger product when you need
-agents to run reliably. It owns the loop, durable artifacts, tool execution,
-permissions, observability, subagents, skills, and gateway contracts while leaving
-deployment choices to your platform. Models, tools, workspace storage, checkpoint
-stores, event sinks, capability brokers, memory, and gateway services are all
-replaceable contracts.
+Monoid owns the agent loop, tool execution, permissions, checkpoints, and observation contracts.
+Your product supplies the model adapter, workspace, storage, and execution host. Start in one
+Python process, then use the same contracts with your backend, gateways, and durable workers.
 
 ## Quickstart (no servers)
 
@@ -23,9 +20,10 @@ python -m pip install .
 python examples/custom_tool_quickstart.py
 ```
 
-This checkout contains v0.25 development examples. Install this revision with the command above,
-or install a wheel built from the same revision. For editable development, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+This is the v0.25 development documentation; package metadata still reports `0.24.0`.
+Install this revision or its matching wheel for these examples. The `examples/` scripts come
+from the repository. For editable development, see
+[Contributing](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/CONTRIBUTING.md).
 
 Expected output:
 
@@ -35,302 +33,157 @@ final_text : Prepared Ada's weekly report.
 tool_result: {'ok': True, 'result': {'customer': 'Ada', 'title': 'Weekly report'}}
 ```
 
-The [complete example](examples/custom_tool_quickstart.py) defines nested Pydantic input and
-a typed result, decorates `summarize_report` with `@tool`, and calls
-`AgentLoop.from_tools(spec, adapter, [summarize_report]).run_once(...)`. Its scripted
-`FakeModelAdapter` invokes the tool, then receives the serialized result in the next request's
-observations. The example checks that result and runs offline without credentials.
+The [complete example](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/examples/custom_tool_quickstart.py)
+defines nested Pydantic input and a typed result, decorates `summarize_report` with `@tool`, and
+calls `AgentLoop.from_tools(spec, adapter, [summarize_report]).run_once(...)`. Its scripted
+`FakeModelAdapter` invokes the tool and receives the serialized result in the next request.
+The example asserts that result and runs offline without credentials.
 
 Choose the next integration step:
 
-| What you need | Run after installing this checkout | What to inspect |
+| Task | Run after installing this checkout | What to inspect |
 |---|---|---|
-| Builtin tools and a local session | `python examples/embedding_local_product.py` | Written release note, checked checkpoint, completed run |
-| Stop and request stream ownership | `python examples/termination_budget.py` | Early break, Stop progress, final facts and sparse reported usage |
-| Observe a background run | `python examples/observe_background_run.py` | Passive disconnect, peer progress, cursor replay/reset and explicit cancel |
-| Tool resources, approval and restore | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Durable approval park and run/task IDs for a new process |
+| [Tools and host resources](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/guides/tools-and-resources.md) | `python examples/custom_tool_quickstart.py` | Validated model inputs and the tool result |
+| [Streaming and Stop](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/guides/streaming-and-stop.md) | `python examples/termination_budget.py` | Early break, exit progress, final receipt and reported usage |
+| [Background observation](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/guides/streaming-and-stop.md#observe-a-background-run) | `python examples/observe_background_run.py` | Reader disconnect, peer progress, replay/reset and explicit cancel |
+| [Approval and recovery](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/guides/approval-and-recovery.md) | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Parked approval and original run/task IDs for resume |
 
-Use the printed IDs to [resume approval in a new process](docs/EMBEDDING.md#resume-approval-in-a-new-process).
-The recipe shows fresh resource creation, one approved read and usage carried across the checkpoint.
-Its no-argument command also demonstrates fresh/fork child resources. The
-[embedding handbook](docs/EMBEDDING.md) explains resource lifetime, permissions and recovery.
-The stream recipe also accepts `--scenario silent_stop` and `--scenario consumer_cancel`.
-It owns request cleanup; the background recipe keeps execution alive across reader disconnects.
-For individual seams, read the [builtin configuration](examples/minimal_quickstart.py),
-[custom model adapter](examples/custom_model_adapter.py),
-[call facts](examples/model_call_facts.py), and
-[in-memory receipt recovery](examples/recover_model_call_facts.py) examples.
-
-> Throughout these docs, **"your gateway" / "your backend platform"** refers to the
-> backend you operate — the credential boundary that hosts the LLM and Web gateways. The
-> kernel never holds provider keys; it calls your gateway with a short-lived, scoped token.
-
-## See it run
-
-The bundled **Agent Studio** reference app (`monoid studio serve`) drives the kernel
-through its Python API behind a single-page UI. A profile chooses the model, reasoning
-level, prompt instructions, and capability surface; each profile keeps its own chat history.
-
-![Agent Studio: a Visual Analyst reads sales data, pauses for approval, and previews an annotated revenue chart](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v019-main.jpg)
-
-*A real Studio run: the agent reads `sales.csv`, pauses for human approval, and stages
-`INSIGHTS.md` and `revenue_trend.svg` for file-by-file review. The user applies the approved
-files through Studio and previews the chart directly in the workspace panel.*
-
-![Agent Profile Builder with capability controls and the exact ModelRequest preview](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/main/docs/img/studio-v019-profile-builder.jpg)
-
-*The Profile Builder places model, reasoning, and capability controls beside the
-backend-resolved first-turn `ModelRequest`: system prompt, exact tool schemas, model
-settings, and boundary notes.*
-
-## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
-
-The package is organized around four roles:
-
-- **Contract** — the stable integration surface, collected in `monoid_agent_kernel.contracts`
-  and re-exported from the top-level `monoid_agent_kernel`. These are the specs and protocols you
-  depend on and implement: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig`, `ModelAdapter`,
-  `ToolSpec` / `@tool`, `EventSink`, `CheckpointStore`, `PermissionPolicy`, and the rest. See
-  [docs/CONTRACTS.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) for the Python, HTTP, wiring, and operational rules.
-- **Conformance Test** — profile-based tests that check contract behavior for a chosen runtime
-  shape. See [docs/CONFORMANCE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md) for the profile model and
-  [docs/OPERATIONAL_RULE_COVERAGE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OPERATIONAL_RULE_COVERAGE.md) for the
-  rule-to-test and Phase 2S hardening coverage matrix.
-- **Core Helper Kit** — the supported runtime and helper modules that make the contract easy to
-  satisfy (`loop.py`, `core/`, `providers/`, `tools/`, `workspace/`, …). See
-  [docs/CORE_HELPER_KIT.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CORE_HELPER_KIT.md) for the helper boundary and
-  validation/library policy.
-- **Reference** — example services under `monoid_agent_kernel.reference` (`backend`,
-  `llm_gateway`, `web_gateway`, `mcp_gateway`, `stores`, `studio`, `conformance`) assembled from
-  the public contract and helper kit. See [docs/REFERENCE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/REFERENCE.md) for the reference
-  role, harnesses, and smoke targets.
-
-For the dynamic binding-based tool surface, see
-[docs/TOOL_SURFACE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md).
+The approval guide supplies the second command for a new process. The packaged report recipe
+also runs directly from an installed wheel. For a local session with builtin tools, run
+`python examples/embedding_local_product.py`; inspect its file output, checked checkpoint, and
+completed run. The [embedding handbook](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/EMBEDDING.md)
+connects these paths to product topology and hosted storage.
 
 ## Install
 
-Install the published package for its released API and examples:
+Install the published package for the released API:
 
 ```bash
 python -m pip install monoid-agent-kernel
 ```
 
-For this checkout's development examples, use the same-revision installation in the
-[quickstart](#quickstart-no-servers). Optional extras can also be installed from the checkout,
-for example `python -m pip install ".[http-async]"`.
+Use the [same-revision quickstart](#quickstart-no-servers) for this development checkout.
+Optional extras work with either package installation or a checkout, for example
+`python -m pip install ".[http-async]"`.
 
-The Studio UI ships as precompiled static assets. Running Studio does not install or require
-Node.js, Svelte, Vite, or Tailwind CSS; those tools are confined to frontend development and the
-release build.
+| Extra | Use |
+|---|---|
+| `http-async` | Async gateway streaming, including Studio's live output |
+| `openai` | Direct OpenAI adapter for local smoke tests |
+| `postgres` | PostgreSQL persistence |
+| `object-store-s3` | S3-compatible content-addressed blobs |
+| `temporal` | Temporal orchestration |
+| `durable-host` | PostgreSQL, ObjectStore, and Temporal composition |
 
-The default install runs Studio with complete one-shot gateway turns. Add the async HTTP extra
-to stream model output and reasoning through Studio's live, reconnectable content channel:
-
-```bash
-pip install "monoid-agent-kernel[http-async]"
-```
-
-Core has no provider SDK dependency. The direct OpenAI adapter is for local smoke tests;
-hosted/product runs use `GatewayModelAdapter` through your gateway:
-
-```bash
-pip install "monoid-agent-kernel[openai]"
-```
-
-Production persistence and orchestration adapters install independently. Use `durable-host` for
-the complete PostgreSQL, S3-compatible ObjectStore, and Temporal composition:
-
-```bash
-pip install "monoid-agent-kernel[postgres]"
-pip install "monoid-agent-kernel[object-store-s3]"
-pip install "monoid-agent-kernel[temporal]"
-pip install "monoid-agent-kernel[durable-host]"
-```
-
-The default package keeps these platform SDKs optional. Follow
-[docs/EMBEDDING.md](docs/EMBEDDING.md) for composition and
-[docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md) for migration, readiness, drain,
-metrics, backup/restore, and garbage collection.
-
-## Memory and default tools
-
-`monoid_agent_kernel.memory` provides an optional provider-backed Memory tool surface. The
-kernel treats memory as ordinary tools and context supplied by a provider; the provider owns the
-storage shape. The bundled `LocalFilesystemMemoryProvider` maps the Claude-style `/memories`
-virtual tree to local files and exposes `memory.search`, `memory.view`, `memory.create`,
-`memory.str_replace`, `memory.insert`, `memory.delete`, and `memory.rename`. Read tools default
-to `allow`; write tools default to `ask`.
-
-Memory providers are attached explicitly by an app, backend, or Studio profile. They are
-available from `monoid_agent_kernel.memory` and stay out of the top-level contract exports and
-`builtin_tools(workspace)`.
-
-The helper `default_tool_bindings(...)` in `monoid_agent_kernel.tools.defaults` creates the
-standard read, write, shell, and artifact tool bundles used by Studio and the builder. The write
-bundle includes `fs.write`, `fs.patch`, `fs.mkdir`, `fs.copy`, `fs.move`, and `fs.delete`;
-`fs.copy`, `fs.move`, and `fs.delete` require approval by default.
-
-## Stability
-
-This package is pre-1.0 (`0.x`): the public surface may change between minor versions, but
-breaking changes are called out in commit messages and this README.
-
-- **Stable Contract** — the core engine and integration contracts exported from
-  `monoid_agent_kernel.contracts`: `AgentLoop`, `AgentRunSpec`, `AgentRuntimeConfig` /
-  `RuntimeConfigProvider`, `ModelAdapter`, `ToolSpec` / `@tool`, `EventSink`,
-  `CheckpointStore`, `Workspace` / `workspace_factory`, and `PermissionPolicy`.
-- **Contract Extension** — surfaces that are public but still settling: async task seams,
-  session lifecycle/control, capability leases, agent-as-tool delegation, Agent Skills,
-  output validation, and multimodal content parts. `ImagePart` and `DocumentPart` are
-  forwarded to multimodal-capable adapters. `AudioPart` / `VideoPart` are exported
-  content contracts and round-trip through core JSON/checkpoint paths; provider forwarding
-  is still adapter-specific.
-- **Helper Kit** — implementation helpers live under explicit modules such as
-  `monoid_agent_kernel.core.*`, `monoid_agent_kernel.providers.*`,
-  `monoid_agent_kernel.tools.*`, `monoid_agent_kernel.recorder`, and
-  `monoid_agent_kernel.observability`.
-- **Reference examples** — everything under `monoid_agent_kernel.reference.*` is example
-  implementation code; build production services against the contracts.
-
-Agent configuration is centered on `AgentDefinition` (the reusable blueprint) and the
-mutable `AgentRuntimeConfig` (the current prompt and `ToolBinding` set). Backends can replace
-runtime config mid-run; the kernel applies it at the next turn boundary.
-
-## Running agents from the CLI
-
-```bash
-monoid run \
-  --workspace examples/workspaces/edit_markdown_notes \
-  --instruction "Read notes.md and create a clearer summary in SUMMARY.md." \
-  --runtime-config-file examples/runtime-config.json \
-  --llm-gateway-url http://127.0.0.1:8080/internal/llm/turns
-```
-
-- **Run spec vs runtime config are separate.** `AgentRunSpec` carries workspace, limits, and
-  permission boundary; the instruction is delivered as the first user turn. `AgentRuntimeConfig`
-  carries model, prompt, tool bindings, guidance, scope, quota, and shell/web runtime.
-- **`propose` vs `apply`.** The default `propose` mode stages writes and emits a proposal
-  package (`diff.patch`, `proposal.json`) without mutating the workspace; `--mode apply` writes
-  directly.
-- **Permissions are permissive by default** — dotfiles and keys are treated as normal files.
-  Pass `--deny-path` / `--redact-path` if the workspace holds secrets.
-  **See the [Threat Model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/THREAT_MODEL.md#permissive-by-default) before exposing secret-bearing workspaces.**
-- **Optional surfaces, each off unless flagged:** `--agents-directory` (subagents via
-  `agent.spawn`), `--skills-directory` (Agent Skills), `--capability-broker` (leased tools).
-
-Full CLI reference — `run`, `builder`, `watch`, `proposal`, `jobs`, custom workspace
-backends, streaming JSON — is in **[docs/CLI.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CLI.md)**.
-
-## Hosted backend and gateways
-
-For hosted, multi-tenant runs over HTTP, the reference backend issues run tokens and starts
-kernel runs, while the LLM and Web gateways hold provider credentials and validate scoped
-tokens. The kernel never receives OpenAI, Anthropic, or search-provider keys.
-
-The end-to-end walkthrough — starting the gateways, creating a run with `curl`, and polling
-status/result/events/proposal — is in **[docs/BACKEND.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/BACKEND.md)**.
+Core keeps provider and platform SDKs optional. Follow the
+[hosted composition](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/EMBEDDING.md#choose-one-hosted-assembly)
+and [operations guide](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/PRODUCTION_OPERATIONS.md)
+when installing production adapters.
 
 ## Model Provider Boundary
 
-`GatewayModelAdapter` is the default path. It sends normalized model-turn
-requests to your LLM gateway and can authenticate with
-`MONOID_LLM_GATEWAY_TOKEN` or `--llm-gateway-token-file`. Provider credentials stay
-inside your backend platform, where tenant usage, budgets, and rate limits
-can be enforced.
+Replace the quickstart's fake adapter at the `AgentLoop.from_tools` or `from_config` call.
+The [custom adapter example](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/examples/custom_model_adapter.py)
+implements `next_turn(request) -> ModelTurn` and injects an `EchoModelAdapter` through `from_config`.
+For hosted runs, `GatewayModelAdapter` sends model turns to the gateway you operate using a scoped
+token; provider credentials stay at that gateway. The
+[model adapter contract](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CONTRACTS.md#model-adapter)
+covers streaming, usage, and cancellation.
 
-`OpenAIModelAdapter` is retained for local smoke tests. CLI use requires
-`runtime_config.model.provider="openai"` and `--allow-direct-provider-api`.
+## Architecture: Contract / Conformance Test / Core Helper Kit / Reference
 
-To target your own LLM gateway, implement the `ModelAdapter` protocol or the
-`monoid.llm-turn.v1` HTTP contract documented in
-[docs/CONTRACTS.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md). Current protocol and schema identifiers
-use `monoid.*`; `native-agent-runner.*` identifiers are accepted during migration
-for existing durable artifacts and gateway requests.
+- **Contract:** import supported specs and protocols from `monoid_agent_kernel.contracts` or the
+  package root. See the [contract index](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CONTRACTS.md#find-a-contract).
+- **Conformance Test:** qualify your adapters and runtime through the
+  [existing profiles](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CONFORMANCE.md).
+- **Core Helper Kit:** use the [supported helpers](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CORE_HELPER_KIT.md)
+  for workspace, providers, tools, recording, and other contract implementations.
+- **Reference:** learn from the [runnable services](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/REFERENCE.md)
+  under `monoid_agent_kernel.reference`, including backend, gateways, Studio, and conformance harnesses.
+
+## Stability
+
+Monoid is pre-1.0: minor versions may change public behavior. The
+[changelog](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/CHANGELOG.md) and
+[compatibility ledger](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/COMPATIBILITY.md)
+record source and durable-format changes. The [contract stability categories](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CONTRACTS.md#stability)
+distinguish stable APIs, evolving extensions, helpers, and Reference examples.
+
+For persistent runs, read [Upgrade from v0.24 to v0.25](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/migrations/v0.25.md).
+The released v0.24 reader rejects the new invocation/ledger v2 records. The
+[release audit](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/V0_25_RELEASE_AUDIT.md)
+tracks the pending v0.25 release gates. Development links in this README follow `develop`;
+release qualification checks them against the selected tag.
+
+## Running agents from the CLI
+
+The [CLI guide](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CLI.md)
+covers `monoid run`, runtime configuration, workspace modes, proposals, jobs, and streaming JSON.
+The default `propose` mode stages file changes for review. Configure path permissions explicitly
+for your workspace; defaults permit paths. See the
+[workspace threat model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/security/THREAT_MODEL.md#permissive-by-default).
+
+## Hosted backend and gateways
+
+Use the [backend walkthrough](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/BACKEND.md)
+for authenticated submission, run tokens, status/result/events, and proposal retrieval.
+The [full-stack example](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/examples/full_stack_integration.py)
+connects the Reference backend and gateway; its fake mode exercises the flow offline.
+Production hosts own tenant isolation, external effects, storage, and transport lifecycle.
 
 ## Observability
 
-Every run emits a structured event stream (`events.jsonl`) and durable artifacts, and can
-mirror that stream to OpenTelemetry. `AgentLoop.astream(user_input)` exposes live token deltas,
-and each run writes `metrics.json` with counters, timing, and token usage.
+Read model-call receipts for termination facts and usage evidence, and `termination_budget()`
+for current Stop progress. Numeric usage remains the accounting input. The
+[streaming guide](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/guides/streaming-and-stop.md)
+shows the observation points and cleanup limits.
 
-`events.jsonl` carries metadata and bounded previews rather than content: model-authored settled
-text leaves as a digest that entitled readers join back from private run artifacts, and tool
-arguments are truncated to a byte budget. Studio renders tokens through a separate passive live
-channel and records replayable output/reasoning in the private `model-content.jsonl` sidecar. Raw
-provider chunks therefore stay out of the durable operation log and its Trace/export surface. A run
-can also opt into `model_calls.jsonl`, a private ledger of one metadata record per settled model
-call — including the failed ones — carrying timings, token usage, failure taxonomy and the replay
-key, and no content. A third opt-in, `model_payloads.jsonl`, records the content half for replay:
-the exact request bytes each replay key was hashed over (stored as verified reassembly recipes,
-deduplicated per tool definition, per message and per observation) and the settled response
-bodies, reasoning included. Both are requested per run with `monoid run --model-calls-file` and
-`monoid run --model-payload-file`, per deployment with the same two flags on
-`monoid backend serve`, and directly by an embedder through the matching `AgentLoop` and
-`RunnerBackend` fields. `monoid run --replay-from RUN_DIR_OR_ID` closes the loop: it serves a
-recorded corpus back as the model — offline, no provider configuration at all — replaying
-answers in recorded order while tools re-execute for real, and failing misses as a typed,
-content-free `replay_miss` unless `--replay-fallthrough` hands them to the live adapter.
-`MONOID_OUTPUT_DELTAS=0` or `monoid studio serve --no-output-deltas` closes both Studio content
-egress surfaces while preserving provider streaming and token-boundary Stop. Direct AgentLoop
-integrations can still opt into the legacy durable `model.output.delta` and
-`model.reasoning.delta` events; see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full
-public/private split.
+The [observability reference](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/OBSERVABILITY.md)
+describes events, metrics, tracing, and the optional private content, model-call, and replay
+artifacts. It defines their access and content boundaries. Use the
+[operations guide](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/PRODUCTION_OPERATIONS.md)
+for readiness, migration, drain, backup/restore, and incident handling.
 
-The run-directory artifact set, custom event sinks (including secret redaction), OTel tracing,
-live streaming, and metrics are all documented in **[docs/OBSERVABILITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)**.
-PostgreSQL/ObjectStore/Temporal startup, migration, metrics, drain, GC, backup/restore, and incident
-procedures are documented in **[docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md)**.
+## Memory and default tools
+
+Bind tools explicitly through runtime configuration. The
+[tool surface reference](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/TOOL_SURFACE.md)
+covers builtin bundles, exposure, authorization, scope, and quotas. Optional memory providers
+supply ordinary tools and context; the [memory example](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/examples/memory_quickstart.py)
+shows explicit attachment. Delegation and skills have their own
+[design guides](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/README.md#integrate-product-capabilities).
 
 ## Defaults
 
-- runtime config is required for CLI and backend runs
-- default model provider inside `ModelConfig`: `gateway`
-- default model inside `ModelConfig`: `gpt-5.5`
-- default reasoning effort inside `ModelConfig`: `medium`
-- mode: `propose`
-- default tool bundles are available through `monoid_agent_kernel.tools.defaults.default_tool_bindings`
-- shell is available through exposed shell bindings such as `shell.exec`
-- web.search/web.fetch/web.context are available through exposed web bindings and WebGateway
-- file mutation tools include write, patch, mkdir, copy, move, and delete in
-  `propose` and `apply` modes when bound in runtime config
-- memory tools are available through an explicitly attached `MemoryProvider`
-- no path deny/redact policy unless explicitly provided
+`AgentRunSpec` selects workspace, limits, and permissions. `AgentRuntimeConfig` selects the model,
+prompt, and tool bindings and can change at a turn boundary. See the
+[configuration contract](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/CONTRACTS.md#agentdefinition-and-runtime-config)
+and [builtin configuration example](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/examples/minimal_quickstart.py)
+for current defaults and explicit configuration.
+
+## See it run
+
+The bundled Agent Studio (`monoid studio serve`) runs the kernel through its Python API and
+provides profile editing, chat, approval, and proposal review. Its precompiled UI ships in the
+package. See the [Reference guide](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/REFERENCE.md)
+for setup.
+
+![Agent Studio showing an approval and proposed report](https://raw.githubusercontent.com/hoonseokyoon/monoid-agent-kernel/develop/docs/img/studio-v019-main.jpg)
+
+The agent reads a sample CSV, requests approval, and stages a report and chart for review.
 
 ## Documentation
 
-Start with **[docs/README.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/README.md)** — it routes you to the right docs by role
-(app developer, tool author, backend/gateway operator, security reviewer, contributor).
-Quick links:
-
-- **Use it:** [CLI reference](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CLI.md) · [Hosted backend](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/BACKEND.md) · [Observability](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/OBSERVABILITY.md)
-- **Build against it:** [Embedding handbook](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/EMBEDDING.md) · [Contracts](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONTRACTS.md) · [Tool surface](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/TOOL_SURFACE.md) · [Conformance](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/CONFORMANCE.md)
-- **Extend it:** [Subagents](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SUBAGENT_DESIGN.md) · [Skills](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/SKILLS_DESIGN.md) · [First skill tutorial](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/FIRST_SKILL_TUTORIAL.md)
-- **Secure it:** [Security model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/SECURITY_MODEL.md) · [Threat model](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/THREAT_MODEL.md) · [Production checklist](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/security/PRODUCTION_CHECKLIST.md) · [Security policy](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/SECURITY.md)
+Use the [documentation index](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/README.md)
+to choose a guide, look up a contract, operate a deployment, or upgrade retained runs.
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CONTRIBUTING.md) for
-development setup and the lint/test workflow, and [CODE_OF_CONDUCT.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/CODE_OF_CONDUCT.md).
-For security issues, follow [SECURITY.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/SECURITY.md) (do not open a public issue).
-
-Fast local confidence checks:
-
-```bash
-python -m pytest tests/conformance -q
-python -m pytest -q -n 4 -m "(unit or contract) and not serial"
-python -m pytest -q -m "(integration or serial) and not live"
-python -m pytest -q -n 4 -m "(unit or contract) and not serial" \
-  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-report=
-python -m pytest -q -m "(integration or serial) and not live" \
-  --cov=monoid_agent_kernel --cov=native_agent_runner --cov-append --cov-fail-under=80
-```
-
-CI requires deterministic parallel unit/contract and serial integration shards on Python 3.11
-and 3.12, an 80% branch-coverage floor, install smoke, and Windows/macOS smoke. See
-[docs/PHASE_4_CLOSURE.md](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/docs/PHASE_4_CLOSURE.md) for the current Phase 4
-structure closure and CI promotion criteria.
+Follow [Contributing](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/CONTRIBUTING.md)
+for setup, test selection, review, and CI. The
+[operational rule coverage](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/docs/OPERATIONAL_RULE_COVERAGE.md)
+connects contract guarantees to their checks.
 
 ## License
 
-Licensed under the [Apache License 2.0](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/main/LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/hoonseokyoon/monoid-agent-kernel/blob/develop/LICENSE).
