@@ -32,9 +32,9 @@ calendar time은 별도로 늘어날 수 있다.
 
 ## 2. 프로그램 배경과 범위 기준
 
-### 2.1 common-skill-pipeline에서 드러난 공통 요구
+### 2.1 제품 통합의 공통 요구
 
-historical Skill Lab과 durable chat은 서로 다른 제품 기능이었으나 실행 기반 요구는 같았다.
+복구 가능한 에이전트를 제품에 통합하려면 다음 실행 기반이 필요하다.
 
 - 모델 호출을 안정된 logical identity로 주소 지정한다.
 - safe semantic boundary에서 checkpoint하고 process replacement 뒤 복구한다.
@@ -52,23 +52,14 @@ terminal outcome, typed interruption, activation write authority를 완성했다
 
 ### 2.2 Monoid 독립성
 
-v0.23은 다음 제품 개념을 포함하지 않는다.
+제품은 계정·권한 모델, 도메인 객체, 사용자 화면, 과금·배포 정책을 소유한다.
+Monoid는 opaque `run_id`, `input_id`, content digest, outcome, stream cursor를 제공한다.
+호스트는 tenant와 product identity를 외부 mapping으로 연결한다.
 
-- CSP tenant/account/RLS GUC
-- Skill, Case, CatalogRevision, RunPlan
-- ChatStore, SubjectStore, assistant message schema
-- HTTP, SSE, GUI, browser reconnect wording
-- Item, Artifact, Paper, Wiki, Interactive Note
-- pricing, budget, deployment, OCI/Kubernetes policy
+### 2.3 독립된 검증 환경
 
-Monoid는 opaque `run_id`, `input_id`, content digest, outcome, stream cursor만 이해한다. host는
-tenant와 product identity를 외부 mapping으로 연결한다.
-
-### 2.3 CSP 작업 보호
-
-사전조사는 CSP의 이미 존재하는 local refs와 파일을 read-only로 읽었다. fetch, checkout,
-branch 변경, test, build, install, migration, 파일 수정을 수행하지 않았다. v0.23 구현과 CI도 CSP를
-fixture, submodule, editable dependency로 사용하지 않는다.
+구현과 CI는 커널 소유 fixture와 공개 계약으로 검증한다. 제품별 저장소·운영 데이터는
+독립된 통합 단계에서 해당 제품이 검증한다.
 
 ## 3. v0.22 기준선
 
@@ -183,7 +174,7 @@ read model이다.
 - Redis/Kafka durable queue adapter
 - Temporal Cloud 또는 AWS 계정 credential이 필요한 blocking CI
 - 자동 repair, operator UI, hosted control plane
-- CSP integration 또는 CSP migration
+- 호스트 integration 또는 호스트 migration
 
 ## 6. package와 dependency 경계
 
@@ -235,7 +226,7 @@ Server 버전과 일치시킨 뒤에만 qualification evidence를 만든다.
 
 ### 7.1 지원 범위
 
-권장 최소 major는 PostgreSQL 16이다. CSP의 현재 운영 major와 맞고 2028년까지 community support가
+권장 최소 major는 PostgreSQL 16이다. 2028년까지 community support가
 남아 있다. release gate는 16과 현재 최신 stable major 18을 실행한다. PostgreSQL은 major별로 5년간
 지원되며 현재 16, 17, 18이 지원 상태다.
 
@@ -797,7 +788,7 @@ PR 2~6은 storage production path, PR 7~10은 orchestration production path, PR 
 | schema auto-upgrade가 rollout을 깨뜨림 | explicit migration plan/apply, N-1 reader window |
 | full CI가 review fix마다 반복 | Draft/Ready checkpoint, Draft review 미지원 시 Ready+`ci:full` label gate, fast/full split, concurrency cancel |
 | optional dependency가 base import를 오염 | lazy adapter imports와 wheel/import audit |
-| CSP schema가 generic API에 스며듦 | opaque ID와 host wrapper, CSP-independent conformance |
+| 호스트 schema가 generic API에 스며듦 | opaque ID와 host wrapper, host-independent conformance |
 
 ## 17. owner 결정 항목
 
@@ -809,7 +800,7 @@ canonical disposition이다.
 | A01 | v0.23 exact cut | production path만 / production+stream+bounded ops / ModelCallActivity까지 | production+stream+bounded ops | durable chat reconnect와 운영 종료 조건을 채우며 mid-step replay 위험을 분리한다. | 승인 |
 | A02 | 배포 구조 | 별도 adapter distributions / 한 wheel의 optional modules | 한 wheel의 optional modules | 첫 release에서 contract와 compatibility를 한 캠페인으로 검증한다. | 승인 |
 | A03 | package/extras | 자유 명명 / 제안 namespace와 `postgres`, `object-store-s3`, `temporal`, `durable-host` | 제안안 | base install을 가볍게 유지하고 사용자가 필요한 backend만 설치한다. | 승인 |
-| A04 | PostgreSQL 지원 | 15+ / 16+ / 17+ | 16+, release 16·18 | CSP와 정렬되고 충분한 지원 기간과 최신 major 호환성을 함께 확보한다. | 승인 |
+| A04 | PostgreSQL 지원 | 15+ / 16+ / 17+ | 16+, release 16·18 | 충분한 지원 기간과 최신 major 호환성을 함께 확보한다. | 승인 |
 | A05 | DB API | sync pool / sync+async 동시 / async-only | sync psycopg pool | 기존 sink/loop와 Temporal threaded Activity에 맞고 public API surface를 하나로 유지한다. | 승인 |
 | A06 | migration | auto-migrate / explicit bundled SQL / Alembic | explicit bundled SQL, no auto-migrate | rollout과 rollback을 운영자가 통제하고 SQL linearization을 직접 review한다. | 승인 |
 | A07 | takeover | 다른 owner 즉시 takeover / expiry 또는 current-token release 뒤 takeover | expiry/release gate | crashed writer overlap에서 stale publication을 확실히 차단한다. | 승인 |

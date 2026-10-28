@@ -249,7 +249,7 @@ S/M은 문서·회귀·호환성·리뷰를 포함한 상대 비용이다. funct
 
 계획 작성 당시 역할: 총괄은 범위·통합·증거를 정리하고, 외부 연구 담당은 DX1 사례를 read-only로 확인했다.
 독립 reviewer는 초안 작성과 분리해 설계를 검토한다. 구현 담당은 후속 구현 요청 때 배정한다.
-2026-10-25 계획 작성에서는 source/test/example 구현, dependency 설치·상향, branch/commit/PR 생성, CSP 수정·배포를 수행하지 않았다.
+2026-10-25 계획 작성에서는 source/test/example 구현, dependency 설치·상향, branch/commit/PR 생성, 호스트 수정·배포를 수행하지 않았다.
 
 ## 7. 현재 실행한 증거
 
@@ -295,7 +295,7 @@ for budget in (0.0, 5.0):
 
 앞의 6개 조합은 texts=`['x', '\ufffd']`, 뒤의 2개는 `['x', 'late']`였다.
 8개 모두 error는 `WriteAuthorityRevoked`, settled는 0이다. 앞의 6개에서는 cause=`lease_lost`도 확인했다.
-관측 범위는 직접 runner consumer다. CSP 운영 환경과 외부 callback의 실제 효과는 이 probe에서 확인하지 않았다.
+관측 범위는 직접 runner consumer다. 호스트 운영 환경과 외부 callback의 실제 효과는 이 probe에서 확인하지 않았다.
 
 ### 기존 회귀의 기준선
 
@@ -358,7 +358,7 @@ reviewer가 확인한 candidate SHA256은 다음과 같다. 그 뒤의 PR 계획
 사용자 요청에 따라 P5 → DX1을 각각 독립 PR로 진행한다. 총괄·현재 소스 조사·구현은 부모 에이전트가 담당하고,
 독립 reviewer는 계획/PR preflight와 코드 검토를 수행한다. P5는 권한 경계의 A등급으로 코드 reviewer 두 명,
 DX1은 typed 도구 B등급으로 한 명을 배정한다. 공유 소스 수정과 테스트 runner 사용은 부모가 순서를 관리한다.
-현재 승인 범위는 구현·검증·PR·develop 통합이며 버전 릴리스·배포·CSP 변경은 별도 후속이다.
+현재 승인 범위는 구현·검증·PR·develop 통합이며 버전 릴리스·배포·호스트 변경은 별도 후속이다.
 
 ### P5 PR preflight
 
@@ -389,7 +389,7 @@ DX1은 typed 도구 B등급으로 한 명을 배정한다. 공유 소스 수정�
 **수정 전 red:** 아래 3개 신규 테스트(12조합)가 모두 예상한 추가 출력 assertion에서 실패했다.
 source는 base와 동일, `tests/test_model_call_runner.py`에 회귀 85줄만 추가한 상태다. elapsed 9.97s / exit 1.
 잔여 U+FFFD 6개, 일반 late delta 2개, terminal/EOF batch의 나머지 조각 4개를 각각 검출했다.
-원본 출력은 worktree의 gitignored `.tmp/v025/p5-red.log`에 보관한다.
+원본 출력은 worktree의 gitignored `p5-red.log`에 보관한다.
 
 ```powershell
 $env:PYTEST_XDIST_AUTO_NUM_WORKERS = '4'
@@ -405,18 +405,18 @@ CI와 같은 `uvx --from ruff==0.15.6 ruff check tests/test_model_call_runner.py
 수정 전 회귀와 사전조사는 `c3f9115`에 먼저 고정했다. 이 commit의 production source는 원래 base와 동일하다.
 최소 수정은 `_astream`의 `deliver` helper에서 조각 append 직전과 consumer 전후에 기존 authority 검사를 적용하고
 normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합이 **12 passed / 8.61s / exit 0**으로 전환됐다.
-원본 출력은 `.tmp/v025/p5-green.log`다. `uvx --from ruff==0.15.6 ruff check src tests tools/v023_ci.py`와
+원본 출력은 `p5-green.log`다. `uvx --from ruff==0.15.6 ruff check src tests tools/v023_ci.py`와
 `git diff --check`도 통과했다. 기존 Unicode·취소·drain·retry·observer·공개 표면·호환성 검증과 코드 리뷰를 이어간다.
 
 검증 중 drain=0의 stalled provider가 테스트 watchdog 취소로 끝나는 것을 확인했다. 해당 fixture에 호스트의
 명시적 HOST_SHUTDOWN 신호를 연결하고, watchdog 전에 끝나는 시간 상한 assertion을 추가했다. 제품 취소 정책은 유지했다.
 명시적 wake를 넣은 회귀도 `c3f9115`의 원래 model_call.py에서 **12 failed / 9.62s**였고,
-실험 뒤 수정 source의 원래 bytes를 복구했다(`.tmp/v025/p5-red-final.log`). 모든 실패는 동일한 출력 assertion이었다.
+실험 뒤 수정 source의 원래 bytes를 복구했다(`p5-red-final.log`). 모든 실패는 동일한 출력 assertion이었다.
 그 뒤 추가한 종료 시간 상한과 문서 설명은 이 red 원인에 영향을 주지 않는다.
 
 최종 테스트 파일 SHA256은 `C8E8307022748AD5E6528DC11C507896D01501C8E8116FB2CFD06E84A492CF24`다.
 현재 수정에서 아래 관련 회귀는 **197 passed / 8.55s / exit 0**, ruff 전체 Python 범위·diff 공백 검사도 통과했다.
-원본 출력: `.tmp/v025/p5-focused-final.log`.
+원본 출력: `p5-focused-final.log`.
 
 ```powershell
 & $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_model_call_runner.py tests/test_model_stream_observer.py tests/test_authority.py tests/test_public_surface.py tests/test_compatibility_ledger.py -k 'stream or drain or lease_loss or consumer or delivered_chunk or delivery_is_marked or authority or public or compatibility' --durations=8 --tb=short
@@ -444,11 +444,11 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 - 취소 경계: 직접 RunCancelled/RunTimeout/TurnInterrupted를 보존하고 PydanticSerializationError의 cause에 있는
   동일 제어 예외와 BaseException 제어 신호를 재발생한다. 일반 도메인 오류의 cause는 탐색하지 않는다.
   wrapper cause를 순회하면 cycle guard를 둔다. loop의 host 취소와 handler-local 취소 분류는 그대로 사용한다.
-- 지원 하한 조사: Python 3.12.11/Pydantic 2.6.0을 `.tmp/v025/dx1-pydantic26`에 격리 설치했다.
+- 지원 하한 조사: Python 3.12.11/Pydantic 2.6.0을 별도 환경에 격리 설치했다.
   Python 3.11.9/Pydantic 2.13.4와 함께 direct serializer·중첩 모델 필드의 원래 제어 예외 cause 보존을 확인했다.
   custom serializer가 다른 모델의 `model_dump()`를 직접 호출하면 두 버전에서 cause/context가 사라진다.
   decorator는 남아 있는 원인 정보만 복원할 수 있다. 오류 문자열 추정이나 Pydantic monkeypatch는 추가하지 않는다.
-  소비자는 중첩 모델 필드의 기본 직렬화를 사용한다. 원본 probe와 출력은 `.tmp/v025/dx1_probe.py`,
+  소비자는 중첩 모델 필드의 기본 직렬화를 사용한다. 원본 probe와 출력은 `dx1_probe.py`,
   `dx1-probe-current.log`, `dx1-probe-floor.log`다.
 - 외부 근거 재확인: [LangChain #34770](https://github.com/langchain-ai/langchain/issues/34770)은 입력 dump가
   context 직렬화를 유발하는 열린 이슈다. 입력 serializer 호출 0회로 이 문제를 예방한다.
@@ -464,7 +464,7 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 
 **수정 전 red:** 신규 수용 회귀 74개 중 **59 failed, 15 passed / 4.87s**.
 중첩 타입 손실·입력 serializer 실행·반환 모델 거부·제어 예외 손실이 의도한 assertion에서 드러났다.
-기존 dict/ToolResult 및 거부해야 할 중첩 모델의 대조 경로는 통과했다. 원본 출력은 `.tmp/v025/dx1-red.log`다.
+기존 dict/ToolResult 및 거부해야 할 중첩 모델의 대조 경로는 통과했다. 원본 출력은 `dx1-red.log`다.
 
 ```powershell
 & $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py -k 'typed or serializer or validated_inputs or input_validation or top_level_models or model_serialization or model_conversion or existing_return or model_dump_preserves' --tb=short
@@ -475,7 +475,7 @@ normal/terminal/remainder의 중복 전달 코드를 모았다. 같은 12조합�
 수정 전 회귀 commit은 `59b27ef1b08f22aa2542d516de57916a17d9dfde`다. production source는 base와 동일하다.
 decorator 구현은 입력 필드 추출과 최상위 모델 반환 경계에 한정했다. 같은 신규 회귀는 **74 passed / 3.93s**다.
 단위·실제 loop·도구 envelope·예제·public/compat·기존 도구 회귀는 **277 passed, 1 skipped / 13.18s**였다.
-skip은 Windows 환경의 symlink 생성 제한이다. 원본 출력은 `.tmp/v025/dx1-green.log`, `dx1-focused.log`다.
+skip은 Windows 환경의 symlink 생성 제한이다. 원본 출력은 `dx1-green.log`, `dx1-focused.log`다.
 
 ```powershell
 & $python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_tool_decorator.py tests/test_async_tools.py tests/test_tool_result_envelope.py tests/test_loop.py tests/test_examples.py tests/test_public_surface.py tests/test_compatibility_ledger.py tests/test_tools.py --tb=short --durations=8
@@ -486,8 +486,8 @@ Python 3.12.11/Pydantic **2.6.0** 격리 환경에서는 decorator·async tool·
 하한 환경의 명령은 동일 pytest prefix에 `tests/test_tool_decorator.py tests/test_async_tools.py
 tests/test_tool_result_envelope.py tests/test_examples.py --tb=short --durations=6`이며 로그는 `dx1-floor.log`다.
 
-`uv build --wheel --out-dir .tmp/v025/dist`와 `tools/release_wheel_audit.py`가 통과했다.
-새 Python 3.12.11/Pydantic 2.13.4 환경에 해당 wheel을 설치하고, 예제를 `.tmp/v025/wheel-smoke`에 복사해
+`uv build --wheel`와 `tools/release_wheel_audit.py`가 통과했다.
+새 Python 3.12.11/Pydantic 2.13.4 환경에 해당 wheel을 설치하고, 예제를 checkout 밖 임시 디렉터리에 복사해
 `python -I`로 실행했다. import 위치가 새 환경의 site-packages 내부임을 먼저 확인했고,
 `completed`와 `{"ok":true,"result":{"customer":"Ada","title":"Weekly report"}}` observation assertion이 통과했다.
 wheel SHA256: `C95B5A179C116A4B70FD4116CA035C80F3351642BD44517AFB58F0712573C4A2`.
@@ -510,6 +510,6 @@ develop merge `5b08b10d82a948268d1a95b51112b1508e233e3d`로 통합했다. 검토
 14개 job 모두 통과했다. 실제 서비스·플랫폼·wheel 설치·DBOS 복구·Studio·coverage 80.65% 검증을 포함한다.
 P5의 [전체 develop CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40407263870)도 통과했다.
 
-두 구현 PR은 완료했다. 릴리스·태그·PyPI·CSP pin은 변경하지 않았다.
+두 구현 PR은 완료했다. 릴리스·태그·PyPI·호스트 pin은 변경하지 않았다.
 사용자가 다음으로 요청한 P3는 [별도 계획](V0_25_P3_PR_PLAN.md)에서 최신 develop 코드와 외부 사례,
 정책·PR별 변경 범위·검증 기준을 구체화한다. 현재 요청은 P3 사전조사와 계획이며 구현은 보류한다.

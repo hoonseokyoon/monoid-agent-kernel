@@ -3,7 +3,7 @@
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48`.
 P5·DX1·P3가 병합된 상태다. 계획은 로컬 `94ea35a`에 기록했다.
 **2026-10-27 사용자가 P1P2-00·01 구현과 리뷰·CI 후 02·03·04 순차 진행을 승인했다.**
-00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·CSP 변경은 별도다.
+00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·호스트 변경은 별도다.
 구현 상태: 00 #156은 develop에, 01–04 #157–160은 통합 브랜치에 병합했다.
 실제 공개 API와 실행 예제를 제공하며, 최종 누적 검증·수정 기록은 §9.6에 둔다.
 
@@ -46,7 +46,7 @@ P5의 출력 권한 검사와 P3의 자원 수명·복구 보장을 유지한다
 ### 2.1 제한된 실행 확인
 
 동일 base, Windows, Python 3.11.9/Pydantic 2.13.4에서 tracked 소스·테스트를 수정하지 않고 실행했다.
-로컬 ignored `.tmp/v025/p1p2_preflight_probe.py`와 `p1p2-preflight-probes.json`에 원본을 보관한다.
+로컬 ignored `p1p2_preflight_probe.py`와 `p1p2-preflight-probes.json`에 원본을 보관한다.
 probe는 기존 test helper로 실제 `AgentLoop.run_until_suspended`를 실행하고 private state는 관찰에만 사용한다.
 
 | 입력·경로 | 관측값 |
@@ -388,7 +388,7 @@ PydanticAI #9491·Vercel #17578과 공식 streaming 계약은 표본 확인했�
 | 이번 단계의 실행 | 결과 |
 |---|---|
 | 시작·마감 `git fetch origin develop` | 모두 `4e14618b3ba68ffd9e243a9bcad2e3c9d2f5ac48` |
-| `python .tmp/v025/p1p2_preflight_probe.py` | §2.1 네 경계의 기존 동작 확인 |
+| `python p1p2_preflight_probe.py` | §2.1 네 경계의 기존 동작 확인 |
 | §7의 다섯 파일 pytest 명령 | 280 passed in 9.50s |
 | 네 계획·색인 문서의 local links / Python 예시 AST | 119 links 존재 / 6 blocks parse 성공 |
 | `git diff --check` | whitespace 오류 없음 |
@@ -451,7 +451,7 @@ A 등급으로 구현 최종 head의 서로 다른 두 코드 리뷰·combined �
 메모리 probe는 canonical v1 failure만 복구했다. namespace alias, legacy `requires_evidence`, 생략된 policy/result_ref는
 decode=loaded 뒤 `durable_invocation_conflict`, digest-generation alias는 request conflict였다.
 checkpoint의 nested 재직렬화도 원래 hash를 바꿨다. v2는 unsupported였다.
-원본 코드·출력은 ignored `.tmp/v025/p1p2-01-baseline-probe.py`, `p1p2-01-baseline-probe-output.txt`다.
+원본 코드·출력은 ignored `p1p2-01-baseline-probe.py`, `p1p2-01-baseline-probe-output.txt`다.
 이 probe는 passive failed settlement만 실행했다. success·required/outbox·PostgreSQL·subscription은 구현 검증에서 추가한다.
 
 **선택한 최소 구조.**
@@ -491,7 +491,7 @@ checkpoint nested hash, v2 fixture의 공개 receipt 복원, mixed ledger와 mal
 v2 nonzero-evidence retry와 backoff cancel은 attempts·누적 숫자·새 v1 revision·옛 v2 hash를 관측한다.
 source mutation, replace(new revision), stale fence, PostgreSQL typed-row/hash/evidence·ObjectStore·Temporal은 해당 기존 suite에 추가한다.
 
-독립 preflight 판정은 **READY**다. 검토 원문은 ignored `.tmp/v025/p1p2-01-preflight.md`,
+독립 preflight 판정은 **READY**다. 검토 원문은 ignored `p1p2-01-preflight.md`,
 SHA-256 `00A70152A16E64801F33E67F0ABADE2D3B0878BB2CB2FFB7D871BB220B8A99D5`다.
 reviewer는 source·원본 probe를 확인했으며 별도 runner를 사용하지 않았다.
 01 초기 400 기능/1,300 총 변경 줄 추정을 유지해 기록하고, 추가로 확인한 경계를 포함한 작업 예산은 500/1,700줄로 갱신한다.
@@ -501,12 +501,12 @@ reviewer는 source·원본 probe를 확인했으며 별도 runner를 사용하�
 **33 failed / 7 passed in 3.05s**였다. canonical v1의 세 evidence policy×성공/실패와 기존 retry는 통과했다.
 historical spelling/default의 같은 좌표 재게시, v2 reader, 공개 receipt/subscription, mixed ledger에서 실패했다.
 테스트 초기 stale-fence 기대 예외를 기존 `WriteAuthorityRevoked` 계약에 맞춘 뒤 다시 실행한 수치다.
-이 시점 `git diff -- src`는 비어 있다. 원본 출력은 ignored `.tmp/v025/p1p2-01-red.txt`에 보관한다.
+이 시점 `git diff -- src`는 비어 있다. 원본 출력은 ignored `p1p2-01-red.txt`에 보관한다.
 
 실패 회귀 commit은 `cc101b5def74e65e5a1d0affcb5a94f200c8dbd9`다. 구현 후 같은 40개는 통과했다.
 관측 타입의 닫힌 값·0·coverage·합계·private key 거부, source envelope의 nested mutation 거부,
 새 revision의 v1 선택, 복구 retry/backoff cancel, LocalFs·SQLite nested 기록, packaged fixture를 추가해
-관련 **608 passed in 7.32s**를 확인했다. raw 출력은 `.tmp/v025/p1p2-01-targeted.txt`다.
+관련 **608 passed in 7.32s**를 확인했다. raw 출력은 `p1p2-01-targeted.txt`다.
 기존 필드 완전성 테스트는 새 optional 필드의 최대/생략 모양을 모두 검사하도록 확장했다.
 PostgreSQL 16/18과 ObjectStore의 historical/v2 payload·원래 hash·typed binding·evidence 복구 테스트는
 combined 서비스 CI에서 실행한다. 두 독립 최종 코드 리뷰, current/minimum Pydantic 설치 wheel, 원격 L1/L2가 남아 있다.
@@ -551,7 +551,7 @@ import가 site-packages임을 검사했고 Pydantic 2.14.1은 120 passed/3.75s, 
 실제 fetch한 integration base는 `ec32ca8e2adc86354cfb9acd7cd5f3b9d657b537`, develop은 계속 `d4e659c`다.
 검토한 01 head와 tree가 같다. 작업 브랜치는 `codex/v0.25-p1-p2-runtime`이다.
 root가 구현·runner, `p1p2_01_research`가 읽기 전용 조사, `p1p2_02_preflight_review`가 독립 검토를 맡았다.
-사전조사 `.tmp/v025/p1p2-02-preflight.md` SHA-256은
+사전조사 `p1p2-02-preflight.md` SHA-256은
 `91F74B73941E3D206CFF629BDC25ABE8D68C0AE50780243458B4D5BC19F45B54`, 판정은 **READY**다.
 같은 날 확인한 §3의 pinned 외부 구현을 재사용하고, 현재 OpenAI Responses 경로를 직접 대조했다.
 
@@ -582,7 +582,7 @@ backoff 취소는 호출 종료 사실만 바꾼다. loop failure observer·예�
 수정 전 테스트는 **14 failed / 1 skipped in 4.58s**였다. shared Python의 OpenAI 미설치로 생긴 skip은
 별도 Python 3.11 환경에 최소 지원 OpenAI 1.80.0을 설치해 다시 실행했고 **1 failed in 5.41s**였다.
 실제 terminal→hung EOF→deadline에서 이미 보고한 120/340/460이 빈 stamp로 나오는 실패다.
-raw 출력은 `.tmp/v025/p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때 `git diff -- src`는 비어 있다.
+raw 출력은 `p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때 `git diff -- src`는 비어 있다.
 
 02 최초 600 기능/1,900 총 변경 줄 추정은 유지하며, 숨은 수신 경계와 실패 전달을 반영한 예산은 850/2,300이다.
 01 실제 source 상한 529를 포함한 누적 예상은 2,249 기능 상한/약 7,500 총 변경 줄이다.
@@ -595,7 +595,7 @@ raw 출력은 `.tmp/v025/p1p2-02-red.txt`, `p1p2-02-openai-red.txt`이며 이때
 `attempts=0`과 provider 진입 0회를 검증한다. unknown의 기존 failed 결과와 별도로 최초 stop·read end를 보존한다.
 
 최종 후보의 관련 suite는 **834 passed in 23.69s**였다. 원본은
-`.tmp/v025/p1p2-02-candidate-tests2.txt`다. 전체 ruff와 diff check, 오프라인
+`p1p2-02-candidate-tests2.txt`다. 전체 ruff와 diff check, 오프라인
 `examples/model_call_facts.py`도 통과했다. 예제는 input=0의 complete와 total의 unknown을 출력한다.
 runner까지 unwind하는 BaseException은 관측을 보존하며, Python event loop 자체를 끝내는
 KeyboardInterrupt/SystemExit의 기존 원형 전파도 검사했다. 프로세스 종료 뒤 subscriber 실행 보장은 추가하지 않는다.
@@ -614,7 +614,7 @@ preflight는 READY였다. 결과 검증 실패의 공개 복구 outcome은 faile
 검증된 복구 receipt 전용 carrier를 recovery hook/decoder 경계에서만 소비해 historical attempts·usage를 보존한다.
 required evidence 게시 실패는 확인된 provider outcome을 유지하고, 읽지 않은 final text·마지막 turn usage는 비워 둔다.
 required refusal 재전달은 원래 facts와 기존 빈 accounting delta를 함께 보존한다.
-추가 회귀 원본은 `.tmp/v025/p1p2-02-*-red.txt`, 수정 후 관련 **884 passed / 22.71s**는
+추가 회귀 원본은 `p1p2-02-*-red.txt`, 수정 후 관련 **884 passed / 22.71s**는
 `p1p2-02-review-green.txt`에 있다. source 변경 상한은 약 710줄(공백·주석 포함)로 갱신 예산 850 이내다.
 초기 600/1,900 추정과 누적 비용 기록은 유지한다. 최종 head 재검토·wheel·CI를 다시 확인한다.
 
@@ -653,7 +653,7 @@ L1 `40461636410`·필수 core L2 `40461723407` SUCCESS 후 통합 `617deadc5012c
 ### 9.4 P1P2-03 실제 base 사전조사
 
 새 branch `codex/v0.25-p1-p2-storage`의 base는 위 02 병합본 `617deadc`다. 재조회한 develop은 `d4e659c`다.
-사전조사 `.tmp/v025/p1p2-03-preflight.md` SHA-256
+사전조사 `p1p2-03-preflight.md` SHA-256
 `064BC150A186FBF04FD865D42DBE5183161ED4BAB88281F0BA6AC38EB2979C71`는 독립 검토 READY다.
 기존 두 codec·source envelope·bounded projection·실제 service harness를 재사용한다. v1 codec 식별자는
 고정하고 version dispatch reader를 registry에 기록한다. reader-prep binary가 새 v1 revision을 쓰는 롤백에서는
@@ -664,7 +664,7 @@ root가 제품 소스와 단일 테스트 runner를 담당하고 별도 worker�
 모든 편집을 마친 뒤 테스트를 실행하며, 최종 두 코드 리뷰·설치 wheel·combined CI는 별도 gate다.
 
 03 실제 base의 제품 소스를 수정하기 전 새 회귀 11개가 모두 실패했다(3.04s;
-`.tmp/v025/p1p2-03-red.txt`). 실제 fenced 복구 6개, recorder 성공·실패·retry 3개,
+`p1p2-03-red.txt`). 실제 fenced 복구 6개, recorder 성공·실패·retry 3개,
 historical v1/v2에서 새 revision 전이 2개다. service worker는 같은 경계를 기존 PG16/18,
 ObjectStore·Temporal 테스트에 연결했고 아직 실행하지 않았다. 아래 테스트 전용 commit으로 red를 고정한다.
 
@@ -683,7 +683,7 @@ provider 호출 1회, v2 facts 유지와 total unknown을 출력했다. 전체 l
 03 PR #159의 첫 후보 `4eadd548` wheel audit과 current/minimum 설치 검증은 각각
 **336 passed, 4 Windows symlink skipped**(5.02/3.84s)였고 복구 예제도 양쪽에서 통과했다.
 제품 import는 site-packages에서 확인했다. 실제 binary 검증 스크립트는
-`.tmp/v025/p1p2-03-installed-tests/binary_rollback.py`, 교환 JSON은 같은 폴더의 `binary-history.json`이다.
+`binary_rollback.py`, 교환 JSON은 같은 폴더의 `binary-history.json`이다.
 03 wheel → 01 reader-prep wheel → 03 wheel 순서로 별도 프로세스를 실행했다. v2 성공 기록·ledger·nested
 checkpoint를 읽고 같은 좌표를 재게시해 hash를 보존했다. 01 lifecycle이 v2 reservation에서 새 v1
 started/settled revision을 썼고, 03 lifecycle은 이를 읽어 새 v2 retry revision으로 이어갔다.
@@ -711,7 +711,7 @@ L1 `40466682625`와 필수 combined L2 `40466739358` SUCCESS였다. 실제 PG16/
 ### 9.5 P1P2-04 실제 base 사전조사
 
 `codex/v0.25-p1-p2-consumers`는 위 03 병합본에서 생성했다. 최신 develop은 재조회한 `d4e659c`다.
-`.tmp/v025/p1p2-04-preflight.md` SHA256
+`p1p2-04-preflight.md` SHA256
 `85002F1FAE2D9CB62ED3F8B202FEFFB72E4E2F2F659F05B84AA0E93A29CCDCEE`는 독립 검토 READY다.
 같은 날 갱신한 §3 외부 구현 근거와 실제 gateway·live·Studio·OTel 소비 코드를 대조했다.
 
@@ -730,14 +730,14 @@ root는 Python 구현·공유 테스트/build runner를, `p1p2_01_research`는 S
 먼저 실제 소비자 회귀를 실패시킨 뒤 구현한다. 최초 400 기능/1,450 총 변경 줄 추정을 유지하며
 Studio 예상 230–300 기능/200–280 테스트 줄을 포함해 실제 누적 비용을 기록한다.
 완료 gate는 두 최종 코드 리뷰, actual old/new peer, UI check/build freshness, current/minimum wheel,
-PG16/18·ObjectStore·Temporal combined CI다. 릴리스·배포·CSP 변경은 포함하지 않는다.
+PG16/18·ObjectStore·Temporal combined CI다. 릴리스·배포·호스트 변경은 포함하지 않는다.
 
 04 제품 수정 전 Python 회귀는 **24 failed/4 passed, 5.58s**였다
-(`.tmp/v025/p1p2-04-red-corrected.txt`). 최초 테스트의 acall 반환 tuple 해제를 고친 뒤 다시 실행했다.
+(`p1p2-04-red-corrected.txt`). 최초 테스트의 acall 반환 tuple 해제를 고친 뒤 다시 실행했다.
 실패는 실제 HTTP/SSE 관측 누락, 반복 terminal의 drain→normal 변경, live close 정보 누락,
 실제 retry OTel 속성 누락이다. 기존 비용·malformed metadata 유지 검증 4개는 통과했다.
 Studio의 실제 모듈·RunView SSR·App 연결 검증 8그룹도 모두 실패했다
-(`.tmp/v025/p1p2-04-studio-red.txt`). 이때 Python·Studio 제품 source diff는 비어 있다.
+(`p1p2-04-studio-red.txt`). 이때 Python·Studio 제품 source diff는 비어 있다.
 
 **04 첫 구현 후보.** red commit은 `878196c`다. 관련 기존 계약까지 537개 통과 후 새 optional error
 observation의 census 등록 한 건을 보완했다. 확장 runner·receipt·consumer·OTel·census는 676개 통과했고,
@@ -753,13 +753,13 @@ Python lint/diff check 통과. 현재 제품 source/Studio 추가 315·삭제 15
 (9.69/9.02s)였다. skip은 Windows symlink 권한이며 Linux CI에서 검증한다. Pydantic 2.14.1/2.6.4,
 HTTPX 0.28.1/0.27.0, OTel SDK 1.45.1/1.20.0을 사용했다. 두 공개 예제도 양쪽에서 통과했다.
 wheel SHA256은 `064dc6095b06e7dc94de789af92ffd1084be4b6772efc30abd345bfa2f03ac00`이다.
-`.tmp/v025/p1p2-04-actual-binary-peers.txt`는 실제 01 reader-prep wheel과 04 wheel을 별도 프로세스로
+`p1p2-04-actual-binary-peers.txt`는 실제 01 reader-prep wheel과 04 wheel을 별도 프로세스로
 연결한 양방향 sync/SSE 성공·실패 검증이다. 구형 peer의 숫자와 오류 분류를 유지하며 관측을 합성하지 않았다.
 
 첫 후보의 독립 리뷰 A는 PASS, B는 Studio projection의 P2 회귀를 확인했다. 현재 호출과 turn이 다른
 compact close를 reducer가 거부해도 App의 후속 projection이 현재 answer/reasoning을 지웠다.
 실제 decode → reduce → project 경로의 회귀를 먼저 실패시켰다
-(`.tmp/v025/p1p2-04-projection-red.txt`). terminal projection도 수락된 close에만 적용하는 경계로 수정하고,
+(`p1p2-04-projection-red.txt`). terminal projection도 수락된 close에만 적용하는 경계로 수정하고,
 같은 identity의 late facts enrichment와 기존 terminal SSE fence를 유지한다. Studio bundle을 다시 생성하고
 최종 head의 두 targeted 리뷰·wheel audit·필수 combined CI로 마무리한다.
 
@@ -779,7 +779,7 @@ tracked Studio bundle 3개 파일의 byte 일치도 확인했다.
 ### 9.6 P1P2-I 누적 검증과 통합 수정
 
 실제 base는 최신 develop `d4e659c`와 04 병합본 `cc7d848`다. 누적 사전조사
-`.tmp/v025/p1p2-integration-preflight.md`와 아래 두 수정 경계의 독립 검토는 READY다.
+`p1p2-integration-preflight.md`와 아래 두 수정 경계의 독립 검토는 READY다.
 두 코드 reviewer는 개별 PR 검토 경험을 밝히고 전체 `d4e659c..5b2aeb7`의 소비자 연결을 다시 검토했다.
 `cc7d848`의 제품 tree는 `5b2aeb7`과 같다. 각 reviewer가 확인한 P2를 다음과 같이 수용했다.
 
@@ -792,14 +792,14 @@ tracked Studio bundle 3개 파일의 byte 일치도 확인했다.
   유지하는 작은 private stamper를 사용한다.
 
 두 수정 전 실제 runner 회귀는 **16 failed / 6 passed, 3.07s**였다
-(`.tmp/v025/p1p2-i-regressions-red-corrected.txt`). 실패는 legacy drain 2개와 sync/SSE local 거부 14개다.
+(`p1p2-i-regressions-red-corrected.txt`). 실패는 legacy drain 2개와 sync/SSE local 거부 14개다.
 같은 gateway_bad_response 코드를 가진 정상 원격 오류와 network control 6개는 통과했다.
 첫 실행의 미보고 numeric 키 assertion을 기존 empty usage 계약에 맞게 고친 뒤 다시 실행했다.
 이 회귀를 테스트 전용 commit으로 먼저 고정하고 제품 수정을 진행한다.
 
 회귀 전용 commit은 `989feb6`이다. collector snapshot 재사용과 local gateway stamper를 적용한 뒤
 runner·gateway·stream observer·회계·carriage census **750 passed / 27.40s**였다
-(`.tmp/v025/p1p2-i-repair-green.txt`). 같은 오류 코드와 손상된 optional observation을 가진 원격 오류도
+(`p1p2-i-repair-green.txt`). 같은 오류 코드와 손상된 optional observation을 가진 원격 오류도
 provider_error로 유지하는 actual runner control을 추가했다. 최종 설치 wheel과 CI는 수정된 binary를 사용한다.
 
 비용은 최초 1,870 기능 / 6,580 전체 변경 줄 추정을 유지한다. 04까지의 non-merge commit을 모두 합산하면
@@ -827,7 +827,7 @@ wait와 drain owner의 cleanup await에서 추가 취소가 와도 같은 사실
 새 종료 상태 머신 없이 기존 stamp와 두 단계 wait 경계를 사용한다. 다른 wait 호출자는 callback 기본값을 유지한다.
 
 제품 수정 전 실제 runner 7개 경합 회귀는 **4 failed / 3 passed, 3.64s**였다
-(`.tmp/v025/p1p2-i-caller-order-expanded-red.txt`). 앞선 stop→caller 및 cleanup 중 첫 caller 4개가 실패하고,
+(`p1p2-i-caller-order-expanded-red.txt`). 앞선 stop→caller 및 cleanup 중 첫 caller 4개가 실패하고,
 caller 단독·caller→cleanup의 user stop·반복 caller control은 통과했다. 이 회귀를 먼저 commit으로 고정한다.
 공유 wait primitive 변경이므로 기존 bridge·model/tool 취소·durable unknown/P5 계약과 두 리뷰를 갱신한다.
 
@@ -850,7 +850,7 @@ soft limit 접근을 다시 검토했고, 기존 wait에 선택적 관찰점을 
 새 영속 슬롯이나 취소 정책을 추가하지 않는다. 공개 계약에 이미 포함된 requester 범위를 공통 소유 경계에서 완성한다.
 
 실제 stream·async one-shot·sync worker·retry backoff와 기존 operational-boundary 회귀는 수정 전
-**14 failed / 1 passed, 4.53s**였다(`.tmp/v025/p1p2-i-requester-scope-expanded-red.txt`).
+**14 failed / 1 passed, 4.53s**였다(`p1p2-i-requester-scope-expanded-red.txt`).
 elapsed deadline에는 수락된 token 요청이 없으므로 뒤의 첫 caller 취소를 caller_cancel로 유지하는 control이 통과했다.
 각 수정의 최초 추정과 누적 비용은 유지하며, 공통 observer 재사용으로 분기별 보상 코드를 줄인다.
 

@@ -43,9 +43,8 @@ v0.26 이후 배치는 우선순위 제안이다. 날짜나 출시 확약을 두
 | `RunStream`과 passive model subscription이 이미 별도로 존재 | 통합자가 연결 단절·Stop·재접속 정책을 직접 해석해야 함 | DX2에서 두 수명을 예제로 설명; 후속 어댑터에 보존 |
 | `from_tools`, `from_config`, `AgentLoop.validate`, 구조화 출력, checkpoint/approval, replay가 이미 존재 | 새 편의 계층을 크게 만들면 같은 기능의 유지 지점이 늘어남 | 기존 진입점을 개선하고 실행 조합을 지원 |
 
-실제 소비 사례는 CSP의 `pipeline_core/agents/modular_kernel.py`에서 확인했다. provider에 workspace를 보관하고
-`workspace_factory`를 감싸는 경로가 P3의 필요성을 보여준다. 커널 예제와 CI는 커널 소유 도구로 같은 통합 요구를 검증한다.
-CSP 저장소 의존성·핀·운영 기능의 변경은 소비 프로젝트의 별도 작업이다.
+통합 도구는 호스트 자원을 주입받고 호출 권한이 적용된 view로 사용한다.
+자원 접근과 복구 검증은 커널 소유 실행 예제로 제공한다. 제품별 adapter와 배포는 호스트가 소유한다.
 
 ## 3. 우선순위와 변경 범위
 

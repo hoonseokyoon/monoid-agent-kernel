@@ -1311,7 +1311,7 @@ opt-in이다. Default in-process 경로는 마지막 PR까지 기존 동작을 �
 2. 해당 PR이 변경할 계약, 호출 경로, 저장 형식, 기존 test와 compatibility fixture를 읽는다.
 3. 정상 경로와 crash, retry, conflict, stale writer 경로를 상태 전이 단위로 적는다.
 4. 변경 파일, 추가 test, 회귀 gate, 종료 조건을 확정한다.
-5. 조사 결과를 `docs/dx-notes/YYYY-MM-DD-v0.22-prN-<slug>.md`에 남긴다.
+5. 조사 결과를 PR별 조사 기록에 남긴다.
 6. 조사에서 장기 계약이 바뀌면 이 계획을 먼저 갱신하고 별도 문서 커밋으로 고정한다.
 
 사전조사 기록에는 최소한 `현재 동작`, `발견한 gap`, `구조 결정`, `수정 파일`, `test matrix`,
@@ -1483,4 +1483,4 @@ PR 7까지 통합한 뒤 다음 순서로 v0.22 캠페인을 닫는다.
 10. `lease_lost` worker는 terminal을 settle하지 않는다.
 
 이 결정으로 v0.22는 작은 production boundary release로 유지된다. Queue, worker supervisor,
-database schema, browser reconnect, CSP projection은 host와 후속 adapter가 계속 소유한다.
+database schema, browser reconnect, 호스트 projection은 host와 후속 adapter가 계속 소유한다.
