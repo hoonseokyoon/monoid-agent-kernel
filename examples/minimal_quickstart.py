@@ -1,4 +1,4 @@
-"""Smallest possible run: one agent, one workspace, NO servers.
+"""Configure one agent with the builtin filesystem tool, offline.
 
 This is the "first turn" example — it uses ``FakeModelAdapter`` (a scripted model) so it
 runs offline with no LLM gateway, no API key, and no HTTP stack. Swap the adapter for
@@ -6,27 +6,24 @@ runs offline with no LLM gateway, no API key, and no HTTP stack. Swap the adapte
 
 Run it::
 
+    python -m pip install .
     python examples/minimal_quickstart.py
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-# Make the example runnable from a checkout without installing the package.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel import (  # noqa: E402
+from monoid_agent_kernel import (
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
     ToolBinding,
 )
-from monoid_agent_kernel.providers.base import ModelTurn  # noqa: E402
-from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call  # noqa: E402
-from monoid_agent_kernel.tools import tool_ids  # noqa: E402
+from monoid_agent_kernel.providers.base import ModelTurn
+from monoid_agent_kernel.providers.fake import FakeModelAdapter, fake_tool_call
+from monoid_agent_kernel.tools import tool_ids
 
 
 def main() -> None:
@@ -47,7 +44,6 @@ def main() -> None:
             definition_id="quickstart",
             tools=(
                 ToolBinding.for_tool(tool_ids.FS_WRITE),
-                ToolBinding.for_tool(tool_ids.RUN_FINISH),
             ),
         )
 
@@ -71,6 +67,8 @@ def main() -> None:
         # 4) from_config wraps the bare config in a provider — one call instead of six.
         result = AgentLoop.from_config(spec, adapter, config).run_once("Summarize notes.md")
 
+        assert result.status == "completed", result.error
+        assert (workspace / "SUMMARY.md").read_text(encoding="utf-8") == "# Summary\n3 words.\n"
         print("status     :", result.status)
         print("final_text :", result.final_text)
         print("SUMMARY.md :", (workspace / "SUMMARY.md").exists())

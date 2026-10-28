@@ -290,3 +290,146 @@ exact branch 기본 combined, 약한 label/manual 거부, push 등록 누락을 
 명령은 §7의 pytest prefix와 `tests/test_v023_ci_foundation.py`, source PYTHONPATH·4 workers를 사용했다.
 원본은 `.tmp/v025/dx2-00-red.txt`, `dx2-00-green.txt`, 독립 검토는 `dx2-00-preflight-review.md`다.
 현재 누적 비용은 계획·승인 기록을 포함한 약 350줄이며 runtime core 변경은 0줄이다.
+
+[PR #166](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/166)은 최종 `9ce2d31` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602017839),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602017844) 통과 후
+develop에 `5fc49b2`로 병합했다. 병합 tree와 리뷰 head의 동일성을 확인했다.
+L2 첫 실행의 기존 payload 메모리 검사는 3.11에서 한 번 실패했고, 같은 head의 실패 job 재실행에서 통과했다.
+로컬 원본 검사도 통과했다. 별도 측정 실험은 정상 validator 증가 78,318 bytes, 의도적 body 보관은 3,274,195 bytes로
+기존 798,720-byte 기준을 구별했다. 최초 CI의 정확한 할당 원인은 재현하지 못했으며 runtime·검사 기준은 변경하지 않았다.
+원문·제한은 `.tmp/v025/dx2-00-ci-triage.md`, `dx2-00-memory-probe-corrected.txt`에 남겼다.
+root가 후속 통합 CI에서 재발하면 측정 경계 수정을 다시 검토한다.
+
+### 9.2 DX2-01 착수
+
+통합 브랜치를 `5fc49b2`에서 만들고 [초기 full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40602933913)를 시작했다.
+01 브랜치는 `codex/v0.25-dx2-installed-onboarding`이다. 이전 조사 대비 관련 runtime·예제·테스트 코드 diff는 없다.
+`.tmp/v025/dx2-01-preflight.md`와 `dx2-01-research.md`를 실제 base에 연결했고 독립 사전 검토를 진행한다.
+`dx2_01_research`가 예제·테스트·설치 CI·진입 문서를 구현하고 root가 runner·Git·계획 기록을 소유한다.
+
+독립 `dx2_01_preflight_review`는 실제 base에서 ready로 판정했다. Tests-only `d5cb936`을 수정 전에 고정했다.
+소스 예제 전체 **6 FAIL / 15 PASS**: local 실패 정리 2개와 실제 gateway helper 환경 전달 4개가 실패했다.
+실패 출력에서 환경 전체가 노출되지 않도록 PYTHONPATH 값만 비교한 최종 회귀 6개도 모두 실패했다.
+동일 CI Python block을 설치된 Python 3.11.9/Pydantic 2.14.1로 checkout 밖에서 실행했으며,
+실제 부모 9개·gateway 자식 2개의 import provenance **11개가 모두 실패**했다.
+원본은 `.tmp/v025/dx2-01-red.txt`, `dx2-01-red-final.txt`, `dx2-01-installed-red.txt`다.
+이후 예제·문서 수정에 착수했다. 기존 사실·복구·종료·host report의 올바른 동작은 수용 검사로 유지한다.
+
+수정 후 `test_examples.py`, `test_session_lifecycle.py`, `test_tool_decorator.py`, `test_scenario_scoring.py`
+**137 PASS**(같은 pytest prefix), Ruff 0.15.6·diff 검사, 문서 4개 local link 118개/Python block 14개 검사를 통과했다.
+정확한 개발 wheel SHA256 `2c37a7aa56bf33d03ff388511c15b97d871e87a9901d4579ff3bd22846406dee`를 audit·설치했다.
+같은 설치본으로 부모 9개·자식 2개 provenance, 복사된 typed/facts/recovery/termination,
+packaged host report를 checkout 밖에서 통과했다. wheel metadata는 기존 `0.24.0`이며 릴리스를 수행하지 않았다.
+현재 Python 3.11.9/Pydantic 2.14.1의 실행 근거는 `.tmp/v025/dx2-01-evidence.md`와 연결된 raw logs에 있다.
+초기 통합 base full CI `40602933913`의 14개 job이 모두 성공했다. 독립 `dx2_01_code_review`의 구현 검토는 PASS다.
+01 누적 변경은 약 630줄(예제·검사·문서·00 종료 기록 포함), 캠페인 누적 약 970줄이며 runtime core는 0줄이다.
+
+[PR #167](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/167)은 최종 `c32e359`의 독립 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605101733),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605101653) 성공 후
+통합 브랜치에 `a5b28e4`로 병합했다. 자동 리뷰도 지적이 없었고, 리뷰 head와 병합 tree가 같다.
+실제 00–01 누적 변경은 972줄이다.
+
+### 9.3 DX2-02 착수
+
+최신 develop `5fc49b2`, 통합 base `a5b28e4`에서 `codex/v0.25-dx2-stream-ownership`을 시작했다.
+runtime과 기존 종료 예제는 최초 조사와 같고, 01이 추가한 예제·설치 수용 검사를 확장한다.
+실제-base 사전조사는 `.tmp/v025/dx2-02-preflight.md`, 외부·코드 근거는 `dx2-02-research.md`다.
+`dx2_02_research`가 예제·검사를 구현하고 `dx2_02_preflight_review`가 독립 사전 검토를 맡는다.
+root는 runner·계획 기록·Git/리뷰/CI 통합을 소유한다.
+
+02 독립 사전 검토에서 passive 관측 실패 뒤 drain만 기다리면 최종 결과 게시 전에 임시 root가
+정리될 수 있는 P2를 확인했다. 성공·실패 경로 모두 공개 `result.ready` 장벽을 통과하고,
+fixture의 Future 회수 전에 예제 자체의 결과 준비·reader 종료를 검사하도록 보완해 ready 판정을 받았다.
+silent Stop은 context exit 전에 자연 정산될 수 있으므로 cooperative_wait snapshot은 의도적으로 붙잡은 break에만 요구한다.
+최종 preflight SHA256은 `795C3A0BE7D4F86A6BBA8A77DF2BE3AB13A6131594406B564B75C2751A6DFF5A`다.
+
+Tests-only `5aa9242`에서 실제 HTTP400 adapter를 주입한 기존 종료 예제는 **1 FAIL**이었다.
+3초 동안 실행 task를 취소하지 않고 관측했으며, 제공자 실패 후 Stop phase를 기다리는 hang을 확인했다.
+수정 뒤 기존·확장 예제 **28 PASS**: silent Stop, break, 소비자 취소·secondary cleanup 오류,
+provider 실패와 실제 backend의 구독 해제·재연결·reset·명시적 취소·관측 실패 정리를 포함한다.
+원본은 `.tmp/v025/dx2-02-red.txt`, `dx2-02-green.txt`다. 독립 `dx2_02_code_review`가 구현을 검토한다.
+01 병합 tree의 [full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40605783431)는
+14개 job 모두 성공했다.
+
+02의 기존 async/종료 예산/live-stream 경계 검사 **113 PASS**, Ruff·diff·문서 120 links/14 Python blocks PASS.
+동일 후보 wheel `d7bbecf3bbbed3d50c98a874b3f43b11489667787379ab60579f0d5161393bb9`를 audit·설치하고,
+Python 3.11.9/Pydantic 2.14.1에서 checkout 밖의 복사된 예제 5개와 추가 종료 시나리오 2개를 통과했다.
+CI의 해당 Python block을 그대로 추출해 실행했으며 `.tmp/v025/dx2-02-evidence.md`에 명령·원본을 연결한다.
+새 background 예제는 142줄이며 runtime core 변경은 0줄이다.
+
+[PR #168](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/168)은 최종 `3f9a83c` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608432209),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608432266) 성공 후
+통합 브랜치에 `16a22a1`로 병합했다. 자동 리뷰도 지적이 없었고, 리뷰 head와 병합 tree가 같다.
+02 변경은 592줄, 최초 develop 대비 현재 누적 diff는 1,556줄이다.
+
+### 9.4 DX2-03 착수
+
+다시 fetch한 develop은 `5fc49b2`이고 실제 통합 base는 `16a22a1`이다.
+브랜치 `codex/v0.25-dx2-approval-resume`에서 03을 시작한다. host report·checkpoint·loop 소스는
+최초 조사와 같으며 `.tmp/v025/dx2-03-preflight.md`가 실제 base의 선택·실패 경계·검증을 기록한다.
+외부 LangGraph 문서·열린 issue #7780을 재확인했다. 명시적 실행 ID와 중복 실행 관측을 적용하고
+기존 checkpoint 복구를 사용한다. lazy blob 복원 실패와 잘못된 task 거부는 원래 오류를 보존하며 자원을 정리한다.
+`dx2_03_research`가 구현을 맡고 root가 runner·계획·Git/PR·통합을 맡는다. 독립 사전 검토 후 tests-only부터 진행한다.
+
+독립 `dx2_03_preflight_review`는 실제 source와 세 interpreter 수용 경로를 검토해 **READY**로 판정했다.
+최종 preflight SHA256은 `0AB3ACE6BAC7A4D541B583157E2B9F7953685F953851E973089873A7C4A74AF0`다.
+관련 core 변경 필요성이나 미해결 중대 지적은 없으며 tests-only 회귀를 먼저 작성한다.
+
+Tests-only `f6abe73`에서 실제 CLI 새 프로세스 수용 검사는 **1 FAIL**(29.13초)이었다.
+기존 CLI가 `--phase prepare`를 무시하고 전체 demo를 반환하여 승인 대기 결과 검사가 실패했다.
+원본은 `.tmp/v025/dx2-03-red.txt`이며, 이 커밋 뒤 packaged recipe·설치 CI·문서 구현에 착수했다.
+
+첫 수용 실행은 **4 FAIL / 199 PASS**였으며 준비 단계의 모델 호출 수 가정에서 실패했다.
+실제 예제를 계측해 자원 1개·승인 전 읽기 0회·모델 호출 **3회**를 확인했다. 세 번째 호출은
+pending approval 결과를 모델에 전달한 뒤 park하는 기존 흐름이었다. 최초 조사에서는 재개 호출 1회만 계측했다.
+기존 fake adapter의 암묵적 fallback을 명시적인 대기 응답·0 usage로 바꾸고 실제 3회를 그대로 표시한다.
+준비 누계 5/3/8과 재개 1회·승인된 읽기 1회 기준은 유지한다. 초기 실패는 `dx2-03-initial-count-failure.txt`,
+원인 실험은 `dx2-03-counter-probe.txt`에 보존하며 수정된 사전조사를 독립 재확인한다.
+
+독립 targeted 검토도 **READY**였다. 보정된 preflight SHA256은
+`E0E4D376253ACCE6CB9209A7BEF8309D97F95C0E6549B54747F1B54E778F84B6`다.
+세 번째 scripted 응답의 numeric usage와 제공자가 보고한 usage evidence를 구분하며 기존 숫자 누계만 검증한다.
+02 병합 tree의 [full push CI](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40608906485)도
+전체 14개 job을 통과했다.
+
+03 수정 후 examples·host bindings·HITL·checkpoint 검사 **203 PASS**(38.84초), Ruff·diff·문서
+123 links/14 Python blocks PASS. 정확한 wheel
+`fea62fe2dd95ea5a7f61537287b451303c6f4156a0afa9682948cca4a912a0ab`를 audit·설치했다.
+Python 3.11.9/Pydantic 2.14.1에서 실제 부모 9개·gateway 자식 2개 provenance, 복사 예제 5개·종료 변형 2개,
+기존 host demo와 별도 prepare/resume 프로세스를 모두 통과했다. 실제 PID는 달랐고 읽기는 0→1회,
+모델 호출은 3→1회, 누계는 5/3/8→9/6/15, 원본 proposal 본문과 중복 승인 무시를 확인했다.
+명령·실패 보존·최종 원본은 `.tmp/v025/dx2-03-evidence.md`에 둔다.
+03 구현·검사·CI·진입 문서는 435줄로 추정 220–360줄을 75줄 넘었다. 실제 프로세스 검사와
+복원/정리 오류 검증이 주요 비용이다. 현재 계획 기록 포함 누적은 약 2,030줄이며 runtime core 변경은 0줄이다.
+
+[PR #169](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/169)은 최종 `8d8277d` 독립 코드 리뷰 PASS,
+[L1](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40611415794),
+[required core L2](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40611415729) 성공 후
+통합 브랜치에 `3bd3095`로 병합했다. 리뷰 head와 병합 tree가 같다.
+병합 시 자동 GitHub 리뷰는 진행 중이었고 게시된 지적은 없었다. 최종 통합 전에 후속 피드백을 확인한다.
+
+### 9.5 DX2-I 최종 통합
+
+실제 통합 base `3bd3095`, 다시 fetch한 develop `5fc49b2`에서 누적 검증을 시작했다.
+브랜치는 `codex/v0.25-dx2-integration-recipes`이며 runtime·설치 입력·예제·CI block은 검증된 `8d8277d`와 같다.
+현재 환경의 정확한 wheel 증거를 재사용하고 같은 wheel을 Pydantic 2.6.4 환경에서 검증한다.
+`.tmp/v025/dx2-i-preflight.md`를 독립 검토한 뒤 기존 계획·설계·문서 index의 구현 상태를 갱신한다.
+최종 head의 누적 독립 코드 리뷰·L1·required combined L2·full push CI와 병합 tree 확인을 완료 조건으로 둔다.
+
+독립 `dx2_i_preflight_review`는 **READY**, preflight SHA256
+`B4D2F498E769D6770A6CE0935DEECDDAF533E98D9F76026D3D510144215E790F`다.
+최종 변경은 기존 상태 문서 4개로 한정한다. `dx2_i_code_review`가 develop 대비 누적 실제 소비 경로를 독립 검토한다.
+현재 wheel 증거와 관련 소스 검사는 입력 동일성을 확인해 재사용하고, 같은 wheel의 최소 계열 실행을 추가한다.
+
+동일 wheel `fea62fe2dd95ea5a7f61537287b451303c6f4156a0afa9682948cca4a912a0ab`를
+Python 3.11.9/Pydantic **2.6.4**에 설치했다. checkout 밖·PYTHONPATH 없는 실제 CI block 3개가 모두 통과했다:
+부모 9개·자식 2개 provenance, 복사 예제 5개·종료 변형 2개, 기존 host demo와 새 프로세스 승인 재개다.
+prepare/resume PID는 34136/11096으로 달랐으며 원래 ID·자원 1개씩·읽기 0→1회·모델 3→1회·누계·본문을 확인했다.
+Pydantic **2.14.1**의 동일 wheel 결과와 함께 세 학습 경로의 설치 소비 검증을 마쳤다.
+현재/최소 실행 증거와 재사용 입력 대조는 `.tmp/v025/dx2-i-evidence.md`에 기록한다.
+새 runtime·저장·권한 정책 변경은 없다. 최초 1,350–1,950줄 대비 최종 누적 변경은 약 2,070줄이며,
+증가분은 실제 프로세스·실패 정리 검사와 실행 기록이다. 별도 예제 프레임워크나 검증 플랫폼은 추가하지 않았다.
+최종 문서 6개의 local link/anchor 179개와 Python block 20개, diff 검사를 통과했다.

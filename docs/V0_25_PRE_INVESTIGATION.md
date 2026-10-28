@@ -10,8 +10,10 @@ P4-00 [#162](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/162)는 de
 P4-01·02 [#163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)·[#164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)는
 통합 브랜치 `be35567`에 병합했다. [P4-I #165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)를 통해
 develop `973e474`에 최종 통합했다. P1–P5와 DX1의 구현은 완료됐다.
-2026-10-28 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)을 최신 develop에서 조사하고 독립 검토 ready를 받았다.
-사용자가 00·01과 리뷰·CI 후 02·03·최종 통합까지 순차 구현을 승인했다.
+2026-10-28 DX2-00 [#166](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/166)을 develop에,
+DX2-01–03 [#167](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/167)·[#168](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/168)·[#169](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/169)를
+통합 브랜치 `3bd3095`에 병합했다. 설치 진입·스트림 소유권·새 프로세스 승인 재개를 구현했으며,
+최종 누적 검증과 develop 통합 기록은 [DX2 PR 계획 §9](V0_25_DX2_PR_PLAN.md#9-계획-검토와-진행-기록)에 둔다.
 정책·외부 근거·회귀·리뷰·CI 기록은 [P4 PR 계획](V0_25_P4_PR_PLAN.md)에 둔다.
 P3의 작업 지시는 [P3 PR 계획](V0_25_P3_PR_PLAN.md), 앞선 실행 기록은 P5·DX1 PR 계획 §9에 있다.
 PR 작업 지시는 [P5·DX1 PR 계획](V0_25_P5_DX1_PR_PLAN.md), 목표 API와 후속 방향은
@@ -308,10 +310,11 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 
 **DX2.** DX1의 순수 typed 도구 예제와 P3의
 [보고서 예제](../src/monoid_agent_kernel/reference/host_tool_report.py)를 구현했다.
-보고서는 승인·park/release·같은 interpreter의 새 loop restore·fresh/fork 상속을 설치 wheel로 검증했다.
-P1/P2/P4의 사실·복구·Stop 예제도 구현됐다. [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)은 남은 조합을 다룬다:
-설치본을 가리는 예제 경로 제거와 상시 CI, silent Stop·요청 취소와 passive 구독의 비교, 새 interpreter의 승인 재개.
-기존 예제를 재사용하고 typed 도구→요청 스트림→승인 재개의 학습 경로를 제공한다.
+보고서는 prepare/resume으로 새 interpreter에서 원래 승인 작업을 복원하고 자원을 다시 주입한다.
+승인 전후 실제 읽기 0→1회, 모델 호출 3→1회, 원본 proposal·중복 승인 무시·누적 사용량을 검증한다.
+P1/P2/P4의 사실·복구·Stop 예제도 기존 실행 검사와 설치 CI에 연결했다. 부모 9개와 gateway 자식 2개의
+강제 source 경로를 제거했으며 silent Stop·요청 취소와 passive 구독·재연결의 수명을 예제로 보여준다.
+typed 도구→요청 스트림→승인 재개의 학습 경로와 검증 기록은 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)에 있다.
 기존 `reference`의 안정성 등급과 CSP의 별도 소비자 마이그레이션 책임을 유지한다. FastAPI/Vercel 어댑터는 후속이다.
 
 ## 6. 작업군과 개발 경계
@@ -323,7 +326,7 @@ P1/P2/P4의 사실·복구·Stop 예제도 구현됐다. [DX2 PR 계획](V0_25_D
 | G3 종료 예산 | P4 | #165로 develop `973e474` 통합 완료 | monotonic 제어·복구 잔여 시간·호출 snapshot과 실제 RunStream escalation의 일치 |
 | G4 출력 권한 수정 | P5 | PR-01, 독립 버그 수정 PR → develop | 일반·terminal·잔여 출력의 권한 검사와 정상 flush 보존 |
 | G6 typed 도구 | DX1 | PR-02, 독립 PR → develop | serializer 없는 입력 전달, JSON 결과·기존 envelope, 실제 loop 소비 |
-| G7 통합 예제 | DX2 | 기능별 예제 구현 후 [DX2-00→01→02→03→I](V0_25_DX2_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 남은 조합 마감; 순차 구현 승인 | 첫 도구·요청/passive 수명·새 interpreter 승인 재개와 설치 wheel 수용 검증 |
+| G7 통합 예제 | DX2 | [DX2-00→01→02→03](V0_25_DX2_PR_PLAN.md#6-pr별-변경-범위와-의존성) 구현·개별 통합 완료; I에서 누적 검증과 develop 통합 | 첫 도구·요청/passive 수명·새 interpreter 승인 재개와 동일 wheel의 current/minimum 수용 검증 |
 | G5 자식 정책 | P8 조건부 | 독립 작업군 → develop | opt-in 상속·전파·대기·회계 검증 |
 | M 유지보수 | P6/P9 | 항목별 독립 PR → develop | 각각의 결함 또는 운영 개선을 단독 검증 |
 
@@ -332,7 +335,7 @@ P1/P2는 receipt·attempt·종료 분류를 함께 검토해야 한다. 공동 �
 G1의 구체적인 순서는 [P1P2-00 → 01 reader → 02 producer/observer → 03 writer/recovery → 04 소비자 → I](V0_25_P1_P2_PR_PLAN.md#6-pr별-범위의존성우선순위)다.
 G1은 통합 브랜치 `codex/v0.25-p1-p2-call-facts`에서 완료하고 #161로 develop에 병합했다.
 G3은 [P4-00 → 01 clock/restore → 02 snapshot/RunStream → I](V0_25_P4_PR_PLAN.md#6-pr별-변경-범위와-의존성)로 완료했다.
-다음 G7은 기존 코드·실행 기준선·외부 구현 조사에 따라 DX2의 학습 경로와 상시 검증을 보완한다.
+G7은 기존 코드·실행 기준선·외부 구현 조사에 따라 학습 경로와 상시 검증을 보완했다.
 착수 순서는 **P5 → DX1**, 다음 우선군은 P3·P1/P2·P4다. P5와 DX1 사이에는 기술적 선행 의존성이 없다.
 P3·P4·P5·DX1은 G1을 기다리는 전역 의존성이 없다. P8도 기존 계약으로 구현할 수 있으며, 새 API를 실제로 소비할 때
 그 관계만 선행 조건으로 추가한다.

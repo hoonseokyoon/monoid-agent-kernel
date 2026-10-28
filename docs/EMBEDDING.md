@@ -1,7 +1,28 @@
 # Production embedding handbook
 
-This handbook defines portable production responsibilities for two product topologies and supplies
-one offline executable path for each:
+## Start with an executable recipe
+
+Use a Python 3.11+ virtual environment and install this checkout with `python -m pip install .`,
+or install a wheel built from the same revision. The v0.25 development examples use that revision's
+API. Start with the [typed tool quickstart](../README.md#quickstart-no-servers).
+
+| Integration task | Run from the checkout root | Observable result |
+|---|---|---|
+| Type a tool's inputs and result | `python examples/custom_tool_quickstart.py` | Nested model access and the result in the next model request |
+| Own a local session | `python examples/embedding_local_product.py` | File content, checked checkpoint and completed session |
+| Stop a request stream | `python examples/termination_budget.py` | Exit phase and final receipt with reported usage |
+| Observe a background run | `python examples/observe_background_run.py` | Reader close, peer progress, reconnect/reset and explicit run cancel |
+| Inject resources and restore after approval | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Durable approval park and IDs for the [resume command](#resume-approval-in-a-new-process) |
+
+These examples run offline. The approval phases retain state under the supplied root; no-argument
+recipes use temporary state. [Call facts](../examples/model_call_facts.py) shows explicit zero and
+unknown counters; [receipt recovery](../examples/recover_model_call_facts.py) shows an in-memory
+lifecycle-hook round trip. The local session recipe also shows failure cleanup that preserves the
+last checkpoint and original exception. The sections below define production responsibilities.
+
+## Choose a product topology
+
+Choose the composition that fits your product:
 
 - [`embedding_local_product.py`](../examples/embedding_local_product.py) embeds `AgentLoop`
   directly in one trusted process through the stable contracts and Core Helper Kit.
@@ -14,16 +35,15 @@ orchestration and storage implementations, and verify observable behavior with c
 profiles. Reference packages provide runnable examples and smoke targets outside the supported
 stable surface. See [REFERENCE.md](REFERENCE.md).
 
-Run both paths from a checkout:
+Run `python examples/embedding_hosted_product.py` for tenant isolation, command inbox and historical
+reads. It uses `FakeModelAdapter`, requires no credentials, makes no network requests, and creates
+state under a temporary directory. Its fresh backend reads completed history.
 
-```bash
-python examples/embedding_local_product.py
-python examples/embedding_hosted_product.py
-python -m pytest -q tests/test_examples.py
-```
-
-Both scripts use `FakeModelAdapter`, require no credentials, make no network requests, and create
-all state under a temporary directory.
+The advanced [full-stack](../examples/full_stack_integration.py) and
+[workspace cleanup](../examples/messy_workspace_cleanup.py) harnesses cover gateway assembly and
+proposal/apply scenarios. Their `--mode fake` paths use the base install; `--mode real` uses
+`python -m pip install ".[openai]"` plus the credentials described in each file. For local span
+output, install `.[otel-export]` and run [otel_tracing.py](../examples/otel_tracing.py).
 
 ## Inject host resources into tools (v0.25)
 
@@ -99,14 +119,34 @@ signals retain their classification. Runtime errors include `host_tool_binding_m
 `host_tool_binding_type`, `host_tool_context_unavailable`, `tool_call_not_in_flight` and
 `host_tool_resource_closed`. Callback failures use `host_tool_binding_open/bind/accepts/close`.
 
-The [complete typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes
-a scoped proposal, parks for approval, releases its activation, restores with fresh resources and
-reads the proposal after approval. It also delegates reports through fresh and fork children and
-uses the parent's independent resource after child cleanup. It runs offline from an installed wheel:
+### Resume approval in a new process
+
+The [typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes a scoped
+proposal, commits an approval park and releases its activation. Run these commands from an installed
+wheel or this installed checkout. Copy `run_id` and `task_id` from the first JSON response into the
+second command, keeping the same root:
 
 ```bash
-python -m monoid_agent_kernel.reference.host_tool_report
+python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state
+python -m monoid_agent_kernel.reference.host_tool_report --phase resume --root ./report-state --run-id RUN_ID --task-id TASK_ID
 ```
+
+Each command starts a new interpreter and creates one resource through the host factory. Prepare
+reports zero reads and three model calls: save, request approval, then acknowledge the pending task.
+Resume loads the checked checkpoint, verifies the pending
+task and delivers approval. A repeated result is ignored; the original proposal reaches the model
+after one read and one new model call. The JSON includes the process ID and report body. Scripted
+cumulative usage grows from 5 input / 3 output / 8 total tokens to 9 / 6 / 15 across restoration.
+The actual workspace stays unchanged; applying a proposal is a separate host operation.
+
+The root and IDs belong to the trusted embedding host. It supplies approval for the pending task.
+An unrelated task is refused with the committed checkpoint preserved, and restore failures retain
+the original error while discarding the local activation. This path demonstrates a committed park
+followed by restoration; hosts own crash recovery and idempotency for external effects.
+
+Run `python -m monoid_agent_kernel.reference.host_tool_report` without arguments for the temporary
+approval demo plus fresh/fork child reports. Each child uses its own resource, and the parent's
+resource remains usable after child cleanup.
 
 ## Use domain models in tools
 
@@ -845,9 +885,8 @@ publishes its authoritative evidence before applying an expired run boundary.
 
 ### Billing a stopped stream
 
-A Stop normally closes the provider stream before its terminal chunk, so the tokens the provider
-already generated are billed to you but reported to no one. Hosts that meter per call opt into a
-bounded drain:
+A Stop can close the provider stream before its terminal usage arrives. Hosts that collect
+per-call usage opt into a bounded drain:
 
 ```python
 loop = make_loop(stream_model_calls=True)
@@ -872,14 +911,14 @@ The driver continues to await resource cleanup and durable settlement after that
 The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
 of `0`, so a token `cancel()` during a child's streamed call still cuts it and reports no usage for
 that call. `interrupt_turn()` never reaches a child: the child streams its call to completion and
-its whole bill is counted, as before this release.
+its reported usage is counted, as before this release.
 
 The drain keeps reading the adapter's own `astream_turn` generator, toward its end, for up to the
 budget. An adapter that retries or re-dispatches inside that generator (an empty-turn retry, say)
 keeps doing so while it is drained, and each such attempt is paid for: stop retrying once the call
 is stopped.
 
-Read the bill where you already read it:
+Read reported usage at the existing observation points:
 
 - `AgentLoop`: `AgentTurnResult.metrics` / `AgentRunResult.metrics` (`input_tokens`,
   `output_tokens`, `total_tokens` and any reported sub-counts), `metrics.updated`,
@@ -890,6 +929,11 @@ Read the bill where you already read it:
   `ValidatedCallRunner`'s escaping error keeps its earlier attempts in `exc.receipts`.
 - An empty usage means the provider reported none before the stream ended or the window closed. Do
   not substitute an estimate for it.
+
+For a user-facing usage display, read `receipt.usage_evidence.reported` and its `completeness`
+map. An explicit `input_tokens: 0` is a reported zero; an absent `total_tokens` remains unknown.
+The legacy numeric metrics support accumulation and budgets. They do not establish whether an
+individual provider reported a missing counter, and a receipt does not settle the provider's bill.
 
 Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
 with `user_cancel`, which drains a streamed call in flight. RunStream freezes its exit wait from
@@ -923,11 +967,46 @@ Before exit, `stream_exit.phase` is idle. During its wait, the phase is cooperat
 exit waiter is cancelled, wait_interrupted/None says that timer has stopped; directly re-entering
 exit reuses the original cutoff. After hard cancellation is requested, remaining is zero and
 cleanup may still be running. The final phase is settled; zero preserves an earlier hard-cancel
-request, while None denotes completion without that request. Read the final bill from receipts.
+request, while None denotes completion without that request. Read reported call usage from receipts.
 
-Run [the offline termination example](../examples/termination_budget.py) with
-`python examples/termination_budget.py`. It opens a real AgentLoop, streams a response, presses
-Stop, polls during exit, and verifies the final termination facts and reported usage.
+The [offline termination example](../examples/termination_budget.py) opens a real AgentLoop and
+owns the stream, progress task and control task through cleanup:
+
+```bash
+python examples/termination_budget.py
+python examples/termination_budget.py --scenario silent_stop
+python examples/termination_budget.py --scenario consumer_cancel
+```
+
+The default breaks after one delta and observes cooperative exit. Silent Stop arrives while the
+provider has emitted no text. Consumer cancellation reaches the caller as `CancelledError` after
+cleanup; the CLI supervisor displays it. All three prevent late output from reaching the consumer.
+The request helper surfaces an unsuccessful model turn as `TurnNotSettled(stream.suspension)`
+and closes its owned tasks and loop before the caller handles the outcome. These examples exercise
+plain asyncio; a web integration must connect its own transport's disconnect signal.
+
+### Choose who owns streamed work
+
+| Product interaction | Execution owner | Disconnect and Stop |
+|---|---|---|
+| Request-scoped response | Host's `async with loop.astream(...)` | Early exit requests cancellation and joins stream cleanup |
+| Background task with reconnecting readers | Host's submitted backend run | Reader close releases that subscription; `cancel_run(run_id, token)` explicitly cancels work |
+
+Run [observe_background_run.py](../examples/observe_background_run.py) for the second path. It
+submits an actual streaming run to the Reference backend with root-scoped credentials. Closing
+one reader leaves another receiving the next delta while the run is active. Reconnecting with
+`after_cursor=reader.cursor` replays only the retained frames after that cursor.
+
+The live broker is a bounded, process-local ring. The example deliberately overflows a two-frame
+ring and handles `cursor_gap` by marking history incomplete. A generation change also requires
+reset handling. A product can show the gap or rebuild its display from separately enabled,
+authorized durable content. A live cursor alone cannot restore a complete response after loss.
+
+The example then calls authenticated `cancel_run`, waits for the terminal state and public
+`result(...)["ready"]`, and closes every reader. Its failure cleanup also releases provider gates,
+drains the backend and waits for result publication before the caller removes temporary state.
+The event subscription below uses durable integer sequence numbers; live content uses its own
+generation/sequence cursor.
 
 ### Resuming event delivery
 

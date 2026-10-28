@@ -2,20 +2,18 @@
 
 Run from a checkout with::
 
+    python -m pip install .
     python examples/embedding_local_product.py
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from monoid_agent_kernel.contracts import (  # noqa: E402
+from monoid_agent_kernel.contracts import (
     AgentLoop,
     AgentRunSpec,
     AgentRuntimeConfig,
@@ -24,10 +22,10 @@ from monoid_agent_kernel.contracts import (  # noqa: E402
     ToolCall,
     ToolBinding,
 )
-from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore  # noqa: E402
-from monoid_agent_kernel.core.event_sequencing import RunEventSequencer  # noqa: E402
-from monoid_agent_kernel.providers import FakeModelAdapter  # noqa: E402
-from monoid_agent_kernel.tools import tool_ids  # noqa: E402
+from monoid_agent_kernel.core.checkpoint import LocalFsCheckpointStore
+from monoid_agent_kernel.core.event_sequencing import RunEventSequencer
+from monoid_agent_kernel.providers import FakeModelAdapter
+from monoid_agent_kernel.tools import tool_ids
 
 
 def run_local_product(root: Path) -> dict[str, Any]:
@@ -42,7 +40,6 @@ def run_local_product(root: Path) -> dict[str, Any]:
         definition_id="embedding-local-product",
         tools=(
             ToolBinding.for_tool(tool_ids.FS_WRITE),
-            ToolBinding.for_tool(tool_ids.RUN_FINISH),
         ),
     )
     adapter = FakeModelAdapter(
@@ -71,15 +68,28 @@ def run_local_product(root: Path) -> dict[str, Any]:
         checkpoint_store=checkpoints,
     )
     session = LoopSession(loop)
-    session.open()
-    session.submit("Create the requested release note.")
-    checkpoint_load = checkpoints.latest_checked(loop.spec.run_id)
-    if not checkpoint_load.ok or checkpoint_load.value is None:
-        raise RuntimeError(
-            f"local checkpoint could not be loaded: {checkpoint_load.status}"
-        )
-    checkpoint = checkpoint_load.value
-    result = session.close()
+    try:
+        session.open()
+        session.submit("Create the requested release note.")
+        checkpoint_load = checkpoints.latest_checked(loop.spec.run_id)
+        if not checkpoint_load.ok or checkpoint_load.value is None:
+            raise RuntimeError(
+                f"local checkpoint could not be loaded: {checkpoint_load.status}"
+            )
+        checkpoint = checkpoint_load.value
+        result = session.close()
+    except BaseException:
+        # Release this activation and preserve its last checkpoint and original failure.
+        try:
+            loop.discard_uncommitted()
+        except BaseException:
+            pass
+        raise
+
+    assert result.status == "completed", result.error
+    assert (workspace / "RELEASE_NOTE.md").read_text(encoding="utf-8") == (
+        "# Release note\n\nOffline embedding is ready.\n"
+    )
 
     events_path = run_root / result.run_id / "events.jsonl"
     event_count = len(

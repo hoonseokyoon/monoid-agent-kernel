@@ -8,12 +8,16 @@ building against, and securing the kernel.
 
 - **I want to run an agent** → [Quickstart](../README.md#quickstart-no-servers),
   then [CLI.md](CLI.md) for the full `run` / `watch` / `jobs` surface.
-- **I'm embedding the kernel in a product** → [CONTRACTS.md](CONTRACTS.md) for the
-  stable Python/HTTP surface, [EMBEDDING.md](EMBEDDING.md) for portable responsibilities and
-  executable local and hosted paths, [CONFORMANCE.md](CONFORMANCE.md) to check your
+- **I'm embedding the kernel in a product** → run the [typed tool quickstart](../README.md#quickstart-no-servers),
+  then choose [local sessions, streaming or approval/restore](EMBEDDING.md#start-with-an-executable-recipe).
+  Compare [request ownership and passive background observation](EMBEDDING.md#choose-who-owns-streamed-work).
+  [Resume a parked approval in a new process](EMBEDDING.md#resume-approval-in-a-new-process) using the host's run/task IDs.
+  Follow [CONTRACTS.md](CONTRACTS.md) for the stable Python/HTTP surface and
+  [CONFORMANCE.md](CONFORMANCE.md) to check your
   implementation, [CORE_HELPER_KIT.md](CORE_HELPER_KIT.md) for the helper boundary,
   [COMPATIBILITY.md](COMPATIBILITY.md) for version and upgrade obligations.
-- **I'm writing tools** → [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
+- **I'm writing tools** → [custom_tool_quickstart.py](../examples/custom_tool_quickstart.py)
+  for typed inputs and observed results, then [TOOL_SURFACE.md](TOOL_SURFACE.md) for `ToolBinding`,
   exposure, authorization, scope, and quota.
 - **I'm running a backend/gateway** → [BACKEND.md](BACKEND.md) for the reference
   wiring and token boundary, [OBSERVABILITY.md](OBSERVABILITY.md) for outputs,
@@ -46,9 +50,9 @@ building against, and securing the kernel.
   The [P4 PR plan](V0_25_P4_PR_PLAN.md) specifies monotonic control, remaining-duration recovery,
   owned-call snapshots, RunStream escalation budgets, external evidence, and completed implementation evidence.
   The [DX2 PR plan](V0_25_DX2_PR_PLAN.md) defines the first-tool, request-stream and approval-restart journeys,
-  example simplification, installed-wheel validation, external cases and PR boundaries; sequential implementation is authorized.
+  example simplification, installed-wheel validation, external cases and the completed DX2-00–03 parts; its execution record tracks final integration.
   The installed [host-resource report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py)
-  exercises approval, restart, and explicit fresh/fork child inheritance.
+  exercises prepare/resume across processes, cumulative usage and explicit fresh/fork child inheritance.
 
 ## All documents
 
