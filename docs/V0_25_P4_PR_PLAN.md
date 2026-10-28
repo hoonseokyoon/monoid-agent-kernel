@@ -1,14 +1,21 @@
 # v0.25 P4: 종료 예산 조회와 시간 제어 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+현재 완료 상태: **P4-00–02과 최종 통합 완료**. [#165](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/165)이 develop `973e474`에 병합됐다.
+현재 출시 준비는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 기록한다.
+
 조사일: 2026-10-27 KST. 기준: fetch한 `origin/develop=2914c4366f8dfd7ed537f854388836a12a05f078`.
 P5·DX1·P3·P1/P2가 develop에 병합된 상태다. P1P2-I는 [#161](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/161)이다.
 **2026-10-28 사용자가 P4-00·01 구현과 리뷰·CI 후 P4-02·최종 통합까지 순차 진행을 승인했다.**
-00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·CSP 제품 변경은 별도다.
+00은 develop 대상 독립 PR, 01은 수정 전 실패 회귀부터 시작한다. 릴리스·배포·호스트 제품 변경은 별도다.
 계획은 로컬 `e16c304`에 기록했다. 최신 구현 상태와 PR별 증거는 §9.1 이후에 둔다.
 
 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#53-p4-실제-제어와-일치하는-종료-예산)의 G3과
 [개발자 API 제안](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#6-v025-api-예시-stop-이후-현재-대기-조회)을 구체화한다.
-상위 저장소의 `docs/operations/campaign-workflow.md`, `docs/operations/campaign-preflight-review.md`를 운영 권위로 따른다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했다. 현재 개발 절차는 [Contributing](../CONTRIBUTING.md)에 있다.
 
 ## 1. 전달할 결과와 범위
 
@@ -51,7 +58,7 @@ local monotonic cutoff로 바꾼 선례다. 이 원칙을 재사용하며 core�
 ### 2.1 제한된 실행 확인
 
 Windows/Python 3.11.9, `PYTHONPATH=src`, 위 develop 소스를 직접 import했다. 제품·기존 테스트 파일은 수정하지 않았다.
-ignored `.tmp/v025/p4_preflight_probe.py`는 실제 ModelCallRunner와 RunStream을 구동한다.
+ignored `p4_preflight_probe.py`는 실제 ModelCallRunner와 RunStream을 구동한다.
 model/bridge 모듈의 wall clock view만 ±3,600초 이동시켰으며 OS 시계와 event-loop monotonic 시계는 유지했다.
 
 | 실제 실행 | 대조군 → wall clock 변경군 |
@@ -66,16 +73,16 @@ model/bridge 모듈의 wall clock view만 ±3,600초 이동시켰으며 OS 시�
 정식 회귀는 PR-01/02에서 제어 가능한 clock·barrier와 실제 생산자/소비자를 사용해 먼저 실패를 고정한다.
 마지막 probe의 예상 abandonment warning 2개도 원본에 남겼다.
 
-원본은 `.tmp/v025/p4-preflight-probes.txt`다. SHA-256:
+원본은 `p4-preflight-probes.txt`다. SHA-256:
 script `936243cdd6051b7b728237afdf2ea6811b92a5beeadf57b935f29b90a0e1024b`,
 output `27229c9c880973de56a483ad9a114bbc740fd29daba58db8719fde506e247cd6`.
 
-기존 관련 기준선은 **209 passed in 13.87s** (`.tmp/v025/p4-baseline.txt`)다. 아래 조건으로 실행했다.
+기존 관련 기준선은 **209 passed in 13.87s** (`p4-baseline.txt`)다. 아래 조건으로 실행했다.
 
 ```powershell
 $env:PYTHONPATH = (Join-Path (Get-Location) 'src')
 $env:PYTEST_XDIST_AUTO_NUM_WORKERS = '4'
-& .tmp/v025/p1p2-01-current311/Scripts/python.exe -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_async_loop.py tests/test_async_tools.py tests/test_model_call_runner.py tests/test_model_stream_observer.py tests/test_validated_call.py tests/test_checkpoint.py -k 'deadline or drain or grace or cancel or boundary or retry or remaining_duration or clock' --tb=short
+& python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_async_loop.py tests/test_async_tools.py tests/test_model_call_runner.py tests/test_model_stream_observer.py tests/test_validated_call.py tests/test_checkpoint.py -k 'deadline or drain or grace or cancel or boundary or retry or remaining_duration or clock' --tb=short
 ```
 
 이번 계획 단계에서 full suite·실제 서비스·wheel 재빌드·브라우저·유료 provider는 실행하지 않았다.
@@ -362,7 +369,7 @@ fresh reviewer `p4_plan_review`는 작성·조사에 참여하지 않고 네 문
 | targeted: close 중 살아 있는 drain timer | `_await_draining_stream`은 aclose까지 포함한 consume task를 race한다. root의 읽기 종료 시 None 제안을 실제 wait owner 해제 시 None으로 수정. 기존 close 중 user cancel 회귀를 §7 기준에 연결 |
 
 reviewer probe는 Python 3.11.9에서 raw timer 경계만 확인하고 driver를 release해 종료했다. managed API 구현 증거로 확대하지 않는다.
-재현 코드·명령·원본 결과는 ignored `.tmp/v025/p4-plan-review.txt`에 보존한다.
+재현 코드·명령·원본 결과는 ignored `p4-plan-review.txt`에 보존한다.
 reviewer는 CPython #154156, AnyIO #1317, gRPC 7269456의 실제 diff·상태도 독립 확인했다.
 legacy 비유한 값도 실제 hard cancel 요청 뒤에는 remaining=0을 우선한다.
 targeted 최종 판정은 **ready**, 남은 blocking/nonblocking 지적은 없다.
@@ -389,13 +396,13 @@ AST 성공은 제안 API의 실행·타입 검증을 뜻하지 않는다. 기존
 manual diagnostic 또는 dormant 성공을 대체 근거로 사용하지 않는다.
 
 독립 사전조사 검토 후 red/green foundation, validate-lock·lint·diff, B 등급 코드 리뷰와 최종 L1/L2 core를 확인한다.
-상세 사전조사는 ignored `.tmp/v025/p4-00-preflight.md`다. 00 병합 뒤 최신 develop에서 통합 브랜치를 생성한다.
+상세 사전조사는 ignored `p4-00-preflight.md`다. 00 병합 뒤 최신 develop에서 통합 브랜치를 생성한다.
 01/02/I의 required combined, 각 PR의 독립 preflight·A 등급 두 코드 reviewer는 별도로 유지한다.
 
 독립 사전조사는 **READY**, 필수 수정 0건이다. 테스트-only `2a31e84`에서 **4 failed / 25 passed (9.57s)**:
 새 branch의 default가 core이고 weaker label/manual core가 허용되며 push allowlist에 없음을 확인했다.
 정확한 두 등록 지점을 수정한 뒤 **29 passed (6.08s)**, ruff 0.15.6·validate-lock·diff check가 통과했다.
-원본은 `.tmp/v025/p4-00-red.txt`, `p4-00-green.txt`다. mandatory pytest prefix와 네 worker, 단일 runner lock을 사용했다.
+원본은 `p4-00-red.txt`, `p4-00-green.txt`다. mandatory pytest prefix와 네 worker, 단일 runner lock을 사용했다.
 [GitHub 이벤트 문서](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)를
 10/28 재확인했고 기존 Draft-fast/Ready-required 경계를 유지한다. 코드 리뷰와 최종 remote CI는 이어서 확인한다.
 기능 delta는 등록 2줄이고 계획 commit의 475줄 churn과 실행 기록을 누적 비용에 포함한다.
@@ -410,7 +417,7 @@ develop merge는 `22aae182f98b8846747b894a661dfad6e5f52bd2`다. fetch 후 review
 ### 9.2 P4-01 사전조사 — 2026-10-28
 
 actual base는 00 병합 뒤 `22aae18`이며 runtime는 계획 기준 `2914c43`과 동일하다.
-읽기 전용 조사자 `p4_01_research`가 내부 public acall 소비자(loop/validated)와 실제 CSP epoch 입력을 대조했다.
+읽기 전용 조사자 `p4_01_research`가 내부 public acall 소비자(loop/validated)와 실제 호스트 epoch 입력을 대조했다.
 최소 private `_MonotonicDeadline(cutoff_s)` carrier는 공개 진입 경계만 구분하고 내부 기존 deadline 인자는 monotonic float로 유지한다.
 public acall 경로·callback arity를 보존하고 `_deadline` keyword로 이미 변환된 unbounded도 전달한다.
 private deadline을 epoch로 표시하는 제품 소비자는 없으므로 별도의 wall deadline 복제본은 만들지 않는다.
@@ -421,7 +428,7 @@ private checkpoint assertion 1개는 monotonic 기준으로, public deadline에 
 테스트 helper가 public runner에 전달하는 epoch 입력은 그대로 유지한다. invalid는 accessor·invocation·receipt 전 검증하되,
 valid-expired durable recovery는 기존 evidence 재게시 뒤 boundary 검사를 유지한다.
 CPython b94b9c8·AnyIO #1317·Python 3.11 clock 문서를 10/28 재확인했다.
-PR별 상세 조사 `.tmp/v025/p4-01-preflight.md`를 별도 독립 reviewer가 검토하며, 코드보다 행동 회귀를 먼저 고정한다.
+PR별 상세 조사 `p4-01-preflight.md`를 별도 독립 reviewer가 검토하며, 코드보다 행동 회귀를 먼저 고정한다.
 
 독립 reviewer `p4_01_preflight_review`는 actual base `22aae18`에서 **READY**, 필수 보완 0건으로 판정했다.
 검토한 preflight SHA-256은 `6846584bf88279f96cc43b0e97371f0e70cc0e732a17635359371edc33ef200f`다.
@@ -430,17 +437,17 @@ PR별 상세 조사 `.tmp/v025/p4-01-preflight.md`를 별도 독립 reviewer가 
 
 통합 branch 최초 push [CI 40544692527](https://github.com/hoonseokyoon/monoid-agent-kernel/actions/runs/40544692527)은
 `22aae18`에서 **SUCCESS**, actual combined services 포함이다. 01 제품 수정 전 테스트-only `029152f`를 고정했다.
-`.tmp/v025/p4-01-red-core.txt`는 **22 failed / 24 passed (8.75s)**다. wall jump의 조기 종료·retry/repair 예산 재충전·
+`p4-01-red-core.txt`는 **22 failed / 24 passed (8.75s)**다. wall jump의 조기 종료·retry/repair 예산 재충전·
 drain 연장과 invalid 입력의 부수효과를 실제 runner에서 확인했다. 최초 테스트 fixture의 사용량 정규화와
 validated durable ID 설정 오류를 교정한 뒤 기록한 결과이며, 모든 무변경 대조군이 통과한다.
 root는 그 뒤 private carrier·16개 시간 계산·public 소비자 연결과 clock 계약 문서를 수정한다.
 
 핵심 회귀 **46 passed (5.90s)**, 실제 loop/tool/restore를 포함한 영향군 **728 passed (40.22s)**다.
 후자는 model/validated/async loop/tools/checkpoint/cancellation/stream observer 8개 모듈을 함께 실행했다.
-원본 `.tmp/v025/p4-01-green-core.txt`, `p4-01-related-green.txt`. 추가 정밀 경계·설치 wheel과 독립 리뷰·CI는 이어서 확인한다.
+원본 `p4-01-green-core.txt`, `p4-01-related-green.txt`. 추가 정밀 경계·설치 wheel과 독립 리뷰·CI는 이어서 확인한다.
 
 추가 exact cutoff·drain 동률·서로 다른 monotonic 원점의 실제 park/restore 10개도 **PASS (5.93s)**:
-`.tmp/v025/p4-01-boundary-green.txt`. P4-01 신규 행동 회귀는 81개다. ruff 0.15.6·diff check와 wheel audit가 통과했다.
+`p4-01-boundary-green.txt`. P4-01 신규 행동 회귀는 81개다. ruff 0.15.6·diff check와 wheel audit가 통과했다.
 
 01 [PR #163](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/163)은 final head `4818e06`에서
 서로 독립적인 코드 reviewer A/B **PASS**, 필수 지적 0건이다. checkout 밖 설치 wheel은 Python 3.11 /
@@ -456,7 +463,7 @@ Python 3.11/3.12 core와 실제 combined services가 모두 통과했다. Draft/
 
 최신 develop은 `22aae18`, actual integration base는 01 merge `3beb805`다. 새 branch는 `codex/v0.25-p4-budget-snapshot`.
 root가 source 변경을 통합하고 공유 runner를 소유한다. 읽기 전용 `p4_02_research`의 조사와 actual-base 대조를
-`.tmp/v025/p4-02-research.md`, `p4-02-preflight.md`에 기록했다. 별도 독립 reviewer가 구현 전 검토한다.
+`p4-02-research.md`, `p4-02-preflight.md`에 기록했다. 별도 독립 reviewer가 구현 전 검토한다.
 
 기존 public acall을 소유권 wrapper로 유지하고 runner의 registry 하나로 drain 전용 목록을 대체한다.
 phase·grace·drain 갱신은 실제 wait owner에서 수행한다. 임의의 grace 객체에 관측용 변환·비교를 추가하지 않고,
@@ -472,7 +479,7 @@ managed RunStream은 실제 owner snapshot으로 최초 cutoff를 고정하고 r
 독립 `p4_02_preflight_review`는 actual base `3beb805`에서 **READY**, blocker 0건이다.
 같은 base에 테스트만 추가한 `b42fa4c`에서 **2 failed / 2 passed (2.76s)**를 확인했다.
 활성 호출이 없어도 11.5초를 주는 경로와 이미 drain 3초를 사용했는데도 13.5초를 다시 주는 경로가 실패했다.
-기대값은 각각 기본 8초와 10.5초다. `.tmp/v025/p4-02-red.txt`에 원본을 보존했다.
+기대값은 각각 기본 8초와 10.5초다. `p4-02-red.txt`에 원본을 보존했다.
 
 root는 model/loop/bridge 연결·공개 export·문서·예제를, `p4_02_research`는 core DTO/registry와 RunStream을,
 `p4_01_research`는 새 관측·RunStream·public surface 테스트를 맡는다. 파일 소유권과 단일 runner를 분리했다.
@@ -481,7 +488,7 @@ root는 model/loop/bridge 연결·공개 export·문서·예제를, `p4_02_resea
 실제 aopen→astream→Stop→진행 조회→receipt offline 예제도 source에서 성공했다. 전체 영향군·wheel·두 리뷰·CI는 이어서 확인한다.
 
 15개 영향 모듈 **1,060 passed (29.14s)**: 종료 관측·실제 exit 경합·공개 export·기존 model/validated/loop/tool/
-checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했다. 원본 `.tmp/v025/p4-02-related-green.txt`.
+checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했다. 원본 `p4-02-related-green.txt`.
 외부 thread의 늦은 on_begin이 settling 중 종료된 drain을 다시 만들지 않는 회귀도 포함한다.
 02 기능 churn은 약 601줄이며 테스트·문서·예제 포함 약 1,690줄이다. 00 계획/CI와 01을 합한 전체는 약 3,200줄로
 최초 2,450줄의 약 1.3배다. 기능 합계는 약 701줄이다. 추가 비용은 실제 경합을 제어하는 fixture와 공개 예제에 사용했다.
@@ -495,7 +502,7 @@ checkpoint/cancellation·carriage/discard·durable recovery를 함께 검증했�
 테스트-only `6527869`에서 callback 정상/예외 fallback 두 경로 모두 **2 failed (9.26s)**를 고정했다.
 raw 경로의 최초 cutoff를 callback 평가 뒤에 잡고 managed snapshot 기준과 재진입 cutoff는 유지했다.
 수정 후 RunStream·request identity·stream observer **83 passed (12.92s)**다.
-원본 `.tmp/v025/p4-02-review-red.txt`, `p4-02-review-green.txt`. 두 독립 최종 검토·새 wheel·필수 CI를 이어서 확인한다.
+원본 `p4-02-review-red.txt`, `p4-02-review-green.txt`. 두 독립 최종 검토·새 wheel·필수 CI를 이어서 확인한다.
 
 02 [PR #164](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/164)의 최종 `08e6eba`는 두 독립 코드 reviewer의 **PASS**를 받았다.
 raw callback 지적은 정상/예외 fallback 모두 실제 cooperative completion을 다시 확인해 해소했다.
@@ -516,21 +523,21 @@ actual base는 02 merge `be35567`, 다시 fetch한 develop은 `22aae18`이며 �
 root가 통합/문서/단일 runner를, 연구자가 실제 소비자 대조를 맡았다. I의 최초 후보는 상태 문서와 기존 종료 대기 설명 5개 문서를 수정했다.
 core 기능·schema·provider·Studio bundle은 02의 검토/설치 후보와 동일하게 유지한다.
 
-실제 CSP `pipeline_core/skills/llm_namespace.py`의 epoch 입력은 그대로 사용 가능하다.
+호스트가 전달하는 기존 epoch deadline 입력을 계속 사용할 수 있다.
 기존 checkpoint는 remaining duration을 유지하고 복구 downtime을 제외한다. P1/P2 facts·usage, P3 resource cleanup,
 P5 전달 권한 경계는 누적 코드와 기존 회귀·full/combined CI에 연결했다. core 703줄·CI/profile 3줄,
 전체 3,212줄의 기존 누적 churn에 이번 문서 마감 비용을 더한다. 최초 추정은 기능 800줄·전체 2,450줄이다.
 
 02 wheel의 packaged source·metadata·asset·예제 입력 동일성을 확인해 현재/최소 환경의 766개 결과를 재사용한다.
 전체 명령·12개 테스트 모듈·source-only 제외 2개·checkout 밖 경로·실제 import provenance는
-`.tmp/v025/p4-02-final-wheel-evidence.md`에 묶었다. I에서 같은 설치 wheel로 facts·recovery·host resource 예제를
-두 환경 모두 추가 실행해 통과했다. 원본은 `.tmp/v025/p4-i-{facts,recovery,resources}-{current311,minimum311}.txt`다.
+`p4-02-final-wheel-evidence.md`에 묶었다. I에서 같은 설치 wheel로 facts·recovery·host resource 예제를
+두 환경 모두 추가 실행해 통과했다. 원본은 `p4-i-{facts,recovery,resources}-{current311,minimum311}.txt`다.
 새 source 검사를 중복 실행하지 않고 최종 head의 두 fresh 누적 리뷰, full push CI와 required combined CI를 확인한다.
 그 결과와 develop merge SHA는 #165의 최종 검증 기록에 둔다.
 
 운영 의미는 기존 범위를 유지한다. `calls=()`는 소유 model wait 부재, `hard_cancel_remaining_s=0`은 강제 취소 요청 사실이다.
 driver의 자원 정리·durable settlement는 계속 기다릴 수 있다. unbounded 실행의 과거 elapsed와 remaining=0 이후 초과 cleanup
-시간은 기존 checkpoint로 복원할 수 없다. 릴리스·배포·CSP pin 변경은 별도 작업이다.
+시간은 기존 checkpoint로 복원할 수 없다. 릴리스·배포·호스트 pin 변경은 별도 작업이다.
 
 최초 I 후보 `44728a2`는 두 fresh 누적 코드 reviewer **PASS**, L1 `40556925253`과 required combined
 `40557033294` **SUCCESS**를 받았다. full push `40556908534`는 14개 중 13개 job이 통과했고,
@@ -542,5 +549,5 @@ coverage job은 **81.16%**로 기준 80%를 충족했으나 기존 backend 복�
 실제 최종 status replace를 barrier로 멈춘 probe에서 helper가 먼저 반환해 **1 failed (9.45s)**를 확인했다.
 `_closed_limited_run`이 추적 Future의 존재를 확인하고 `result(timeout=20)`으로 완료·오류를 받도록 수정했다.
 legacy terminal 거부·nonterminal 복구·중복 재개 방지 assertion을 보존했고, probe와 backend recovery 모듈은
-**37 passed (16.51s)**다. 원본 `.tmp/v025/p4-i-fixture-{red,green}.txt`; probe는 `test_p4_i_fixture_race.py`다.
+**37 passed (16.51s)**다. 원본 `p4-i-fixture-{red,green}.txt`; probe는 `test_p4_i_fixture_race.py`다.
 제품 코드와 설치 wheel 입력은 그대로다. 최종 수정에 대한 두 targeted 리뷰와 새 head의 L1·full push·required combined를 확인한다.

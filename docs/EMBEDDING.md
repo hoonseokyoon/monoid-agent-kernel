@@ -1,24 +1,25 @@
 # Production embedding handbook
 
+Choose the product topology, execution authority, and storage contracts for an embedded or hosted
+agent. The practical guides below cover tools, streaming, and approval; this handbook connects
+those flows to local and production hosting responsibilities.
+
 ## Start with an executable recipe
 
-Use a Python 3.11+ virtual environment and install this checkout with `python -m pip install .`,
-or install a wheel built from the same revision. The v0.25 development examples use that revision's
-API. Start with the [typed tool quickstart](../README.md#quickstart-no-servers).
+Use Python 3.11+ and install this checkout with `python -m pip install .`, or a wheel from the same
+revision. Repository examples use that revision's API. Start with the
+[typed tool quickstart](../README.md#quickstart-no-servers), then choose a guide:
 
-| Integration task | Run from the checkout root | Observable result |
+| Integration task | Guide and executable source | Observable result |
 |---|---|---|
-| Type a tool's inputs and result | `python examples/custom_tool_quickstart.py` | Nested model access and the result in the next model request |
-| Own a local session | `python examples/embedding_local_product.py` | File content, checked checkpoint and completed session |
-| Stop a request stream | `python examples/termination_budget.py` | Exit phase and final receipt with reported usage |
-| Observe a background run | `python examples/observe_background_run.py` | Reader close, peer progress, reconnect/reset and explicit run cancel |
-| Inject resources and restore after approval | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Durable approval park and IDs for the [resume command](#resume-approval-in-a-new-process) |
+| Typed tools and host resources | [Guide](guides/tools-and-resources.md), [first tool](../examples/custom_tool_quickstart.py) | Validated model inputs and next-request tool result |
+| Request streaming and background observation | [Guide](guides/streaming-and-stop.md), [request](../examples/termination_budget.py), [background](../examples/observe_background_run.py) | Stop progress, final receipt, passive disconnect and replay/reset |
+| Approval across processes | [Guide](guides/approval-and-recovery.md), [packaged recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) | Original IDs, fresh resources and approved proposal read after restore |
+| Local session with builtin tools | [Local product](../examples/embedding_local_product.py) | File output, checked checkpoint and completed session |
 
-These examples run offline. The approval phases retain state under the supplied root; no-argument
-recipes use temporary state. [Call facts](../examples/model_call_facts.py) shows explicit zero and
-unknown counters; [receipt recovery](../examples/recover_model_call_facts.py) shows an in-memory
-lifecycle-hook round trip. The local session recipe also shows failure cleanup that preserves the
-last checkpoint and original exception. The sections below define production responsibilities.
+The examples run offline. The approval guide retains state under a supplied root; the other paths
+use temporary state. Keep model, workspace, run storage, resource factories, and transport ownership
+explicit when replacing the scripted components with product services.
 
 ## Choose a product topology
 
@@ -45,165 +46,41 @@ proposal/apply scenarios. Their `--mode fake` paths use the base install; `--mod
 `python -m pip install ".[openai]"` plus the credentials described in each file. For local span
 output, install `.[otel-export]` and run [otel_tracing.py](../examples/otel_tracing.py).
 
+| Requirement | Embedded/local | Hosted/multi-tenant |
+|---|---|---|
+| Process model | One trusted owner process | Product API plus one chosen activation runtime |
+| Product interface | Direct Python calls | Authenticated HTTP/RPC plus SSE or equivalent event delivery |
+| Tenant isolation | Product process and workspace boundary | Signed principal plus isolated storage, workspace, quotas, and projections |
+| Durable inputs | Direct session calls from the owner | Product-routed initial submission plus authenticated, ordered, idempotent post-submission control/callback transport |
+| Recovery | Reconstruct one loop from its checked checkpoint | Runtime recovery plus stale-executor fencing and checked checkpoint restore |
+| Storage | Local durable filesystem can be sufficient | Shared or runtime-addressable stores selected by the deployment |
+| Operations | Process lifecycle and local backups | Admission limits, draining, health, version routing, incident response, and retention |
+
+The embedded path fits a desktop app, appliance, or single worker. The hosted path fits products
+with tenant routing, multiple API instances, external workers, callbacks, and durable control.
+
 ## Inject host resources into tools (v0.25)
 
-Register process-local resources on `AgentLoop`, `from_tools` or `from_config` with the
-keyword `host_tool_bindings`. A shared identity key joins the host factory and the handler:
-
-```python
-from monoid_agent_kernel import AgentLoop, ToolContext, tool
-from monoid_agent_kernel.tools.host_bindings import (
-    HostToolBinding, HostToolKey, ToolWorkspace, require_host_tool_binding,
-)
-
-REPORTS = HostToolKey[ToolWorkspace](
-    "reports.workspace", accepts=lambda view: isinstance(view, ToolWorkspace),
-)
-
-@tool(id="report.save", side_effect="write")
-def save_report(ctx: ToolContext, title: str) -> dict:
-    workspace = require_host_tool_binding(ctx, REPORTS)
-    digest = workspace.write_bytes("reports/draft.md", title.encode(), create_dirs=True)
-    return {"sha256": digest}
-
-# spec and adapter belong to the embedding product.
-loop = AgentLoop.from_tools(
-    spec, adapter, [save_report],
-    host_tool_bindings=(HostToolBinding(REPORTS, open=lambda activation: activation.workspace_resource()),),
-)
-```
-
-Use `from_config` with `ToolBinding.scope` to restrict report paths and `authorization="ask"`
-to require approval. Each workspace operation checks both the binding and current surface scopes,
-operator `PermissionPolicy`, the original call, activation lifetime and writer authority.
-Workspace writes require an admitted `side_effect="write"` tool. Reads and existence checks also
-respect path scopes. Paths use the existing normalized lexical matching contract.
-
-Factories receive `HostToolActivation` metadata and a deferred `workspace_resource()` adapter.
-They run once per activation before checkpoint restoration. Read restored content inside handlers.
-The view's `read_bytes` returns `(bytes, sha256)`; `write_bytes` returns a digest and preserves
-`create_dirs`, `expected_sha256`, `overwrite` and backend mode behavior. Overlay proposals stay
-in the overlay; staging backends write to the host-provided staging directory.
-
-Custom adapters implement synchronous `bind_call(lease)` and local `close()`. Their methods must
-check `lease.assert_active()` or use `lease.guard_external_call(callback)` before and after client
-operations. Async client methods check before and after `await`. The host owns shared pools and
-external fencing/idempotency. Callbacks execute without kernel authority locks; callback duration
-and already-started external effects stay under host control.
-
-The kernel closes adapters in reverse order once on close, discard and committed park release,
-including partial factory failure. Normal cleanup leaves a shared host writer authority active.
-Call views expire on return, failure, cancellation, timeout and abandonment. A retained context
-keeps its original call identity even when another call starts. Pass a context explicitly to any
-joined helper thread. Child and fork activations receive no bindings by default.
-
-Opt in per binding to create fresh adapters for each child and fork:
-
-```python
-HostToolBinding(
-    REPORTS, open=lambda activation: activation.workspace_resource(),
-    inherit_to_children=True,
-)
-```
-
-Each hop carries opted-in factories and creates its own adapters and call views. Resource operations
-check the child and every original ancestor's activation lifetime and writer authority. Parent close,
-committed release or revoke stops new descendant resource access. Child cleanup leaves parent and
-sibling adapters open; a restored parent creates a new lineage. Child and fork workspaces inherit
-the effective operator policy, including the `AgentLoop` constructor keyword. General child tool
-dispatch retains its existing policy; model-call cancellation and draining are separate controls.
-
-Keys, clients and adapters remain process-local. Configure fresh factories on a restored loop.
-Ordinary factory, binder, type-check and close failures use safe fixed diagnostics; direct control
-signals retain their classification. Runtime errors include `host_tool_binding_missing`,
-`host_tool_binding_type`, `host_tool_context_unavailable`, `tool_call_not_in_flight` and
-`host_tool_resource_closed`. Callback failures use `host_tool_binding_open/bind/accepts/close`.
+Use optional `host_tool_bindings` to connect process-local factories to call-scoped tool views.
+The [tools and resources guide](guides/tools-and-resources.md#connect-product-resources) covers
+wiring, path permissions, lifetime, child inheritance, and failure diagnostics. The complete
+[report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) supplies a workspace
+factory and runtime bindings with approval policy.
 
 ### Resume approval in a new process
 
-The [typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes a scoped
-proposal, commits an approval park and releases its activation. Run these commands from an installed
-wheel or this installed checkout. Copy `run_id` and `task_id` from the first JSON response into the
-second command, keeping the same root:
-
-```bash
-python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state
-python -m monoid_agent_kernel.reference.host_tool_report --phase resume --root ./report-state --run-id RUN_ID --task-id TASK_ID
-```
-
-Each command starts a new interpreter and creates one resource through the host factory. Prepare
-reports zero reads and three model calls: save, request approval, then acknowledge the pending task.
-Resume loads the checked checkpoint, verifies the pending
-task and delivers approval. A repeated result is ignored; the original proposal reaches the model
-after one read and one new model call. The JSON includes the process ID and report body. Scripted
-cumulative usage grows from 5 input / 3 output / 8 total tokens to 9 / 6 / 15 across restoration.
-The actual workspace stays unchanged; applying a proposal is a separate host operation.
-
-The root and IDs belong to the trusted embedding host. It supplies approval for the pending task.
-An unrelated task is refused with the committed checkpoint preserved, and restore failures retain
-the original error while discarding the local activation. This path demonstrates a committed park
-followed by restoration; hosts own crash recovery and idempotency for external effects.
-
-Run `python -m monoid_agent_kernel.reference.host_tool_report` without arguments for the temporary
-approval demo plus fresh/fork child reports. Each child uses its own resource, and the parent's
-resource remains usable after child cleanup.
+Follow [approval and recovery](guides/approval-and-recovery.md) for the installed prepare/resume
+commands and expected results. Keep the same root and original run/task IDs, reconstruct compatible
+runtime dependencies, and inject fresh factories before restore. The recipe verifies the original
+proposal reaches the model after one approved read and ignores duplicate task-result delivery.
 
 ## Use domain models in tools
 
-`@tool` validates JSON arguments and passes Python values to the handler, including nested
-Pydantic models, models inside lists or dictionaries, enums, and defaults. Input handling calls
-no serializers. Both synchronous and async functions use this boundary.
-
-```python
-from pydantic import BaseModel
-from monoid_agent_kernel import AgentLoop, tool
-
-class Customer(BaseModel):
-    name: str
-
-class ReportDraft(BaseModel):
-    customer: Customer
-    title: str
-
-class ReportSummary(BaseModel):
-    customer: str
-    title: str
-
-@tool
-def summarize_report(draft: ReportDraft) -> ReportSummary:
-    return ReportSummary(customer=draft.customer.name, title=draft.title)
-
-# spec and adapter are the application's existing run spec and model adapter.
-loop = AgentLoop.from_tools(spec, adapter, tools=[summarize_report])
-```
-
-A call with `{"draft":{"customer":{"name":"Ada"},"title":"Weekly report"}}` produces
-`{"ok":true,"result":{"customer":"Ada","title":"Weekly report"}}` for the next model request.
-The [offline custom tool quickstart](../examples/custom_tool_quickstart.py) executes this flow
-with a scripted adapter and asserts the observation. Run `python examples/custom_tool_quickstart.py`.
-
-A top-level `BaseModel` return uses `model_dump(mode="json")`, including JSON conversion of
-datetime, UUID, and enum fields. A dictionary dump becomes `ToolResult.content`; other dump shapes
-use `content={"result": value}`. For example, `RootModel[list[int]]([1, 2])` produces the observation
-`{"ok":true,"result":{"result":[1,2]}}`. Custom model serializers follow their actual output shape.
-Explicit `ToolResult`, dictionaries, and scalar returns retain their existing envelopes. Models
-inside an arbitrary dictionary or explicit `ToolResult.content` must be converted by the author.
-
-The returned model's exclusion and `SecretStr` rules apply. Choose a result type containing the
-data the model should see: the actual returned subclass is serialized, and the return annotation
-does not filter its fields or validate the result.
-
-Ordinary serialization failures produce a failed tool observation with `tool_result_unportable`,
-category `tool`, `retryable=true`, and a fixed diagnostic. The retryable flag is information for
-the model; it does not invoke the tool again automatically. Direct run-control exceptions and
-control causes retained by `PydanticSerializationError` preserve their original classification.
-Handler-local `asyncio.CancelledError` becomes `tool_handler_cancelled`; host/run cancellation
-stops the run through its existing boundary.
-
-Pydantic 2.6.0 and 2.13.4 preserve these causes for ordinary nested model fields. A custom serializer
-that calls another model's `model_dump()` can discard the original cause upstream. Once that
-information is gone, the decorator can report only a serialization failure. Use nested model
-fields with Pydantic's normal serialization to preserve the original control cause.
+The [typed tool guide](guides/tools-and-resources.md#use-domain-models) explains validated Python
+inputs and JSON-mode top-level model results. Run the
+[complete quickstart](../examples/custom_tool_quickstart.py) to inspect the tool observation in the
+next model request. [Compatibility](COMPATIBILITY.md#typed-tool-source-compatibility-v025) records
+source migration and rollback requirements.
 
 ## Preserve the authority boundary
 
@@ -222,31 +99,23 @@ Use one activation runtime for a run. Its queue and workflow states are operatio
 Monoid checkpoints and terminal receipts carry portable semantic state. Externally retried effects
 use a replay-stable idempotency key or durable outbox staging.
 
-For each run, select exactly one activation authority: a product-owned runtime, the Reference inbox
-assembly, or the optional experimental DBOS profile. DBOS must not coexist with `LeaseStore`,
+For each run, select exactly one activation authority: a product-owned runtime (including the
+Temporal durable host below), the Reference inbox assembly, or the optional experimental DBOS
+profile. DBOS must not coexist with `LeaseStore`,
 `CommandStore`, `RecoveryService`, or watchdog lifecycle ownership for that run. Core contracts
 contain no DBOS, lease, watchdog, executor, or workflow-version types.
 
 ## Choose the product topology
 
-| Requirement | Embedded/local | Hosted/multi-tenant |
-|---|---|---|
-| Process model | One trusted owner process | Product API plus one chosen activation runtime |
-| Product interface | Direct Python calls | Authenticated HTTP/RPC plus SSE or equivalent event delivery |
-| Tenant isolation | Product process and workspace boundary | Signed principal plus isolated storage, workspace, quotas, and projections |
-| Durable inputs | Direct session calls from the owner | Product-routed initial submission plus authenticated, ordered, idempotent post-submission control/callback transport |
-| Recovery | Reconstruct one loop from its checked checkpoint | Runtime recovery plus stale-executor fencing and checked checkpoint restore |
-| Storage | Local durable filesystem can be sufficient | Shared or runtime-addressable stores selected by the deployment |
-| Operations | Process lifecycle and local backups | Admission limits, draining, health, version routing, incident response, and retention |
-
-The embedded path fits a desktop app, appliance, or single worker. The hosted path fits products
-with tenant routing, multiple API instances, external workers, callbacks, and durable control.
+The [topology comparison](#choose-a-product-topology) distinguishes embedded and hosted ownership.
+After choosing a hosted product, select one assembly below for each run.
 
 ## Choose one hosted assembly
 
-| Assembly | v0.19.2 position | Operational owner | Recovery scope |
+| Assembly | Current role | Operational owner | Recovery scope |
 |---|---|---|---|
 | Product-owned runtime | Production integration target | The product's scheduler and worker control plane | Defined and qualified by the product |
+| [Temporal durable host](#temporal-run-orchestration) | Optional production adapter composition | Temporal orchestration and finite activation workers; PostgreSQL writer and terminal authority | Checked PostgreSQL/ObjectStore state, fenced activation takeover, and Workflow replay |
 | Reference inbox assembly | Runnable Reference example and CI-qualified hosted golden path | `RunnerBackend`, `LeaseStore`, `CommandStore`, `RecoveryService`, and watchdog | Shared-store stale-owner claim demonstrated with SQLite |
 | Optional DBOS activation-recovery profile | Experimental private Reference composition proof | One private host owns the process-global DBOS runtime and hosted control/run lifecycle | Same `executor_id` and `application_version` after a fenced restart; hosted control and run recovery are acceptance-tested |
 
@@ -264,7 +133,7 @@ runtime, listener set, launch, admission, drain, and shutdown lifecycle while re
 partitioned queues. The exported standalone components remain individual experimental entry
 points.
 
-The v0.19.2 scope excludes `RunnerBackend` replacement, hosted-golden-path routing, Studio and
+The experimental DBOS profile excludes `RunnerBackend` replacement, hosted-golden-path routing, Studio and
 terminal-projection migration, PostgreSQL production qualification, rolling upgrades,
 arbitrary-host takeover, and Conductor. See [DBOS_REFERENCE.md](DBOS_REFERENCE.md) for the exact
 verified invariant and non-goals.
@@ -730,6 +599,11 @@ its observation is returned. The interruption checkpoint restores the kernel-own
 
 ## Model and tool wiring
 
+The [tools and resources guide](guides/tools-and-resources.md#connect-product-resources) maps the
+workspace/run roots, model adapter, runtime bindings, and resource factory to their construction
+points. [custom_model_adapter.py](../examples/custom_model_adapter.py) implements
+`next_turn(request) -> ModelTurn` and injects its adapter through `AgentLoop.from_config`.
+
 The offline examples inject a fake adapter, so no gateway is contacted. A hosted deployment places
 provider credentials in its model gateway and passes only a short-lived, run-scoped gateway token
 to the runner. The gateway validates tenant, user, run, audience, kind, expiry, model policy, and
@@ -791,6 +665,9 @@ identity, and application-version operation remain governed by the experimental 
 v0.19.2 makes no production rolling-upgrade claim for that profile.
 
 ## Streaming and cursor ownership
+
+Use the [streaming and Stop guide](guides/streaming-and-stop.md) for request ownership, passive
+readers, Stop progress, and final receipts. The following section covers durable hosted storage.
 
 ### Durable private model streams
 
@@ -870,164 +747,37 @@ apply tenant scoping in that wrapper.
 
 ### Deadline inputs and restoration
 
-Pass an absolute Unix epoch to standalone `ModelCallRunner.acall` or
-`ValidatedCallRunner.acall`, for example `deadline=time.time() + 30`. The runner converts
-it once to a monotonic budget covering retries and validated repairs. `None` or `math.inf`
-is unbounded; an expired epoch or `-math.inf` expires immediately. Invalid numbers such as
-NaN, booleans, nonnumeric values and overflowing integers raise `ValueError` before any
-adapter or receipt callback. Keep passing epoch values through existing wrappers.
-
-`RunLimits.max_duration_s` measures active time from workspace and host-resource setup
-completion. Model waits, tool waits, drain windows and duration metrics share this monotonic
-clock. Checkpoints store the remaining duration and restore it against the new process clock,
-so time spent parked does not consume the run budget. Existing settled-call recovery still
-publishes its authoritative evidence before applying an expired run boundary.
+Use the [deadline guide](guides/streaming-and-stop.md#deadline-inputs-and-recovery) for epoch inputs,
+monotonic wait budgets, and remaining-duration restoration. Checkpoints preserve active-time budgets
+across a park; production recovery still follows the [checked-state rules](#checkpoints-recovery-and-upgrades).
 
 ### Billing a stopped stream
 
-A Stop can close the provider stream before its terminal usage arrives. Hosts that collect
-per-call usage opt into a bounded drain:
-
-```python
-loop = make_loop(stream_model_calls=True)
-loop.async_model_abort_drain_s = 5.0  # read live; 0 (default) closes at the stop
-
-runner = ModelCallRunner(adapter=adapter, abort_drain_s=5.0)  # direct ModelCallRunner callers
-```
-
-Both Stop paths drain: `interrupt_turn()` (or a caller's `should_abort`) and
-`cancellation_token.cancel()` with the default `user_cancel` cause, which is the path a
-`RunStream`/`astream` chat Stop takes. `graceful_drain`, `deadline`, `host_shutdown` and lease loss
-still stop at once, unless a `user_cancel` already turned the stop into a drain (the token keeps its
-first cause); then, of these, only lease loss cuts it short, and the run deadline still closes its
-window: a drain ends by `min(Stop + async_model_abort_drain_s, run deadline)` and is still reported
-as the Stop, never as a timeout. Nothing read after the Stop is delivered to the UI, observers,
-recorder or sidecars. The Stop's outcome is unchanged (the `interrupted` suspension, or the
-terminal `limited` result with `interruption_cause=user_cancel` that a `user_cancel` produces), only
-later: the owned drain and cleanup windows allow time to collect usage and close the stream.
-Use `termination_budget()` to observe those windows and the stream's hard-cancel request cutoff.
-The driver continues to await resource cleanup and durable settlement after that request.
-
-The drain applies to the loop's own model calls. Child and fork (subagent) loops use their default
-of `0`, so a token `cancel()` during a child's streamed call still cuts it and reports no usage for
-that call. `interrupt_turn()` never reaches a child: the child streams its call to completion and
-its reported usage is counted, as before this release.
-
-The drain keeps reading the adapter's own `astream_turn` generator, toward its end, for up to the
-budget. An adapter that retries or re-dispatches inside that generator (an empty-turn retry, say)
-keeps doing so while it is drained, and each such attempt is paid for: stop retrying once the call
-is stopped.
-
-Read reported usage at the existing observation points:
-
-- `AgentLoop`: `AgentTurnResult.metrics` / `AgentRunResult.metrics` (`input_tokens`,
-  `output_tokens`, `total_tokens` and any reported sub-counts), `metrics.updated`,
-  `RunCheckpoint.total_usage` and the token budget include the drained usage.
-- `ModelCallRunner` / `ValidatedCallRunner`: `provider_usage_of(exc)` (from
-  `monoid_agent_kernel.providers.base`) on the escaping `ModelCallAborted` or `RunCancelled`; the
-  failed receipt delivered to `settled_sink` and subscriptions carries the same usage.
-  `ValidatedCallRunner`'s escaping error keeps its earlier attempts in `exc.receipts`.
-- An empty usage means the provider reported none before the stream ended or the window closed. Do
-  not substitute an estimate for it.
-
-For a user-facing usage display, read `receipt.usage_evidence.reported` and its `completeness`
-map. An explicit `input_tokens: 0` is a reported zero; an absent `total_tokens` remains unknown.
-The legacy numeric metrics support accumulation and budgets. They do not establish whether an
-individual provider reported a missing counter, and a receipt does not settle the provider's bill.
-
-Leaving the `astream` block early, instead of iterating to its end after `cancel()`, cancels the run
-with `user_cancel`, which drains a streamed call in flight. RunStream freezes its exit wait from
-the calls actually owned at that moment: 8 seconds plus the largest remaining drain-and-cleanup
-allowance. An active one-shot call contributes its cleanup reservation; no active call adds zero.
-Already consumed drain time and future configured drain add no extra time. Phase-specific cleanup
-continues to sample its own grace, while later settings changes leave the stream's first cutoff fixed.
-After that cutoff, RunStream requests driver cancellation and awaits its cleanup and settlement.
+The [bounded-drain guide](guides/streaming-and-stop.md#collect-usage-during-a-bounded-drain) explains
+Stop windows, child-run limits, and adapter retry ownership. Read
+[final facts and usage](guides/streaming-and-stop.md#read-final-facts-and-usage) from receipts;
+numeric usage remains the accounting input, and the host reconciles billing separately.
 
 ### Showing Stop progress
 
-Keep the `RunStream` handle in the host and poll it from a separate progress task while the context
-manager exits. The same read-only `termination_budget()` API is available on AgentLoop and a
-standalone ModelCallRunner. It exposes frozen DTOs and performs no cancellation or getter calls.
-
-```python
-snapshot = stream.termination_budget()
-for call in snapshot.calls:
-    print(call.call_id, call.phase, call.deadline_remaining_s, call.drain_remaining_s)
-    for window in call.grace_windows:
-        print(window.source, window.budget_s, window.remaining_s)
-exit_wait = snapshot.stream_exit
-print(exit_wait.phase, exit_wait.hard_cancel_remaining_s)
-```
-
-A finite grace budget with remaining=None is reserved but has not begun. None/None denotes an
-unbounded grace window. Closing can coexist with a live outer drain window. Empty `calls` describes
-the root runner's model calls; tool, child and resource cleanup remain separate.
-
-Before exit, `stream_exit.phase` is idle. During its wait, the phase is cooperative_wait. If the
-exit waiter is cancelled, wait_interrupted/None says that timer has stopped; directly re-entering
-exit reuses the original cutoff. After hard cancellation is requested, remaining is zero and
-cleanup may still be running. The final phase is settled; zero preserves an earlier hard-cancel
-request, while None denotes completion without that request. Read reported call usage from receipts.
-
-The [offline termination example](../examples/termination_budget.py) opens a real AgentLoop and
-owns the stream, progress task and control task through cleanup:
-
-```bash
-python examples/termination_budget.py
-python examples/termination_budget.py --scenario silent_stop
-python examples/termination_budget.py --scenario consumer_cancel
-```
-
-The default breaks after one delta and observes cooperative exit. Silent Stop arrives while the
-provider has emitted no text. Consumer cancellation reaches the caller as `CancelledError` after
-cleanup; the CLI supervisor displays it. All three prevent late output from reaching the consumer.
-The request helper surfaces an unsuccessful model turn as `TurnNotSettled(stream.suspension)`
-and closes its owned tasks and loop before the caller handles the outcome. These examples exercise
-plain asyncio; a web integration must connect its own transport's disconnect signal.
+Follow [Stop progress](guides/streaming-and-stop.md#show-stop-progress) to poll the retained stream
+handle while it exits. Phase `hard_cancel_requested` records the cancellation request. A cooperative
+countdown can reach zero first; resource cleanup and settlement retain their own completion boundaries.
+The [complete request example](../examples/termination_budget.py) owns progress and control tasks
+through cleanup and covers early break, silent Stop, and consumer cancellation.
 
 ### Choose who owns streamed work
 
-| Product interaction | Execution owner | Disconnect and Stop |
-|---|---|---|
-| Request-scoped response | Host's `async with loop.astream(...)` | Early exit requests cancellation and joins stream cleanup |
-| Background task with reconnecting readers | Host's submitted backend run | Reader close releases that subscription; `cancel_run(run_id, token)` explicitly cancels work |
-
-Run [observe_background_run.py](../examples/observe_background_run.py) for the second path. It
-submits an actual streaming run to the Reference backend with root-scoped credentials. Closing
-one reader leaves another receiving the next delta while the run is active. Reconnecting with
-`after_cursor=reader.cursor` replays only the retained frames after that cursor.
-
-The live broker is a bounded, process-local ring. The example deliberately overflows a two-frame
-ring and handles `cursor_gap` by marking history incomplete. A generation change also requires
-reset handling. A product can show the gap or rebuild its display from separately enabled,
-authorized durable content. A live cursor alone cannot restore a complete response after loss.
-
-The example then calls authenticated `cancel_run`, waits for the terminal state and public
-`result(...)["ready"]`, and closes every reader. Its failure cleanup also releases provider gates,
-drains the backend and waits for result publication before the caller removes temporary state.
-The event subscription below uses durable integer sequence numbers; live content uses its own
-generation/sequence cursor.
+The [execution-owner comparison](guides/streaming-and-stop.md#install-and-choose-an-owner) separates
+request-owned execution from passive readers of background work. The
+[background example](../examples/observe_background_run.py) demonstrates disconnect, peer progress,
+retained replay, cursor gaps, and authenticated run cancellation.
 
 ### Resuming event delivery
 
-Use the `EventSubscription` and `SequenceCursor` contracts for reusable polling or frame iteration.
-The cursor stores the next required sequence, suppresses replayed events, and raises on a gap. The
-Reference facade exposes the same behavior through `subscribe_events()`:
-
-```python
-subscription = backend.subscribe_events(run_id, run_token, from_seq=1)
-page = subscription.poll(limit=500)
-next_seq = page["next_seq"]
-```
-
-For SSE, send each event sequence as `id`, accept `Last-Event-ID` on reconnect, and resume at the
-next sequence. Heartbeats carry no event ID. A terminal subscription drains the event log once more
-before emitting its end frame. Persist the cursor in the consuming product when delivery must
-survive client restarts.
-
-The hosted golden path polls twice through one subscription and asserts that the second page is
-empty. It then constructs a fresh Reference backend and reads the durable event history with the
-original authorized run token.
+Use the [event delivery guide](guides/streaming-and-stop.md#resume-event-delivery) for durable integer
+sequences, `EventSubscription`, SSE reconnect, and cursor persistence. Live content uses a separate
+generation/sequence cursor; the durable private stream store above uses its own generation/byte cursor.
 
 ## Control commands, tasks, and approvals
 

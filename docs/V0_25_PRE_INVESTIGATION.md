@@ -1,6 +1,14 @@
 # v0.25 통합 개발 계획과 사전조사
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
 작성일: 2026-09-28. 통합 갱신: 2026-10-28. 최초 코드 기준: v0.24.0 / `8d56e0d`.
+
+현재 상태: **P1–P5·DX1·DX2 구현과 develop 통합 완료** (`b27a15c`, [#170](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/170)).
+아래는 최초 조사와 구현 과정의 기록이다. 출시 준비 상태는 [release audit](V0_25_RELEASE_AUDIT.md),
+사용자의 업그레이드 절차는 [v0.25 migration guide](migrations/v0.25.md)에 둔다.
 
 구현 기록: **P5 #148·DX1 #149·P3 #150–155·P1/P2 #156–161 develop 병합**.
 P1P2-I #161의 develop 반영은 `2914c4366f8dfd7ed537f854388836a12a05f078`이다.
@@ -65,7 +73,7 @@ FastAPI/Vercel 어댑터, 새 Studio 진단 화면, context compaction은 후속
 전체 pytest·실제 서비스 기동·wheel build/install·배포는 이번 조사에서 수행하지 않았다.
 기능 코드를 수정하지 않았으며, 위 baseline은 새 API 구현의 검증 결과를 뜻하지 않는다.
 
-상세 실험과 조사 과정은 로컬 gitignored `docs/dx-notes/`에 보존한다:
+상세 실험과 조사 과정은 로컬 gitignored PR별 조사 기록에 보존한다:
 
 - `2026-09-28-v0.25-pre-investigation.md`: 기준선·선례·CI·릴리스 및 baseline 명령.
 - `2026-09-28-v0.25-p1-p2-pre-investigation.md`: 종료·사용량 상태표와 전달 경계.
@@ -79,24 +87,20 @@ Python 3.11.9 / Pydantic 2.13.4 환경의 관련 기존 테스트는 **76 passed
 이 green baseline은 새로 재현한 경합을 잡지 못한다. 구현 PR에서 신규 회귀가 수정 전 실패하는 증거를 추가한다.
 외부 이슈·고정 revision의 구현·재현 명령·실행한 테스트 목록은 [PR 계획 §2·§7](V0_25_P5_DX1_PR_PLAN.md)에 보존한다.
 
-## 3. first-party 소비 제품과 커널의 책임
+## 3. 통합 제품과 커널의 책임
 
-CSP는 독립된 first-party 소비 프로젝트다. 통합 문제의 실제 사례를 제공하며, 커널은 여러 호스트가
-사용할 수 있는 실행 사실·확장점·호환성 계약으로 요구를 정리한다.
+커널은 여러 호스트가 사용할 실행 사실·확장점·호환성 계약을 제공한다.
+통합 제품은 사용자 경험과 도메인 정책을 구성한다.
 
-| 경계 | 커널 | CSP 등 소비 호스트 |
+| 경계 | 커널 | 소비 호스트 |
 |---|---|---|
 | 종료 | 관측한 요청·경계·결과와 우선순위 | UI Stop·연결 단절·제품 cause 매핑 |
 | 사용량 | 확인값·관측 경로·완전성·재시도/복구 의미 | 가격·청구·환불·journal과 비용 부담 정책 |
 | 도구 | 실행 권한·자원 접근·수명 계약 | 도메인 객체·tenant·자원 구성과 외부 효과 |
 | 배포 | 커널 패키지·fixture·서비스 검증 | 핀 상향·adapter 변경·제품 수용 검증·기능 활성화 |
 
-CSP #305의 취소 fallback 수정은 CSP 코드의 완료된 수정이다. 커널 `CancellationToken` 변경이
-CSP 자체 신호 타입을 바꾸지는 않는다. CSP의 현재 workspace 주입 우회는 확장점 요구의 근거이며,
-그 우회 구현을 커널의 공개 권한 계약으로 그대로 채택하지 않는다.
-
-커널 조사·CI는 CSP를 editable dependency, fixture, submodule로 사용하지 않는다. CSP의 저장소·refs·
-환경·운영 데이터는 변경하지 않는다. 소비자 마이그레이션은 커널 배포 후 CSP 소유 작업으로 기록한다.
+커널 조사·CI는 자체 fixture와 공개 계약을 사용한다. 소비자 마이그레이션은 해당 제품의
+배포 절차에 따라 검증한다.
 
 ## 4. 선례와 v0.25에 적용할 운영 방식
 
@@ -193,9 +197,9 @@ deferred workspace, 별도 P3 lifetime guard를 채택했다. 구현 실행 기�
 **최초 조사에서 확인한 간격.** [ToolContext](../src/monoid_agent_kernel/tools/base.py)는 method-only Protocol이고,
 [extension façade](../src/monoid_agent_kernel/loop.py)는 내부 workspace·recorder를 감춘다.
 [bootstrap](../src/monoid_agent_kernel/loop_phases.py)은 `workspace_factory`의 반환값을 받은 뒤
-authority wrapper를 만든다. CSP는 factory에서 원본 workspace를 provider에 보관한다.
-그 참조에는 커널 wrapper의 revoke 검사가 적용되지 않는다. 이 구조는 소스로 확인했으며,
-CSP 운영 환경의 권한 상실 후 쓰기 발생은 이번 조사에서 검증하지 않았다.
+authority wrapper를 만든다. factory가 원본 workspace 참조를 도구에 따로 전달하면
+그 참조에는 커널 wrapper의 revoke 검사가 적용되지 않는다. 자원 factory와 handler 사이에서도
+이 권한 경계를 유지하도록 커널 소유 fixture에서 검증한다.
 
 **구현한 공개 표면.** keyword-only `host_tool_bindings`와
 `monoid_agent_kernel.tools.host_bindings`의 `HostToolKey[T]`, `HostToolBinding[T]`,
@@ -296,7 +300,7 @@ GC 경합·corruption·response-loss 의미를 실제 service suite로 검증한
 기존 packaging test가 일치를 검사한다. 자동화는 source/build/audit 동기화를 개선하는 독립 작업이다.
 
 **P7 후속.** 기존 shell의 timeout·cwd·env·명령 정책을 유지한다. backend별 CPU·메모리·네트워크·
-프로세스 종료 강제 능력과 플랫폼 지원은 후속 조사에서 정한다. CSP 기능 활성화는 CSP의 배포 결정이다.
+프로세스 종료 강제 능력과 플랫폼 지원은 후속 조사에서 정한다. 호스트 기능 활성화는 호스트의 배포 결정이다.
 
 ### 5.6 DX1·DX2: 도구 작성과 실제 통합 경로
 
@@ -315,7 +319,7 @@ RootModel과 custom serializer가 dict 이외의 결과를 만드는 경우를 �
 P1/P2/P4의 사실·복구·Stop 예제도 기존 실행 검사와 설치 CI에 연결했다. 부모 9개와 gateway 자식 2개의
 강제 source 경로를 제거했으며 silent Stop·요청 취소와 passive 구독·재연결의 수명을 예제로 보여준다.
 typed 도구→요청 스트림→승인 재개의 학습 경로와 검증 기록은 [DX2 PR 계획](V0_25_DX2_PR_PLAN.md)에 있다.
-기존 `reference`의 안정성 등급과 CSP의 별도 소비자 마이그레이션 책임을 유지한다. FastAPI/Vercel 어댑터는 후속이다.
+기존 `reference`의 안정성 등급과 호스트의 별도 소비자 마이그레이션 책임을 유지한다. FastAPI/Vercel 어댑터는 후속이다.
 
 ## 6. 작업군과 개발 경계
 
@@ -423,7 +427,7 @@ tag/version 검사·exact wheel audit·twine check 후 같은 artifact를 게시
 - 기존 공개 표면·호환성·패키지·CI·문자 경계 focused baseline은 73 passed / 8.67s / exit 0이었다.
 - P5의 drain OFF 문제는 독립 진단으로 재현했다. 수정은 이번 조사 범위에 포함하지 않았다.
 - 전체 테스트, 실제 서비스, 새 schema/codec, 새 도구 API, 새로운 cancellation 정책은 구현 단계 검증 대상이다.
-- CSP 운영 서버·실청구 성과·대체 S3 서버의 현재 유지 상태는 이번 조사에서 검증하지 않았다.
+- 호스트 운영 서버·실청구 성과·대체 S3 서버의 현재 유지 상태는 이번 조사에서 검증하지 않았다.
 
 재현 가능한 baseline 명령은 다음과 같다. Python은 저장소 `.venv`의 3.11.9이고 xdist worker 상한은 4였다.
 

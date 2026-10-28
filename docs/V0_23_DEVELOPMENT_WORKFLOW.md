@@ -1,6 +1,10 @@
 # v0.23 Production Adapters 개발 workflow
 
-> 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+> 기록 당시 상태: 구현 기준안; A01~A14 권장안 owner 승인 완료
 >
 > 작성일: 2026-08-23
 >
@@ -37,7 +41,7 @@ v0.22 Git 이력과 [`V0_22_IMPLEMENTATION_PLAN.md`](V0_22_IMPLEMENTATION_PLAN.m
 
 - 통합 브랜치에서 각 구현 브랜치를 순차 생성했다.
 - 앞 PR이 리뷰, 병합, 통합 브랜치 동기화를 마친 뒤 다음 PR을 시작했다.
-- 각 PR 전에 `docs/dx-notes/`에 현재 동작, gap, 상태 전이, test matrix를 기록했다.
+- 각 PR 전에 PR별 조사 기록에 현재 동작, gap, 상태 전이, test matrix를 기록했다.
 - 구현 PR마다 `$gh-pr-review-cycle`을 수렴시켰다.
 - rebase와 force-push를 사용하지 않고 merge commit으로 리뷰 이력을 보존했다.
 - 동일한 durability 지적이 반복될 때 구조적 재검토 gate를 적용했다.
@@ -70,7 +74,7 @@ commit으로 통합한다.
 |---|---|
 | 이 문서 | 브랜치, PR, 리뷰, CI, merge 운영 규칙 |
 | [`V0_23_IMPLEMENTATION_PLAN.md`](V0_23_IMPLEMENTATION_PLAN.md) | 승인된 기술 범위, 구조, PR 분할, test matrix |
-| `docs/dx-notes/YYYY-MM-DD-v0.23-prNN-<slug>.md` | PR별 사전조사와 실행 증거; gitignored |
+| PR별 조사 기록 | PR별 사전조사와 실행 증거; gitignored |
 | [`V0_23_RELEASE_AUDIT.md`](V0_23_RELEASE_AUDIT.md) | 최종 shipped 범위, 검증 결과, 제외 범위 |
 
 장기 계약이나 PR 경계가 바뀌면 구현 전에 구현 계획을 갱신한다. 세부 실험과 실패 기록은
@@ -86,7 +90,7 @@ dx-note에 남긴다. release audit에는 실제로 통과한 증거만 기록�
 4. PostgreSQL transaction과 ObjectStore/Temporal 사이의 각 crash prefix를 적는다.
 5. optional dependency와 root/import/wheel 경계를 확인한다.
 6. 변경 파일, migration 영향, targeted test, 실제 서비스 test, compatibility gate를 확정한다.
-7. 결과를 `docs/dx-notes/YYYY-MM-DD-v0.23-prNN-<slug>.md`에 기록한다.
+7. 결과를 PR별 조사 기록에 기록한다.
 
 각 dx-note에는 다음 항목이 들어간다.
 
@@ -457,16 +461,11 @@ Remaining risks and follow-up
 provider dispatch count, unknown dispatch retry count, terminal winner, stale writer rejection처럼 비용이나
 권위를 직접 증명하는 숫자는 artifact로 보존한다.
 
-## 13. common-skill-pipeline 보호 규칙
+## 13. 제품 통합 경계
 
-v0.23 개발은 `monoid-agent-kernel` repository에서 독립적으로 진행한다. active
-`common-skill-pipeline`은 다음 원칙으로 보호한다.
-
-- CSP working tree, branch, refs, dependency, migration, test data를 변경하지 않는다.
-- CSP를 v0.23 CI fixture나 git submodule로 사용하지 않는다.
-- CSP schema, tenant/RLS, chat/Skill/Catalog type을 Monoid public contract에 넣지 않는다.
-- 필요한 요구는 provider-neutral contract와 conformance case로 환원한다.
-- CSP integration은 v0.23 release 뒤 CSP 소유의 별도 campaign에서 수행한다.
+v0.23 개발은 `monoid-agent-kernel` repository에서 독립적으로 진행한다.
+커널 소유 fixture와 provider-neutral contract, conformance case로 검증한다.
+제품별 schema·도메인 객체·배포 정책은 호스트가 소유하며 제품 통합은 별도로 진행한다.
 
 ## 14. 이 문서의 승인 상태
 

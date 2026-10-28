@@ -1,10 +1,17 @@
 # v0.25 P3: 호스트 자원 주입·권한·수명·복구 PR 계획
 
+> 개발 이력: 아래 날짜·상태·명령·검증 결과는 기록된 리비전을 기준으로 읽는다.
+> 현재 사용법은 [문서 목록](README.md), 개발 절차는 [Contributing](../CONTRIBUTING.md),
+> 관련 기록은 [이력 색인](history/README.md)에 있다.
+
+현재 완료 상태: **P3-00–03과 최종 통합 완료**. [#155](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/155)이 develop `4e14618`에 병합됐다.
+현재 출시 준비는 [v0.25 release audit](V0_25_RELEASE_AUDIT.md)에 기록한다.
+
 작성·조사일: 2026-10-27 KST. 최초 기준은 `develop=5b08b10` (P5 #148, DX1 #149 병합),
 최종 통합 사전조사 기준은 `origin/develop=336cb4cb59d78e9bc083cfbbdd9500817f6065da`다.
 구현 기록: **P3-00/01 develop 병합, P3-02/03 통합 브랜치 병합.** 사용자는 P3-00·01부터 진행하고,
 P3-01은 실패 회귀를 먼저 고정한 독립 PR로 구현한 뒤 리뷰·CI를 확인하도록 요청했다.
-이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·CSP 변경은 범위 밖이다.
+이후 P3-02·03을 계획된 통합 브랜치에서 순차 진행한다. 릴리스·배포·호스트 변경은 범위 밖이다.
 
 범위의 기준은 [v0.25 통합 계획](V0_25_PRE_INVESTIGATION.md#52-p3-타입-있는-주입과-호출별-권한)이다.
 [개발자 API 설계](V0_25_DEVELOPER_EXPERIENCE_PROPOSAL.ko.md#4-v025-api-예시-타입-있는-도구와-자원-주입)의
@@ -24,8 +31,7 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 | 독립 계획 검토 | 작성·조사에 참여하지 않은 fresh reviewer; §8에 대상과 판정 기록 |
 | 구현 | root가 P3-00·01을 소유하고 runner·공유 파일 편집을 직렬화. 후속 PR도 착수 시 담당 기록 |
 
-상위 저장소의 현재 운영 권위인 `docs/operations/campaign-workflow.md`와
-`docs/operations/campaign-preflight-review.md`를 따른다. 권한·수명 변경은 A 등급이다.
+당시 캠페인은 PR별 사전조사와 독립 리뷰를 적용했고, 권한·수명 변경을 A 등급으로 분류했다.
 각 구현 PR은 최신 실제 base에서 사전조사를 갱신하고 독립 사전 검토 및 서로 다른 두 코드 reviewer를 거친다.
 계획 검토는 향후 코드 검토를 대체하지 않는다. 공유 파일 편집과 무거운 검사는 root가 직렬화한다.
 
@@ -35,20 +41,20 @@ P3 수명 계약을 아래 정책으로 구체화한다. P5·DX1 실행 기록�
 |---|---|---|
 | handler dispatch → extension context | [loop.py](../src/monoid_agent_kernel/loop.py) `_ainvoke_handler`는 provider와 handler에 같은 façade를 전달. `_live_call`은 ContextVar가 없는 thread에서 최신 `_call_fallback`을 사용 | 호출마다 새 façade에 원래 lease를 고정. 새 helper가 현재 전역 call을 조회하지 않음 |
 | tool admission → workspace | `_aexecute_tool_call`이 surface·승인·capability를 검사. `_check_permissions`는 선언한 `path_args`만 확인. [AuthorityBoundWorkspace](../src/monoid_agent_kernel/core/workspace.py)는 activation authority만 확인 | handler가 계산한 경로에도 작업마다 call의 path scope·PermissionPolicy·workspace mode 적용 |
-| workspace factory → CSP provider | 상위 CSP `pipeline_core/agents/modular_kernel.py`의 `_binding_workspace_factory`, `PaperWorkspaceToolProvider.bind_kernel_workspace`, `_tool_workspace`가 원본 backend를 보관해 직접 write | kernel 소유 보고서 fixture로 이 사용법을 대체할 seam 검증. CSP 배포·pin 변경은 별도 |
+| workspace factory → host tool | 원본 workspace를 직접 보관하는 도구도 호출별 권한 view와 자원 수명 경계가 필요 | kernel 소유 보고서 fixture로 공개 자원 주입·승인·복구 경로 검증 |
 | bootstrap → partial cleanup | [loop_phases.py](../src/monoid_agent_kernel/loop_phases.py): recorder 생성 118, observer factory 136, partial resources 게시 228 순서 | 첫 owned handle부터 cleanup 책임을 확보 |
 | restore → handler | `restore`의 bootstrap 3753 → `_rehydrate` 3756 → workspace checkpoint 적용 3877 순서 | factory는 descriptor와 deferred resource만 생성. 복구가 끝난 실제 handler에서 내용 읽기 |
 | lifecycle → observer cleanup | `discard_uncommitted`의 subscription close 2733은 오류 수집 밖. `close`에도 subscription close가 마지막 teardown의 try/finally 앞에 있음 | cleanup 오류 뒤에도 activation 정리 완료; 원래 제어 예외 보존 |
 | child/fork → inherited providers | `_run_subagent_child`는 provider·workspace factory를 전달하지만 child authority는 새 객체. parent authority 검사는 child 반환 뒤 | 자원 상속은 명시적 선택, fresh factory와 parent lineage 검사 동반 |
 | hosted driver → restore/release | [activation.py](../src/monoid_agent_kernel/hosting/activation.py)는 checkpoint/command 검증 후 loop를 만들고, 중복 receipt면 loop 생성도 생략. committed boundary 뒤 release | 유효한 실제 activation마다 자원 생성·해제. 중복 명령은 factory 0회 |
 
-위 CSP 경로는 통합 요구의 소스 근거다. 운영에서 stale write가 발생했다는 조사 결과는 없다.
+도구의 자원 접근은 공개 권한 계약과 커널 소유 fixture로 검증한다.
 
 ### 2.1 기존 정리 결함의 제한된 재현
 
 동일 base, Python 3.11.9에서 소스·테스트를 수정하지 않고 두 callback 순서만 주입했다.
-원본 script/output은 로컬 ignored `.tmp/v025/p3_preflight_probe.py`,
-`.tmp/v025/p3-preflight-probes.json`에 있다. private 필드 관찰은 정리 여부 확인을 위한 probe에 한정했다.
+원본 script/output은 로컬 ignored `p3_preflight_probe.py`,
+`p3-preflight-probes.json`에 있다. private 필드 관찰은 정리 여부 확인을 위한 probe에 한정했다.
 
 | 조건 | 관측 결과 | 해석·선행 조치 |
 |---|---|---|
@@ -247,7 +253,7 @@ P3-02의 root 계약을 임시 registry PR로 쪼개지 않는다. 예상 초과
 
 P1/P2/P4는 기술적 선행이 아니다. DX1은 현재 base에 있으며 보고서 예제가 이를 소비한다.
 P5 authority 검사는 유지한다. P8 도입 여부와 무관하게 P3 lineage 검증을 완료한다.
-CSP migration·배포·릴리스, 범용 DB/HTTP adapter, delete/list/glob 등 workspace API 확대는 이번 PR군 범위 밖이다.
+호스트 migration·배포·릴리스, 범용 DB/HTTP adapter, delete/list/glob 등 workspace API 확대는 이번 PR군 범위 밖이다.
 
 ## 6. 실제 통합 개발자 API 예시
 
@@ -380,7 +386,7 @@ guard를 제거한 작은 음성 대조가 stale 접근·scope 위반·cleanup �
 | D3 / 02 | resource 안 secret sentinel·직렬화 시 실패하는 객체; open/bind_call/accepts가 sentinel 포함 ValueError 발생 | kernel request/schema/event/manifest/checkpoint와 새 진단에 자원·secret·원본 오류 문자열 없음; 승인 전 handler/write 0회 |
 | H1 / 03 | root/child/fork default OFF 및 opt-in; grandchild | 기본 누락 오류, opt-in factory마다 올바른 descriptor·별도 identity. 부모 writer token 전달 없음 |
 | H2 / 03 | child 작업 중 parent revoke/normal release; child 실패·종료 | 상속 view의 read/write/새 lookup 차단, parent/sibling 자원 생존, lineage callback 해제 |
-| X1 / 02·I | fake adapter로 nested ReportDraft → scoped proposal → 승인/park/restart | 공개 API만 사용, wheel 설치본에서 result JSON·proposal·복구 내용 확인; CSP 모듈 import 없음 |
+| X1 / 02·I | fake adapter로 nested ReportDraft → scoped proposal → 승인/park/restart | 공개 API만 사용, wheel 설치본에서 result JSON·proposal·복구 내용 확인; 호스트 모듈 import 없음 |
 
 기존 기준 테스트는 다음 13개다. 이번 조사에서는 아래 명령으로 통과를 확인했다.
 추가 구현에서는 영향을 받는 `tests/test_loop.py`, tool surface/permissions/authority,
@@ -424,7 +430,7 @@ head/base가 바뀌면 영향을 받는 merge candidate 증거를 갱신한다.
 계획 검토 당시 구현 변경 0, 새 회귀 테스트 0. baseline probe 2건, 기존 회귀 13건 통과.
 fresh 독립 reviewer `p3_plan_review`의 최초 판정은 **ready — 계획 단계 진행 가능**이다.
 대상은 base `5b08b10`과 계획 SHA256 `B63FD7982E9490ECE614A81E52178C20DE3FF93F8B4F4086CFBE3A0E34D2AB05`다.
-작성·조사에 참여하지 않은 reviewer가 실제 dispatch·bootstrap·close/discard·restore·CSP 소비자와 외부 근거를 대조했다.
+작성·조사에 참여하지 않은 reviewer가 실제 dispatch·bootstrap·close/discard·restore·호스트 소비자와 외부 근거를 대조했다.
 새 테스트 실행 없이 기존 13개 결과와 두 probe 원본을 재사용했다. 구현을 차단하는 설계 결함은 없었다.
 
 확인사항 두 건을 구체화했다: callback의 secret 포함 ValueError를 안전한 공개 오류로 바꾸는 D3,
@@ -445,7 +451,7 @@ diff 공백 검사와 production/test/example/CI source가 기준 commit과 동�
 | generic client의 외부 효과·tenant 권한 | host adapter 소유자. kernel 제공 DB/HTTP adapter를 제품 범위에 넣을 때 별도 조사·실제 서비스 검증 |
 | 자식 모델 중단·drain·usage 및 기존 builtin parent writer 연동 | P8 담당. P8 착수 시 현재 P3 lineage와 함께 검토 |
 | async owned resource/유한 cleanup deadline | host 통합 담당. 동기 callback 계약으로 실제 소비자를 지원하지 못할 때 API·실행 모델을 다시 선택 |
-| CSP raw workspace 보관 제거 | CSP 통합 담당. P3 패키지 릴리스 뒤 새 seam으로 이관 PR·pin·운영 검증 |
+| 호스트 raw workspace 보관 제거 | 호스트 통합 담당. P3 패키지 릴리스 뒤 새 seam으로 이관 PR·pin·운영 검증 |
 
 각 PR 착수 시 이 기록에 실제 base/head, 수정 전 실패, 수정 후 결과, 최종 리뷰·CI, 예상 대비 누적 비용을 이어 기록한다.
 
@@ -517,13 +523,13 @@ develop `61865effbabfec28adebd85e9574c52bc572c62a`로 병합했다. P3-01은 이
 P3-01 독립 preflight reviewer `p3_01_preflight_review`의 판정은 **ready**다.
 검토 대상은 base `61865ef`와 preflight SHA256 `038001BC9396D04F66B697501728507C402FBF5B0226108E23234CA29957614A`다.
 추가 constructor probe에서도 initialization body 반환 뒤 revoke하면 두 owned handle이 모두 열린 채 남음을 확인했다.
-출력은 `.tmp/v025/p3-01-constructor-probe.json`이다.
+출력은 `p3-01-constructor-probe.json`이다.
 
 **수정 전 회귀:** `tests/test_activation_cleanup.py`는 **12 failed, 3 passed / 4.31s**다.
 실패는 constructor/초기화 handle 누수, 첫 종료의 session 잔존, cleanup이 원래 오류를 덮는 경계다.
 committed release와 provider/config의 recordable failed-session 수명은 통과 대조다.
 초기 fixture의 config 주입은 runtime-config provider Protocol에 맞춰 수정한 뒤 이 결과를 고정했다.
-production source는 아직 base와 동일하다. 원본 출력은 `.tmp/v025/p3-01-red.log`다.
+production source는 아직 base와 동일하다. 원본 출력은 `p3-01-red.log`다.
 
 ~~~powershell
 python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_activation_cleanup.py --tb=short
@@ -539,7 +545,7 @@ escaping open/restore 제어 예외도 정리 후 원래 의미로 전파한다.
 
 동일 신규 회귀는 **15 passed / 3.61s**였다. 기존 checkpoint·취소·model-I/O·hosting·loop/session lifecycle·
 stream observer·public/compat를 포함한 최종 focused 검사는 **337 passed / 12.90s**다.
-원본은 `.tmp/v025/p3-01-green.log`, `.tmp/v025/p3-01-focused.log`다.
+원본은 `p3-01-green.log`, `p3-01-focused.log`다.
 
 ~~~powershell
 python -m pytest -q -n auto --dist=worksteal --timeout=120 --timeout-method=thread tests/test_activation_cleanup.py tests/test_checkpoint.py tests/test_cancellation.py tests/test_loop_model_io_integration.py tests/test_activation_hosting.py tests/test_agent_loop_lifecycle.py tests/test_session_lifecycle.py tests/test_session_drive.py tests/test_model_stream_observer.py tests/test_public_surface.py tests/test_compatibility_ledger.py --tb=short --durations=8
@@ -553,10 +559,10 @@ P3-01 첫 후보 `d3d047d`의 독립 코드 reviewer `p3_01_code_review_a/b`는 
 기존 discard helper는 sink 목록에서 첫 JsonlEventSink를 선택하므로 authoritative host sink가 먼저 있으면
 그 외부 sink를 닫고 owned events 파일은 남긴다. 새 prepublication caller에서도 이 문제가 도달 가능했다.
 추가 회귀는 provisional/published 두 경로 모두 **2 failed / 0.70s**로 고정했다(commit `fb55581`,
-`.tmp/v025/p3-01-owned-sink-red.log`). 생성자가 정확한 owned sink를 private 필드에 보관하고
+`p3-01-owned-sink-red.log`). 생성자가 정확한 owned sink를 private 필드에 보관하고
 discard가 그 인스턴스만 닫도록 수정했다. 정상 EventBus.close 계약은 유지한다.
 같은 focused 검사에 두 회귀를 더한 결과는 **339 passed / 17.75s**다
-(`.tmp/v025/p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
+(`p3-01-final-focused.log`). ruff 0.15.6 및 diff 공백 검사도 통과했다.
 최종 후보를 두 reviewer가 표적 재검토한 뒤 독립 PR의 L1/L2를 확인한다.
 
 두 reviewer의 최종 판정은 `47ff2cf424b88189082202173601bb66b97910f3`에 대해 PASS다.
@@ -628,7 +634,7 @@ callback close가 writer를 revoke하는 경우에도 local dispose를 모두 �
 검증 경로를 수정했다. staging backend는 host가 제공한 staging directory에 직접 쓰므로 overlay와 구분해
 기존 동작을 검증했다. 신규 회귀 및 기존 cleanup/checkpoint/cancellation/hosting/session/loop/async/tool-surface/
 workspace-permission/public/compat 검사는 **583 passed, 1 platform skip / 17.56s**다
-(`.tmp/v025/p3-02-focused.log`). 추가 hosted duplicate-command 테스트 및 close/secret/awaitable 검사
+(`p3-02-focused.log`). 추가 hosted duplicate-command 테스트 및 close/secret/awaitable 검사
 **5 passed / 0.89s**도 확인했다. 실제 duplicate command는 host factory를 다시 실행하지 않았다.
 
 새 wheel audit에 두 모듈을 포함하고 기존 minimal install CI에서 report recipe를 실행하도록 연결했다.
@@ -648,7 +654,7 @@ coverage 수치는 80.67%로 기준을 충족했다. 실패 원인은 해당 테
 원래 base `61865ef`와 병합 head `4539296` 모두에서 driver의 park snapshot 직전 barrier를 삽입하면
 fixture가 `last_suspension=None`을 먼저 써서 같은 sequence의 checkpoint를 오염시킨다.
 `AWAITING_INPUT` 상태는 최종 snapshot보다 먼저 게시된다. backend/drive/test source는 두 revision에서 같다.
-원본 probe는 P3 worktree `.tmp/v025/p3-01-cancel-triage/`에 있으며, 양쪽 revision에서 원래 실패와
+원본 probe는 P3 worktree `p3-01-cancel-triage`에 있으며, 양쪽 revision에서 원래 실패와
 직렬화 대조를 확인하는 2개 probe가 각각 3.39s/3.12s에 통과했다.
 
 선택: fixture의 인위적인 marker 변경을 기존 `_run_on_shared_loop`로 보낸다. 앞선 driver snapshot 완료 후
@@ -730,7 +736,7 @@ production은 480줄 registry와 156줄 소비 예제, 기존 loop/bootstrap 연
 
 독립 reviewer `p3_03_preflight_review`는 두 보완을 반영한 preflight
 SHA256 `5F1AEE882658BE31DEBA24AFB21783A26E6B1BF8D7B03F6EED3E19C049D9551A`에 **READY**다.
-정책 probe 원본/결과는 `.tmp/v025/p3-03-preflight-review-policy.py`와 같은 이름의 `.json`에 있다.
+정책 probe 원본/결과는 `p3-03-preflight-review-policy.py`와 같은 이름의 `.json`에 있다.
 해당 probe는 미구현 상속 전달만 메모리에서 모사했으며 production 완료 증거로 사용하지 않는다.
 CI fixture 보완 뒤 develop `40430925138` 및 integration `40430979676` 전체 CI는 모두 성공했다.
 
@@ -739,7 +745,7 @@ CI fixture 보완 뒤 develop `40430925138` 및 integration `40430979676` 전체
 나머지 2개 실패는 `inherit_to_children` 신규 API가 아직 없어 생긴 TypeError다.
 기본 상속 거부와 spec policy 경로 4개는 통과 대조다. 초기 fixture의 reports directory를 준비한 뒤
 실제 child write 성공을 관찰해 고정했다. production source는 base와 동일하다.
-원본은 `.tmp/v025/p3-03-red.log`. 표준 4-worker pytest로 새 test module만 실행했다.
+원본은 `p3-03-red.log`. 표준 4-worker pytest로 새 test module만 실행했다.
 
 수정 전 회귀 commit은 `f10f6de`다. P3-02 integration 전체 CI `40431588835`의 14개 job 성공을
 확인한 뒤 production을 변경했다. opt-in field, fresh child factory, parent lifetime chain,
@@ -747,7 +753,7 @@ effective policy 전달과 handler의 local/resource 검사를 연결했다. 초
 
 실제 child/fork/nested 실행, 호출 중 root·중간 parent 종료/revoke, callback 전후, 진입한 child write barrier,
 sibling/parent 독립, mixed opt-in, fresh restore 및 packaged consumer까지 **35 passed / 5.96s**다.
-원본은 `.tmp/v025/p3-03-green.log`. 초기 restore fixture는 공유 FakeModelAdapter의 소비된 turn list를
+원본은 `p3-03-green.log`. 초기 restore fixture는 공유 FakeModelAdapter의 소비된 turn list를
 복사하도록 수정했고, 중간 parent revoke의 기존 `TurnNotSettled(interruption_cause=lease_lost)`도 보존했다.
 기존 `snapshot()`은 실행 중인 in-process resume job을 durable park로 허용하지 않는다.
 공개 committed release 회귀는 `create_task(..., resume_on_exit=False)`의 host-driven child를 사용해
@@ -755,11 +761,11 @@ sibling/parent 독립, mixed opt-in, fresh restore 및 packaged consumer까지 *
 새로운 background-task 복구 정책은 추가하지 않았다.
 
 최종 focused 검사는 **647 passed, 1 platform skip / 20.31s**다
-(`.tmp/v025/p3-03-focused.log`). 기존 P3-02 focused 목록에 새 child tests와 기존
+(`p3-03-focused.log`). 기존 P3-02 focused 목록에 새 child tests와 기존
 `test_subagent.py`/`test_subagent_runtime_context.py`를 추가했다. ruff0.15.6과 diff 공백 검사도 통과했다.
 메모리에서 parent token 연결만 제거한 음성 대조는 child write 도중 parent end가 즉시 반환하여
 barrier 회귀가 **1 failed / 0.66s**로 검출했다. production은 변경하지 않았고 원본은
-`.tmp/v025/p3-03-parent-guard-negative.py`/`.log`다.
+`p3-03-parent-guard-negative.py`/`.log`다.
 
 현재 source wheel audit 및 PYTHONPATH 없는 checkout 밖 installed-wheel recipe를 다시 실행했다.
 Python3.11.9/Pydantic2.14.1과 최소 계열2.6.4 모두 승인·복구 및 fresh/fork report를 완료했다.
@@ -773,9 +779,9 @@ computed allowed write 및 parent read가 거부돼도 앞서 기록한 표식 �
 성공 표식을 실제 read/check 완료 뒤로 옮기고 handler 밖에서 확인한다. factory 중 parent end 검사도
 parent 두 요청만 model에 도달했음을 확인한다. production 변경은 없다.
 보완 뒤 같은 positive-operation 거부 변이는 **4 failed / 1.48s**, parent token 제거 변이는 barrier와
-factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tmp/v025/p3-03-success-oracle-negative.log`,
+factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `p3-03-success-oracle-negative.log`,
 `p3-03-parent-guard-negative-final.log`다. 원래 구현의 새 35개 검사는 **35 passed / 12.21s**이며
-`.tmp/v025/p3-03-final-green.log`에 기록했다. 두 reviewer의 최종 판정은
+`p3-03-final-green.log`에 기록했다. 두 reviewer의 최종 판정은
 `c517e15dbc61d4c3b6ca28877b350fb7057ea631`에서 모두 PASS다.
 같은 head의 L1 `40438800639`, 필수 L2 `40439077960`이 성공했다.
 [PR #154](https://github.com/hoonseokyoon/monoid-agent-kernel/pull/154)는 통합 브랜치에
@@ -784,7 +790,7 @@ factory 검사에서 **2 failed / 5.43s**로 모두 검출했다. 원본은 `.tm
 ### P3-I 통합 사전조사와 인계 — 2026-10-27
 
 최신 develop `336cb4c`를 다시 fetch했고, 통합 `aa9e07e`의 source tree가 P3-03 최종 검토 후보와 같음을 확인했다.
-독립 사전 검토는 `.tmp/v025/p3-i-preflight.md`의 SHA256
+독립 사전 검토는 `p3-i-preflight.md`의 SHA256
 `CF76EB5E4164FD093A24D6D89F2B8E585AE2BE9DD0161F5CA131E96444738125`에 READY를 반환했다.
 이 검토 이후 P3-03의 테스트 성공 관찰점만 보완했고, production 차이는 없다.
 
@@ -811,7 +817,7 @@ P3-I PR에 최종 head, 두 리뷰 판정, L1/L2 및 통합 브랜치 전체 CI�
   두 번 닫혔다. 순차 `open()` 시도의 지역 객체 맵으로 중복 identity를 보존하고 finally에서 해제한다.
   ExitStack의 소유권과 역순 해제는 유지한다. 늦게 반환된 새로운 adapter는 한 번 닫는다.
 
-수정 전 test-only `9cf1003`은 **4 failed, 10 passed / 7.46s**였다(`.tmp/v025/p3-i-red.log`).
+수정 전 test-only `9cf1003`은 **4 failed, 10 passed / 7.46s**였다(`p3-i-red.log`).
 실패는 위 세 결과 덮어쓰기와 중복 close였고, 정상 disposer·writer revoke·기존 unwind·fresh late adapter는 대조로 통과했다.
 보완 후 관련 cleanup 검사는 **24 passed / 5.66s**, 전체 focused 검사는 **661 passed, 1 platform skip / 38.14s**다
 (`p3-i-repair-green.log`, `p3-i-focused.log`). ruff0.15.6과 공백 검사도 통과했다.
