@@ -12,10 +12,10 @@ API. Start with the [typed tool quickstart](../README.md#quickstart-no-servers).
 | Own a local session | `python examples/embedding_local_product.py` | File content, checked checkpoint and completed session |
 | Stop a request stream | `python examples/termination_budget.py` | Exit phase and final receipt with reported usage |
 | Observe a background run | `python examples/observe_background_run.py` | Reader close, peer progress, reconnect/reset and explicit run cancel |
-| Inject resources and restore after approval | `python -m monoid_agent_kernel.reference.host_tool_report` | Committed park, released resources and approved read in a fresh loop |
+| Inject resources and restore after approval | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Durable approval park and IDs for the [resume command](#resume-approval-in-a-new-process) |
 
-These examples run offline with temporary state. The approval recipe currently creates its fresh
-loop in the same process. [Call facts](../examples/model_call_facts.py) shows explicit zero and
+These examples run offline. The approval phases retain state under the supplied root; no-argument
+recipes use temporary state. [Call facts](../examples/model_call_facts.py) shows explicit zero and
 unknown counters; [receipt recovery](../examples/recover_model_call_facts.py) shows an in-memory
 lifecycle-hook round trip. The local session recipe also shows failure cleanup that preserves the
 last checkpoint and original exception. The sections below define production responsibilities.
@@ -119,14 +119,34 @@ signals retain their classification. Runtime errors include `host_tool_binding_m
 `host_tool_binding_type`, `host_tool_context_unavailable`, `tool_call_not_in_flight` and
 `host_tool_resource_closed`. Callback failures use `host_tool_binding_open/bind/accepts/close`.
 
-The [complete typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes
-a scoped proposal, parks for approval, releases its activation, restores with fresh resources and
-reads the proposal after approval. It also delegates reports through fresh and fork children and
-uses the parent's independent resource after child cleanup. It runs offline from an installed wheel:
+### Resume approval in a new process
+
+The [typed report recipe](../src/monoid_agent_kernel/reference/host_tool_report.py) writes a scoped
+proposal, commits an approval park and releases its activation. Run these commands from an installed
+wheel or this installed checkout. Copy `run_id` and `task_id` from the first JSON response into the
+second command, keeping the same root:
 
 ```bash
-python -m monoid_agent_kernel.reference.host_tool_report
+python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state
+python -m monoid_agent_kernel.reference.host_tool_report --phase resume --root ./report-state --run-id RUN_ID --task-id TASK_ID
 ```
+
+Each command starts a new interpreter and creates one resource through the host factory. Prepare
+reports zero reads and three model calls: save, request approval, then acknowledge the pending task.
+Resume loads the checked checkpoint, verifies the pending
+task and delivers approval. A repeated result is ignored; the original proposal reaches the model
+after one read and one new model call. The JSON includes the process ID and report body. Scripted
+cumulative usage grows from 5 input / 3 output / 8 total tokens to 9 / 6 / 15 across restoration.
+The actual workspace stays unchanged; applying a proposal is a separate host operation.
+
+The root and IDs belong to the trusted embedding host. It supplies approval for the pending task.
+An unrelated task is refused with the committed checkpoint preserved, and restore failures retain
+the original error while discarding the local activation. This path demonstrates a committed park
+followed by restoration; hosts own crash recovery and idempotency for external effects.
+
+Run `python -m monoid_agent_kernel.reference.host_tool_report` without arguments for the temporary
+approval demo plus fresh/fork child reports. Each child uses its own resource, and the parent's
+resource remains usable after child cleanup.
 
 ## Use domain models in tools
 

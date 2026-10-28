@@ -480,7 +480,7 @@ def test_host_report_cli_restores_approval_in_a_fresh_process(tmp_path: Path) ->
     assert prepared["pid"] != os.getpid()
     assert prepared["resource_opens"] == 1
     assert prepared["read_calls"] == 0
-    assert prepared["model_calls"] == 2
+    assert prepared["model_calls"] == 3
     assert prepared["total_usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
     assert prepared["proposal_only"] is True
     report_path = root / "workspace" / "reports" / "weekly.md"
@@ -527,6 +527,52 @@ def test_host_report_cli_restores_approval_in_a_fresh_process(tmp_path: Path) ->
     assert resumed["report_body"] == "# Weekly\n\nReady for approval.\n"
     assert resumed["proposal_only"] is True
     assert not report_path.exists()
+
+
+def test_host_report_restore_failure_preserves_error_and_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from monoid_agent_kernel import LoopSession
+    from monoid_agent_kernel.core.checkpoint import CheckpointRecord, LocalFsCheckpointStore
+    from monoid_agent_kernel.reference import host_tool_report as module
+
+    prepared = module.prepare_report(tmp_path)
+    store = LocalFsCheckpointStore(tmp_path / "runs")
+    before = store.latest_checked(prepared["run_id"])
+    assert before.ok and before.value is not None
+    original_from_config = module.AgentLoop.from_config
+    original_discard = module.AgentLoop.discard_uncommitted
+    loops = []
+    blob_error = OSError("saved report blob unavailable")
+
+    def observe_loop(*args, **kwargs):
+        loop = original_from_config(*args, **kwargs)
+        loops.append(loop)
+        return loop
+
+    def fail_blob(self, sha256):
+        raise blob_error
+
+    def discard_then_fail(loop):
+        original_discard(loop)
+        raise RuntimeError("cleanup failed after releasing the activation")
+
+    monkeypatch.setattr(module.AgentLoop, "from_config", observe_loop)
+    monkeypatch.setattr(CheckpointRecord, "blob", fail_blob)
+    monkeypatch.setattr(module.AgentLoop, "discard_uncommitted", discard_then_fail)
+    try:
+        with pytest.raises(OSError) as raised:
+            module.resume_report(tmp_path, prepared["run_id"], prepared["task_id"])
+        assert raised.value is blob_error
+        loop, = loops
+        assert LoopSession(loop).health().alive is False
+        after = store.latest_checked(prepared["run_id"])
+        assert after.ok and after.value is not None
+        assert after.value.seq == before.value.seq
+        assert after.value.checkpoint.to_json() == before.value.checkpoint.to_json()
+    finally:
+        for loop in loops:
+            original_discard(loop)
 
 
 def test_hosted_product_embedding_golden_path(tmp_path: Path) -> None:

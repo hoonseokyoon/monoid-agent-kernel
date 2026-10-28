@@ -48,9 +48,11 @@ Choose the next integration step:
 | Builtin tools and a local session | `python examples/embedding_local_product.py` | Written release note, checked checkpoint, completed run |
 | Stop and request stream ownership | `python examples/termination_budget.py` | Early break, Stop progress, final facts and sparse reported usage |
 | Observe a background run | `python examples/observe_background_run.py` | Passive disconnect, peer progress, cursor replay/reset and explicit cancel |
-| Tool resources, approval and restore | `python -m monoid_agent_kernel.reference.host_tool_report` | Park/release, fresh loop restoration, approved read, separate child resources |
+| Tool resources, approval and restore | `python -m monoid_agent_kernel.reference.host_tool_report --phase prepare --root ./report-state` | Durable approval park and run/task IDs for a new process |
 
-The approval recipe restores into a fresh loop in the same process. The
+Use the printed IDs to [resume approval in a new process](docs/EMBEDDING.md#resume-approval-in-a-new-process).
+The recipe shows fresh resource creation, one approved read and usage carried across the checkpoint.
+Its no-argument command also demonstrates fresh/fork child resources. The
 [embedding handbook](docs/EMBEDDING.md) explains resource lifetime, permissions and recovery.
 The stream recipe also accepts `--scenario silent_stop` and `--scenario consumer_cancel`.
 It owns request cleanup; the background recipe keeps execution alive across reader disconnects.

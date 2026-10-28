@@ -307,7 +307,45 @@ jobs:
       - name: Run installed host resource approval and recovery recipe
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}
-        run: python -m monoid_agent_kernel.reference.host_tool_report
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          command = [sys.executable, "-m", "monoid_agent_kernel.reference.host_tool_report"]
+          env = os.environ.copy()
+          env.pop("PYTHONPATH", None)
+          with tempfile.TemporaryDirectory(prefix="monoid-installed-approval-") as directory:
+              subprocess.run(command, cwd=directory, env=env, check=True, timeout=30)
+              root = Path(directory) / "report"
+              prepared = json.loads(subprocess.check_output(
+                  command + ["--phase", "prepare", "--root", str(root)],
+                  cwd=directory, env=env, text=True, timeout=30,
+              ))
+              resumed = json.loads(subprocess.check_output(
+                  command + ["--phase", "resume", "--root", str(root),
+                             "--run-id", prepared["run_id"], "--task-id", prepared["task_id"]],
+                  cwd=directory, env=env, text=True, timeout=30,
+              ))
+              assert prepared["status"] == "awaiting_tasks" and resumed["status"] == "completed"
+              assert prepared["pid"] != resumed["pid"]
+              assert resumed["run_id"] == prepared["run_id"]
+              assert resumed["task_id"] == prepared["task_id"]
+              assert (prepared["resource_opens"], resumed["resource_opens"]) == (1, 1)
+              assert (prepared["read_calls"], resumed["read_calls"]) == (0, 1)
+              assert (prepared["model_calls"], resumed["model_calls"]) == (3, 1)
+              assert prepared["total_usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+              assert resumed["total_usage"] == {"input_tokens": 9, "output_tokens": 6, "total_tokens": 15}
+              assert resumed["duplicate_ignored"] is True
+              assert resumed["report_body"] == "# Weekly\n\nReady for approval.\n"
+              assert prepared["proposal_only"] and resumed["proposal_only"]
+              assert not (root / "workspace/reports/weekly.md").exists()
+              print(json.dumps({"prepared": prepared, "resumed": resumed}, sort_keys=True))
+          PY
       - name: Run installed conformance evidence smoke
         if: matrix.install == 'minimal'
         working-directory: ${{ runner.temp }}
